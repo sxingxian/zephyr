@@ -1,0 +1,32 @@
+---
+import { MASCOT, type MascotPose } from '@zephyr/brand';
+
+interface Props {
+  pose: MascotPose;
+  size: number;
+  bg?: string;
+  round?: boolean;
+  class?: string;
+}
+const { pose, size, bg = 'var(--m-sky)', round = true, class: cls } = Astro.props;
+const h = Math.round(size * (250 / 220));
+const svg = MASCOT[pose].replace('<svg ', `<svg width="${size}" height="${h}" `);
+---
+<div class:list={['mascot', cls]} style={`--s: ${size}px; --bg: ${bg}; border-radius: ${round ? '50%' : '28px'}`}>
+  <Fragment set:html={svg} />
+</div>
+<style>
+  .mascot {
+    width: var(--s);
+    height: var(--s);
+    background: var(--bg);
+    overflow: hidden;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .mascot :global(svg) {
+    overflow: visible;
+  }
+</style>

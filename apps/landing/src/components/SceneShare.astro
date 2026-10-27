@@ -1,0 +1,177 @@
+---
+import { anim } from '../lib/motion';
+import { kindAt, seeded } from '../lib/site';
+import Mascot from './Mascot.astro';
+import Sample from './Sample.astro';
+import Steps from './Steps.astro';
+
+// Selects ride the wind into a client gallery, which then locks behind a passcode.
+const { between } = seeded(83);
+const spots: [number, number, number, number][] = [
+  [0, 0, 2, 2],
+  [2, 0, 1, 1],
+  [3, 0, 1, 2],
+  [2, 1, 1, 1],
+  [0, 2, 1, 1],
+  [1, 2, 2, 1],
+  [3, 2, 1, 1],
+];
+const cards = spots.map(([c, r, cs, rs], i) => {
+  const g1x = between(-1300, -900);
+  const from = {
+    g1x,
+    g1y: between(-300, 200),
+    g1r: between(-50, -20),
+    g2x: Math.round(g1x * 0.45),
+    g2y: between(80, 220),
+    g2r: between(10, 30),
+    g3x: between(-40, 40),
+    g3y: between(-60, -20),
+    g3r: between(-6, 6),
+  };
+  return {
+    kind: kindAt(i + 7),
+    style: `grid-column: ${c + 1} / span ${cs}; grid-row: ${r + 1} / span ${rs}`,
+    attrs: anim('gust', 0.04 + i * 0.045, 0.3 + i * 0.045, from),
+  };
+});
+const digits = '427193'.split('');
+---
+<section id="sharing" class="scene" aria-label="Private passcode galleries" data-scene style="--scene-h: 300vh">
+  <div class="scene__stick">
+    <div class="wrap share">
+      <Steps
+        items={[
+          ['Pick the keepers.', 'Favourites and selects blow straight into a client gallery. No exporting, no zip files.'],
+          ['It settles into a gallery.', "A clean grid in your client's browser, on any phone, with no ads, ever."],
+          ['Then it locks.', 'A long private link plus six digits, checked on our servers. Five wrong tries and it pauses for 15 minutes.'],
+        ]}
+        ranges={[{ in: [0, 0.05], out: [0.3, 0.35] }, { in: [0.35, 0.4], out: [0.64, 0.68] }, { in: [0.68, 0.73] }]}
+      />
+      <div class="share__stage">
+        <svg class="share__wind" viewBox="0 0 1240 620" preserveAspectRatio="none" aria-hidden="true">
+          <g fill="none" stroke="var(--m-scarf)" stroke-width="3" stroke-linecap="round" stroke-dasharray="1200" opacity="0.8">
+            <path d="M-40 120 C 240 40, 420 220, 700 140 S 1100 60, 1300 160" {...anim('draw', 0, 0.3)}></path>
+            <path d="M-40 330 C 200 260, 480 420, 760 320 S 1120 240, 1300 340" {...anim('draw', 0.08, 0.38)}></path>
+            <path d="M-40 520 C 300 460, 520 600, 820 500 S 1140 440, 1300 520" {...anim('draw', 0.16, 0.46)}></path>
+          </g>
+        </svg>
+        <div class="share__board" {...anim('dimBoard', 0.7, 0.78)}>
+          {
+            cards.map((c) => (
+              <figure class="share__card photo" style={c.style} {...c.attrs}>
+                <Sample kind={c.kind} />
+              </figure>
+            ))
+          }
+        </div>
+        <div class="share__lock-wrap">
+          <div class="share__lock" {...anim('popIn', 0.74, 0.8)}>
+            <Mascot pose="guard" size={112} bg="#E3E9F5" />
+            <span class="share__title">Tan &amp; Wei · Wedding proofs</span>
+            <div class="share__digits" aria-label="Passcode, 6 digits">
+              {
+                digits.map((d, i) => (
+                  <span class="share__digit mono">
+                    <span {...anim('digitIn', 0.8 + i * 0.022, 0.83 + i * 0.022)}>{d}</span>
+                  </span>
+                ))
+              }
+            </div>
+            <span class="share__url">zephyrapp.midnightpoetry.studio/g/q7Rk…f2Vx</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<style>
+  .share {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
+    gap: 48px;
+    align-items: center;
+  }
+  .share__stage {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    max-height: 620px;
+  }
+  .share__wind {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    overflow: visible;
+  }
+  .share__board {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-rows: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+  }
+  :global(html:not(.motion)) .share__board {
+    filter: blur(6px);
+    opacity: 0.3;
+  }
+  .share__card {
+    border-radius: 14px;
+    box-shadow:
+      0 0 0 1px var(--line),
+      0 12px 30px rgba(13, 17, 23, 0.12);
+  }
+  .share__lock-wrap {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: min(440px, 100%);
+    transform: translate(-50%, -50%);
+    z-index: 4;
+  }
+  .share__lock {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: clamp(16px, 4vw, 28px);
+    border-radius: 28px;
+    background: var(--surf);
+    box-shadow:
+      0 0 0 1px var(--line),
+      0 30px 80px rgba(13, 17, 23, 0.25);
+    text-align: center;
+  }
+  .share__title {
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+  .share__digits {
+    display: flex;
+    gap: 6px;
+  }
+  .share__digit {
+    width: clamp(34px, 9vw, 48px);
+    height: clamp(44px, 11vw, 60px);
+    border-radius: 12px;
+    background: var(--surf2);
+    border: 1px solid var(--line2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: clamp(20px, 5vw, 26px);
+    font-weight: 500;
+  }
+  .share__digit span {
+    display: inline-block;
+  }
+  .share__url {
+    font-size: 13px;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+</style>

@@ -1,0 +1,39 @@
+---
+import '../styles/global.css';
+import { SITE_URL } from '../lib/site';
+
+interface Props {
+  title: string;
+  description: string;
+  path?: string;
+  noindex?: boolean;
+}
+const { title, description, path = '/', noindex = false } = Astro.props;
+const canonical = new URL(path, SITE_URL).toString();
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    {noindex && <meta name="robots" content="noindex" />}
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#F4F6F9" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0A0C10" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:site_name" content="Zephyr" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <slot />
+  </body>
+</html>

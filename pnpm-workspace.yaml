@@ -1,0 +1,11 @@
+packages:
+  - apps/*
+  - packages/*
+
+# Supply-chain hardening: don't install versions published in the last day,
+# and only let these packages run install scripts.
+minimumReleaseAge: 1440
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+  - workerd

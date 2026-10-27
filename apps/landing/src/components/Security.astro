@@ -1,0 +1,96 @@
+---
+import type { IconName } from '@zephyr/brand';
+import Icon from './Icon.astro';
+
+const items: [IconName, string, string][] = [
+  [
+    'key',
+    'Passcodes checked on our servers',
+    'Never in your browser. Five wrong tries in 15 minutes locks the link for that visitor.',
+  ],
+  [
+    'link',
+    'Links nobody can guess',
+    'Each gallery link carries a long random token, so the passcode is a second lock, not the only one.',
+  ],
+  [
+    'lock',
+    'Encrypted everywhere',
+    'TLS on the wire and encryption at rest for every photo. Images load through short-lived signed URLs.',
+  ],
+  [
+    'passkey',
+    'Passkeys and two-step sign-in',
+    'Sign in with Google, Apple, email or a passkey. Add an authenticator app for a second step.',
+  ],
+  [
+    'face',
+    'Face grouping is off until you say so',
+    'People grouping is opt-in, per library, and can be wiped in one tap.',
+  ],
+  [
+    'megaphone',
+    'Ads stay in the app',
+    'Free-plan ads never appear on galleries you share, and never inside the editor.',
+  ],
+];
+---
+<section id="security" class="section">
+  <div class="wrap security">
+    <header class="section-head security__head">
+      <span class="eyebrow">Security</span>
+      <h2 class="h2">Your clients trusted you with these moments.</h2>
+      <p class="lede">So we built Zephyr as if every gallery were a wedding.</p>
+    </header>
+    <ul class="grid-auto security__list" style="--min: 260px; --gap: 28px">
+      {
+        items.map(([ic, t, d]) => (
+          <li>
+            <span class="security__icon"><Icon name={ic} size={22} /></span>
+            <div>
+              <h3>{t}</h3>
+              <p>{d}</p>
+            </div>
+          </li>
+        ))
+      }
+    </ul>
+  </div>
+</section>
+<style>
+  .security {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 48px;
+    align-items: flex-start;
+  }
+  .security__head {
+    flex: 1 1 320px;
+  }
+  .security__list {
+    flex: 2 1 560px;
+    min-width: 0;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .security__list li {
+    display: flex;
+    gap: 14px;
+  }
+  .security__icon {
+    color: var(--acc);
+    margin-top: 2px;
+  }
+  .security__list h3 {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .security__list p {
+    margin-top: 4px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--muted);
+  }
+</style>

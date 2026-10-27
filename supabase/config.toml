@@ -1,0 +1,39 @@
+# Supabase CLI config for local development. Production settings live in the Supabase dashboard;
+# keep the auth hook below enabled there too (Authentication › Hooks › Before User Created).
+project_id = "zephyr"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+major_version = 17
+
+[db.seed]
+enabled = true
+sql_paths = ["./seed.sql"]
+
+[auth]
+enabled = true
+site_url = "http://localhost:4321"
+additional_redirect_urls = ["http://localhost:5173"]
+jwt_expiry = 3600
+# Public sign-up (POST /auth/v1/signup) is off. Accounts are created only by the API, which checks
+# the invite token server-side and then uses the Auth admin API (invite / magic link), so nobody can
+# pre-register an invited email with their own password. Mirror this in the dashboard:
+# Authentication › Sign In / Providers › "Allow new users to sign up" = off.
+enable_signup = false
+
+[auth.email]
+enable_signup = false
+enable_confirmations = true
+
+# Defence in depth: even admin-created accounts must match an open invite while Invite only is on.
+# Enforces Open / Invite only / paused on the server before any account is created.
+[auth.hook.before_user_created]
+enabled = true
+uri = "pg-functions://postgres/public/hook_before_user_created"

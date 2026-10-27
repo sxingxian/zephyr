@@ -1,0 +1,170 @@
+---
+import { kindAt, LINKS, seeded } from '../lib/site';
+import Icon from './Icon.astro';
+import Sample from './Sample.astro';
+
+// The CSS tunnel is the poster: it runs without JavaScript and is replaced by the three.js scene
+// (scripts/hero3d.ts) on capable devices once the page is idle.
+const { rnd, between } = seeded(11);
+const cards = Array.from({ length: 16 }, (_, i) => {
+  const ang = (i / 16) * Math.PI * 2 + rnd() * 0.3;
+  const rad = between(220, 420);
+  return {
+    kind: kindAt(i),
+    tx: Math.round(Math.cos(ang) * rad * 1.5),
+    ty: Math.round(Math.sin(ang) * rad * 0.8),
+    tr: between(-10, 10),
+    delay: (-i * 0.56).toFixed(2),
+  };
+});
+---
+<section id="top" class="hero">
+  <div class="hero__grid" aria-hidden="true"></div>
+  <div class="hero__tunnel" aria-hidden="true" data-hero-poster>
+    {
+      cards.map((c) => (
+        <figure class="hero__card" style={`--tx: ${c.tx}px; --ty: ${c.ty}px; --tr: ${c.tr}deg; animation-delay: ${c.delay}s`}>
+          <Sample kind={c.kind} eager />
+        </figure>
+      ))
+    }
+  </div>
+  <canvas class="hero__gl" aria-hidden="true" data-hero-canvas></canvas>
+  <div class="hero__content">
+    <span class="chip chip--acc chip--lg"><Icon name="mail" size={14} />Early access · by invite</span>
+    <h1 class="h1">Five hundred photos.<br />One breeze.</h1>
+    <p class="lede hero__lede">
+      Drop a whole shoot, let Zephyr AI grade it, and hand it to your client behind a 6-digit passcode. All in your
+      browser.
+    </p>
+    <div class="hero__ctas">
+      <a class="btn btn--primary btn--lg" href={LINKS.requestInvite}>Request an invite<Icon name="arrowR" size={17} /></a>
+      <a class="btn btn--secondary btn--lg" href={LINKS.haveInvite}><Icon name="key" size={17} />I have an invite</a>
+    </div>
+    <p class="hero__note">
+      Early access, opening a few seats at a time · Already a member? <a href={LINKS.signIn}>Sign in</a>
+    </p>
+    <span class="scroll-hint" aria-hidden="true"><span class="scroll-hint__line"><span></span></span>Scroll</span>
+  </div>
+</section>
+<style>
+  .hero {
+    position: relative;
+    min-height: max(760px, 100svh);
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 140px 24px 80px;
+  }
+  .hero__grid {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 72px 72px;
+    -webkit-mask-image: radial-gradient(ellipse at center, #000 20%, transparent 70%);
+    mask-image: radial-gradient(ellipse at center, #000 20%, transparent 70%);
+  }
+  .hero__tunnel {
+    position: absolute;
+    inset: 0;
+    perspective: 900px;
+    transform-style: preserve-3d;
+    transition: opacity 600ms ease;
+  }
+  .hero__card {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 150px;
+    height: 104px;
+    margin: -52px 0 0 -75px;
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.08),
+      0 20px 50px rgba(0, 0, 0, 0.35);
+    animation: tunnel 9s linear infinite;
+    will-change: transform, opacity;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .hero__card {
+      animation: none !important;
+      transform: translate3d(calc(var(--tx) * 1.2), calc(var(--ty) * 1.2), -500px) rotate(var(--tr));
+      opacity: 0.55;
+    }
+  }
+  .hero__gl {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    transition: opacity 900ms ease;
+  }
+  :global(html.gl-ready) .hero__gl {
+    opacity: 1;
+  }
+  :global(html.gl-ready) .hero__tunnel {
+    opacity: 0;
+  }
+  .hero__content {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 22px;
+    text-align: center;
+    max-width: 940px;
+    padding: 40px;
+    border-radius: 40px;
+    background: radial-gradient(closest-side, var(--bg) 58%, transparent);
+  }
+  .hero__lede {
+    text-align: center;
+  }
+  .hero__ctas {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: center;
+  }
+  .hero__note {
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .scroll-hint {
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .scroll-hint__line {
+    position: relative;
+    width: 1px;
+    height: 36px;
+    background: var(--line2);
+    overflow: hidden;
+  }
+  .scroll-hint__line span {
+    position: absolute;
+    inset: 0;
+    background: var(--ink);
+    animation: scan 1.8s var(--ease-in-out) infinite;
+  }
+  @media (max-width: 600px) {
+    .hero__content {
+      padding: 24px 8px;
+    }
+    .hero__card {
+      width: 110px;
+      height: 76px;
+      margin: -38px 0 0 -55px;
+    }
+  }
+</style>

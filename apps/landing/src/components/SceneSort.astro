@@ -1,0 +1,148 @@
+---
+import { anim, anim2 } from '../lib/motion';
+import { kindAt, seeded } from '../lib/site';
+import Icon from './Icon.astro';
+import Sample from './Sample.astro';
+import Steps from './Steps.astro';
+
+// Photos fly out of depth into a sorted contact sheet; duplicates and blurry frames are set aside.
+const { between } = seeded(17);
+const TAGS: [string, boolean][] = [
+  ['People', false],
+  ['Night', false],
+  ['Flowers', false],
+  ['Product', false],
+  ['Desert', false],
+  ['Duplicate', true],
+  ['Portrait', false],
+  ['Forest', false],
+  ['Food', false],
+  ['Blurry', true],
+  ['Pets', false],
+  ['Product', false],
+];
+const cards = TAGS.map(([tag, flagged], i) => {
+  const a = 0.02 + i * 0.026;
+  const from = {
+    x: between(-900, 900),
+    y: between(-500, 500),
+    z: between(-2400, -900),
+    rotationX: between(-50, 50),
+    rotationY: between(-60, 60),
+    rotation: between(-25, 25),
+    blur: 10,
+  };
+  const attrs = flagged
+    ? anim2(['flyIn', a, a + 0.24, from], ['dimOut', 0.8, 0.86])
+    : anim('flyIn', a, a + 0.24, from);
+  const t = 0.62 + (i % 4) * 0.03;
+  return { kind: kindAt(i + 2), tag, flagged, attrs, tagAttrs: anim('tagIn', t, t + 0.04), i };
+});
+---
+<section id="features" class="scene" aria-label="Upload and auto-organise" data-scene style="--scene-h: 300vh">
+  <div class="scene__stick">
+    <div class="wrap sort">
+      <div class="sort__text">
+        <div class="sort__rail" aria-hidden="true"><span {...anim('grow', 0, 1)}></span></div>
+        <Steps
+          items={[
+            ['Drop the whole shoot.', 'Drag in 500 JPEGs or RAW files. They stream into your library in the background while you keep working.'],
+            ['They land in order.', 'Every frame finds its place by time and scene, so a messy memory card becomes a contact sheet.'],
+            ['Sorted before you look.', 'Scenes are tagged for you, and duplicates and blurry frames are set aside. Face grouping only if you switch it on.'],
+          ]}
+          ranges={[{ in: [0, 0.06], out: [0.26, 0.32] }, { in: [0.32, 0.38], out: [0.54, 0.58] }, { in: [0.58, 0.64] }]}
+        />
+      </div>
+      <div class="sort__board">
+        <div class="sort__grid">
+          {
+            cards.map((c) => (
+              <figure class="sort__card photo" {...c.attrs}>
+                <Sample kind={c.kind} alt={`Sample shoot photo ${c.i + 1}`} />
+                <span class:list={['chip', 'sort__tag', c.flagged && 'chip--warn']} {...c.tagAttrs}>
+                  {c.tag}
+                </span>
+              </figure>
+            ))
+          }
+        </div>
+        <div class="sort__meta">
+          <span><Icon name="upload" size={16} />Uploading 12 of 486</span>
+          <span><Icon name="copy" size={16} />2 set aside</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<style>
+  .sort {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr));
+    gap: 48px;
+    align-items: center;
+  }
+  .sort__text {
+    display: flex;
+    gap: 28px;
+    align-items: stretch;
+  }
+  .sort__rail {
+    width: 2px;
+    border-radius: 2px;
+    background: var(--line2);
+    position: relative;
+    min-height: 220px;
+    flex-shrink: 0;
+  }
+  .sort__rail span {
+    position: absolute;
+    inset: 0;
+    background: var(--acc);
+    border-radius: 2px;
+    transform-origin: top;
+  }
+  .sort__board {
+    perspective: 1100px;
+  }
+  .sort__grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    transform-style: preserve-3d;
+  }
+  .sort__card {
+    position: relative;
+    aspect-ratio: 4 / 3;
+    border-radius: 12px;
+    box-shadow:
+      0 0 0 1px var(--line),
+      0 18px 40px rgba(0, 0, 0, 0.22);
+  }
+  .sort__tag {
+    position: absolute;
+    left: 6px;
+    bottom: 6px;
+    height: 20px;
+    padding: 0 7px;
+    font-size: 11px;
+  }
+  .sort__meta {
+    margin-top: 16px;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .sort__meta span {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  @media (max-width: 520px) {
+    .sort__grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+  }
+</style>

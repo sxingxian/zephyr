@@ -1,0 +1,83 @@
+---
+import Wordmark from './Wordmark.astro';
+
+const year = new Date().getFullYear();
+---
+<footer class="footer">
+  <div class="wrap footer__top">
+    <div class="footer__brand">
+      <Wordmark size={20} />
+      <p>Photo editing and private galleries that move at the speed of a breeze. Made by Midnight Poetry Studio.</p>
+    </div>
+    <nav class="footer__cols" aria-label="Footer">
+      <div>
+        <h2>Product</h2>
+        <a href="#features">Features</a>
+        <a href="#pricing">Pricing</a>
+        <a href="#security">Security</a>
+        <a href="#install">Install</a>
+      </div>
+      <div>
+        <h2>Company</h2>
+        <a href="https://midnightpoetry.studio">Midnight Poetry Studio</a>
+        <a href="/contact">Contact</a>
+      </div>
+      <div>
+        <h2>Legal</h2>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+      </div>
+    </nav>
+  </div>
+  <div class="wrap footer__bottom">© {year} Midnight Poetry Studio</div>
+</footer>
+<style>
+  .footer {
+    border-top: 1px solid var(--line);
+    padding: 48px 24px 56px;
+  }
+  .footer__top {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 32px;
+    align-items: flex-start;
+  }
+  .footer__brand {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-width: 340px;
+  }
+  .footer__brand p {
+    font-size: 14px;
+    color: var(--muted);
+  }
+  .footer__cols {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 48px;
+  }
+  .footer__cols div {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .footer__cols h2 {
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .footer__cols a {
+    font-size: 14px;
+    color: var(--muted);
+    text-decoration: none;
+  }
+  .footer__cols a:hover {
+    color: var(--ink);
+  }
+  .footer__bottom {
+    margin-top: 32px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+</style>

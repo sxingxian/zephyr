@@ -1,0 +1,34 @@
+---
+import { INVITE_REQUEST_LIMITS } from '@zephyr/shared/client';
+import Prose from '../layouts/Prose.astro';
+---
+<Prose title="Privacy" description="How Zephyr handles your data." path="/privacy" updated="28 October 2026">
+  <p class="draft">Draft for legal review before launch. It covers what this site collects today.</p>
+  <h2>What this website collects</h2>
+  <p>
+    This site has no analytics, advertising or tracking scripts, and sets no cookies. If you request an invite, we
+    store your email address, the optional use case you pick, and a one-way hash of your network address (never the
+    address itself) so we can stop abuse.
+  </p>
+  <h2>Why</h2>
+  <p>
+    Your email is used only to send you an invite. The hashed network address limits requests to
+    {INVITE_REQUEST_LIMITS.perNetwork} every {INVITE_REQUEST_LIMITS.windowMinutes} minutes per network.
+  </p>
+  <h2>How long we keep it</h2>
+  <p>
+    Requests that aren’t approved are deleted after {INVITE_REQUEST_LIMITS.retentionDays} days. The network hash is
+    removed as soon as your request is approved or declined, and the anti-abuse log of attempts is deleted after 2
+    days. If your request is approved, the invite is tied to your email and expires if it isn’t used.
+  </p>
+  <h2>Who processes it</h2>
+  <p>
+    Cloudflare (hosting and the Turnstile security check) and Supabase (database). Turnstile checks that a real person
+    is using the form without showing puzzles in most cases.
+  </p>
+  <h2>Your choices</h2>
+  <p>
+    To withdraw a request or ask what we hold about you, contact us through the <a href="/contact">contact page</a>.
+    We’ll delete it.
+  </p>
+</Prose>

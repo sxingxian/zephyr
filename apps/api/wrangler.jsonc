@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zephyr-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // No public URL of its own. The landing Worker (and later the PWA Worker) forwards /api/* here
+  // through a service binding, so the API is reachable only as
+  // zephyr.midnightpoetry.studio/api/* and zephyrapp.midnightpoetry.studio/api/*.
+  "workers_dev": false,
+  "preview_urls": false,
+  // Invocation logs record request metadata, including the client IP, for every request. Turn them
+  // off so raw IPs never reach the log store; our own console.error lines carry no personal data.
+  "observability": { "enabled": true, "logs": { "invocation_logs": false } },
+  "ratelimits": [
+    {
+      // Burst guard per client IP, counted per Cloudflare location. The durable limit
+      // (5 per network per 15 minutes, 20 per day) is enforced in Postgres.
+      "name": "BURST_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 10, "period": 60 }
+    }
+  ],
+  "vars": {
+    "ENVIRONMENT": "production",
+    "SUPABASE_URL": "https://YOUR-PROJECT-REF.supabase.co",
+    "ALLOWED_ORIGINS": "https://zephyr.midnightpoetry.studio",
+    "TURNSTILE_EXPECTED_HOSTNAMES": "zephyr.midnightpoetry.studio"
+  }
+  // Secrets (wrangler secret put …): SUPABASE_SERVICE_ROLE_KEY, TURNSTILE_SECRET_KEY, IP_HASH_SECRET
+}

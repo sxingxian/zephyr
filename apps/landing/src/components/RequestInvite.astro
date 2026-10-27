@@ -1,0 +1,249 @@
+---
+import { INVITE_REQUEST_LIMITS, USE_CASES } from '@zephyr/shared/client';
+import { LINKS } from '../lib/site';
+import Icon from './Icon.astro';
+import Mascot from './Mascot.astro';
+
+// Cloudflare's always-pass test key is used outside production builds.
+const siteKey = import.meta.env.PUBLIC_TURNSTILE_SITE_KEY || '1x00000000000000000000AA';
+---
+<section id="request-invite" class="section invite">
+  <div class="wrap invite__inner">
+    <div class="invite__copy">
+      <Mascot pose="wave" size={160} bg="var(--m-lilac)" class="invite__mascot" />
+      <h2 class="h2">Let the wind take the busywork.</h2>
+      <p class="lede">
+        Zephyr is opening a few seats at a time. Leave your email and Zephyr will hop over with an invite when your seat
+        is ready.
+      </p>
+    </div>
+
+    <div class="invite__card" data-invite data-state="form" data-sitekey={siteKey}>
+      <!-- Form -->
+      <form class="invite__form" data-view="form" novalidate>
+        <div class="invite__intro">
+          <h3 class="h3">Request an invite</h3>
+          <p class="muted">One field. No card, no password yet.</p>
+        </div>
+        <div class="field">
+          <label for="invite-email">Email</label>
+          <div class="input-wrap">
+            <Icon name="mail" size={17} />
+            <input
+              id="invite-email"
+              class="input"
+              name="email"
+              type="email"
+              inputmode="email"
+              autocomplete="email"
+              spellcheck="false"
+              autocapitalize="off"
+              required
+              maxlength={INVITE_REQUEST_LIMITS.maxEmailLength}
+              placeholder="you@example.com"
+              aria-describedby="invite-email-error"
+            />
+          </div>
+          <span id="invite-email-error" class="hint hint--error" data-email-error hidden></span>
+        </div>
+        <div class="field">
+          <label for="invite-use">What will you use Zephyr for? <span class="muted invite__opt">(optional)</span></label>
+          <select id="invite-use" class="select" name="useCase">
+            <option value="">Choose one</option>
+            {USE_CASES.map((u) => <option value={u.id}>{u.label}</option>)}
+          </select>
+        </div>
+        <div class="invite__turnstile" data-turnstile aria-label="Security check"></div>
+        <div class="invite__alert" role="alert" data-alert hidden>
+          <Icon name="clock" size={16} />
+          <span data-alert-text></span>
+        </div>
+        <button class="btn btn--primary btn--lg btn--full" type="submit" data-submit>
+          <span data-submit-label>Request an invite</span>
+          <Icon name="arrowR" size={17} />
+        </button>
+        <p class="invite__fine">
+          We only use your email to send your invite, and delete unapproved requests after {INVITE_REQUEST_LIMITS.retentionDays} days.
+          <a href="/privacy">Privacy</a>
+        </p>
+        <div class="invite__links">
+          <span>Got an invite? <a href={LINKS.haveInvite}>Use it here</a></span>
+          <span>Member? <a href={LINKS.signIn}>Sign in</a></span>
+        </div>
+        <noscript>
+          <p class="invite__noscript">The request form needs JavaScript for its security check. Turn it on and reload the page.</p>
+        </noscript>
+      </form>
+
+      <!-- Sent -->
+      <div class="invite__done" data-view="sent" tabindex="-1" hidden>
+        <span class="invite__badge invite__badge--good"><Icon name="mail" size={24} /></span>
+        <h3 class="invite__done-title">You’re on the list.</h3>
+        <p class="muted">
+          If <strong data-sent-email></strong> can get an invite, it’ll arrive there as a single-use link. Most requests are
+          answered within a week.
+        </p>
+        <a class="btn btn--secondary" href="#top">Back to the tour</a>
+        <p class="invite__fine">Already a member? <a href={LINKS.signIn}>Sign in</a></p>
+      </div>
+
+      <!-- Paused -->
+      <div class="invite__done" data-view="paused" tabindex="-1" hidden>
+        <span class="invite__badge"><Icon name="pause" size={22} /></span>
+        <h3 class="invite__done-title">Requests are paused for now</h3>
+        <p class="muted">We’re not taking new requests at the moment. If a Zephyr member invites you, their link still works.</p>
+        <div class="invite__row">
+          <a class="btn btn--primary" href={LINKS.haveInvite}><Icon name="key" size={17} />I have an invite</a>
+          <a class="btn btn--secondary" href={LINKS.signIn}>Sign in</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  import { initInviteForm } from '../scripts/invite-form';
+  const root = document.querySelector<HTMLElement>('[data-invite]');
+  if (root) initInviteForm(root);
+</script>
+
+<style>
+  .invite {
+    padding-bottom: clamp(96px, 12vw, 140px);
+    scroll-margin-top: 96px;
+  }
+  .invite__inner {
+    max-width: 1080px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 48px;
+  }
+  .invite__copy {
+    flex: 1 1 360px;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    align-items: flex-start;
+  }
+  .invite__card {
+    flex: 1 1 400px;
+    min-width: 0;
+    max-width: 480px;
+    padding: clamp(20px, 4vw, 32px);
+    border-radius: 28px;
+    background: var(--surf);
+    border: 1px solid var(--line);
+    box-shadow: 0 30px 80px -30px rgba(13, 17, 23, 0.3);
+  }
+  .invite__form,
+  .invite__done {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .invite__form[hidden],
+  .invite__done[hidden] {
+    display: none;
+  }
+  .invite__done:focus {
+    outline: none;
+  }
+  .invite__intro {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .invite__intro p {
+    font-size: 14px;
+  }
+  .invite__opt {
+    font-weight: 400;
+  }
+  .invite__turnstile {
+    min-height: 65px;
+  }
+  .invite__alert {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: var(--warnTint);
+    color: var(--warn);
+    font-size: 13.5px;
+    line-height: 1.45;
+  }
+  .invite__alert[hidden] {
+    display: none;
+  }
+  .invite__alert :global(svg) {
+    margin-top: 2px;
+    flex-shrink: 0;
+  }
+  .invite__fine {
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--muted);
+  }
+  .invite__links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+    font-size: 13.5px;
+    color: var(--ink2);
+  }
+  .invite__links a,
+  .invite__fine a {
+    font-weight: 550;
+    text-decoration: none;
+  }
+  .invite__noscript {
+    font-size: 13.5px;
+    color: var(--warn);
+  }
+  .invite__badge {
+    width: 48px;
+    height: 48px;
+    border-radius: 16px;
+    background: var(--bg2);
+    color: var(--ink2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .invite__badge--good {
+    background: var(--goodTint);
+    color: var(--good);
+  }
+  .invite__done-title {
+    font-size: 24px;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+  }
+  .invite__done p {
+    font-size: 15px;
+    line-height: 1.55;
+  }
+  .invite__done strong {
+    color: var(--ink);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+  .invite__done .btn {
+    align-self: flex-start;
+  }
+  .invite__row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  [data-submit][aria-busy='true'] {
+    opacity: 0.7;
+    cursor: progress;
+  }
+</style>

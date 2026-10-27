@@ -1,0 +1,162 @@
+---
+import { anim, anim2 } from '../lib/motion';
+import { kindAt, seeded } from '../lib/site';
+import Icon from './Icon.astro';
+import Sample from './Sample.astro';
+import Steps from './Steps.astro';
+
+// Prints drop onto a light table, then the Zephyr AI loupe sweeps across and grades each one.
+const { between } = seeded(29);
+const placed: [number, number, number, number, number][] = [
+  [4, 8, 21, 30, -5],
+  [27, 4, 18.5, 45, 3],
+  [47, 10, 20, 29, -2],
+  [70, 6, 19.5, 32, 6],
+  [8, 52, 18, 27, 4],
+  [28, 58, 22, 30, -6],
+  [52, 50, 18.5, 40, 2],
+  [74, 56, 18, 27, -4],
+  [88, 30, 12, 32, 8],
+  [40, 34, 15, 21, -9],
+];
+const prints = placed.map(([l, t, w, h, r], i) => ({
+  kind: kindAt(i + 3),
+  style: `left: ${l}%; top: ${t}%; width: ${w}%; height: ${h}%; --r: ${r}deg`,
+  attrs: anim2(
+    [
+      'flyIn',
+      i * 0.03,
+      i * 0.03 + 0.15,
+      {
+        x: between(-160, 160),
+        y: between(-900, -600),
+        z: 260,
+        rotationX: between(40, 70),
+        rotation: between(-40, 40),
+        scale: 1.25,
+      },
+    ],
+    ['grade', 0.5 + l * 0.0038, 0.55 + l * 0.0038],
+  ),
+}));
+---
+<section class="scene scene--tint" aria-label="Batch grading with Zephyr AI" data-scene style="--scene-h: 300vh">
+  <div class="scene__stick">
+    <div class="wrap grade">
+      <div class="grade__head">
+        <Steps
+          items={[
+            ['Perfect one frame.', 'Exposure, white balance, HSL and crop on a single hero shot. The edit saves as a tiny recipe; your original is never touched.'],
+            ['Zephyr AI carries it across.', 'Paste the recipe, or let Zephyr AI match the look on every print on the table. Undo any of it, any time.'],
+          ]}
+          ranges={[{ in: [0, 0.06], out: [0.4, 0.46] }, { in: [0.46, 0.52] }]}
+        />
+        <span class="grade__recipe mono"><Icon name="layers" size={16} />recipe · 6 adjustments</span>
+      </div>
+      <div class="grade__table">
+        {
+          prints.map((p) => (
+            <figure class="grade__print" style={p.style} {...p.attrs}>
+              <div class="grade__img">
+                <Sample kind={p.kind} />
+              </div>
+            </figure>
+          ))
+        }
+        <div class="grade__loupe" aria-hidden="true" {...anim('sweep', 0.48, 0.92)}>
+          <span class="chip chip--ink"><Icon name="breeze" size={13} />Zephyr AI</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<style>
+  .scene--tint {
+    background: var(--bg2);
+  }
+  .grade {
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+  }
+  .grade__head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: end;
+    gap: 24px;
+  }
+  .grade__recipe {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .grade__table {
+    position: relative;
+    width: 100%;
+    align-self: center;
+    aspect-ratio: 2 / 1;
+    max-height: 620px;
+    border-radius: 28px;
+    background-color: var(--surf);
+    background-image:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 40px 40px;
+    box-shadow: inset 0 0 0 1px var(--line);
+    perspective: 1400px;
+  }
+  .grade__print {
+    position: absolute;
+    margin: 0;
+    padding: 0.6% 0.6% 1.8%;
+    background: #ffffff;
+    border-radius: 4px;
+    rotate: var(--r);
+    box-shadow:
+      0 1px 1px rgba(0, 0, 0, 0.06),
+      0 14px 30px rgba(13, 17, 23, 0.16);
+  }
+  .grade__img {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    border-radius: 2px;
+  }
+  .grade__loupe {
+    position: absolute;
+    top: 16%;
+    left: 104%;
+    width: 18%;
+    aspect-ratio: 1;
+    margin-left: -9%;
+    border-radius: 50%;
+    border: 2px solid var(--acc);
+    box-shadow:
+      0 0 0 8px color-mix(in srgb, var(--acc) 18%, transparent),
+      0 24px 60px rgba(13, 17, 23, 0.25);
+    -webkit-backdrop-filter: saturate(1.5) brightness(1.08);
+    backdrop-filter: saturate(1.5) brightness(1.08);
+    z-index: 5;
+    opacity: 0;
+  }
+  .grade__loupe .chip {
+    position: absolute;
+    bottom: -14px;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+  /* While pinned, keep the table inside the viewport under the captions. */
+  @media (min-width: 861px) {
+    :global(html.motion) .grade__table {
+      width: min(100%, calc((100vh - 330px) * 2));
+    }
+  }
+  @media (max-width: 860px) {
+    .grade__table {
+      aspect-ratio: 4 / 3;
+    }
+  }
+</style>

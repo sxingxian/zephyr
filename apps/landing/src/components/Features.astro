@@ -1,0 +1,69 @@
+---
+import type { IconName } from '@zephyr/brand';
+import { viewAnim } from '../lib/motion';
+import Icon from './Icon.astro';
+
+const feats: [IconName, string, string][] = [
+  [
+    'breeze',
+    'Zephyr AI, in bulk',
+    'Auto-enhance, HDR and colour match run free on your device. Studio background removal runs in the cloud.',
+  ],
+  ['copy', 'Copy, paste, done', 'Perfect one frame and paste the exact edit stack across matching shots.'],
+  [
+    'face',
+    'Sorts itself',
+    'Scenes like beach or night, duplicates and blur found for you. People grouping is opt-in.',
+  ],
+  [
+    'shieldCheck',
+    'Private by design',
+    'Heavy edits run on your device with WebGL. Shared galleries never carry ads.',
+  ],
+];
+---
+<section class="section features">
+  <div class="wrap features__inner">
+    <div class="section-head">
+      <h2 class="h2">Everything blows in. Nothing blows away.</h2>
+      <p class="lede">Four things Zephyr does so you can spend the evening somewhere other than your editing chair.</p>
+    </div>
+    <div class="grid-auto" style="--min: 260px; --gap: 18px">
+      {
+        feats.map(([ic, t, b], i) => (
+          <article
+            class="card features__card"
+            {...viewAnim('gust', {
+              g1x: i % 2 ? 700 : -700, g1y: -120, g1r: i % 2 ? 24 : -24,
+              g2x: i % 2 ? 260 : -260, g2y: 80, g2r: i % 2 ? -10 : 10,
+              g3x: 0, g3y: -14, g3r: i % 2 ? 2 : -2,
+            })}
+          >
+            <span class="ico-tile"><Icon name={ic} size={22} /></span>
+            <h3 class="h3">{t}</h3>
+            <p class="muted">{b}</p>
+          </article>
+        ))
+      }
+    </div>
+  </div>
+</section>
+<style>
+  .features {
+    overflow-x: clip;
+  }
+  .features__inner {
+    display: flex;
+    flex-direction: column;
+    gap: 44px;
+  }
+  .features__card {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .features__card p {
+    font-size: 15px;
+    line-height: 1.55;
+  }
+</style>

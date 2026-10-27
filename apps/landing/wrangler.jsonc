@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zephyr-landing",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "zephyr.midnightpoetry.studio", "custom_domain": true }],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "html_handling": "drop-trailing-slash",
+    "not_found_handling": "404-page",
+    // Only API calls run the Worker script; everything else is served as a static file.
+    "run_worker_first": ["/api/*"]
+  },
+  "services": [{ "binding": "API", "service": "zephyr-api" }],
+  "observability": { "enabled": true, "logs": { "invocation_logs": false } }
+}

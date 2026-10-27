@@ -1,0 +1,31 @@
+---
+import type { SampleKind } from '@zephyr/brand';
+
+interface Props {
+  kind: SampleKind;
+  alt?: string;
+  eager?: boolean;
+  class?: string;
+  style?: string;
+}
+const { kind, alt = '', eager = false, class: cls, style } = Astro.props;
+---
+<img
+  class:list={['sample', cls]}
+  src={`/brand/samples/${kind}.svg`}
+  alt={alt}
+  width="1200"
+  height="900"
+  loading={eager ? 'eager' : 'lazy'}
+  decoding="async"
+  draggable="false"
+  style={style}
+/>
+<style>
+  .sample {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    user-select: none;
+  }
+</style>

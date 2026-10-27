@@ -1,0 +1,24 @@
+{
+  "name": "zephyr",
+  "private": true,
+  "description": "Zephyr: AI photo editing and private galleries, by Midnight Poetry Studio.",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "brand:export": "pnpm --filter @zephyr/brand export"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.3",
+    "turbo": "2.11.10",
+    "typescript": "6.0.3"
+  }
+}

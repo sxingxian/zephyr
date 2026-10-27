@@ -1,0 +1,212 @@
+---
+import Icon from './Icon.astro';
+import Sample from './Sample.astro';
+
+const scenes = [
+  { id: 'interior', label: 'Interior', icon: 'home' },
+  { id: 'product', label: 'Product', icon: 'tag' },
+  { id: 'portrait', label: 'Portrait', icon: 'user' },
+] as const;
+---
+<section id="try-it" class="section">
+  <div class="wrap tryit" data-tryit>
+    <header class="section-head section-head--center">
+      <span class="eyebrow">Zephyr AI</span>
+      <h2 class="h2">Drag across one photo. Picture it on the whole shoot.</h2>
+      <p class="lede" style="text-align: center">
+        Auto-enhance fixes exposure, white balance and skin tones in a single pass, and Zephyr applies it to every photo
+        you select.
+      </p>
+    </header>
+    <fieldset class="tryit__tabs">
+      <legend class="sr-only">Sample scene</legend>
+      {
+        scenes.map((s, i) => (
+          <label class="tryit__tab">
+            <input type="radio" name="tryit-scene" value={s.id} checked={i === 0} class="sr-only" />
+            <Icon name={s.icon} size={16} />
+            {s.label}
+          </label>
+        ))
+      }
+    </fieldset>
+    <figure class="tryit__frame" style="--pos: 50%">
+      {
+        scenes.map((s) => (
+          <div class="tryit__scene" data-scene-id={s.id}>
+            <div class="tryit__layer">
+              <Sample kind={s.id} alt={`Sample ${s.label.toLowerCase()} photo after auto-enhance`} />
+            </div>
+            <div class="tryit__layer tryit__before">
+              <Sample kind={s.id} alt={`Sample ${s.label.toLowerCase()} photo before auto-enhance`} />
+            </div>
+          </div>
+        ))
+      }
+      <div class="tryit__handle" aria-hidden="true">
+        <span><Icon name="chevL" size={16} /><Icon name="chevR" size={16} /></span>
+      </div>
+      <span class="chip chip--ink chip--lg tryit__label tryit__label--before">Before</span>
+      <span class="chip chip--lg tryit__label tryit__label--after"><Icon name="breeze" size={14} />After · Zephyr AI auto-enhance</span>
+      <input class="tryit__range" type="range" min="0" max="100" value="50" aria-label="Before and after comparison. Move to reveal the edit." />
+    </figure>
+    <ul class="tryit__facts">
+      <li><Icon name="stack" size={16} />Same edit across a batch</li>
+      <li><Icon name="undo" size={16} />Undo any step, any time</li>
+      <li><Icon name="clock" size={16} />Runs on your device, free on every plan</li>
+    </ul>
+  </div>
+</section>
+<script>
+  for (const root of document.querySelectorAll<HTMLElement>('[data-tryit]')) {
+    const frame = root.querySelector<HTMLElement>('.tryit__frame');
+    const range = root.querySelector<HTMLInputElement>('.tryit__range');
+    range?.addEventListener('input', () => frame?.style.setProperty('--pos', `${range.value}%`));
+  }
+</script>
+<style>
+  .tryit {
+    display: flex;
+    flex-direction: column;
+    gap: 32px;
+  }
+  .tryit__tabs {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    border: 0;
+    margin: 0;
+    padding: 0;
+  }
+  .tryit__tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 44px;
+    padding: 0 18px;
+    border-radius: 99px;
+    border: 1px solid var(--line2);
+    background: var(--surf);
+    font-size: 14px;
+    font-weight: 550;
+    cursor: pointer;
+    transition:
+      background-color 160ms ease,
+      color 160ms ease;
+  }
+  .tryit__tab:has(input:checked) {
+    background: var(--pri);
+    border-color: var(--pri);
+    color: var(--onPri);
+  }
+  .tryit__tab:has(input:focus-visible) {
+    outline: 2px solid var(--acc);
+    outline-offset: 2px;
+  }
+  .tryit__frame {
+    margin: 0;
+    position: relative;
+    border-radius: 28px;
+    overflow: hidden;
+    aspect-ratio: 16 / 9;
+    background: var(--canvas);
+    box-shadow: var(--shadow);
+  }
+  .tryit__scene {
+    position: absolute;
+    inset: 0;
+    display: none;
+  }
+  .tryit:has(input[value='interior']:checked) [data-scene-id='interior'],
+  .tryit:has(input[value='product']:checked) [data-scene-id='product'],
+  .tryit:has(input[value='portrait']:checked) [data-scene-id='portrait'] {
+    display: block;
+  }
+  .tryit__layer {
+    position: absolute;
+    inset: 0;
+  }
+  .tryit__before {
+    clip-path: inset(0 calc(100% - var(--pos)) 0 0);
+    filter: brightness(0.72) saturate(0.55) contrast(0.9);
+  }
+  .tryit__handle {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: var(--pos);
+    width: 2px;
+    margin-left: -1px;
+    background: #ffffff;
+    box-shadow: 0 0 0 1px rgba(13, 17, 23, 0.15);
+    pointer-events: none;
+  }
+  .tryit__handle span {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: #ffffff;
+    color: #0d1117;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    box-shadow: 0 6px 20px rgba(13, 17, 23, 0.25);
+  }
+  .tryit__label {
+    position: absolute;
+    top: 16px;
+    pointer-events: none;
+  }
+  .tryit__label--before {
+    left: 16px;
+  }
+  .tryit__label--after {
+    right: 16px;
+    background: rgba(255, 255, 255, 0.88);
+    color: #1f4bb5;
+  }
+  .tryit__range {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    cursor: ew-resize;
+    margin: 0;
+  }
+  .tryit__frame:has(.tryit__range:focus-visible) {
+    outline: 2px solid var(--acc);
+    outline-offset: 3px;
+  }
+  .tryit__facts {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    justify-content: center;
+    gap: 12px 24px;
+    flex-wrap: wrap;
+    font-size: 14px;
+    color: var(--muted);
+  }
+  .tryit__facts li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  @media (max-width: 600px) {
+    .tryit__frame {
+      aspect-ratio: 4 / 3;
+    }
+    .tryit__label--after {
+      top: auto;
+      bottom: 16px;
+    }
+  }
+</style>

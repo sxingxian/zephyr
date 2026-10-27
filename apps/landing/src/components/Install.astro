@@ -1,0 +1,162 @@
+---
+import { LINKS } from '../lib/site';
+import Icon from './Icon.astro';
+import Sample from './Sample.astro';
+
+const nine = ['dunes', 'sea', 'portrait', 'bloom', 'interior', 'city', 'food', 'peaks', 'couple'] as const;
+---
+<section id="install" class="section install-section">
+  <div class="wrap install">
+    <div class="install__copy">
+      <span class="install__eyebrow">Install</span>
+      <h2 class="install__title">On your desk and in your pocket. No app store needed.</h2>
+      <p class="install__body">
+        Zephyr installs straight from the browser on Mac, Windows, iPhone, iPad and Android, opens full screen and keeps
+        working on a patchy connection. Members can install it from the app after signing in.
+      </p>
+      <div class="install__ctas">
+        <a href={LINKS.app} class="install__btn install__btn--solid"><Icon name="monitor" size={18} />Open the app</a>
+        <a href="#faq" class="install__btn install__btn--line"><Icon name="phone" size={18} />Add to Home Screen</a>
+      </div>
+    </div>
+    <div class="install__devices" aria-hidden="true">
+      <div class="install__laptop">
+        <div class="install__dots"><span></span><span></span><span></span></div>
+        <div class="install__grid install__grid--3">{nine.map((k) => <span><Sample kind={k} /></span>)}</div>
+      </div>
+      <div class="install__phone">
+        <div class="install__screen">
+          <div class="install__grid install__grid--2">{nine.slice(0, 6).map((k) => <span><Sample kind={k} /></span>)}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<style>
+  .install-section {
+    padding-top: 24px;
+    padding-bottom: 24px;
+  }
+  .install {
+    background: var(--pri);
+    color: var(--onPri);
+    border-radius: 36px;
+    padding: clamp(28px, 5vw, 56px);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 40px;
+    align-items: center;
+    overflow: hidden;
+  }
+  .install__copy {
+    flex: 1 1 380px;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .install__eyebrow {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    opacity: 0.7;
+  }
+  .install__title {
+    font-size: clamp(32px, 4.6vw, 48px);
+    font-weight: 600;
+    letter-spacing: -0.04em;
+    line-height: 1.04;
+  }
+  .install__body {
+    font-size: 17px;
+    line-height: 1.5;
+    opacity: 0.75;
+  }
+  .install__ctas {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .install__btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 48px;
+    padding: 0 20px;
+    border-radius: 12px;
+    font-weight: 550;
+    text-decoration: none;
+    transition: transform 160ms var(--ease-out);
+  }
+  .install__btn:active {
+    transform: scale(0.97);
+  }
+  .install__btn--solid,
+  .install__btn--solid:hover {
+    background: var(--onPri);
+    color: var(--pri);
+  }
+  .install__btn--line,
+  .install__btn--line:hover {
+    border: 1px solid currentColor;
+    color: var(--onPri);
+    opacity: 0.9;
+  }
+  .install__devices {
+    flex: 1 1 380px;
+    min-width: 0;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    gap: 18px;
+  }
+  .install__laptop {
+    flex: 1;
+    max-width: 360px;
+    border-radius: 16px;
+    background: #14181f;
+    padding: 10px;
+    box-shadow: 0 30px 60px -20px rgba(0, 0, 0, 0.5);
+  }
+  .install__dots {
+    display: flex;
+    gap: 5px;
+    padding: 2px 4px 8px;
+  }
+  .install__dots span {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #3a3f4a;
+  }
+  .install__phone {
+    width: 120px;
+    flex-shrink: 0;
+    border-radius: 26px;
+    background: #14181f;
+    padding: 8px;
+    box-shadow: 0 30px 60px -20px rgba(0, 0, 0, 0.5);
+  }
+  .install__screen {
+    border-radius: 18px;
+    overflow: hidden;
+    background: #0a0c10;
+    padding: 6px;
+  }
+  .install__grid {
+    display: grid;
+    gap: 4px;
+  }
+  .install__grid--3 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .install__grid--2 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .install__grid span {
+    aspect-ratio: 1;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+</style>

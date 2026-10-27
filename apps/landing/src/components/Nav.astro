@@ -1,0 +1,199 @@
+---
+import { LINKS, NAV } from '../lib/site';
+import Icon from './Icon.astro';
+import Wordmark from './Wordmark.astro';
+---
+<div class="progress" aria-hidden="true"></div>
+<header class="nav-shell">
+  <nav class="nav" aria-label="Main">
+    <a href="#top" class="nav__home" aria-label="Zephyr home"><Wordmark size={20} /></a>
+    <div class="nav__links d-only">
+      {NAV.map((l) => <a href={l.href} class="nav__link">{l.label}</a>)}
+    </div>
+    <div class="nav__actions">
+      <a class="btn btn--ghost btn--sm d-only" href={LINKS.signIn}>Sign in</a>
+      <a class="btn btn--primary btn--sm" href={LINKS.requestInvite}>Request an invite</a>
+      <button class="btn btn--ghost btn--sm nav__menu-btn m-only" type="button" popovertarget="nav-menu" aria-label="Open menu">
+        <Icon name="menu" size={20} />
+      </button>
+    </div>
+  </nav>
+</header>
+<div id="nav-menu" class="menu" popover>
+  <div class="menu__head">
+    <Wordmark size={20} />
+    <button class="btn btn--ghost btn--sm" type="button" popovertarget="nav-menu" popovertargetaction="hide" aria-label="Close menu">
+      <Icon name="x" size={20} />
+    </button>
+  </div>
+  <nav aria-label="Menu" class="menu__links">
+    {
+      [...NAV, { label: 'Questions', href: '#faq' }].map((l) => (
+        <a href={l.href} class="menu__link" data-close-menu>
+          {l.label}
+          <Icon name="chevR" size={16} />
+        </a>
+      ))
+    }
+  </nav>
+  <div class="menu__actions">
+    <a class="btn btn--primary btn--lg btn--full" href={LINKS.requestInvite} data-close-menu>Request an invite</a>
+    <a class="btn btn--secondary btn--lg btn--full" href={LINKS.haveInvite}><Icon name="key" size={17} />I have an invite</a>
+    <a class="btn btn--ghost btn--lg btn--full" href={LINKS.signIn}>Sign in</a>
+  </div>
+</div>
+<script>
+  // Close the phone menu after following an in-page link.
+  const menu = document.getElementById('nav-menu');
+  for (const a of document.querySelectorAll('[data-close-menu]')) {
+    a.addEventListener('click', () => menu?.hidePopover?.());
+  }
+</script>
+<style>
+  .progress {
+    position: fixed;
+    inset: 0 0 auto 0;
+    height: 2px;
+    z-index: 41;
+    background: var(--acc);
+    transform: scaleX(0);
+    transform-origin: left;
+    display: none;
+  }
+  @supports (animation-timeline: scroll()) {
+    .progress {
+      display: block;
+      animation: fillBar linear both;
+      animation-timeline: scroll(root block);
+    }
+  }
+  .nav-shell {
+    position: fixed;
+    inset: 0 0 auto 0;
+    z-index: 40;
+    display: flex;
+    justify-content: center;
+    padding: 14px max(16px, env(safe-area-inset-right)) 0 max(16px, env(safe-area-inset-left));
+    pointer-events: none;
+  }
+  .nav {
+    pointer-events: auto;
+    width: 100%;
+    max-width: 1240px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 8px 8px 8px 18px;
+    border-radius: 18px;
+    background: var(--glass);
+    -webkit-backdrop-filter: blur(18px) saturate(1.4);
+    backdrop-filter: blur(18px) saturate(1.4);
+    border: 1px solid var(--line);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+  }
+  .nav__home {
+    display: flex;
+    text-decoration: none;
+  }
+  .nav__links {
+    display: flex;
+    gap: 2px;
+  }
+  .nav__link {
+    padding: 8px 12px;
+    border-radius: 10px;
+    font-size: 14px;
+    color: var(--ink2);
+    text-decoration: none;
+    transition: background-color 160ms ease;
+  }
+  @media (hover: hover) {
+    .nav__link:hover {
+      background: var(--hover);
+      color: var(--ink);
+    }
+  }
+  .nav__actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .nav__menu-btn {
+    width: 40px;
+    padding: 0;
+  }
+  .menu {
+    margin: 0 0 0 auto;
+    inset: 0 0 0 auto;
+    width: min(400px, 100vw);
+    height: 100dvh;
+    max-height: none;
+    border: 0;
+    padding: 20px max(20px, env(safe-area-inset-right)) 24px 20px;
+    background: var(--surf);
+    color: var(--ink);
+    display: none;
+    flex-direction: column;
+    gap: 12px;
+    box-shadow: -20px 0 60px rgba(13, 17, 23, 0.2);
+    opacity: 0;
+    transform: translateX(24px);
+    transition:
+      opacity 220ms var(--ease-out),
+      transform 220ms var(--ease-out),
+      display 220ms allow-discrete,
+      overlay 220ms allow-discrete;
+  }
+  .menu:popover-open {
+    display: flex;
+    opacity: 1;
+    transform: none;
+  }
+  @starting-style {
+    .menu:popover-open {
+      opacity: 0;
+      transform: translateX(24px);
+    }
+  }
+  .menu::backdrop {
+    background: var(--scrim);
+  }
+  .menu__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 8px;
+  }
+  .menu__head .btn {
+    width: 40px;
+    padding: 0;
+  }
+  .menu__links {
+    display: flex;
+    flex-direction: column;
+  }
+  .menu__link {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 52px;
+    padding: 0 8px;
+    border-radius: 12px;
+    font-size: 17px;
+    font-weight: 550;
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .menu__link :global(svg) {
+    color: var(--muted);
+  }
+  .menu__actions {
+    margin-top: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+</style>

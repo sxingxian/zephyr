@@ -1,0 +1,58 @@
+---
+import type { StepRange } from '../lib/motion';
+
+interface Props {
+  items: [string, string][];
+  ranges: StepRange[];
+}
+const { items, ranges } = Astro.props;
+---
+<ol class="steps">
+  {
+    items.map(([title, body], k) => {
+      const r = ranges[k];
+      return (
+        <li
+          class="step"
+          data-step-in={r ? `${r.in[0]} ${r.in[1]}` : undefined}
+          data-step-out={r?.out ? `${r.out[0]} ${r.out[1]}` : undefined}
+        >
+          <span class="step__n mono">
+            0{k + 1} / 0{items.length}
+          </span>
+          <h3 class="step__title">{title}</h3>
+          <p class="step__body">{body}</p>
+        </li>
+      );
+    })
+  }
+</ol>
+<style>
+  .steps {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    align-items: start;
+  }
+  .step {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-width: 420px;
+  }
+  .step__n {
+    font-size: 13px;
+    color: var(--acc);
+  }
+  .step__title {
+    font-size: clamp(28px, 3vw, 42px);
+    font-weight: 600;
+    letter-spacing: -0.035em;
+    line-height: 1.05;
+  }
+  .step__body {
+    font-size: 16px;
+    line-height: 1.55;
+    color: var(--muted);
+  }
+</style>

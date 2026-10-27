@@ -1,0 +1,30 @@
+---
+import { MARK_SVG } from '@zephyr/brand';
+
+interface Props {
+  size?: number;
+}
+const { size = 20 } = Astro.props;
+const mark = MARK_SVG.replace(
+  '<svg ',
+  `<svg width="${Math.round(size * 1.25)}" height="${Math.round(size * 1.25)}" `,
+);
+---
+<span class="wordmark" style={`--wm: ${size}px`}>
+  <Fragment set:html={mark} />
+  <span class="wordmark__text">zephyr</span>
+</span>
+<style>
+  .wordmark {
+    display: inline-flex;
+    align-items: center;
+    gap: calc(var(--wm) * 0.36);
+    color: var(--ink);
+  }
+  .wordmark__text {
+    font-weight: 600;
+    font-size: var(--wm);
+    letter-spacing: -0.035em;
+    line-height: 1;
+  }
+</style>

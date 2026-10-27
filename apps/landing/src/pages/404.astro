@@ -1,0 +1,24 @@
+---
+import Mascot from '../components/Mascot.astro';
+import Layout from '../layouts/Layout.astro';
+---
+<Layout title="Page not found · Zephyr" description="This page blew away." path="/404" noindex>
+  <main id="main" class="nf">
+    <Mascot pose="ponder" size={180} bg="var(--m-lilac)" />
+    <h1 class="h2">This page blew away.</h1>
+    <p class="lede">The link may be old, or the page may have moved.</p>
+    <a class="btn btn--primary btn--lg" href="/">Back to Zephyr</a>
+  </main>
+</Layout>
+<style>
+  .nf {
+    min-height: 100svh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 20px;
+    padding: 48px 24px;
+    text-align: center;
+  }
+</style>

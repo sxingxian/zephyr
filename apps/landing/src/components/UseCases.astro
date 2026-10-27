@@ -1,0 +1,80 @@
+---
+import type { IconName } from '@zephyr/brand';
+import Icon from './Icon.astro';
+
+const uses: [IconName, string, string][] = [
+  [
+    'camera',
+    'Weddings and events',
+    'Grade 500 RAW frames in one pass, then send guests a proofing gallery by passcode.',
+  ],
+  [
+    'tag',
+    'Product shots',
+    'Remove backgrounds on 50 SKUs, standardise shadows and light, export in matching sizes.',
+  ],
+  [
+    'sparkGrid',
+    'Creators',
+    'Let Zephyr sort a month of content by topic and palette; edit from your phone between shoots.',
+  ],
+  [
+    'home',
+    'Real estate',
+    'Balance dark interiors and blown-out windows in bulk; share a listing gallery that expires.',
+  ],
+  [
+    'heart',
+    'Family albums',
+    'Keep everyday photos private, open a link for the family, lock the sensitive ones with a PIN.',
+  ],
+];
+---
+<section id="use-cases" class="section section--tint">
+  <div class="wrap uses">
+    <header class="section-head">
+      <span class="eyebrow">Use cases</span>
+      <h2 class="h2">One app, five very different Mondays.</h2>
+    </header>
+    <div class="grid-auto" style="--min: 210px; --gap: 16px">
+      {
+        uses.map(([ic, t, d]) => (
+          <article class="uses__card">
+            <span class="uses__icon"><Icon name={ic} size={24} /></span>
+            <h3>{t}</h3>
+            <p>{d}</p>
+          </article>
+        ))
+      }
+    </div>
+  </div>
+</section>
+<style>
+  .uses {
+    display: flex;
+    flex-direction: column;
+    gap: 36px;
+  }
+  .uses__card {
+    background: var(--surf);
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .uses__icon {
+    color: var(--acc);
+  }
+  .uses__card h3 {
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+  .uses__card p {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--muted);
+  }
+</style>

@@ -1,0 +1,241 @@
+---
+import { CREDIT_TOP_UP, PLANS, type Plan } from '@zephyr/shared/client';
+import { LINKS } from '../lib/site';
+import Icon from './Icon.astro';
+
+const RAW = ['cr2', 'nef', 'arw'];
+function features(p: Plan): [string, boolean][] {
+  const l = p.limits;
+  const raw = RAW.every((t) => l.fileTypes.includes(t));
+  if (p.id === 'free') {
+    return [
+      [`${l.storageGb} GB storage`, true],
+      ['Unlimited Zephyr AI on your device', true],
+      [`${l.cloudCreditsPerMonth} cloud AI credits a month`, true],
+      [`Batch edit up to ${l.batchSize} photos`, true],
+      ['JPEG, PNG and WEBP', true],
+      [`${l.galleries} passcode galleries, links up to ${l.maxLinkDays} days`, true],
+      ['Web-size downloads for guests', true],
+      ['Ads in the app, never on galleries you share', true],
+      ['RAW files', raw],
+    ];
+  }
+  if (p.id === 'pro') {
+    return [
+      ['No ads', true],
+      [`${l.storageGb} GB storage`, true],
+      [`${l.cloudCreditsPerMonth.toLocaleString('en')} cloud AI credits a month`, true],
+      [`Batch edit up to ${l.batchSize} photos`, true],
+      ['RAW: CR2, NEF and ARW', raw],
+      ['Unlimited galleries, any expiry', true],
+      ['Full-resolution download toggle', l.guestFullRes],
+      ['People grouping (opt-in), cleanup, synced presets', l.peopleGrouping],
+    ];
+  }
+  return [
+    ['Everything in Pro', true],
+    [
+      `${l.storageGb >= 1000 ? `${l.storageGb / 1000} TB` : `${l.storageGb} GB`} storage, ${l.cloudCreditsPerMonth.toLocaleString('en')} cloud credits a month`,
+      true,
+    ],
+    [`${l.seats} team seats`, true],
+    ['Client proofing with favourites', true],
+    ['Watermarks and gallery branding', l.branding],
+    ['Priority GPU queue', l.priorityQueue],
+    ['Gallery access log', true],
+  ];
+}
+---
+<section id="pricing" class="section section--tint">
+  <div class="wrap pricing">
+    <header class="section-head section-head--center">
+      <span class="eyebrow">Pricing</span>
+      <h2 class="h2">Free once you’re in. Upgrade when the shoots get bigger.</h2>
+      <p class="lede" style="text-align: center">
+        Zephyr is invite-only during early access. Every plan is open to you as soon as you join. Prices in brackets are
+        placeholders.
+      </p>
+    </header>
+    <fieldset class="pricing__period">
+      <legend class="sr-only">Billing period</legend>
+      <label><input type="radio" name="period" value="monthly" checked class="sr-only" />Monthly</label>
+      <label><input type="radio" name="period" value="yearly" class="sr-only" />Yearly · 2 months free</label>
+    </fieldset>
+    <div class="grid-auto pricing__plans" style="--min: 300px">
+      {
+        PLANS.map((p) => (
+          <article class:list={['pricing__plan', p.id === 'pro' && 'pricing__plan--hi']}>
+            <div class="pricing__name">
+              <h3 class="h3">{p.name}</h3>
+              {p.id === 'pro' && <span class="chip chip--ink">Most popular</span>}
+            </div>
+            <div class="pricing__price">
+              {p.priceYearly ? (
+                <>
+                  <span class="pricing__amount monthly">{p.priceMonthly}</span>
+                  <span class="pricing__per monthly">per month</span>
+                  <span class="pricing__amount yearly">{p.priceYearly}</span>
+                  <span class="pricing__per yearly">per year</span>
+                </>
+              ) : (
+                <>
+                  <span class="pricing__amount">{p.priceMonthly}</span>
+                  <span class="pricing__per">forever</span>
+                </>
+              )}
+            </div>
+            <p class="pricing__blurb">{p.blurb}</p>
+            <a class:list={['btn', 'btn--full', p.id === 'pro' ? 'btn--primary' : 'btn--secondary']} href={LINKS.requestInvite}>
+              Request an invite
+            </a>
+            <ul class="pricing__list">
+              {features(p).map(([t, on]) => (
+                <li class:list={[!on && 'off']}>
+                  <Icon name={on ? 'check' : 'x'} size={16} />
+                  {t}
+                </li>
+              ))}
+            </ul>
+          </article>
+        ))
+      }
+    </div>
+    <p class="pricing__note">
+      <Icon name="breeze" size={18} />
+      <span>
+        Zephyr AI on your device is free and unlimited on every plan. Cloud credits are only for studio background
+        removal, at 1 credit per photo. Top up <strong>{CREDIT_TOP_UP.credits} credits for {CREDIT_TOP_UP.price}</strong> on any plan.
+      </span>
+    </p>
+  </div>
+</section>
+<style>
+  .pricing {
+    display: flex;
+    flex-direction: column;
+    gap: 36px;
+  }
+  .pricing__period {
+    align-self: center;
+    display: inline-flex;
+    padding: 4px;
+    border-radius: 99px;
+    background: var(--bg);
+    gap: 4px;
+    border: 0;
+    margin: 0;
+  }
+  .pricing__period label {
+    display: inline-flex;
+    align-items: center;
+    height: 40px;
+    padding: 0 18px;
+    border-radius: 99px;
+    font-size: 14px;
+    font-weight: 550;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      background-color 160ms ease,
+      color 160ms ease;
+  }
+  .pricing__period label:has(input:checked) {
+    background: var(--surf);
+    color: var(--ink);
+    box-shadow: var(--shadow);
+  }
+  .pricing__period label:has(input:focus-visible) {
+    outline: 2px solid var(--acc);
+    outline-offset: 2px;
+  }
+  .pricing .yearly {
+    display: none;
+  }
+  .pricing:has(input[value='yearly']:checked) .yearly {
+    display: inline;
+  }
+  .pricing:has(input[value='yearly']:checked) .monthly {
+    display: none;
+  }
+  .pricing__plan {
+    background: var(--surf);
+    border: 1px solid var(--line);
+    border-radius: 28px;
+    padding: 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .pricing__plan--hi {
+    border: 2px solid var(--ink);
+  }
+  .pricing__name {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .pricing__price {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+  .pricing__amount {
+    font-size: 44px;
+    font-weight: 600;
+    letter-spacing: -0.04em;
+  }
+  .pricing__per {
+    font-size: 14px;
+    color: var(--muted);
+  }
+  .pricing__blurb {
+    font-size: 14px;
+    color: var(--muted);
+    line-height: 1.5;
+    min-height: 42px;
+  }
+  .pricing__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .pricing__list li {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .pricing__list li :global(svg) {
+    color: var(--good);
+    margin-top: 1px;
+    flex-shrink: 0;
+  }
+  .pricing__list li.off {
+    color: var(--muted);
+  }
+  .pricing__list li.off :global(svg) {
+    color: var(--muted);
+  }
+  .pricing__note {
+    align-self: center;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 18px;
+    border-radius: 16px;
+    background: var(--surf);
+    border: 1px solid var(--line);
+    font-size: 14px;
+    max-width: 900px;
+  }
+  .pricing__note :global(svg) {
+    flex-shrink: 0;
+  }
+  .pricing__note strong {
+    font-weight: 600;
+  }
+</style>

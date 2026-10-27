@@ -1,0 +1,72 @@
+---
+import Footer from '../components/Footer.astro';
+import Wordmark from '../components/Wordmark.astro';
+import Layout from './Layout.astro';
+
+interface Props {
+  title: string;
+  description: string;
+  path: string;
+  updated?: string;
+}
+const { title, description, path, updated } = Astro.props;
+---
+<Layout title={`${title} · Zephyr`} description={description} path={path}>
+  <header class="prose-nav">
+    <a href="/" aria-label="Zephyr home"><Wordmark size={20} /></a>
+  </header>
+  <main id="main" class="prose">
+    <h1>{title}</h1>
+    {updated && <p class="prose__meta">Last updated {updated}</p>}
+    <slot />
+  </main>
+  <Footer />
+</Layout>
+<style>
+  .prose-nav {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 28px 24px 0;
+  }
+  .prose-nav a {
+    text-decoration: none;
+    display: inline-flex;
+  }
+  .prose {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 48px 24px 96px;
+  }
+  .prose h1 {
+    font-size: clamp(36px, 5vw, 52px);
+    font-weight: 600;
+    letter-spacing: -0.04em;
+    line-height: 1.05;
+  }
+  .prose__meta {
+    margin-top: 12px;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  .prose :global(h2) {
+    margin-top: 40px;
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+  .prose :global(p),
+  .prose :global(li) {
+    margin-top: 12px;
+    font-size: 16px;
+    line-height: 1.65;
+    color: var(--ink2);
+  }
+  .prose :global(.draft) {
+    margin-top: 24px;
+    padding: 14px 16px;
+    border-radius: 14px;
+    background: var(--warnTint);
+    color: var(--warn);
+    font-size: 14px;
+  }
+</style>
