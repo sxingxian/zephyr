@@ -29,7 +29,7 @@ docs/          Architecture, security, setup, roadmap, decisions
 
 ## Getting started
 
-Requires Node 22 and pnpm 10 (`corepack enable`).
+Requires Node 22.23.4+ (see .nvmrc) and pnpm 10 (`corepack enable`).
 
 ```sh
 pnpm install
