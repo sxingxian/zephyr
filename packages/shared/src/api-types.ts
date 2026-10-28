@@ -115,6 +115,8 @@ export interface SessionUser {
   plan: 'free' | 'pro' | 'studio';
   passkeyCount: number;
   createdAt: string;
+  /** Set while the account is scheduled for deletion: the app shows the Restore screen. */
+  pendingDeletion?: { purgeAt: string };
 }
 export interface SessionResponse {
   ok: true;

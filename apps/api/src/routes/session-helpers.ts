@@ -38,12 +38,21 @@ export async function sessionUser(
     plan: p.plan ?? 'free',
     passkeyCount: await passkeyCount(c.env, s.accessToken, c.get('requestId')),
     createdAt: p.createdAt,
+    ...(p.deletionDue ? { pendingDeletion: { purgeAt: p.deletionDue } } : {}),
   };
 }
 
+/** While an account is scheduled for deletion only these routes work (plus sign-out, which needs no member). */
+const PENDING_DELETION_ALLOWED = new Set([
+  'GET /api/v1/auth/session',
+  'HEAD /api/v1/auth/session',
+  'POST /api/v1/me/restore',
+]);
+
 /**
  * App routes that need a member. Staff accounts are separate and can't use the app: their session is
- * ended here. Deleted accounts are signed out too.
+ * ended here. Deleted accounts are signed out too, and accounts scheduled for deletion get 403
+ * account_pending_deletion everywhere but the session and restore routes.
  */
 export const requireMember: MiddlewareHandler<HonoEnv> = async (c, next) => {
   const s = await resolveSession(c, 'app');
@@ -62,6 +71,9 @@ export const requireMember: MiddlewareHandler<HonoEnv> = async (c, next) => {
   if (profile.isStaff) {
     await endSession(c, 'app', s.accessToken);
     return c.json(fail('forbidden'), 403);
+  }
+  if (profile.deletionDue && !PENDING_DELETION_ALLOWED.has(`${c.req.method} ${c.req.path}`)) {
+    return c.json(fail('account_pending_deletion'), 403);
   }
   c.set('session', s);
   c.set('profile', profile);

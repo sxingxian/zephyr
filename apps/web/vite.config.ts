@@ -51,6 +51,8 @@ export default defineConfig(({ mode, command }) => {
       }),
     ],
     build: { sourcemap: false, target: 'es2022' },
+    // The hashing worker is emitted as its own same-origin module file (CSP worker-src 'self').
+    worker: { format: 'es' },
     server: { port: 5173, proxy: { '/api': 'http://localhost:8788' } },
     test: { environment: 'jsdom', globals: true, include: ['src/**/*.test.{ts,tsx}'] },
   };

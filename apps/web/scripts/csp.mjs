@@ -24,7 +24,9 @@ for (const file of pages) {
 const TURNSTILE = 'https://challenges.cloudflare.com';
 const csp = [
   "default-src 'self'",
-  `script-src 'self' ${TURNSTILE} ${[...hashes].join(' ')}`.trim(),
+  // 'wasm-unsafe-eval' lets hash-wasm compile its SHA-256 WebAssembly (upload fingerprinting). It allows
+  // WebAssembly compilation only, not JavaScript eval; the worker script itself is 'self'.
+  `script-src 'self' 'wasm-unsafe-eval' ${TURNSTILE} ${[...hashes].join(' ')}`.trim(),
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self'",

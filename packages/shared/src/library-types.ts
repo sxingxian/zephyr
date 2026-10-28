@@ -71,6 +71,12 @@ export interface UploadCreateResult {
   /** Same order as the request. */
   results: UploadDecision[];
 }
+export interface UploadCompleteResult {
+  ok: true;
+  photo: PhotoItem;
+  /** The same file finished first in another upload: `photo` is that copy and this upload was discarded. */
+  duplicate?: true;
+}
 export interface UploadStatus {
   ok: true;
   uploadId: string;

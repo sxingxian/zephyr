@@ -2,6 +2,7 @@ import { APP_API, type Passkey, type PasskeyOptions, type SessionResponse } from
 import { Button, Card, CardHead, Chip, Dialog, Field, Icon, Note, Spinner, useToast } from '@zephyr/ui';
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
+import { DeleteAccountCard } from '../components/DeleteAccount';
 import { SettingsNav } from '../components/SettingsNav';
 import { Shell } from '../components/Shell';
 import { ApiFailure, api, errorMessage } from '../lib/api';
@@ -67,7 +68,7 @@ export function Security() {
   const reauth = (e: unknown) => {
     if (e instanceof ApiFailure && e.code === 'reauth_required') {
       toast.show(errorMessage(e), 'bad');
-      navigate(`/sign-in?next=${encodeURIComponent('/settings/security')}`);
+      navigate(`/sign-in?reauth=1&next=${encodeURIComponent('/settings/security')}`);
       return true;
     }
     return false;
@@ -232,6 +233,7 @@ export function Security() {
               </Button>
             </Row>
           </Card>
+          <DeleteAccountCard />
         </div>
       </div>
 

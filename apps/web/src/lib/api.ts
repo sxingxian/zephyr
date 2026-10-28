@@ -18,6 +18,16 @@ let onUnauthenticated: Listener | null = null;
 export function setUnauthenticatedHandler(fn: Listener | null): void {
   onUnauthenticated = fn;
 }
+let onPendingDeletion: Listener | null = null;
+/** The session layer registers this to re-check the session when the account turns out to be scheduled for deletion. */
+export function setPendingDeletionHandler(fn: Listener | null): void {
+  onPendingDeletion = fn;
+}
+/** Shared by every request helper: global reactions to 401 and 403 account_pending_deletion. */
+export function notifyFailure(failure: ApiFailure, quiet401?: boolean): void {
+  if (failure.code === 'unauthenticated' && !quiet401) onUnauthenticated?.();
+  if (failure.code === 'account_pending_deletion') onPendingDeletion?.();
+}
 
 export interface RequestOptions {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
@@ -44,6 +54,10 @@ const KNOWN: ApiErrorCode[] = [
   'reauth_required',
   'not_found',
   'conflict',
+  'account_pending_deletion',
+  'upload_expired',
+  'too_large',
+  'storage_full',
   'server',
 ];
 
@@ -91,7 +105,7 @@ export async function api<T>(path: string, opts: RequestOptions = {}): Promise<T
   const body: unknown = await res.json().catch(() => null);
   if (res.ok) return body as T;
   const failure = toFailure(res.status, body, res.headers.get('retry-after'));
-  if (failure.code === 'unauthenticated' && !opts.quiet401) onUnauthenticated?.();
+  notifyFailure(failure, opts.quiet401);
   throw failure;
 }
 
@@ -134,6 +148,16 @@ export function errorMessage(err: unknown): string {
       return 'Your session ended. Sign in again.';
     case 'forbidden':
       return 'You don’t have access to that.';
+    case 'not_found':
+      return 'That isn’t here any more. It may have been deleted.';
+    case 'account_pending_deletion':
+      return 'This account is scheduled for deletion. Restore it to keep using Zephyr.';
+    case 'upload_expired':
+      return 'This upload expired. Retry to start it again.';
+    case 'too_large':
+      return 'That file is larger than your plan allows.';
+    case 'storage_full':
+      return 'Your storage is full. Free up space or upgrade to upload more.';
     default:
       return 'Something went wrong on our side. Try again in a minute.';
   }

@@ -239,9 +239,9 @@ describe('everything else', () => {
     expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
   });
   it('rejects other methods with 405', async () => {
-    const res = await app.request('/api/v1/invite-requests', { method: 'PUT' }, env);
+    const res = await app.request('/api/v1/invite-requests', { method: 'OPTIONS' }, env);
     expect(res.status).toBe(405);
-    expect(res.headers.get('Allow')).toBe('GET, HEAD, POST, PATCH, DELETE');
+    expect(res.headers.get('Allow')).toBe('GET, HEAD, POST, PUT, PATCH, DELETE');
     expect(res.headers.get('Content-Security-Policy')).toBeTruthy();
   });
 });

@@ -7,6 +7,7 @@ import { vi } from 'vitest';
 import { app } from '../src/app';
 import { CODE_TIMING } from '../src/auth/code-limits';
 import type { Env } from '../src/env';
+import { MockR2 } from './r2';
 
 export const SB = 'https://db.test';
 export const APP = 'https://zephyrapp.midnightpoetry.studio';
@@ -19,6 +20,10 @@ export const setLimiter = (ok: boolean) => {
   limiterOk = ok;
 };
 export const limiterKeys: string[] = [];
+/** Whether the per-member upload limiter allows the next PUT. */
+export const uploadLimiter = { ok: true, keys: [] as string[] };
+/** The PHOTOS bucket binding. */
+export const r2 = new MockR2();
 
 export const env: Env = {
   ENVIRONMENT: 'test',
@@ -43,6 +48,13 @@ export const env: Env = {
       return { success: limiterOk };
     },
   } as unknown as RateLimit,
+  UPLOAD_LIMITER: {
+    limit: async ({ key }: { key: string }) => {
+      uploadLimiter.keys.push(key);
+      return { success: uploadLimiter.ok };
+    },
+  } as unknown as RateLimit,
+  PHOTOS: r2 as unknown as R2Bucket,
 };
 
 // ---- keys --------------------------------------------------------------------------------------------
@@ -132,6 +144,10 @@ export interface World {
   createUserStatus: number;
   /** In-memory rate_limit_attempts: "kind|key" → attempt times (ms). Synchronous, so atomic like the SQL. */
   limits: Map<string, number[]>;
+  /** Called when GoTrue's admin API deletes a user (library tests cascade their rows). */
+  onUserDeleted?: (id: string) => void;
+  /** Bearer tokens GoTrue was asked to sign out globally. */
+  globalLogouts: string[];
 }
 export const world: World = {} as World;
 
@@ -169,9 +185,14 @@ export function resetWorld() {
     refresh: new Map(),
     createUserStatus: 200,
     limits: new Map(),
+    onUserDeleted: undefined,
+    globalLogouts: [],
   } satisfies World);
   limiterOk = true;
   limiterKeys.length = 0;
+  uploadLimiter.ok = true;
+  uploadLimiter.keys.length = 0;
+  r2.reset();
   CODE_TIMING.floorMs = 0;
 }
 
@@ -295,7 +316,10 @@ async function gotrueHandler(
     world.refresh.delete(String(body.refresh_token));
     return json(await sessionFor(u));
   }
-  if (method === 'POST' && path.startsWith('/logout')) return new Response(null, { status: 204 });
+  if (method === 'POST' && path.startsWith('/logout')) {
+    if (path.includes('scope=global')) world.globalLogouts.push(bearer);
+    return new Response(null, { status: 204 });
+  }
   if (method === 'GET' && path === '/user') return json(userFromBearer() ?? {}, userFromBearer() ? 200 : 401);
   if (method === 'POST' && path === '/passkeys/authentication/options') {
     return json({ challenge_id: 'ch-auth', options: { challenge: 'abc', rpId: 'midnightpoetry.studio' } });
@@ -351,6 +375,14 @@ async function gotrueHandler(
       verification_type: 'magiclink',
     });
   }
+  const del = path.match(/^\/admin\/users\/([^/]+)$/);
+  if (method === 'DELETE' && del) {
+    const id = decodeURIComponent(del[1] ?? '');
+    if (!byId(id)) return json({ error_code: 'user_not_found' }, 404);
+    world.users = world.users.filter((u) => u.id !== id);
+    world.onUserDeleted?.(id);
+    return json({});
+  }
   const m = path.match(/^\/admin\/users\/([^/]+)\/passkeys$/);
   if (method === 'GET' && m) {
     const u = byId(decodeURIComponent(m[1] ?? ''));
@@ -399,7 +431,7 @@ export function installFetch() {
         const path = url.slice(`${SB}/auth/v1`.length);
         return gotrueHandler(
           method,
-          path.split('?')[0] === '/token' ? path : (path.split('?')[0] ?? ''),
+          ['/token', '/logout'].includes(path.split('?')[0] ?? '') ? path : (path.split('?')[0] ?? ''),
           (body ?? {}) as Record<string, unknown>,
           headers,
         );

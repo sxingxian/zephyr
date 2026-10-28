@@ -47,9 +47,12 @@ Nothing here is committed; each value goes into Cloudflare, Supabase, Resend or 
    pnpm exec wrangler secret put SESSION_HMAC_SECRET   # openssl rand -base64 48
    pnpm exec wrangler secret put RESEND_API_KEY
    ```
-4. Create an API token with _Workers Scripts: Edit_, _Workers Routes: Edit_ and _Zone: Read_ on
-   midnightpoetry.studio.
-5. Deploy order: the API (`zephyr-api`), then the landing Worker (custom domain `zephyr.midnightpoetry.studio`,
+4. **R2 (photo storage):** create a bucket named `zephyr-photos` in the region closest to your users. Leave
+   public access **off** and don't enable the r2.dev URL: every image is served by the API after an ownership
+   check. No R2 API tokens or CORS rules are needed, because uploads go through the API Worker's binding.
+5. Create an API token with _Workers Scripts: Edit_, _Workers Routes: Edit_, _Workers R2 Storage: Edit_ and
+   _Zone: Read_ on midnightpoetry.studio.
+6. Deploy order: the API (`zephyr-api`, which also runs the 15-minute clean-up job), then the landing Worker (custom domain `zephyr.midnightpoetry.studio`,
    includes /admin), then the app Worker (custom domain `zephyrapp.midnightpoetry.studio`).
 
 ## 4. GitHub (Settings › Environments › production)

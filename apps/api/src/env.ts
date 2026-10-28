@@ -31,6 +31,10 @@ export interface Env {
   /** Signs the admin idle-timeout cookie. 32+ random bytes. */
   SESSION_HMAC_SECRET: string;
   BURST_LIMITER: RateLimit;
+  /** Per-member limit on upload part and variant PUTs (wrangler.jsonc ratelimits). */
+  UPLOAD_LIMITER: RateLimit;
+  /** Private photo bucket (zephyr-photos): originals and variants under u/<ownerId>/p/<photoId>/. */
+  PHOTOS: R2Bucket;
 }
 
 export const list = (v: string | undefined): string[] =>

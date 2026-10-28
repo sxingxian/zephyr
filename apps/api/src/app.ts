@@ -2,13 +2,17 @@ import { Hono } from 'hono';
 import { rejectDuplicateCookies } from './auth/session';
 import { fail, logError } from './http';
 import { adminRoutes } from './routes/admin';
+import { albumRoutes } from './routes/albums';
 import { appAuthRoutes } from './routes/app-auth';
 import { inviteRoutes } from './routes/invites';
 import { meRoutes } from './routes/me';
+import { photoRoutes } from './routes/photos';
 import { publicRoutes } from './routes/public';
+import { trashRoutes } from './routes/trash';
+import { uploadRoutes } from './routes/uploads';
 import type { HonoEnv } from './types';
 
-const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST', 'PATCH', 'DELETE']);
+const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']);
 
 export const app = new Hono<HonoEnv>();
 
@@ -17,7 +21,7 @@ app.use('*', async (c, next) => {
   const requestId = crypto.randomUUID();
   c.set('requestId', requestId);
   if (!ALLOWED_METHODS.has(c.req.method)) {
-    const res = c.json(fail('method_not_allowed'), 405, { Allow: 'GET, HEAD, POST, PATCH, DELETE' });
+    const res = c.json(fail('method_not_allowed'), 405, { Allow: 'GET, HEAD, POST, PUT, PATCH, DELETE' });
     applyHeaders(res.headers, c.req.method, requestId);
     return res;
   }
@@ -26,7 +30,10 @@ app.use('*', async (c, next) => {
 });
 
 function applyHeaders(h: Headers, method: string, requestId: string) {
-  h.set('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+  // Media responses set their own (stricter) sandbox policy; everything else gets the API default.
+  if (!h.has('Content-Security-Policy')) {
+    h.set('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+  }
   h.set('X-Content-Type-Options', 'nosniff');
   h.set('Referrer-Policy', 'no-referrer');
   h.set('Cross-Origin-Resource-Policy', 'same-origin');
@@ -46,6 +53,10 @@ app.route('/api', publicRoutes);
 app.route('/api/v1/auth', appAuthRoutes);
 app.route('/api/v1/me', meRoutes);
 app.route('/api/v1/invites', inviteRoutes);
+app.route('/api/v1/uploads', uploadRoutes);
+app.route('/api/v1/photos', photoRoutes);
+app.route('/api/v1/albums', albumRoutes);
+app.route('/api/v1/trash', trashRoutes);
 // Admin console (zephyr.midnightpoetry.studio/admin, behind Cloudflare Access).
 app.route('/admin/api', adminRoutes);
 

@@ -18,8 +18,19 @@
       "name": "BURST_LIMITER",
       "namespace_id": "1001",
       "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      // Upload part and variant PUTs per member (keyed by user id): 240 a minute is ~3.75 GiB of
+      // 16 MiB parts, far above a browser's real rate but a ceiling on abuse.
+      "name": "UPLOAD_LIMITER",
+      "namespace_id": "1002",
+      "simple": { "limit": 240, "period": 60 }
     }
   ],
+  // Private photo bucket: no public access, no r2.dev URL. Every byte goes through this Worker.
+  "r2_buckets": [{ "binding": "PHOTOS", "bucket_name": "zephyr-photos" }],
+  // Library clean-up jobs (src/jobs.ts): expired uploads, Trash purges, account purges.
+  "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
     "ENVIRONMENT": "production",
     "SUPABASE_URL": "https://YOUR-PROJECT-REF.supabase.co",

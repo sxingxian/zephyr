@@ -23,3 +23,4 @@ CF_ACCESS_DEV_EMAIL=
 # Resend API key (https://resend.com/api-keys). Use a test key locally; emails go to real inboxes.
 RESEND_API_KEY=
 EMAIL_FROM=Zephyr <onboarding@resend.dev>
+# The PHOTOS bucket and the rate-limit bindings need no variables: `wrangler dev` simulates them locally.

@@ -2,18 +2,28 @@ import { ToastProvider } from '@zephyr/ui';
 import { useCallback } from 'react';
 import { createBrowserRouter, Outlet, type RouteObject, useLocation, useNavigate } from 'react-router';
 import { PublicOnly, RequireAuth } from './components/Guards';
+import { LibraryHost } from './components/LibraryHost';
+import { UploadProvider } from './components/Uploads';
 import { safeReturnPath } from './lib/returnPath';
-import { SessionProvider } from './lib/session';
+import { SessionProvider, useSession } from './lib/session';
+import { AccountDeleted } from './routes/AccountScheduled';
+import { AlbumsPage } from './routes/Albums';
 import { InviteFriends } from './routes/Invites';
 import { Join } from './routes/Join';
-import { Library } from './routes/Library';
 import { NotFound } from './routes/NotFound';
 import { Security } from './routes/Security';
 import { SignIn } from './routes/SignIn';
 import { SignInCode } from './routes/SignInCode';
 import { SignUp } from './routes/SignUp';
+import { TrashPage } from './routes/Trash';
 import { WelcomePasskey } from './routes/WelcomePasskey';
 import { You } from './routes/You';
+
+/** Uploads (picker, drag & drop, tray) for signed-in members, kept mounted across pages. */
+function Uploads({ children }: { children: React.ReactNode }) {
+  const { user } = useSession();
+  return <UploadProvider enabled={Boolean(user && !user.pendingDeletion)}>{children}</UploadProvider>;
+}
 
 function Root() {
   const nav = useNavigate();
@@ -26,7 +36,9 @@ function Root() {
   return (
     <SessionProvider onUnauthenticated={onUnauthenticated}>
       <ToastProvider>
-        <Outlet />
+        <Uploads>
+          <Outlet />
+        </Uploads>
       </ToastProvider>
     </SessionProvider>
   );
@@ -39,7 +51,19 @@ export const routes: RouteObject[] = [
   {
     element: <Root />,
     children: [
-      { path: '/', element: auth(<Library />) },
+      {
+        // Grid pages and the photo viewer share one host, so opening a photo keeps the grid underneath.
+        element: auth(<LibraryHost />),
+        children: [
+          { path: '/', element: null },
+          { path: '/favourites', element: null },
+          { path: '/albums/:albumId', element: null },
+          { path: '/photo/:photoId', element: null },
+        ],
+      },
+      { path: '/albums', element: auth(<AlbumsPage />) },
+      { path: '/trash', element: auth(<TrashPage />) },
+      { path: '/account-deleted', element: <AccountDeleted /> },
       { path: '/sign-in', element: pub(<SignIn />) },
       { path: '/sign-in/code', element: pub(<SignInCode />) },
       { path: '/sign-up', element: pub(<SignUp />) },

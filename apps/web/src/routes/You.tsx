@@ -2,7 +2,7 @@ import { Button, Chip, Icon } from '@zephyr/ui';
 import type { ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { Avatar } from '../components/Avatar';
-import { Shell } from '../components/Shell';
+import { Shell, StorageMeter } from '../components/Shell';
 import { initials, useSession } from '../lib/session';
 
 const PLAN_LABEL = { free: 'Free plan', pro: 'Pro plan', studio: 'Studio plan' } as const;
@@ -40,8 +40,25 @@ export function You() {
             <strong>{PLAN_LABEL[user.plan]}</strong>
             {user.plan === 'free' && <Chip size="sm">With ads</Chip>}
           </div>
-          <p className="z-hint">Storage, credits and upgrades appear here once uploads open.</p>
+          <StorageMeter />
+          <p className="z-hint">Cloud AI credits and upgrades are coming soon.</p>
         </section>
+        <Group title="Library">
+          <Link to="/favourites" className="you-row">
+            <span className="you-row__icon">
+              <Icon name="heart" size={17} />
+            </span>
+            <span className="you-row__label">Favourites</span>
+            <Icon name="chevR" size={16} />
+          </Link>
+          <Link to="/trash" className="you-row">
+            <span className="you-row__icon">
+              <Icon name="trash" size={17} />
+            </span>
+            <span className="you-row__label">Trash</span>
+            <Icon name="chevR" size={16} />
+          </Link>
+        </Group>
         <Group title="Security">
           <Link to="/settings/security" className="you-row">
             <span className="you-row__icon">
@@ -49,6 +66,13 @@ export function You() {
             </span>
             <span className="you-row__label">Passkeys</span>
             <span className="z-muted">{user.passkeyCount}</span>
+            <Icon name="chevR" size={16} />
+          </Link>
+          <Link to="/settings/security?delete=1" className="you-row">
+            <span className="you-row__icon you-row__icon--bad">
+              <Icon name="trash" size={17} />
+            </span>
+            <span className="you-row__label">Delete account</span>
             <Icon name="chevR" size={16} />
           </Link>
         </Group>

@@ -88,6 +88,9 @@ export const gotrue = {
     ),
 
   logout: (env: Env, jwt: string) => call<unknown>(env, 'POST', '/logout?scope=local', { kind: 'user', jwt }),
+  /** Ends every session of the token's user (all devices). */
+  logoutEverywhere: (env: Env, jwt: string) =>
+    call<unknown>(env, 'POST', '/logout?scope=global', { kind: 'user', jwt }),
 
   getUser: (env: Env, jwt: string) => call<GoTrueUser>(env, 'GET', '/user', { kind: 'user', jwt }),
 
@@ -141,6 +144,15 @@ export const gotrue = {
     call<unknown>(env, 'DELETE', `/passkeys/${encodeURIComponent(id)}`, { kind: 'user', jwt }),
 
   // ---- admin ----
+  /** Deletes the Auth user (cascades to the profile and library rows). A user already gone is not an error. */
+  adminDeleteUser: async (env: Env, userId: string) => {
+    try {
+      await call<unknown>(env, 'DELETE', `/admin/users/${encodeURIComponent(userId)}`, { kind: 'admin' });
+    } catch (err) {
+      if (err instanceof UpstreamError && err.status === 404) return;
+      throw err;
+    }
+  },
   adminCreateUser: (env: Env, email: string, displayName?: string) =>
     call<GoTrueUser>(
       env,

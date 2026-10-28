@@ -61,6 +61,34 @@ Tokens never reach the browser. After sign-in the API sets httpOnly cookies and 
 | GET          | `invites/mine`         | Member invites and remaining monthly quota                                                                                                                                                                                |
 | POST         | `invites`              | `{ email }` → 201 (no note: members can't add text to the email). 403 disabled/paused, 409 already a member/invited, 429 `quota_exceeded` (`retryAfter` = to month end), 500 if the email failed (the invite is revoked). |
 
+### Library: `/api/v1/*` (phase 3)
+
+Contract: `LIBRARY_API` in `packages/shared/src/library-types.ts`; design in `docs/phase-3.md`. Every route needs a member session, and every database call passes the session's user id as `p_owner`: another member's upload, photo, file or album is always **404**.
+
+| Method               | Path                         | Notes                                                                                                                                                                                                                                                         |
+| -------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST                 | `uploads`                    | `{ files: [{ name, size, sha256 }] }` → a decision per file, in order: `ready` (reserves storage), `duplicate` (same SHA-256 and size already in your library, **including the Trash**: offer Restore), or `rejected` (`type`, `too_large`, `quota`).         |
+| PUT                  | `uploads/:id/parts/:n`       | Raw bytes. `Content-Length` must equal the part (16 MiB, the last part the remainder): missing 411, bigger 413 `too_large`, smaller 400. The body is cut off at that length. Part 1 must start with the type's signature, else 415 and the upload is aborted. |
+| PUT                  | `uploads/:id/variants/:kind` | `thumb` (≤ 512 px, 300 KB) or `preview` (≤ 2048 px, 1.5 MB): a JPEG or WEBP, checked from its header. Over the size cap 413, wrong dimensions 400, not JPEG/WEBP 415.                                                                                         |
+| POST                 | `uploads/:id/complete`       | `{ metadata }` → `{ photo }`. Completes the R2 upload and checks the stored size (mismatch: 400 and the upload is discarded). If the same file finished first elsewhere: `{ photo, duplicate: true }` with the kept copy.                                     |
+| GET / DELETE         | `uploads/:id`                | Status for resuming (`partsDone`, `variantsDone`) / abort. Expired uploads: 410 `upload_expired`.                                                                                                                                                             |
+| GET                  | `photos`                     | `?view&albumId&q&from&to&sort&cursor&limit` → `Page<PhotoItem>`                                                                                                                                                                                               |
+| GET / PATCH          | `photos/:id`                 | `{ photo }` (detail with metadata and albums) / `{ favourite?, filename? }`                                                                                                                                                                                   |
+| GET                  | `photos/:id/:kind`           | `thumb`, `preview`: fixed type, `private, max-age=31536000, immutable`, ETag/304. `original`: `no-store`, `attachment` (RFC 5987 name, the type's extension kept), single byte ranges. All: `nosniff`, CSP `default-src 'none'; sandbox`, CORP same-origin.   |
+| POST                 | `photos/bulk`                | `{ ids (≤ 500), action, albumId? }` → `{ affected }` (your own photos only). `delete_forever` only from the Trash.                                                                                                                                            |
+| GET / POST           | `albums`                     | `{ albums }` / `{ name, photoIds? }` → 201 `{ album }` (1,000 albums each)                                                                                                                                                                                    |
+| GET / PATCH / DELETE | `albums/:id`                 | `{ album }` / `{ name?, coverPhotoId? }` (the cover must be in the album) / 204. Deleting an album keeps its photos.                                                                                                                                          |
+| POST                 | `trash/empty`                | `{}` → `{ deleted }`                                                                                                                                                                                                                                          |
+| GET                  | `me/usage`                   | `Usage`: bytes used, reserved and limit, Trash bytes, photo count, the plan's file types, max file size and batch size                                                                                                                                        |
+| POST                 | `me/delete`                  | `{ confirm: "DELETE" }` → `{ purgeAt }` (30 days). Needs a sign-in in the last 10 minutes (403 `reauth_required`). Signs out every session (GoTrue global logout) and emails the account.                                                                     |
+| POST                 | `me/restore`                 | `{}` → `SessionResponse`; 409 if nothing is scheduled                                                                                                                                                                                                         |
+
+While deletion is pending, `auth/session` returns `user.pendingDeletion: { purgeAt }` and every other member route answers **403 `account_pending_deletion`** (sign-out and `me/restore` still work).
+
+**Deleting objects.** R2 objects are deleted before the rows that count them. Delete forever and Empty Trash move photos to `purging` (hidden, still counted, can't be restored), delete the objects, then remove the rows and usage; if R2 fails, the clean-up job finishes it.
+
+**Clean-up jobs** (`src/jobs.ts`, Cron Trigger `*/15 * * * *`), bounded per run: abort uploads older than 24 hours (200), purge Trash past 30 days (300 photos), purge accounts past their date (5 accounts, up to 10,000 objects each, finished over later runs if needed; then the Auth user is deleted, which cascades), and delete old rate-limit rows. A run that did library work writes one `jobs.cleanup` audit row with counts only.
+
 ### Admin: `/admin/api/v1/*`
 
 Every request first needs a valid **Cloudflare Access** JWT (`Cf-Access-Jwt-Assertion`, verified against `https://<CF_ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs`, `aud = CF_ACCESS_AUD`), else 403. The staff account's email must equal the Access identity.
@@ -99,6 +127,9 @@ Durable limits live in Postgres (`rate_limit_hit`, per attempt, reserved atomica
 | Invite links (preview + redeem) | 20 / network per 15 min                                                                                                                                                                                |
 | Invite codes                    | 5 / network per 15 min; 1 new invite / address per day (database)                                                                                                                                      |
 | Admin email codes               | Start: 5 / network, 3 / address per 15 min. Verify: 5 attempts / (address, network), 25 / address per 15 min, reset by a new code                                                                      |
+| Upload batches (`POST uploads`) | 120 / member per hour (database), each up to the plan's batch size; JSON body ≤ 256 KB                                                                                                                 |
+| Upload parts and variants       | 240 PUTs / member per minute (`UPLOAD_LIMITER` binding, keyed by user id): about 3.75 GiB a minute of 16 MiB parts                                                                                     |
+| Library JSON bodies             | ≤ 32 KB (bulk: up to 500 ids)                                                                                                                                                                          |
 
 Supabase applies its own Auth rate limits per IP, and every call comes from this Worker, so raise them (Authentication › Rate Limits) and leave Supabase's CAPTCHA off: Turnstile is verified here.
 
@@ -128,8 +159,11 @@ Logs carry a request id, the failing step and upstream status/error codes only: 
 | `RESEND_API_KEY`               | **secret**         |                                                                                      |
 | `CF_ACCESS_DEV_EMAIL`          | dev only           | Skips Access only when `ENVIRONMENT=development` **and** the request is to localhost |
 | `BURST_LIMITER`                | rate-limit binding | `namespace_id` must be unique in your account                                        |
+| `UPLOAD_LIMITER`               | rate-limit binding | As above                                                                             |
+| `PHOTOS`                       | R2 binding         | Bucket `zephyr-photos`: private, no public access, no r2.dev URL, no CORS rules      |
+| Cron Trigger                   | `triggers.crons`   | `*/15 * * * *`: the library clean-up jobs                                            |
 
-Set secrets with `wrangler secret put <NAME>`.
+Set secrets with `wrangler secret put <NAME>`. Create the bucket once with `wrangler r2 bucket create zephyr-photos` (leave public access and the r2.dev URL off).
 
 Supabase Auth settings that must match (see `supabase/config.toml`): public sign-up off, email OTP length 6 / expiry 600 s, the sign-in code template (`supabase/templates/sign-in-code.html`), SMTP through Resend, passkeys on with RP ID `midnightpoetry.studio` and both Zephyr origins, and the before-user-created hook.
 
@@ -141,6 +175,8 @@ supabase start                   # from the repo root; applies migrations and th
 pnpm --filter @zephyr/api dev
 ```
 
+`wrangler dev` simulates the `PHOTOS` bucket locally (`.wrangler/state`). To run the clean-up jobs by hand: `wrangler dev --test-scheduled`, then `curl "http://localhost:8787/__scheduled?cron=*/15+*+*+*+*"`.
+
 ## Scripts
 
-`pnpm --filter @zephyr/api <script>`: `test` (Vitest; Supabase, Turnstile, Access and Resend are mocked, and tokens are signed with real ES256/RS256 test keys), `typecheck`, `build` (Wrangler dry run into `dist/`), `deploy`.
+`pnpm --filter @zephyr/api <script>`: `test` (Vitest; Supabase, Turnstile, Access and Resend are mocked, R2 is an in-memory bucket with multipart uploads (`test/r2.ts`), the library's database functions are faked in `test/library-db.ts` (the real ones are tested in `supabase/tests`), and tokens are signed with real ES256/RS256 test keys), `typecheck`, `build` (Wrangler dry run into `dist/`), `deploy`.

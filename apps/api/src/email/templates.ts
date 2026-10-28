@@ -94,3 +94,41 @@ export function passkeyChangeEmail(e: PasskeyChangeEmail): { subject: string; ht
   const text = [subject, '', what, '', advice].join('\n');
   return { subject, html, text };
 }
+
+export interface AccountDeletionEmail {
+  purgeAt: string;
+  appUrl: string;
+}
+
+/** Sent when a member schedules their account for deletion: what happens, when, and how to undo it. */
+export function accountDeletionEmail(e: AccountDeletionEmail): {
+  subject: string;
+  html: string;
+  text: string;
+} {
+  const subject = 'Your Zephyr account is scheduled for deletion';
+  const when = formatDate(e.purgeAt);
+  const what = `Your account, every photo and album in it, will be permanently deleted on ${when}. You’ve been signed out on every device.`;
+  const undo =
+    'Changed your mind? Sign in before then and choose Restore account: everything comes back as it was.';
+  const advice =
+    'If you didn’t ask for this, sign in now, restore your account and reply to this email so we can help.';
+  const link = escapeHtml(e.appUrl);
+
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#F4F6F9;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0D1117;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F4F6F9;padding:40px 16px;"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#FFFFFF;border-radius:20px;padding:36px 32px;">
+<tr><td style="font-size:20px;font-weight:600;letter-spacing:-0.02em;padding-bottom:28px;">zephyr</td></tr>
+<tr><td style="font-size:22px;font-weight:600;letter-spacing:-0.03em;line-height:1.25;padding-bottom:12px;">${escapeHtml(subject)}</td></tr>
+<tr><td style="font-size:15px;line-height:1.55;color:#2A313C;padding-bottom:16px;">${escapeHtml(what)}</td></tr>
+<tr><td style="font-size:15px;line-height:1.55;color:#2A313C;padding-bottom:24px;">${escapeHtml(undo)}</td></tr>
+<tr><td style="padding-bottom:24px;"><a href="${link}" style="display:inline-block;background:#0D1117;color:#FFFFFF;text-decoration:none;font-size:16px;font-weight:600;border-radius:12px;padding:14px 22px;">Open Zephyr</a></td></tr>
+<tr><td style="font-size:13px;line-height:1.55;color:#566070;">${escapeHtml(advice)}</td></tr>
+</table>
+<p style="font-size:12px;color:#566070;margin:20px 0 0;">Midnight Poetry Studio · zephyr.midnightpoetry.studio</p>
+</td></tr></table></body></html>`;
+  const text = [subject, '', what, '', undo, `Open Zephyr: ${e.appUrl}`, '', advice].join('\n');
+  return { subject, html, text };
+}

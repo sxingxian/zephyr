@@ -1,11 +1,24 @@
 import { APP_API, type SessionResponse, type SessionUser } from '@zephyr/shared/client';
-import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { ApiFailure, api, setUnauthenticatedHandler } from './api';
+import {
+  createContext,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { ApiFailure, api, setPendingDeletionHandler, setUnauthenticatedHandler } from './api';
+import { resetUsage } from './usage';
+
+/** The session user; `pendingDeletion` is set while the account is scheduled for deletion. */
+export type AppUser = SessionUser;
 
 interface SessionState {
   /** undefined while the first check is in flight. */
-  user: SessionUser | null | undefined;
-  setUser: (u: SessionUser | null) => void;
+  user: AppUser | null | undefined;
+  setUser: (u: AppUser | null) => void;
   refresh: () => Promise<void>;
   signOut: () => Promise<void>;
 }
@@ -18,7 +31,14 @@ export function SessionProvider({
   children: ReactNode;
   onUnauthenticated: () => void;
 }) {
-  const [user, setUser] = useState<SessionUser | null | undefined>(undefined);
+  const [user, setUserState] = useState<AppUser | null | undefined>(undefined);
+  const lastId = useRef<string | null>(null);
+  const setUser = useCallback((u: AppUser | null) => {
+    // A different member (or none): forget the cached storage figures.
+    if (!u || (lastId.current && lastId.current !== u.id)) resetUsage();
+    lastId.current = u?.id ?? null;
+    setUserState(u);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -26,9 +46,9 @@ export function SessionProvider({
       setUser(r.user);
     } catch (e) {
       if (e instanceof ApiFailure && (e.code === 'unauthenticated' || e.code === 'forbidden')) setUser(null);
-      else setUser((u) => (u === undefined ? null : u));
+      else setUserState((u) => (u === undefined ? null : u));
     }
-  }, []);
+  }, [setUser]);
 
   useEffect(() => {
     void refresh();
@@ -40,7 +60,13 @@ export function SessionProvider({
       onUnauthenticated();
     });
     return () => setUnauthenticatedHandler(null);
-  }, [onUnauthenticated]);
+  }, [onUnauthenticated, setUser]);
+
+  // Any call answering 403 account_pending_deletion: re-read the session, which then routes to Restore.
+  useEffect(() => {
+    setPendingDeletionHandler(() => void refresh());
+    return () => setPendingDeletionHandler(null);
+  }, [refresh]);
 
   const signOut = useCallback(async () => {
     try {
@@ -48,9 +74,9 @@ export function SessionProvider({
     } finally {
       setUser(null);
     }
-  }, []);
+  }, [setUser]);
 
-  const value = useMemo(() => ({ user, setUser, refresh, signOut }), [user, refresh, signOut]);
+  const value = useMemo(() => ({ user, setUser, refresh, signOut }), [user, setUser, refresh, signOut]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 

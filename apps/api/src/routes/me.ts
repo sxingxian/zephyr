@@ -1,23 +1,26 @@
 import {
+  type DeleteAccountResult,
+  deleteAccountSchema,
   passkeyRenameSchema,
   passkeyVerifySchema,
   profilePatchSchema,
   type SessionResponse,
+  type Usage,
 } from '@zephyr/shared';
 import { Hono, type MiddlewareHandler } from 'hono';
 import { gotrue } from '../auth/gotrue';
-import { recentlyAuthenticated } from '../auth/session';
+import { appendCookies, clearCookies, recentlyAuthenticated } from '../auth/session';
 import { ceremonyMatches } from '../auth/webauthn';
-import { notifyPasskeyChange } from '../email/notify';
+import { notifyAccountDeletion, notifyPasskeyChange } from '../email/notify';
 import { list } from '../env';
 import { burstOk, fail, guardWrite, logError, rateLimited, readBody } from '../http';
 import { rpc, UpstreamError } from '../supabase';
 import type { HonoEnv } from '../types';
-import { requireMember, sessionUser, toPasskey } from './session-helpers';
+import { getProfile, requireMember, sessionUser, toPasskey } from './session-helpers';
 
 const PASSKEY_ID = /^[A-Za-z0-9_-]{1,100}$/;
 
-/** /api/v1/me/*: the signed-in member's profile and passkeys. */
+/** /api/v1/me/*: the signed-in member's profile, passkeys, storage usage and account deletion. */
 export const meRoutes = new Hono<HonoEnv>();
 meRoutes.use(
   '*',
@@ -26,8 +29,8 @@ meRoutes.use(
 meRoutes.use('*', requireMember);
 
 /**
- * Adding or removing a passkey needs a sign-in in the last 10 minutes, so a stolen or left-open
- * session can't quietly add its own key or remove the owner's.
+ * Adding or removing a passkey, or deleting the account, needs a sign-in in the last 10 minutes, so a
+ * stolen or left-open session can't quietly add its own key, remove the owner's or delete everything.
  */
 const requireRecentAuth: MiddlewareHandler<HonoEnv> = async (c, next) => {
   if (!recentlyAuthenticated(c.get('session').claims)) return c.json(fail('reauth_required'), 403);
@@ -119,6 +122,59 @@ meRoutes.delete('/passkeys/:id', requireRecentAuth, async (c) => {
   } catch (err) {
     if (err instanceof UpstreamError && err.status === 404) return c.json(fail('not_found'), 404);
     logError(c.get('requestId'), 'passkey_delete', err);
+    return c.json(fail('server'), 500);
+  }
+});
+
+meRoutes.get('/usage', async (c) => {
+  try {
+    const usage = await rpc<Omit<Usage, 'ok'> | null>(c.env, 'get_usage', {
+      p_owner: c.get('session').userId,
+    });
+    if (!usage) return c.json(fail('not_found'), 404);
+    return c.json({ ok: true, ...usage } satisfies Usage);
+  } catch (err) {
+    logError(c.get('requestId'), 'usage', err);
+    return c.json(fail('server'), 500);
+  }
+});
+
+/**
+ * Schedules the account for deletion in 30 days, signs out every session (all devices) and emails the
+ * account. Signing in again shows the Restore screen until the purge job runs.
+ */
+meRoutes.post('/delete', requireRecentAuth, async (c) => {
+  const body = await readBody(c, deleteAccountSchema);
+  if (!body) return c.json(fail('invalid'), 400);
+  const s = c.get('session');
+  try {
+    const purgeAt = await rpc<string | null>(c.env, 'request_account_deletion', { p_owner: s.userId });
+    if (!purgeAt) return c.json(fail('forbidden'), 403);
+    try {
+      await gotrue.logoutEverywhere(c.env, s.accessToken);
+    } catch (err) {
+      // The pending-deletion gate still refuses every other route for any session left.
+      logError(c.get('requestId'), 'delete_logout', err);
+    }
+    appendCookies(c, clearCookies('app'));
+    await notifyAccountDeletion(c, s.email, purgeAt);
+    return c.json({ ok: true, purgeAt } satisfies DeleteAccountResult);
+  } catch (err) {
+    logError(c.get('requestId'), 'account_delete', err);
+    return c.json(fail('server'), 500);
+  }
+});
+
+meRoutes.post('/restore', async (c) => {
+  const s = c.get('session');
+  try {
+    const restored = await rpc<boolean | null>(c.env, 'restore_account', { p_owner: s.userId });
+    if (!restored) return c.json(fail('conflict'), 409);
+    const profile = await getProfile(c.env, s.userId);
+    if (!profile) return c.json(fail('server'), 500);
+    return c.json({ ok: true, user: await sessionUser(c, s, profile) } satisfies SessionResponse);
+  } catch (err) {
+    logError(c.get('requestId'), 'account_restore', err);
     return c.json(fail('server'), 500);
   }
 });

@@ -7,6 +7,8 @@ export interface SessionProfile {
   plan: 'free' | 'pro' | 'studio';
   createdAt: string;
   deleted: boolean;
+  /** When a scheduled account deletion runs (ISO), or null. */
+  deletionDue: string | null;
 }
 export interface StaffContext {
   id: string;
