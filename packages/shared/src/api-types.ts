@@ -69,6 +69,10 @@ export type ApiErrorCode =
   | 'reauth_required' // adding or removing a passkey needs a sign-in in the last 10 minutes
   | 'not_found'
   | 'conflict'
+  | 'account_pending_deletion' // scheduled for deletion: only restore, session and sign-out work
+  | 'upload_expired'
+  | 'too_large'
+  | 'storage_full'
   | 'server';
 
 export interface ApiError {

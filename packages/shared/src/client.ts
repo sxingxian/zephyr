@@ -4,5 +4,6 @@
  */
 export * from './api-types';
 export * from './invite-constants';
+export * from './library-types';
 export * from './plans';
 export * from './settings';
