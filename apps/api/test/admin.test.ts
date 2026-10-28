@@ -18,6 +18,8 @@ import {
   world,
 } from './helpers';
 
+const b64url = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+
 beforeAll(initKeys);
 beforeEach(() => {
   resetWorld();
@@ -62,7 +64,8 @@ describe('Cloudflare Access', () => {
     for (const access of [
       await accessToken('owner@zephyr.test', { aud: 'other-app' }),
       await accessToken('owner@zephyr.test', { iss: 'https://evil.cloudflareaccess.com' }),
-      'eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im93bmVyQHplcGh5ci50ZXN0In0.',
+      // An unsigned token (alg: none), built at runtime.
+      `${b64url({ alg: 'none' })}.${b64url({ email: 'owner@zephyr.test' })}.`,
     ]) {
       expect((await call('/admin/api/v1/signups', { access })).status).toBe(403);
     }

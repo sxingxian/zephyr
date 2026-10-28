@@ -1,0 +1,2 @@
+# Fake unsigned (alg:none) JWT in a test that checks such tokens are rejected; not a secret.
+9a60c508c0ae69781c850cec3dc73d366d808bde:apps/api/test/admin.test.ts:jwt:63
