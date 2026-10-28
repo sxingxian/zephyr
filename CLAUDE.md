@@ -13,4 +13,5 @@
 - Brand assets come from `design/kit/shared.cjs` via `pnpm brand:export`; don't hand-edit `packages/brand/src/generated`.
 - Motion: the markup is always the final layout. Animations are described with data attributes
   (`apps/landing/src/lib/motion.ts`) and played by GSAP; reduced motion and no-JS get the static page.
-- Before a PR: `pnpm lint && pnpm typecheck && pnpm test && pnpm build` and `supabase/tests/run-local.sh`.
+- Pull requests are switched off on GitHub: work on a branch, then fast-forward `main` once CI passes.
+- Before merging: `pnpm lint && pnpm typecheck && pnpm test && pnpm build` and `supabase/tests/run-local.sh`.

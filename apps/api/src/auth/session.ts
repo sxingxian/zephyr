@@ -1,15 +1,19 @@
 /**
  * Sessions as httpOnly cookies (backend-for-frontend). The browser never sees a token.
  *
- *   app:   __Secure-zs-at, __Secure-zs-rt                    Path=/api    SameSite=Lax
- *   admin: __Secure-za-at, __Secure-za-rt, __Secure-za-seen  Path=/admin  SameSite=Strict
+ *   app:   __Host-zs-at, __Host-zs-rt                  Path=/  SameSite=Lax     (app host)
+ *   admin: __Host-za-at, __Host-za-rt, __Host-za-seen  Path=/  SameSite=Strict  (landing host)
+ *
+ * __Host- cookies must be Secure, Path=/ and carry no Domain, so a sibling *.midnightpoetry.studio
+ * host can't set or shadow them (cookie tossing). As a second line, a request that carries any of a
+ * realm's cookie names twice is refused and its cookies cleared (rejectDuplicateCookies).
  *
  * Access tokens are verified on every request against Supabase's JWKS and refreshed when under five
  * minutes remain. The admin session also carries an HMAC-signed last-activity time and locks after
  * 30 idle minutes.
  */
 
-import type { Context } from 'hono';
+import type { Context, MiddlewareHandler } from 'hono';
 import { getCookie } from 'hono/cookie';
 import { createRemoteJWKSet, type JWTPayload, jwtVerify } from 'jose';
 import { sign, unsign } from '../crypto';
@@ -21,21 +25,28 @@ export type Realm = 'app' | 'admin';
 
 const REALMS = {
   app: {
-    at: '__Secure-zs-at',
-    rt: '__Secure-zs-rt',
-    path: '/api',
+    at: '__Host-zs-at',
+    rt: '__Host-zs-rt',
+    path: '/',
     sameSite: 'Lax',
     refreshMaxAge: 60 * 60 * 24 * 30,
   },
   admin: {
-    at: '__Secure-za-at',
-    rt: '__Secure-za-rt',
-    path: '/admin',
+    at: '__Host-za-at',
+    rt: '__Host-za-rt',
+    path: '/',
     sameSite: 'Strict',
     refreshMaxAge: 60 * 60 * 12,
   },
 } as const;
-export const ADMIN_SEEN_COOKIE = '__Secure-za-seen';
+export const ADMIN_SEEN_COOKIE = '__Host-za-seen';
+/** Every cookie name a realm uses. */
+export const COOKIE_NAMES: Record<Realm, readonly string[]> = {
+  app: [REALMS.app.at, REALMS.app.rt],
+  admin: [REALMS.admin.at, REALMS.admin.rt, ADMIN_SEEN_COOKIE],
+};
+/** Adding or removing a passkey needs a sign-in this recent. */
+export const RECENT_AUTH_SECONDS = 10 * 60;
 export const ADMIN_IDLE_SECONDS = 30 * 60;
 const REFRESH_WHEN_UNDER_SECONDS = 5 * 60;
 
@@ -44,7 +55,7 @@ export interface SessionClaims extends JWTPayload {
   email?: string;
   session_id?: string;
   aal?: string;
-  amr?: ({ method?: string } | string)[];
+  amr?: ({ method?: string; timestamp?: number } | string)[];
   role?: string;
 }
 export interface ActiveSession {
@@ -83,6 +94,35 @@ export function appendCookies(c: Context, cookies: string[]) {
   for (const v of cookies) c.header('Set-Cookie', v, { append: true });
 }
 
+/** True if the Cookie header names any of the realm's cookies more than once. */
+export function hasDuplicateSessionCookie(header: string | undefined, realm: Realm): boolean {
+  if (!header) return false;
+  const names = COOKIE_NAMES[realm];
+  const seen = new Set<string>();
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=');
+    const name = (i < 0 ? part : part.slice(0, i)).trim();
+    if (!names.includes(name)) continue;
+    if (seen.has(name)) return true;
+    seen.add(name);
+  }
+  return false;
+}
+
+/**
+ * Refuses (401, cookies cleared) any request carrying a session cookie name twice: whichever copy a
+ * parser picks, one of them was planted.
+ */
+export function rejectDuplicateCookies(realm: Realm): MiddlewareHandler {
+  return async (c, next) => {
+    if (hasDuplicateSessionCookie(c.req.header('Cookie'), realm)) {
+      appendCookies(c, clearCookies(realm));
+      return c.json({ ok: false, error: 'unauthenticated' }, 401);
+    }
+    await next();
+  };
+}
+
 // ---- token verification --------------------------------------------------------------------------
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 function jwks(env: Env) {
@@ -115,6 +155,24 @@ export async function verifyAccessToken(env: Env, token: string): Promise<Sessio
 export function signedInWithPasskey(claims: SessionClaims): boolean {
   const methods = (claims.amr ?? []).map((a) => (typeof a === 'string' ? a : a?.method));
   return methods.some((m) => m === 'passkey' || m === 'webauthn' || m === 'mfa/webauthn');
+}
+
+/**
+ * When the user last actually authenticated: the newest `amr` timestamp (kept as-is across refreshes),
+ * or, only if the token has none, its `iat`.
+ */
+export function authenticatedAt(claims: SessionClaims): number | null {
+  const stamps = (claims.amr ?? [])
+    .map((a) => (typeof a === 'object' && a ? (a as { timestamp?: unknown }).timestamp : undefined))
+    .filter((t): t is number => typeof t === 'number' && Number.isFinite(t));
+  if (stamps.length) return Math.max(...stamps);
+  return typeof claims.iat === 'number' ? claims.iat : null;
+}
+
+/** True if the session's sign-in happened within RECENT_AUTH_SECONDS. */
+export function recentlyAuthenticated(claims: SessionClaims, now = Date.now() / 1000): boolean {
+  const at = authenticatedAt(claims);
+  return at !== null && now - at <= RECENT_AUTH_SECONDS && at <= now + 60;
 }
 
 /**

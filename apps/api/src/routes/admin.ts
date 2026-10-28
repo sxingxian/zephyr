@@ -21,6 +21,7 @@ import {
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { z } from 'zod';
 import { accessEmail } from '../auth/access';
+import { CODE_WINDOW, padReply, reserveCodeAttempt, resetCodeAttempts } from '../auth/code-limits';
 import { type GoTrueSession, gotrue } from '../auth/gotrue';
 import {
   adminSeenCookie,
@@ -32,11 +33,14 @@ import {
   signedInWithPasskey,
   verifyAccessToken,
 } from '../auth/session';
+import { ceremonyMatches } from '../auth/webauthn';
 import { newInviteToken } from '../crypto';
+import { notifyPasskeyChange } from '../email/notify';
 import { list } from '../env';
 import {
   background,
   burstOk,
+  clientNetwork,
   emailHash,
   fail,
   guardWrite,
@@ -180,6 +184,7 @@ adminRoutes.post('/v1/auth/email/start', async (c) => {
       return rateLimited(c, WINDOW);
     }
     const accessIdentity = c.get('accessEmail');
+    const network = clientNetwork(c);
     await background(c, async () => {
       try {
         if (body.email !== accessIdentity) return;
@@ -187,6 +192,7 @@ adminRoutes.post('/v1/auth/email/start', async (c) => {
         if (!uid || !(await rpc<boolean>(c.env, 'is_staff', { p_user_id: uid }))) return;
         if ((await gotrue.adminListPasskeys(c.env, uid)).length > 0) return;
         await gotrue.sendEmailCode(c.env, body.email);
+        await resetCodeAttempts(c.env, 'admin', body.email, network);
       } catch (err) {
         logError(requestId, 'admin_email_send', err);
       }
@@ -198,30 +204,31 @@ adminRoutes.post('/v1/auth/email/start', async (c) => {
   }
 });
 
+/**
+ * Only the Access identity's own address is checked, and only staff accounts reach Auth. Each attempt
+ * is reserved before Auth sees it (see auth/code-limits.ts).
+ */
 adminRoutes.post('/v1/auth/email/verify', async (c) => {
+  const startedAt = Date.now();
   if (!(await burstOk(c, 'admin_email'))) return rateLimited(c, 60);
   const body = await readBody(c, emailVerifySchema);
   if (!body) return c.json(fail('invalid'), 400);
   const requestId = c.get('requestId');
+  const wrongCode = async () => {
+    await padReply(startedAt);
+    return c.json(fail('invalid_code'), 400);
+  };
   try {
-    const addr = await emailHash(c.env, body.email);
-    const failures = await rpc<number>(c.env, 'rate_limit_count', {
-      p_kind: 'admin_verify_fail',
-      p_key: addr,
-      p_window_seconds: WINDOW,
-    });
-    if (failures >= 5) return rateLimited(c, WINDOW);
-    if (body.email !== c.get('accessEmail')) {
-      await rpc(c.env, 'rate_limit_record', { p_kind: 'admin_verify_fail', p_key: addr });
-      return c.json(fail('invalid_code'), 400);
-    }
+    // Someone else's address: nothing is counted against it (no locking colleagues out).
+    if (body.email !== c.get('accessEmail')) return wrongCode();
+    if (!(await reserveCodeAttempt(c, 'admin', body.email))) return rateLimited(c, CODE_WINDOW);
+    if ((await rpc<string>(c.env, 'account_kind', { p_email: body.email })) !== 'staff') return wrongCode();
     let session: GoTrueSession;
     try {
       session = await gotrue.verifyEmailCode(c.env, body.email, body.code);
     } catch (err) {
       if (err instanceof UpstreamError && err.status >= 400 && err.status < 500 && err.status !== 429) {
-        await rpc(c.env, 'rate_limit_record', { p_kind: 'admin_verify_fail', p_key: addr });
-        return c.json(fail('invalid_code'), 400);
+        return wrongCode();
       }
       throw err;
     }
@@ -247,6 +254,9 @@ adminRoutes.post('/v1/auth/passkey/verify', async (c) => {
   if (!(await burstOk(c, 'admin_passkey'))) return rateLimited(c, 60);
   const body = await readBody(c, passkeyVerifySchema);
   if (!body) return c.json(fail('invalid'), 400);
+  if (!ceremonyMatches(c, body.credential, 'webauthn.get', list(c.env.ADMIN_ORIGINS))) {
+    return c.json(fail('passkey_failed'), 400);
+  }
   try {
     let session: GoTrueSession;
     try {
@@ -275,7 +285,26 @@ adminRoutes.post('/v1/auth/sign-out', async (c) => {
 });
 
 // ---- passkey enrolment -------------------------------------------------------------------------------
-adminRoutes.post('/v1/me/passkeys/options', requireStaff({ allowEnrol: true }), async (c) => {
+/**
+ * An enrol-only session (email code) may add the *first* passkey only. Once a staff member has one,
+ * more keys need a full (passkey) session, so an email code can never add a second key.
+ */
+const enrolAllowed: MiddlewareHandler<HonoEnv> = async (c, next) => {
+  const staff = c.get('staff');
+  if (staff.enrolOnly) {
+    try {
+      if ((await gotrue.adminListPasskeys(c.env, staff.id)).length > 0) {
+        return c.json(fail('passkey_required'), 403);
+      }
+    } catch (err) {
+      logError(c.get('requestId'), 'admin_passkey_count', err);
+      return c.json(fail('server'), 500);
+    }
+  }
+  await next();
+};
+
+adminRoutes.post('/v1/me/passkeys/options', requireStaff({ allowEnrol: true }), enrolAllowed, async (c) => {
   try {
     const ch = await gotrue.passkeyRegisterOptions(c.env, c.get('staff').accessToken);
     return c.json({ challengeId: ch.challenge_id, options: ch.options } satisfies PasskeyOptions);
@@ -286,15 +315,25 @@ adminRoutes.post('/v1/me/passkeys/options', requireStaff({ allowEnrol: true }), 
 });
 
 /**
- * Saves the passkey. The current session stays enrol-only (it was made with an email code); the
- * console opens after the next sign-in with the new passkey.
+ * Saves the passkey and emails the staff member about it. The current session stays enrol-only (it
+ * was made with an email code); the console opens after the next sign-in with the new passkey.
  */
-adminRoutes.post('/v1/me/passkeys/verify', requireStaff({ allowEnrol: true }), async (c) => {
+adminRoutes.post('/v1/me/passkeys/verify', requireStaff({ allowEnrol: true }), enrolAllowed, async (c) => {
   const body = await readBody(c, passkeyVerifySchema);
   if (!body) return c.json(fail('invalid'), 400);
+  if (!ceremonyMatches(c, body.credential, 'webauthn.create', list(c.env.ADMIN_ORIGINS))) {
+    return c.json(fail('passkey_failed'), 400);
+  }
+  const staff = c.get('staff');
   try {
-    await gotrue.passkeyRegisterVerify(c.env, c.get('staff').accessToken, body.challengeId, body.credential);
-    return c.json(sessionBody(c.get('staff')), 201);
+    const pk = await gotrue.passkeyRegisterVerify(
+      c.env,
+      staff.accessToken,
+      body.challengeId,
+      body.credential,
+    );
+    await notifyPasskeyChange(c, staff.email, 'added', pk?.friendly_name ?? null, 'the Zephyr admin console');
+    return c.json(sessionBody(staff), 201);
   } catch (err) {
     if (err instanceof UpstreamError && err.status >= 400 && err.status < 500 && err.status !== 429) {
       return c.json(fail('passkey_failed'), 400);
@@ -432,6 +471,8 @@ adminRoutes.post('/v1/signups/invites/:id/resend', requireStaff({ write: true })
     }>(c.env, 'resend_invite', { p_actor: staff.id, p_id: id, p_token_hash: hash });
     if (out.status === 'forbidden') return c.json(fail('forbidden'), 403);
     if (out.status === 'signups_paused') return c.json(fail('signups_paused'), 409);
+    if (out.status === 'already_member') return c.json(fail('already_member'), 409);
+    if (out.status === 'superseded') return c.json(fail('conflict'), 409);
     if (out.status !== 'ok' || !out.invite || !out.email) return c.json(fail('not_found'), 404);
     await sendInvite(c.env, out.email, token, out.invite.expiresAt, out.inviterName ?? null, null);
     return c.json({ ok: true, invite: out.invite });

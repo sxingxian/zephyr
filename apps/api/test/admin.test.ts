@@ -4,11 +4,13 @@ import {
   APP,
   accessToken,
   call,
+  credential,
   env,
   initKeys,
   installFetch,
   type Jar,
   jar,
+  LANDING,
   must,
   read,
   resetWorld,
@@ -37,7 +39,7 @@ async function staffSession(email = 'owner@zephyr.test'): Promise<{ j: Jar; acce
   world.passkeyUser = user(email);
   const j = jar();
   const res = await call('/admin/api/v1/auth/passkey/verify', {
-    body: { challengeId: 'ch-auth', credential: { id: 'x' } },
+    body: { challengeId: 'ch-auth', credential: credential('webauthn.get', LANDING) },
     jar: j,
     access,
   });
@@ -92,12 +94,12 @@ describe('Cloudflare Access', () => {
 });
 
 describe('admin sign-in', () => {
-  it('a passkey sign-in opens the console with Strict cookies scoped to /admin', async () => {
+  it('a passkey sign-in opens the console with Strict __Host- cookies', async () => {
     const access = await accessToken('owner@zephyr.test');
     world.passkeyUser = user('owner@zephyr.test');
     const j = jar();
     const res = await call('/admin/api/v1/auth/passkey/verify', {
-      body: { challengeId: 'ch-auth', credential: {} },
+      body: { challengeId: 'ch-auth', credential: credential('webauthn.get', LANDING) },
       jar: j,
       access,
     });
@@ -108,17 +110,18 @@ describe('admin sign-in', () => {
     });
     const cookies = res.headers.getSetCookie();
     expect(cookies.map((c) => c.split('=')[0]).sort()).toEqual([
-      '__Secure-za-at',
-      '__Secure-za-rt',
-      '__Secure-za-seen',
+      '__Host-za-at',
+      '__Host-za-rt',
+      '__Host-za-seen',
     ]);
     for (const c of cookies) {
-      expect(c).toContain('Path=/admin');
+      expect(c).toMatch(/; Path=\/;/);
+      expect(c).not.toMatch(/Domain=/i);
       expect(c).toContain('SameSite=Strict');
       expect(c).toContain('HttpOnly');
       expect(c).toContain('Secure');
     }
-    expect(cookies.find((c) => c.startsWith('__Secure-za-seen'))).toContain('Max-Age=1800');
+    expect(cookies.find((c) => c.startsWith('__Host-za-seen'))).toContain('Max-Age=1800');
     expect((await call('/admin/api/v1/signups', { jar: j, access })).status).toBe(200);
   });
 
@@ -126,7 +129,7 @@ describe('admin sign-in', () => {
     const access = await accessToken('mei@example.com');
     world.passkeyUser = user('mei@example.com');
     const res = await call('/admin/api/v1/auth/passkey/verify', {
-      body: { challengeId: 'ch-auth', credential: {} },
+      body: { challengeId: 'ch-auth', credential: credential('webauthn.get', LANDING) },
       access,
     });
     expect(res.status).toBe(403);
@@ -140,7 +143,7 @@ describe('admin sign-in', () => {
     expect(
       (
         await call('/admin/api/v1/auth/passkey/verify', {
-          body: { challengeId: 'ch-auth', credential: {} },
+          body: { challengeId: 'ch-auth', credential: credential('webauthn.get', LANDING) },
           access,
         })
       ).status,
@@ -152,7 +155,7 @@ describe('admin sign-in', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(Date.now() + 31 * 60 * 1000);
     j.cookies.set(
-      '__Secure-za-at',
+      '__Host-za-at',
       await sbToken({ sub: user('owner@zephyr.test').id, email: 'owner@zephyr.test', amr: ['passkey'] }),
     );
     const res = await call('/admin/api/v1/signups', { jar: j, access });
@@ -163,7 +166,7 @@ describe('admin sign-in', () => {
   it('a forged or missing idle cookie ends the session', async () => {
     const { j, access } = await staffSession();
     j.cookies.set(
-      '__Secure-za-seen',
+      '__Host-za-seen',
       `${user('owner@zephyr.test').id}:${Math.floor(Date.now() / 1000)}.forged`,
     );
     expect((await call('/admin/api/v1/signups', { jar: j, access })).status).toBe(401);
@@ -173,7 +176,7 @@ describe('admin sign-in', () => {
     const access = await accessToken('owner@zephyr.test');
     const j = jar();
     j.cookies.set(
-      '__Secure-zs-at',
+      '__Host-zs-at',
       await sbToken({ sub: user('owner@zephyr.test').id, email: 'owner@zephyr.test', amr: ['passkey'] }),
     );
     expect((await call('/admin/api/v1/signups', { jar: j, access })).status).toBe(401);
@@ -225,7 +228,7 @@ describe('first sign-in: email code, then enrol a passkey', () => {
     const opt = await call('/admin/api/v1/me/passkeys/options', { body: {}, jar: j, access });
     expect((await read(opt)).challengeId).toBe('ch-reg');
     const reg = await call('/admin/api/v1/me/passkeys/verify', {
-      body: { challengeId: 'ch-reg', credential: {} },
+      body: { challengeId: 'ch-reg', credential: credential('webauthn.create', LANDING) },
       jar: j,
       access,
     });
@@ -235,7 +238,7 @@ describe('first sign-in: email code, then enrol a passkey', () => {
     world.passkeyUser = user(NEW);
     const k = jar();
     const pk = await call('/admin/api/v1/auth/passkey/verify', {
-      body: { challengeId: 'ch-auth', credential: {} },
+      body: { challengeId: 'ch-auth', credential: credential('webauthn.get', LANDING) },
       jar: k,
       access,
     });
@@ -256,6 +259,145 @@ describe('first sign-in: email code, then enrol a passkey', () => {
     });
     expect(res.status).toBe(400);
     expect(gotrue('/verify')).toHaveLength(0);
+  });
+});
+
+describe('security review fixes (admin)', () => {
+  const NEW = 'new.staff@zephyr.test';
+
+  it('H1: parallel wrong codes reach Auth at most the per-address cap', async () => {
+    const access = await accessToken(NEW);
+    world.code = '999999';
+    const res = await Promise.all(
+      Array.from({ length: 50 }, (_, i) =>
+        call('/admin/api/v1/auth/email/verify', {
+          body: { email: NEW, code: String(100000 + i) },
+          access,
+          ip: `2001:db8:${i.toString(16)}::1`,
+        }),
+      ),
+    );
+    expect(gotrue('/verify').length).toBeLessThanOrEqual(25);
+    expect(res.filter((r) => r.status === 429).length).toBeGreaterThanOrEqual(25);
+  });
+
+  it('M1: another address is never counted, and a new code clears the address counter', async () => {
+    const access = await accessToken(NEW);
+    // Someone (even a colleague, through their own Access identity) can't burn this address.
+    for (let i = 0; i < 30; i++) {
+      await call('/admin/api/v1/auth/email/verify', {
+        body: { email: NEW, code: '000000' },
+        access: await accessToken('owner@zephyr.test'),
+      });
+    }
+    expect(rpcCalls('rate_limit_hit')).toHaveLength(0);
+    // From one network: 5 attempts, then locked out there.
+    const tries = [];
+    for (let i = 0; i < 6; i++) {
+      tries.push(
+        (await call('/admin/api/v1/auth/email/verify', { body: { email: NEW, code: '000000' }, access }))
+          .status,
+      );
+    }
+    expect(tries).toEqual([400, 400, 400, 400, 400, 429]);
+    // A new code (sent to this network) unlocks it.
+    expect((await call('/admin/api/v1/auth/email/start', { body: { email: NEW }, access })).status).toBe(202);
+    expect(rpcCalls('rate_limit_reset').length).toBeGreaterThan(0);
+    const ok = await call('/admin/api/v1/auth/email/verify', {
+      body: { email: NEW, code: '123456' },
+      access,
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it('L4: a non-staff account never reaches Auth', async () => {
+    const access = await accessToken('mei@example.com');
+    const res = await call('/admin/api/v1/auth/email/verify', {
+      body: { email: 'mei@example.com', code: '123456' },
+      access,
+    });
+    expect(await read(res)).toEqual({ ok: false, error: 'invalid_code' });
+    expect(gotrue('/verify')).toHaveLength(0);
+  });
+
+  it('L1: an assertion made on the app origin, or a registration response, is refused', async () => {
+    const access = await accessToken('owner@zephyr.test');
+    world.passkeyUser = user('owner@zephyr.test');
+    for (const cred of [
+      credential('webauthn.get', APP),
+      credential('webauthn.create', LANDING),
+      credential('webauthn.get', LANDING, { crossOrigin: true }),
+      { id: 'x', response: { clientDataJSON: 'not base64 json!' } },
+      { id: 'x' },
+    ]) {
+      const res = await call('/admin/api/v1/auth/passkey/verify', {
+        body: { challengeId: 'ch-auth', credential: cred },
+        access,
+      });
+      expect(await read(res)).toEqual({ ok: false, error: 'passkey_failed' });
+    }
+    expect(gotrue('/passkeys/authentication/verify')).toHaveLength(0);
+  });
+
+  it('L1/L2: enrolment checks the origin, emails the staff member, and an enrol-only session adds one key only', async () => {
+    const access = await accessToken(NEW);
+    const j = jar();
+    await call('/admin/api/v1/auth/email/verify', { body: { email: NEW, code: '123456' }, jar: j, access });
+    const wrong = await call('/admin/api/v1/me/passkeys/verify', {
+      body: { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
+      jar: j,
+      access,
+    });
+    expect(await read(wrong)).toEqual({ ok: false, error: 'passkey_failed' });
+    const reg = await call('/admin/api/v1/me/passkeys/verify', {
+      body: { challengeId: 'ch-reg', credential: credential('webauthn.create', LANDING) },
+      jar: j,
+      access,
+    });
+    expect(reg.status).toBe(201);
+    expect(world.emails).toHaveLength(1);
+    expect(world.emails[0]?.to).toBe(NEW);
+    expect(world.emails[0]?.subject).toBe('A passkey was added to your Zephyr account');
+    // The same email-code session can't add a second key.
+    for (const path of ['/admin/api/v1/me/passkeys/options', '/admin/api/v1/me/passkeys/verify']) {
+      const res = await call(path, {
+        body: { challengeId: 'ch-reg', credential: credential('webauthn.create', LANDING) },
+        jar: j,
+        access,
+      });
+      expect(await read(res)).toEqual({ ok: false, error: 'passkey_required' });
+    }
+    expect(user(NEW).passkeys).toBe(1);
+  });
+
+  it('L3: resend is refused for an account that exists or a superseded invite', async () => {
+    const { j, access } = await staffSession();
+    const id = '30000000-0000-0000-0000-000000000009';
+    world.rpc.resend_invite = () => ({ status: 'already_member' });
+    const a = await call(`/admin/api/v1/signups/invites/${id}/resend`, { body: {}, jar: j, access });
+    expect(a.status).toBe(409);
+    expect(await read(a)).toEqual({ ok: false, error: 'already_member' });
+    world.rpc.resend_invite = () => ({ status: 'superseded' });
+    const b = await call(`/admin/api/v1/signups/invites/${id}/resend`, { body: {}, jar: j, access });
+    expect(b.status).toBe(409);
+    expect(await read(b)).toEqual({ ok: false, error: 'conflict' });
+    expect(world.emails).toHaveLength(0);
+  });
+
+  it('M2: duplicate admin session cookies are refused and cleared', async () => {
+    const { access } = await staffSession();
+    const res = await app.request(
+      'https://zephyr.midnightpoetry.studio/admin/api/v1/auth/session',
+      { headers: { Cookie: '__Host-za-at=a; __Host-za-at=b', 'Cf-Access-Jwt-Assertion': access } },
+      env,
+    );
+    expect(res.status).toBe(401);
+    expect(
+      res.headers
+        .getSetCookie()
+        .map((c) => c.split('=')[0])
+        .sort(),
+    ).toEqual(['__Host-za-at', '__Host-za-rt', '__Host-za-seen']);
   });
 });
 

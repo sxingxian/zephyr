@@ -41,6 +41,7 @@ const KNOWN: ApiErrorCode[] = [
   'already_member',
   'passkey_failed',
   'passkey_required',
+  'reauth_required',
   'not_found',
   'conflict',
   'server',
@@ -127,6 +128,8 @@ export function errorMessage(err: unknown): string {
       return 'Check the details and try again.';
     case 'passkey_required':
       return 'Add a passkey to continue.';
+    case 'reauth_required':
+      return 'For your security, sign in again before changing passkeys.';
     case 'unauthenticated':
       return 'Your session ended. Sign in again.';
     case 'forbidden':

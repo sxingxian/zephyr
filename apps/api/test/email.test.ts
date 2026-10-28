@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { escapeHtml, oneLine } from '../src/email/escape';
-import { inviteEmail } from '../src/email/templates';
+import { inviteEmail, passkeyChangeEmail } from '../src/email/templates';
 
 const base = {
   link: 'https://zephyrapp.midnightpoetry.studio/join#t=abc',
@@ -41,5 +41,21 @@ describe('invite email', () => {
       '&lt;a href=&quot;x&quot; onclick=&#39;y&#39;&gt;&amp;&lt;/a&gt;',
     );
     expect(oneLine('a\nb\u0000c')).toBe('a b c');
+  });
+});
+
+describe('passkey change notice', () => {
+  it('escapes the passkey name and keeps it on one line', () => {
+    const m = passkeyChangeEmail({
+      change: 'added',
+      name: '<img src=x onerror=alert(1)>\r\nBcc: x@example.com',
+      where: 'Zephyr',
+      at: new Date('2026-10-28T09:30:00Z'),
+    });
+    expect(m.subject).toBe('A passkey was added to your Zephyr account');
+    expect(m.html).not.toContain('<img');
+    expect(m.html).toContain('&lt;img');
+    expect(m.text).not.toMatch(/\r|\nBcc/);
+    expect(m.text).toContain('28 October 2026');
   });
 });

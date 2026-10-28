@@ -50,7 +50,6 @@ describe('invite links', () => {
 
   it('redeeming creates a confirmed account, signs in, and marks the user new', async () => {
     world.rpc.preview_invite = () => live;
-    world.rpc.mark_invite_accepted = () => false; // the confirm trigger already consumed it
     const j = jar();
     const res = await call('/api/v1/invites/redeem', {
       body: { token: TOKEN, displayName: 'Wei Tan' },
@@ -67,18 +66,27 @@ describe('invite links', () => {
     expect(created?.body).toMatchObject({ email: 'wei@example.com', email_confirm: true });
     expect(created?.headers.get('apikey')).toBe('sb_secret_test');
     expect(gotrue('/admin/generate_link')).toHaveLength(1);
-    expect(j.cookies.has('__Secure-zs-at')).toBe(true);
+    expect(j.cookies.has('__Host-zs-at')).toBe(true);
   });
 
-  it('an existing member redeeming an invite just signs in, once', async () => {
+  it('L3: an invite whose email already has an account is not redeemable (no session)', async () => {
     world.rpc.preview_invite = () => ({ ...live, email: 'mei@example.com' });
-    world.rpc.mark_invite_accepted = () => true;
-    const res = await call('/api/v1/invites/redeem', { body: { token: TOKEN } });
-    expect(res.status).toBe(200);
-    expect((await read(res)).isNew).toBe(false);
+    const j = jar();
+    const res = await call('/api/v1/invites/redeem', { body: { token: TOKEN }, jar: j });
+    expect(res.status).toBe(404);
+    expect(await read(res)).toEqual({ ok: false, error: 'invite_invalid' });
     expect(gotrue('/admin/users')).toHaveLength(0);
-    world.rpc.mark_invite_accepted = () => false; // a concurrent redemption won
-    expect((await call('/api/v1/invites/redeem', { body: { token: TOKEN } })).status).toBe(404);
+    expect(gotrue('/admin/generate_link')).toHaveLength(0);
+    expect(j.cookies.size).toBe(0);
+  });
+
+  it('L3: a concurrent redemption that loses the account-creation race looks invalid', async () => {
+    world.rpc.preview_invite = () => live;
+    world.rpc.account_kind = () => 'none';
+    world.createUserStatus = 422;
+    const res = await call('/api/v1/invites/redeem', { body: { token: TOKEN } });
+    expect(res.status).toBe(404);
+    expect(gotrue('/admin/generate_link')).toHaveLength(0);
   });
 
   it('never redeems into a staff account', async () => {
@@ -132,9 +140,9 @@ describe('invite codes', () => {
     expect(stored).toBe(`\\x${Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('')}`);
   });
 
-  it('invalid, used-up codes and existing members get the identical reply and no email', async () => {
+  it('M3: invalid codes, members, live invites and repeat addresses get the identical reply and no email', async () => {
     const replies: string[] = [];
-    for (const status of ['created', 'invalid', 'already_member']) {
+    for (const status of ['created', 'invalid', 'already_member', 'already_invited', 'rate_limited']) {
       world.rpc.redeem_invite_code = () => ({ status, id: 'i1', expiresAt: '2026-11-04T00:00:00Z' });
       const res = await redeem();
       expect(res.status).toBe(202);
@@ -180,26 +188,44 @@ describe('member invites', () => {
     expect(await read(res)).toEqual({ ok: true, enabled: true, perMonth: 3, remaining: 2, invites: [] });
   });
 
-  it('sends an invite with my name and an escaped note', async () => {
+  it('L5: sends an invite with my name and no free-text note', async () => {
     world.rpc.create_invite = (a) => {
       expect(a.p_source).toBe('member');
+      expect(a.p_note).toBeNull();
       return { status: 'created', id: 'inv-1', expiresAt: '2026-11-04T00:00:00Z' };
     };
     const j = await member();
     const res = await call('/api/v1/invites', {
-      body: { email: 'friend@example.com', note: '<b>Hi</b> & welcome' },
+      body: { email: 'friend@example.com', note: 'Click http://evil.example to claim' },
       jar: j,
     });
     expect(res.status).toBe(201);
     expect((await read(res)).invite).toMatchObject({
+      id: 'inv-1',
       email: 'friend@example.com',
       status: 'pending',
       invitedBy: 'Mei Lin',
     });
     const mail = must(world.emails[0]);
     expect(mail.subject).toBe('Mei Lin invited you to Zephyr');
-    expect(mail.html).toContain('&lt;b&gt;Hi&lt;/b&gt; &amp; welcome');
-    expect(mail.html).not.toContain('<b>Hi</b>');
+    expect(mail.html).not.toContain('evil.example');
+    expect(mail.text).not.toContain('evil.example');
+  });
+
+  it('L6: if the email cannot be sent, the invite is revoked and the reply is a 500', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    world.rpc.create_invite = () => ({ status: 'created', id: 'inv-2', expiresAt: '2026-11-04T00:00:00Z' });
+    world.resendStatus = 500;
+    const j = await member();
+    const res = await call('/api/v1/invites', { body: { email: 'friend@example.com' }, jar: j });
+    expect(res.status).toBe(500);
+    expect(await read(res)).toEqual({ ok: false, error: 'server' });
+    const revoked = rpcCalls('revoke_unsent_invite');
+    expect(revoked).toHaveLength(1);
+    expect(revoked[0]?.body).toEqual({
+      p_id: 'inv-2',
+      p_invited_by: must(world.users.find((u) => u.email === 'mei@example.com')).id,
+    });
   });
 
   it('maps quota, disabled, paused and duplicate outcomes', async () => {

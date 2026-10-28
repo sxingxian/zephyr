@@ -62,6 +62,17 @@ export function Security() {
     void load();
   }, [load]);
 
+  const navigate = useNavigate();
+  /** Changing passkeys needs a recent sign-in; send the member to sign in and bring them back here. */
+  const reauth = (e: unknown) => {
+    if (e instanceof ApiFailure && e.code === 'reauth_required') {
+      toast.show(errorMessage(e), 'bad');
+      navigate(`/sign-in?next=${encodeURIComponent('/settings/security')}`);
+      return true;
+    }
+    return false;
+  };
+
   const add = async () => {
     setAdding(true);
     setError(null);
@@ -75,6 +86,7 @@ export function Security() {
       toast.show('Passkey added', 'good');
       await Promise.all([load(), refresh()]);
     } catch (e) {
+      if (reauth(e)) return;
       if (!isCancelled(e))
         setError(e instanceof ApiFailure ? errorMessage(e) : 'Your device couldn’t save the passkey.');
     } finally {
@@ -103,6 +115,8 @@ export function Security() {
       toast.show('Passkey removed', 'good');
       await Promise.all([load(), refresh()]);
     } catch (err) {
+      setRemoving(null);
+      if (reauth(err)) return;
       toast.show(errorMessage(err), 'bad');
     }
   };

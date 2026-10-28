@@ -44,15 +44,11 @@ begin
 end;
 $$;
 
--- For limits on failures (e.g. wrong email codes): read without recording, record separately.
-create function public.rate_limit_count(p_kind text, p_key bytea, p_window_seconds integer) returns integer
-language sql stable security definer set search_path = '' as $$
-  select count(*)::integer from public.rate_limit_attempts
-   where kind = p_kind and key_hash = p_key and created_at > now() - make_interval(secs => p_window_seconds);
-$$;
-create function public.rate_limit_record(p_kind text, p_key bytea) returns void
+-- Clears a key's attempts. Used when a new sign-in code is sent: the guesses counted against the
+-- old code don't carry over to the new one (bounded by how many codes an address can be sent).
+create function public.rate_limit_reset(p_kind text, p_key bytea) returns void
 language sql volatile security definer set search_path = '' as $$
-  insert into public.rate_limit_attempts (kind, key_hash) values (p_kind, p_key);
+  delete from public.rate_limit_attempts where kind = p_kind and key_hash = p_key;
 $$;
 
 -- The existing daily purge (scheduled by the cron migration) now clears these attempts too.
@@ -309,19 +305,12 @@ language sql stable security definer set search_path = '' as $$
     and i.accepted_at is null and i.revoked_at is null and i.expires_at > now();
 $$;
 
--- Marks a live invite used. True only if this call did it (so a link works once).
-create function public.mark_invite_accepted(p_invite_id uuid) returns boolean
-language plpgsql volatile security definer set search_path = '' as $$
-begin
-  update public.invites set accepted_at = now()
-   where id = p_invite_id and accepted_at is null and revoked_at is null and expires_at > now();
-  return found;
-end;
-$$;
-
 -- Invite codes: one use creates an invite tied to the given email. Returns {status, id?, expiresAt?}
--- with status created | already_member | invalid. The API replies the same way to all three.
--- If that email already has a live invite, its link is rotated instead of using up another code use.
+-- with status created | already_member | already_invited | rate_limited | invalid. The API replies
+-- the same way to all of them and emails a link only for created.
+-- An email that already has a live invite gets nothing new (no second email, no new link, no use
+-- consumed), and an address gets at most one code invite a day, so a known code can't be used to
+-- flood someone's inbox or keep their links rotating.
 create function public.redeem_invite_code(p_code text, p_email text, p_token_hash bytea) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
@@ -330,10 +319,9 @@ declare
   v_email text := lower(trim(p_email));
   v_id uuid;
   v_expires timestamptz;
-  v_rotated_expires timestamptz;
 begin
   select * into s from public.app_settings where id = 1;
-  if s.signups_paused or v_email is null or v_email !~ '^[^@[:space:]]+@[^@[:space:]]+$' then
+  if s.signups_paused or v_email is null or v_email !~ '^[^@[:space:]]+@[^@[:space:]]+$' or length(v_email) > 254 then
     return jsonb_build_object('status', 'invalid');
   end if;
   select * into c from public.invite_codes
@@ -347,25 +335,35 @@ begin
   if exists (select 1 from auth.users u where lower(u.email) = v_email) then
     return jsonb_build_object('status', 'already_member');
   end if;
-
-  v_expires := now() + make_interval(days => s.invite_ttl_days);
-  update public.invites set token_hash = p_token_hash, expires_at = greatest(expires_at, v_expires)
-   where id = (
-     select i.id from public.invites i
-      where lower(i.email::text) = v_email and i.accepted_at is null and i.revoked_at is null and i.expires_at > now()
-      order by i.created_at desc limit 1
-   )
-  returning id, expires_at into v_id, v_rotated_expires;
-  if v_id is not null then
-    return jsonb_build_object('status', 'created', 'id', v_id, 'expiresAt', v_rotated_expires);
+  if exists (
+    select 1 from public.invites i
+     where lower(i.email::text) = v_email and i.accepted_at is null and i.revoked_at is null and i.expires_at > now()
+  ) then
+    return jsonb_build_object('status', 'already_invited');
+  end if;
+  if exists (
+    select 1 from public.invites i
+     where lower(i.email::text) = v_email and i.source = 'code' and i.created_at > now() - interval '24 hours'
+  ) then
+    return jsonb_build_object('status', 'rate_limited');
   end if;
 
+  v_expires := now() + make_interval(days => s.invite_ttl_days);
   update public.invite_codes set uses = uses + 1 where id = c.id;
   insert into public.invites (email, token_hash, source, code_id, expires_at)
   values (v_email, p_token_hash, 'code', c.id, v_expires)
   returning id into v_id;
   return jsonb_build_object('status', 'created', 'id', v_id, 'expiresAt', v_expires);
 end;
+$$;
+
+-- A member's invite whose email couldn't be sent: revoked so the unsent link never works. It still
+-- counts towards the month's quota, like every other member invite attempt.
+create function public.revoke_unsent_invite(p_id uuid, p_invited_by uuid) returns void
+language sql volatile security definer set search_path = '' as $$
+  update public.invites set revoked_at = now()
+   where id = p_id and invited_by = p_invited_by and source = 'member'
+     and accepted_at is null and revoked_at is null;
 $$;
 
 -- Member's own invites and remaining quota for this calendar month.
@@ -455,7 +453,9 @@ end;
 $$;
 
 -- Send an unaccepted, unrevoked invite again: new token (the old link stops working) and a fresh
--- expiry. Returns {status, invite?, email?, inviterName?}.
+-- expiry. Returns {status, invite?, email?, inviterName?}; status is ok | forbidden | signups_paused |
+-- not_found | already_member (the email has an account now) | superseded (expired, and a newer
+-- invite exists for the same email).
 create function public.resend_invite(p_actor uuid, p_id uuid, p_token_hash bytea) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
@@ -469,13 +469,24 @@ begin
   if s.signups_paused then
     return jsonb_build_object('status', 'signups_paused');
   end if;
-  update public.invites
-     set token_hash = p_token_hash, expires_at = now() + make_interval(days => s.invite_ttl_days)
-   where id = p_id and accepted_at is null and revoked_at is null
-  returning * into i;
+  select * into i from public.invites where id = p_id and accepted_at is null and revoked_at is null for update;
   if not found then
     return jsonb_build_object('status', 'not_found');
   end if;
+  perform pg_advisory_xact_lock(hashtextextended('invite-email:' || lower(i.email::text), 0));
+  if exists (select 1 from auth.users u where lower(u.email) = lower(i.email::text)) then
+    return jsonb_build_object('status', 'already_member');
+  end if;
+  if i.expires_at <= now() and exists (
+    select 1 from public.invites n
+     where lower(n.email::text) = lower(i.email::text) and n.id <> i.id and n.created_at > i.created_at
+  ) then
+    return jsonb_build_object('status', 'superseded');
+  end if;
+  update public.invites
+     set token_hash = p_token_hash, expires_at = now() + make_interval(days => s.invite_ttl_days)
+   where id = p_id
+  returning * into i;
   perform public._audit(p_actor, 'invites.resend', p_id::text);
   return jsonb_build_object(
     'status', 'ok',
@@ -634,6 +645,27 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------------------------
+-- A confirmed account consumes every live invite for its email (phase 1 only took the newest), so
+-- no older link for that address keeps working once the account exists.
+-- ---------------------------------------------------------------------------------------------
+create or replace function public.handle_user_confirmed() returns trigger
+language plpgsql security definer set search_path = '' as $$
+begin
+  update public.invites
+     set accepted_at = now()
+   where lower(email::text) = lower(new.email)
+     and accepted_at is null and revoked_at is null and expires_at > now();
+
+  update public.invite_requests
+     set status = 'approved', decided_at = coalesce(decided_at, now())
+   where lower(email::text) = lower(new.email) and status = 'pending';
+
+  return new;
+end;
+$$;
+revoke execute on function public.handle_user_confirmed() from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------------------------------
 -- Privileges: nothing here is reachable from the browser; the API (service_role) calls the public
 -- entry points. Internal helpers (_*) are callable by no role but their owner.
 -- ---------------------------------------------------------------------------------------------
@@ -651,8 +683,7 @@ revoke execute on function
 from service_role;
 grant execute on function
   public.rate_limit_hit(text, bytea, integer, integer),
-  public.rate_limit_count(text, bytea, integer),
-  public.rate_limit_record(text, bytea),
+  public.rate_limit_reset(text, bytea),
   public.purge_invite_requests(),
   public.user_id_by_email(text),
   public.account_kind(text),
@@ -662,8 +693,8 @@ grant execute on function
   public.update_display_name(uuid, text),
   public.create_invite(text, bytea, public.invite_source, uuid, uuid, text),
   public.preview_invite(bytea),
-  public.mark_invite_accepted(uuid),
   public.redeem_invite_code(text, text, bytea),
+  public.revoke_unsent_invite(uuid, uuid),
   public.list_member_invites(uuid),
   public.get_signup_overview(),
   public.update_signup_settings(uuid, jsonb, text),

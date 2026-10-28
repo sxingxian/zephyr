@@ -1,3 +1,4 @@
+import { TURNSTILE_ACTIONS } from '@zephyr/shared';
 import type { Env } from './env';
 import { list } from './env';
 
@@ -9,11 +10,7 @@ interface SiteverifyResponse {
 }
 
 /** One Turnstile action per form, so a token solved for one form can't be replayed on another. */
-export const TURNSTILE_ACTIONS = {
-  inviteRequest: 'invite_request',
-  emailStart: 'email_start',
-  inviteCode: 'invite_code',
-} as const;
+export { TURNSTILE_ACTIONS };
 export type TurnstileAction = (typeof TURNSTILE_ACTIONS)[keyof typeof TURNSTILE_ACTIONS];
 /** @deprecated use TURNSTILE_ACTIONS.inviteRequest */
 export const TURNSTILE_ACTION = TURNSTILE_ACTIONS.inviteRequest;

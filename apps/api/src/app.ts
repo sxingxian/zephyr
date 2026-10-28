@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { rejectDuplicateCookies } from './auth/session';
 import { fail, logError } from './http';
 import { adminRoutes } from './routes/admin';
 import { appAuthRoutes } from './routes/app-auth';
@@ -37,6 +38,9 @@ function applyHeaders(h: Headers, method: string, requestId: string) {
 }
 
 // ---- Routes ------------------------------------------------------------------------------------
+// A session cookie name sent twice means one copy was planted: refuse before anything reads them.
+app.use('/api/*', rejectDuplicateCookies('app'));
+app.use('/admin/api/*', rejectDuplicateCookies('admin'));
 // Members and the landing page (same origin on each host, via the site Workers' service bindings).
 app.route('/api', publicRoutes);
 app.route('/api/v1/auth', appAuthRoutes);

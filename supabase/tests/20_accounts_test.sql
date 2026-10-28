@@ -53,9 +53,12 @@ select pg_temp.ok(preview_invite(pg_temp.h('unknown')) is null, 'unknown token �
 update public.app_settings set signups_paused = true;
 select pg_temp.ok(preview_invite(pg_temp.h('t-admin-1')) is null, 'paused → preview looks invalid');
 update public.app_settings set signups_paused = false;
-select pg_temp.ok(mark_invite_accepted((select id from public.invites where token_hash = pg_temp.h('t-admin-1'))), 'first accept succeeds');
-select pg_temp.ok(not mark_invite_accepted((select id from public.invites where token_hash = pg_temp.h('t-admin-1'))), 'second accept fails (single use)');
-select pg_temp.ok(preview_invite(pg_temp.h('t-admin-1')) is null, 'used invite → preview null');
+-- A second live invite for the same address (e.g. made before phase 2's duplicate check).
+insert into public.invites (email, token_hash, source, invited_by, expires_at)
+values ('new.person@example.com', pg_temp.h('t-admin-1b'), 'admin', '10000000-0000-0000-0000-000000000001', now() + interval '7 days');
+insert into auth.users (id, email, email_confirmed_at) values ('30000000-0000-0000-0000-000000000001', 'new.person@example.com', now());
+select pg_temp.ok(preview_invite(pg_temp.h('t-admin-1')) is null, 'confirmed account consumes its invite → preview null');
+select pg_temp.ok(preview_invite(pg_temp.h('t-admin-1b')) is null, 'confirmed account consumes every live invite for its email');
 
 -- ---- Member invites and quota ----------------------------------------------------------------------
 select pg_temp.ok(create_invite('f1@example.com', pg_temp.h('m1'), 'member', '20000000-0000-0000-0000-000000000001', null, null) ->> 'status' = 'created', 'member invite 1');
@@ -79,9 +82,13 @@ select pg_temp.ok(create_invite_code('10000000-0000-0000-0000-000000000002', 'we
 select pg_temp.ok(create_invite_code('10000000-0000-0000-0000-000000000002', 'WEDDING-EXPO', null, 2, null) ->> 'status' = 'conflict', 'duplicate code → conflict');
 select pg_temp.ok(create_invite_code('10000000-0000-0000-0000-000000000002', 'PAST', null, 2, now() - interval '1 day') ->> 'status' = 'invalid', 'expiry in the past → invalid');
 select pg_temp.ok(redeem_invite_code('wedding-expo', 'Guest1@Example.com', pg_temp.h('c1')) ->> 'status' = 'created', 'code redeemed (case-insensitive)');
-select pg_temp.ok(redeem_invite_code('WEDDING-EXPO', 'guest1@example.com', pg_temp.h('c1b')) ->> 'status' = 'created', 'same email again → link rotated');
-select pg_temp.ok(preview_invite(pg_temp.h('c1')) is null and preview_invite(pg_temp.h('c1b')) ->> 'email' = 'guest1@example.com', 'rotation retires the old link');
-select pg_temp.ok((select uses = 1 from public.invite_codes where code = 'WEDDING-EXPO'), 'rotation did not use another code use');
+select pg_temp.ok(redeem_invite_code('WEDDING-EXPO', 'guest1@example.com', pg_temp.h('c1b')) ->> 'status' = 'already_invited', 'same email again → already_invited');
+select pg_temp.ok(preview_invite(pg_temp.h('c1')) is not null and preview_invite(pg_temp.h('c1b')) is null, 'no new link: the original keeps working, nothing rotates');
+select pg_temp.ok((select expires_at < now() + interval '7 days 1 minute' from public.invites where token_hash = pg_temp.h('c1')), 'expiry not extended');
+select pg_temp.ok((select uses = 1 from public.invite_codes where code = 'WEDDING-EXPO'), 'no code use consumed');
+update public.invites set revoked_at = now() where token_hash = pg_temp.h('c1');
+select pg_temp.ok(redeem_invite_code('WEDDING-EXPO', 'guest1@example.com', pg_temp.h('c1c')) ->> 'status' = 'rate_limited', 'one code invite per address a day');
+select pg_temp.ok((select uses = 1 from public.invite_codes where code = 'WEDDING-EXPO') and preview_invite(pg_temp.h('c1c')) is null, 'rate-limited redemption creates nothing');
 select pg_temp.ok(redeem_invite_code('WEDDING-EXPO', 'mei@example.com', pg_temp.h('c2')) ->> 'status' = 'already_member', 'member email → already_member (no use consumed)');
 select pg_temp.ok(redeem_invite_code('WEDDING-EXPO', 'guest2@example.com', pg_temp.h('c3')) ->> 'status' = 'created', 'second use');
 select pg_temp.ok(redeem_invite_code('WEDDING-EXPO', 'guest3@example.com', pg_temp.h('c4')) ->> 'status' = 'invalid', 'code used up → invalid');
@@ -96,6 +103,22 @@ select pg_temp.ok(preview_invite(pg_temp.h('m1')) is null and preview_invite(pg_
 select pg_temp.ok(revoke_invite('10000000-0000-0000-0000-000000000002', (select id from public.invites where token_hash = pg_temp.h('m1-new'))) -> 'invite' ->> 'status' = 'revoked', 'admin revokes');
 select pg_temp.ok(revoke_invite('10000000-0000-0000-0000-000000000002', (select id from public.invites where token_hash = pg_temp.h('m1-new'))) ->> 'status' = 'not_found', 'revoking twice → not_found');
 select pg_temp.ok(preview_invite(pg_temp.h('m1-new')) is null, 'revoked invite → preview null');
+-- An invite that expired before its person signed up some other way: no resend.
+select create_invite('late@example.com', pg_temp.h('late'), 'admin', '10000000-0000-0000-0000-000000000002', null, null);
+update public.invites set created_at = now() - interval '10 days', expires_at = now() - interval '1 day' where token_hash = pg_temp.h('late');
+insert into auth.users (id, email, email_confirmed_at) values ('30000000-0000-0000-0000-000000000002', 'late@example.com', now());
+select pg_temp.ok(resend_invite('10000000-0000-0000-0000-000000000002', (select id from public.invites where token_hash = pg_temp.h('late')), pg_temp.h('late-new')) ->> 'status' = 'already_member', 'resend refused once the email has an account');
+-- An expired invite with a newer one for the same email: superseded.
+select create_invite('again@example.com', pg_temp.h('old'), 'admin', '10000000-0000-0000-0000-000000000002', null, null);
+update public.invites set created_at = now() - interval '10 days', expires_at = now() - interval '1 day' where token_hash = pg_temp.h('old');
+select pg_temp.ok(create_invite('again@example.com', pg_temp.h('newer'), 'admin', '10000000-0000-0000-0000-000000000002', null, null) ->> 'status' = 'created', 'a new invite after the old one expired');
+select pg_temp.ok(resend_invite('10000000-0000-0000-0000-000000000002', (select id from public.invites where token_hash = pg_temp.h('old')), pg_temp.h('old-new')) ->> 'status' = 'superseded', 'resending the expired, superseded invite is refused');
+select pg_temp.ok(preview_invite(pg_temp.h('old-new')) is null and preview_invite(pg_temp.h('newer')) is not null, 'superseded resend changed nothing');
+-- A member's invite whose email failed to send.
+select revoke_unsent_invite((select id from public.invites where token_hash = pg_temp.h('m3')), '20000000-0000-0000-0000-000000000002');
+select pg_temp.ok(preview_invite(pg_temp.h('m3')) is not null, 'revoke_unsent_invite ignores another member''s invite');
+select revoke_unsent_invite((select id from public.invites where token_hash = pg_temp.h('m3')), '20000000-0000-0000-0000-000000000001');
+select pg_temp.ok(preview_invite(pg_temp.h('m3')) is null, 'revoke_unsent_invite revokes the inviter''s unsent invite');
 
 -- ---- Settings --------------------------------------------------------------------------------------
 select pg_temp.ok(update_signup_settings('10000000-0000-0000-0000-000000000002', '{"signupMode":"open"}', 'try') ->> 'status' = 'forbidden', 'an admin cannot switch the sign-up mode');
@@ -147,8 +170,9 @@ select pg_temp.ok(not rate_limit_hit('email_start', pg_temp.h('net'), 5, 900), '
 select pg_temp.ok((select count(*) = 5 from public.rate_limit_attempts where kind = 'email_start'), 'refused attempts are not recorded');
 select pg_temp.ok(rate_limit_hit('email_start', pg_temp.h('other'), 5, 900), 'another key is unaffected');
 select pg_temp.ok(rate_limit_hit('invite_code', pg_temp.h('net'), 5, 900), 'another kind is unaffected');
-select rate_limit_record('email_verify_fail', pg_temp.h('mail')) from generate_series(1, 3);
-select pg_temp.ok(rate_limit_count('email_verify_fail', pg_temp.h('mail'), 900) = 3, 'failures are counted');
+select pg_temp.ok((select bool_and(rate_limit_hit('code_addr', pg_temp.h('mail'), 3, 900)) from generate_series(1, 3)) and not rate_limit_hit('code_addr', pg_temp.h('mail'), 3, 900), 'code attempts are reserved up to the cap');
+select rate_limit_reset('code_addr', pg_temp.h('mail'));
+select pg_temp.ok(rate_limit_hit('code_addr', pg_temp.h('mail'), 3, 900) and (select count(*) = 5 from public.rate_limit_attempts where kind = 'email_start' and key_hash = pg_temp.h('net')), 'reset clears only that key');
 insert into public.rate_limit_attempts (kind, key_hash, created_at) values ('email_start', pg_temp.h('old'), now() - interval '3 days');
 select purge_invite_requests();
 select pg_temp.ok(not exists (select 1 from public.rate_limit_attempts where created_at < now() - interval '2 days'), 'old attempts purged');

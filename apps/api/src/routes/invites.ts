@@ -101,8 +101,10 @@ inviteRoutes.post('/preview', async (c) => {
 });
 
 /**
- * Opening the link proves the address, so redeeming creates the account (already confirmed) or reuses
- * an existing one, then signs the person in. Every failure looks like an invalid link.
+ * Opening the link proves the address, so redeeming creates the account (already confirmed) and signs
+ * the person in. Confirming the account consumes every live invite for that email. An invite whose
+ * email already has an account isn't redeemable: that person signs in instead. Every failure looks
+ * like an invalid link.
  */
 inviteRoutes.post('/redeem', async (c) => {
   const body = await readBody(c, inviteRedeemSchema);
@@ -114,34 +116,24 @@ inviteRoutes.post('/redeem', async (c) => {
       p_token_hash: await inviteTokenHash(body.token),
     });
     if (!invite) return c.json(INVALID(), 404);
-
-    const kind = await rpc<string>(c.env, 'account_kind', { p_email: invite.email });
-    if (kind === 'staff') return c.json(INVALID(), 404);
-
-    let created = false;
-    if (kind === 'none') {
-      try {
-        const user = await gotrue.adminCreateUser(c.env, invite.email, body.displayName);
-        created = true;
-        if (body.displayName) {
-          await rpc(c.env, 'update_display_name', { p_user_id: user.id, p_name: body.displayName });
-        }
-      } catch (err) {
-        // 422: created by a concurrent redemption a moment ago; carry on as an existing account.
-        // 403 (the sign-up hook): sign-ups paused or the invite stopped being valid.
-        if (!(err instanceof UpstreamError) || err.status !== 422) {
-          if (err instanceof UpstreamError && err.status < 500) return c.json(INVALID(), 404);
-          throw err;
-        }
-      }
+    if ((await rpc<string>(c.env, 'account_kind', { p_email: invite.email })) !== 'none') {
+      return c.json(INVALID(), 404);
     }
-    // A new account consumed the invite when it was created (confirmed email). For an existing
-    // account this is what makes the link single-use.
-    const claimed = await rpc<boolean>(c.env, 'mark_invite_accepted', { p_invite_id: invite.id });
-    if (!created && !claimed) return c.json(INVALID(), 404);
+
+    try {
+      const user = await gotrue.adminCreateUser(c.env, invite.email, body.displayName);
+      if (body.displayName) {
+        await rpc(c.env, 'update_display_name', { p_user_id: user.id, p_name: body.displayName });
+      }
+    } catch (err) {
+      // 422: someone redeemed it a moment ago (the account exists now). 403: the sign-up hook refused
+      // (sign-ups paused, or the invite stopped being valid).
+      if (err instanceof UpstreamError && err.status < 500) return c.json(INVALID(), 404);
+      throw err;
+    }
 
     const session = await mintSession(c.env, invite.email);
-    return await startMemberSession(c, session, { isNew: created });
+    return await startMemberSession(c, session, { isNew: true });
   } catch (err) {
     logError(requestId, 'invite_redeem', err);
     return c.json(fail('server'), 500);
@@ -150,8 +142,9 @@ inviteRoutes.post('/redeem', async (c) => {
 
 /**
  * Invite codes: a valid code plus an email sends a sign-up link to that address. The reply is the
- * same whether the code was valid, used up, unknown, or the email already has an account, and the
- * email goes out after the response.
+ * same whether the code was valid, used up, unknown, the email already has an account or a live
+ * invite, or already got a code invite today, and the email goes out after the response. Only a newly
+ * created invite sends anything, so a known code can't be used to flood an inbox.
  */
 inviteRoutes.post('/code', async (c) => {
   if (!(await burstOk(c, 'invite_code'))) return rateLimited(c, 60);
@@ -171,11 +164,12 @@ inviteRoutes.post('/code', async (c) => {
       p_email: body.email,
       p_token_hash: hash,
     });
-    if (res.status === 'created' && res.expiresAt) {
+    if (res.status === 'created' && res.id && res.expiresAt) {
       const expiresAt = res.expiresAt;
+      const inviteId = res.id;
       await background(c, async () => {
         try {
-          await sendInvite(c.env, body.email, token, expiresAt, null, null);
+          await sendInvite(c.env, body.email, token, expiresAt, null, null, inviteId);
         } catch (err) {
           logError(requestId, 'invite_code_send', err);
         }
@@ -206,7 +200,10 @@ const monthEndSeconds = () => {
   return Math.max(60, Math.ceil((next - now.getTime()) / 1000));
 };
 
-/** A member invites someone (quota per calendar month). */
+/**
+ * A member invites someone (quota per calendar month). The email carries Zephyr's wording only (no
+ * free-text note). If it can't be sent, the invite is revoked so no unsent link stays live.
+ */
 inviteRoutes.post('/', requireMember, async (c) => {
   if (!(await burstOk(c, 'member_invite'))) return rateLimited(c, 60);
   const body = await readBody(c, memberInviteSchema);
@@ -221,7 +218,7 @@ inviteRoutes.post('/', requireMember, async (c) => {
       p_source: 'member',
       p_invited_by: s.userId,
       p_code_id: null,
-      p_note: body.note ?? null,
+      p_note: null,
     });
     switch (res.status) {
       case 'created':
@@ -239,11 +236,18 @@ inviteRoutes.post('/', requireMember, async (c) => {
       default:
         return c.json(fail('invalid'), 400);
     }
-    const expiresAt = res.expiresAt ?? new Date().toISOString();
+    if (!res.id || !res.expiresAt) throw new Error('UnexpectedResult');
+    const { id, expiresAt } = res;
     const inviterName = c.get('profile').displayName ?? null;
-    await sendInvite(c.env, body.email, token, expiresAt, inviterName, body.note ?? null, res.id);
+    try {
+      await sendInvite(c.env, body.email, token, expiresAt, inviterName, null, id);
+    } catch (err) {
+      logError(requestId, 'member_invite_send', err);
+      await rpc(c.env, 'revoke_unsent_invite', { p_id: id, p_invited_by: s.userId });
+      return c.json(fail('server'), 500);
+    }
     const invite: InviteRow = {
-      id: res.id ?? '',
+      id,
       email: body.email,
       status: 'pending',
       source: 'member',

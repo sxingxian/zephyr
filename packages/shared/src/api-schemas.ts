@@ -21,7 +21,11 @@ const displayName = z.string().trim().min(1).max(80);
 
 export const emailStartSchema = z.object({ email, turnstileToken });
 export const adminEmailStartSchema = z.object({ email });
-export const emailVerifySchema = z.object({ email, code: z.string().regex(/^\d{6}$/) });
+export const emailVerifySchema = z.object({
+  email,
+  code: z.string().regex(/^\d{6}$/),
+  turnstileToken: turnstileToken.optional(),
+});
 export const passkeyVerifySchema = z.object({
   challengeId: z.string().min(1).max(200),
   credential: z
@@ -33,7 +37,7 @@ export const passkeyRenameSchema = z.object({ friendlyName: z.string().trim().mi
 export const invitePreviewSchema = z.object({ token: inviteToken });
 export const inviteRedeemSchema = z.object({ token: inviteToken, displayName: displayName.optional() });
 export const inviteCodeSchema = z.object({ code: inviteCodeValue, email, turnstileToken });
-export const memberInviteSchema = z.object({ email, note: z.string().trim().max(500).optional() });
+export const memberInviteSchema = z.object({ email });
 
 export const signupSettingsPatchSchema = z
   .object({

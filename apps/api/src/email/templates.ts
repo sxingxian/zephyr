@@ -51,3 +51,46 @@ ${note ? `<tr><td style="padding-bottom:24px;"><div style="font-size:15px;line-h
   ].join('\n');
   return { subject, html, text };
 }
+
+export interface PasskeyChangeEmail {
+  change: 'added' | 'removed';
+  /** The passkey's name, when known (added). */
+  name: string | null;
+  /** 'Zephyr' or 'the Zephyr admin console'. */
+  where: string;
+  at: Date;
+}
+
+/**
+ * Security notice sent whenever a passkey is added to or removed from an account, so an unexpected
+ * change is noticed even if a session was taken over.
+ */
+export function passkeyChangeEmail(e: PasskeyChangeEmail): { subject: string; html: string; text: string } {
+  const subject =
+    e.change === 'added'
+      ? 'A passkey was added to your Zephyr account'
+      : 'A passkey was removed from your Zephyr account';
+  const name = e.name ? oneLine(e.name).slice(0, 120) : null;
+  const when = `${e.at.toLocaleString('en-GB', { dateStyle: 'long', timeStyle: 'short', timeZone: 'UTC' })} UTC`;
+  const what =
+    e.change === 'added'
+      ? `${name ? `A passkey named “${name}”` : 'A new passkey'} was added to your account in ${e.where} on ${when}.`
+      : `A passkey was removed from your account in ${e.where} on ${when}.`;
+  const advice =
+    'If this was you, there’s nothing to do. If it wasn’t, sign in, remove any passkey you don’t recognise and reply to this email so we can help.';
+
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#F4F6F9;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0D1117;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F4F6F9;padding:40px 16px;"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#FFFFFF;border-radius:20px;padding:36px 32px;">
+<tr><td style="font-size:20px;font-weight:600;letter-spacing:-0.02em;padding-bottom:28px;">zephyr</td></tr>
+<tr><td style="font-size:22px;font-weight:600;letter-spacing:-0.03em;line-height:1.25;padding-bottom:12px;">${escapeHtml(subject)}</td></tr>
+<tr><td style="font-size:15px;line-height:1.55;color:#2A313C;padding-bottom:16px;">${escapeHtml(what)}</td></tr>
+<tr><td style="font-size:13px;line-height:1.55;color:#566070;">${escapeHtml(advice)}</td></tr>
+</table>
+<p style="font-size:12px;color:#566070;margin:20px 0 0;">Midnight Poetry Studio · zephyr.midnightpoetry.studio</p>
+</td></tr></table></body></html>`;
+  const text = [subject, '', what, '', advice].join('\n');
+  return { subject, html, text };
+}

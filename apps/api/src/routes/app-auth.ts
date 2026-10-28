@@ -7,6 +7,13 @@ import {
   type SessionResponse,
 } from '@zephyr/shared';
 import { type Context, Hono } from 'hono';
+import {
+  CODE_WINDOW,
+  padReply,
+  reserveCodeAttempt,
+  resetCodeAttempts,
+  takeFreeAttempt,
+} from '../auth/code-limits';
 import { type GoTrueSession, gotrue } from '../auth/gotrue';
 import {
   appendCookies,
@@ -15,11 +22,13 @@ import {
   sessionCookies,
   verifyAccessToken,
 } from '../auth/session';
+import { ceremonyMatches } from '../auth/webauthn';
 import { list } from '../env';
 import {
   background,
   burstOk,
   clientIp,
+  clientNetwork,
   emailHash,
   fail,
   guardWrite,
@@ -35,11 +44,13 @@ import type { HonoEnv } from '../types';
 import { getProfile, requireMember, sessionUser } from './session-helpers';
 
 const WINDOW = 15 * 60;
+const DAY = 24 * 60 * 60;
 export const LIMITS = {
   emailStartPerNetwork: 5,
   emailStartPerAddress: 3,
+  /** Codes per address per day: with ≤25 guesses per code, ≤250 guesses a day against 10⁶ codes. */
+  emailStartPerAddressPerDay: 10,
   emailVerifyPerNetwork: 20,
-  emailVerifyFailuresPerAddress: 5,
   passkeyPerNetwork: 30,
 } as const;
 const ACCEPTED: Accepted = { ok: true };
@@ -54,7 +65,7 @@ appAuthRoutes.use(
 /**
  * Sends a sign-in code to an existing member. The reply is identical for unknown emails and staff
  * accounts (which get nothing), and the email goes out after the response, so timing doesn't tell
- * them apart either.
+ * them apart either. A new code clears the address's guess counters (see auth/code-limits.ts).
  */
 appAuthRoutes.post('/email/start', async (c) => {
   if (!(await burstOk(c, 'email_start'))) return rateLimited(c, 60);
@@ -68,22 +79,19 @@ appAuthRoutes.post('/email/start', async (c) => {
     if (!(await limitHit(c.env, 'email_start', await networkHash(c), LIMITS.emailStartPerNetwork, WINDOW))) {
       return rateLimited(c, WINDOW);
     }
-    if (
-      !(await limitHit(
-        c.env,
-        'email_start_addr',
-        await emailHash(c.env, body.email),
-        LIMITS.emailStartPerAddress,
-        WINDOW,
-      ))
-    ) {
+    const addr = await emailHash(c.env, body.email);
+    if (!(await limitHit(c.env, 'email_start_addr', addr, LIMITS.emailStartPerAddress, WINDOW))) {
       return rateLimited(c, WINDOW);
     }
+    if (!(await limitHit(c.env, 'email_start_day', addr, LIMITS.emailStartPerAddressPerDay, DAY))) {
+      return rateLimited(c, WINDOW);
+    }
+    const network = clientNetwork(c);
     await background(c, async () => {
       try {
-        if ((await rpc<string>(c.env, 'account_kind', { p_email: body.email })) === 'member') {
-          await gotrue.sendEmailCode(c.env, body.email);
-        }
+        if ((await rpc<string>(c.env, 'account_kind', { p_email: body.email })) !== 'member') return;
+        await gotrue.sendEmailCode(c.env, body.email);
+        await resetCodeAttempts(c.env, 'app', body.email, network);
       } catch (err) {
         logError(requestId, 'email_start_send', err);
       }
@@ -95,32 +103,42 @@ appAuthRoutes.post('/email/start', async (c) => {
   }
 });
 
+/**
+ * Checks a code. Each attempt is reserved before Auth sees it (see auth/code-limits.ts); only members
+ * reach Auth at all, and wrong-code replies take the same minimum time either way.
+ */
 appAuthRoutes.post('/email/verify', async (c) => {
+  const startedAt = Date.now();
   if (!(await burstOk(c, 'email_verify'))) return rateLimited(c, 60);
   const body = await readBody(c, emailVerifySchema);
   if (!body) return c.json(fail('invalid'), 400);
   const requestId = c.get('requestId');
+  const wrongCode = async () => {
+    await padReply(startedAt);
+    return c.json(fail('invalid_code'), 400);
+  };
   try {
     if (
       !(await limitHit(c.env, 'email_verify', await networkHash(c), LIMITS.emailVerifyPerNetwork, WINDOW))
     ) {
       return rateLimited(c, WINDOW);
     }
-    const addr = await emailHash(c.env, body.email);
-    const failures = await rpc<number>(c.env, 'rate_limit_count', {
-      p_kind: 'email_verify_fail',
-      p_key: addr,
-      p_window_seconds: WINDOW,
-    });
-    if (failures >= LIMITS.emailVerifyFailuresPerAddress) return rateLimited(c, WINDOW);
+    if (body.turnstileToken) {
+      if (!(await verifyTurnstile(c.env, body.turnstileToken, clientIp(c), TURNSTILE_ACTIONS.emailVerify))) {
+        return c.json(fail('verification_failed'), 403);
+      }
+    } else if (!(await takeFreeAttempt(c, 'app', body.email))) {
+      return c.json(fail('verification_failed'), 403);
+    }
+    if (!(await reserveCodeAttempt(c, 'app', body.email))) return rateLimited(c, CODE_WINDOW);
+    if ((await rpc<string>(c.env, 'account_kind', { p_email: body.email })) !== 'member') return wrongCode();
 
     let session: GoTrueSession;
     try {
       session = await gotrue.verifyEmailCode(c.env, body.email, body.code);
     } catch (err) {
       if (err instanceof UpstreamError && err.status >= 400 && err.status < 500 && err.status !== 429) {
-        await rpc(c.env, 'rate_limit_record', { p_kind: 'email_verify_fail', p_key: addr });
-        return c.json(fail('invalid_code'), 400);
+        return wrongCode();
       }
       throw err;
     }
@@ -149,6 +167,9 @@ appAuthRoutes.post('/passkey/verify', async (c) => {
   if (!(await burstOk(c, 'passkey'))) return rateLimited(c, 60);
   const body = await readBody(c, passkeyVerifySchema);
   if (!body) return c.json(fail('invalid'), 400);
+  if (!ceremonyMatches(c, body.credential, 'webauthn.get', list(c.env.APP_ORIGINS))) {
+    return c.json(fail('passkey_failed'), 400);
+  }
   try {
     let session: GoTrueSession;
     try {

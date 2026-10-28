@@ -14,7 +14,6 @@ export function InviteFriends() {
   const toast = useToast();
   const [data, setData] = useState<MemberInvites | null>(null);
   const [email, setEmail] = useState('');
-  const [note, setNote] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -41,10 +40,9 @@ export function InviteFriends() {
     try {
       await api<{ invite: InviteRow }>(APP_API.memberInvite, {
         method: 'POST',
-        body: note.trim() ? { email: m, note: note.trim() } : { email: m },
+        body: { email: m },
       });
       setEmail('');
-      setNote('');
       toast.show(`Invite sent to ${m}`, 'good');
       await load();
     } catch (err) {
@@ -86,13 +84,6 @@ export function InviteFriends() {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="friend@example.com"
-                />
-                <Field
-                  label="Personal note (optional)"
-                  maxLength={500}
-                  value={note}
-                  onChange={(e) => setNote(e.target.value)}
-                  placeholder="Come and try Zephyr"
                 />
                 <Button
                   type="submit"

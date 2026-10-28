@@ -17,15 +17,17 @@ The original request arrives unchanged: Origin, `CF-Connecting-IP`, `Cf-Access-J
 
 Tokens never reach the browser. After sign-in the API sets httpOnly cookies and reads them on every request:
 
-| Realm | Cookies                                                | Attributes                                             |
-| ----- | ------------------------------------------------------ | ------------------------------------------------------ |
-| App   | `__Secure-zs-at`, `__Secure-zs-rt`                     | `Path=/api; HttpOnly; Secure; SameSite=Lax`, host-only |
-| Admin | `__Secure-za-at`, `__Secure-za-rt`, `__Secure-za-seen` | `Path=/admin; HttpOnly; Secure; SameSite=Strict`       |
+| Realm | Cookies                                          | Attributes                                  |
+| ----- | ------------------------------------------------ | ------------------------------------------- |
+| App   | `__Host-zs-at`, `__Host-zs-rt`                   | `Path=/; HttpOnly; Secure; SameSite=Lax`    |
+| Admin | `__Host-za-at`, `__Host-za-rt`, `__Host-za-seen` | `Path=/; HttpOnly; Secure; SameSite=Strict` |
+- **Cookie tossing:** the `__Host-` prefix makes browsers refuse these names from any other `*.midnightpoetry.studio` host (no `Domain`, `Path=/`, `Secure`). A request whose `Cookie` header has one of a realm's names twice gets 401 and the realm's cookies are cleared.
 - **Access tokens** are verified on every request against `${SUPABASE_URL}/auth/v1/.well-known/jwks.json` (signature, issuer, `aud: authenticated`, expiry), with `jose`. **The project must use asymmetric JWT signing keys** (Supabase › Project Settings › JWT Keys); legacy HS256 secrets are not accepted.
 - **Refresh:** done by the API when under 5 minutes remain; a dead refresh token clears the cookies.
 - **Sign-out** revokes the session upstream (`/logout?scope=local`).
-- **Admin idle timeout:** `__Secure-za-seen` holds an HMAC-signed `userId:timestamp` (key `SESSION_HMAC_SECRET`). Over 30 minutes old, missing or forged → the session ends.
+- **Admin idle timeout:** `__Host-za-seen` holds an HMAC-signed `userId:timestamp` (key `SESSION_HMAC_SECRET`). Over 30 minutes old, missing or forged → the session ends.
 - **CSRF:** every non-GET needs an allow-listed `Origin` (app routes: `APP_ORIGINS`; admin: `ADMIN_ORIGINS`; landing forms: `ALLOWED_ORIGINS`) and a JSON body. Bodies are capped (4 KB, 20 KB for passkey routes).
+- **Passkeys:** the API reads each credential's `clientDataJSON` and requires the ceremony type (`webauthn.get` to sign in, `webauthn.create` to register) and the realm's own origin, matching the request's `Origin`, before Supabase sees it. Adding or removing an app passkey needs a sign-in in the last 10 minutes (newest `amr` timestamp), else 403 `reauth_required`; the account is emailed about every added or removed passkey.
 - **Staff and members are separate.** App routes end any session that belongs to a staff account (403); admin routes accept only staff.
 
 ## Routes
@@ -40,24 +42,24 @@ Tokens never reach the browser. After sign-in the API sets httpOnly cookies and 
 
 ### App: `/api/v1/*`
 
-| Method       | Path                   | Notes                                                                                                                                   |
-| ------------ | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| POST         | `auth/email/start`     | `{ email, turnstileToken }` (action `email_start`) → **202 for everyone**. A code is sent only to members, after the response.          |
-| POST         | `auth/email/verify`    | `{ email, code }` → session cookies + `SessionResponse`. Wrong code → 400 `invalid_code`.                                               |
-| POST         | `auth/passkey/options` | → `{ challengeId, options }` (WebAuthn request options, base64url JSON)                                                                 |
-| POST         | `auth/passkey/verify`  | `{ challengeId, credential }` → session. Rejected assertion → 400 `passkey_failed`.                                                     |
-| GET          | `auth/session`         | `SessionResponse` or 401                                                                                                                |
-| POST         | `auth/sign-out`        | 204                                                                                                                                     |
-| PATCH        | `me`                   | `{ displayName }`                                                                                                                       |
-| GET          | `me/passkeys`          | `{ passkeys }`                                                                                                                          |
-| POST         | `me/passkeys/options`  | Registration options                                                                                                                    |
-| POST         | `me/passkeys/verify`   | → 201 `{ passkey }`                                                                                                                     |
-| PATCH/DELETE | `me/passkeys/:id`      | Rename / remove                                                                                                                         |
-| POST         | `invites/preview`      | `{ token }` → email, inviter, expiry. **Every dead link is the same 404 `invite_invalid`.**                                             |
-| POST         | `invites/redeem`       | `{ token, displayName? }` → creates the account (email confirmed by the link) or reuses it, signs in. `isNew` is true for new accounts. |
-| POST         | `invites/code`         | `{ code, email, turnstileToken }` (action `invite_code`) → **202 for everyone**; a live code emails a link after the response.          |
-| GET          | `invites/mine`         | Member invites and remaining monthly quota                                                                                              |
-| POST         | `invites`              | `{ email, note? }` → 201. 403 disabled/paused, 409 already a member/invited, 429 `quota_exceeded` (`retryAfter` = to month end).        |
+| Method       | Path                   | Notes                                                                                                                                                                                                                     |
+| ------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST         | `auth/email/start`     | `{ email, turnstileToken }` (action `email_start`) → **202 for everyone**. A code is sent only to members, after the response.                                                                                            |
+| POST         | `auth/email/verify`    | `{ email, code, turnstileToken? }` → session. Wrong code → 400 `invalid_code`; after the first attempt a Turnstile token (action `email_verify`) is required, else 403 `verification_failed`.                             |
+| POST         | `auth/passkey/options` | → `{ challengeId, options }` (WebAuthn request options, base64url JSON)                                                                                                                                                   |
+| POST         | `auth/passkey/verify`  | `{ challengeId, credential }` → session. Rejected assertion → 400 `passkey_failed`.                                                                                                                                       |
+| GET          | `auth/session`         | `SessionResponse` or 401                                                                                                                                                                                                  |
+| POST         | `auth/sign-out`        | 204                                                                                                                                                                                                                       |
+| PATCH        | `me`                   | `{ displayName }`                                                                                                                                                                                                         |
+| GET          | `me/passkeys`          | `{ passkeys }`                                                                                                                                                                                                            |
+| POST         | `me/passkeys/options`  | Registration options. 403 `reauth_required` if the sign-in is over 10 minutes old                                                                                                                                         |
+| POST         | `me/passkeys/verify`   | → 201 `{ passkey }`, emails the account. 403 `reauth_required` as above                                                                                                                                                   |
+| PATCH/DELETE | `me/passkeys/:id`      | Rename / remove (remove: `reauth_required` as above; emails the account)                                                                                                                                                  |
+| POST         | `invites/preview`      | `{ token }` → email, inviter, expiry. **Every dead link is the same 404 `invite_invalid`.**                                                                                                                               |
+| POST         | `invites/redeem`       | `{ token, displayName? }` → creates the account (email confirmed by the link) and signs in. An invite whose email already has an account is a 404 like any dead link.                                                     |
+| POST         | `invites/code`         | `{ code, email, turnstileToken }` (action `invite_code`) → **202 for everyone**; a live code emails a link after the response, only when it creates a new invite (one per address a day).                                 |
+| GET          | `invites/mine`         | Member invites and remaining monthly quota                                                                                                                                                                                |
+| POST         | `invites`              | `{ email }` → 201 (no note: members can't add text to the email). 403 disabled/paused, 409 already a member/invited, 429 `quota_exceeded` (`retryAfter` = to month end), 500 if the email failed (the invite is revoked). |
 
 ### Admin: `/admin/api/v1/*`
 
@@ -66,34 +68,37 @@ Every request first needs a valid **Cloudflare Access** JWT (`Cf-Access-Jwt-Asse
 | Method | Path                                | Who                   | Notes                                                                                                              |
 | ------ | ----------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | POST   | `auth/email/start`                  | —                     | 202 always. A code is sent only to a staff member **with no passkey**, signing in as their Access identity.        |
-| POST   | `auth/email/verify`                 | —                     | → `enrolOnly: true` session. Staff who already have a passkey get 403 `passkey_required`.                          |
+| POST   | `auth/email/verify`                 | —                     | → `enrolOnly: true` session. Staff who already have a passkey get 403 `passkey_required`. See below.               |
 | POST   | `auth/passkey/options` / `verify`   | —                     | Full session (`enrolOnly: false`) when the token's `amr` shows a passkey                                           |
 | GET    | `auth/session`                      | any staff, enrol-only |                                                                                                                    |
 | POST   | `auth/sign-out`                     | —                     |                                                                                                                    |
-| POST   | `me/passkeys/options` / `verify`    | any staff, enrol-only | Saves the passkey. The session stays enrol-only; the console opens after signing in with the passkey.              |
+| POST   | `me/passkeys/options` / `verify`    | any staff, enrol-only | Saves the passkey and emails the staff member. See below.                                                          |
 | GET    | `signups`                           | any staff             | Settings, counts, codes                                                                                            |
 | PATCH  | `signups/settings`                  | owner, admin          | Only an Owner may switch the mode (enforced in the database too). Audited with the reason.                         |
 | GET    | `signups/invites` / `requests`      | any staff             | `?status=&cursor=`, 50 per page                                                                                    |
 | POST   | `signups/invites`                   | owner, admin          | Up to 50 emails. Skips members, open invites and bad addresses; a failed email revokes its invite (`send_failed`). |
-| POST   | `signups/invites/:id/resend`        | owner, admin          | New token, fresh expiry (the old link stops working)                                                               |
+| POST   | `signups/invites/:id/resend`        | owner, admin          | New token, fresh expiry (the old link stops working). See below.                                                   |
 | POST   | `signups/invites/:id/revoke`        | owner, admin          |                                                                                                                    |
 | POST   | `signups/codes`, `codes/:id/revoke` | owner, admin          |                                                                                                                    |
 | POST   | `signups/requests/decide`           | owner, admin          | Approving emails an invite; if the email fails the invite is revoked and the request reopened.                     |
+- **Email verify** checks only the Access identity's own address: any other address is `invalid_code` and isn't counted against anyone.
+- **Enrolment:** an enrol-only session can add only the _first_ passkey (403 `passkey_required` after that). The session stays enrol-only; the console opens after signing in with the new passkey.
+- **Resend** is 409 `already_member` once the email has an account, and 409 `conflict` when the invite expired and a newer one exists.
 
 Enrol-only sessions get 403 `passkey_required` everywhere except `auth/*` and `me/passkeys/*`. Every admin write is audited in the database with the acting staff id.
 
 ## Limits
 
-Durable limits live in Postgres (`rate_limit_hit`, per attempt, keyed by HMAC hashes of the client's network or the email address) because the Workers rate-limit binding counts per location and only over 10 s or 60 s. The binding (`BURST_LIMITER`, 10/min per network) runs first as a cheap guard. Networks are IPv4 addresses or IPv6 /64s.
+Durable limits live in Postgres (`rate_limit_hit`, per attempt, reserved atomically under an advisory lock _before_ the work it limits, keyed by HMAC hashes of the client's network or the email address) because the Workers rate-limit binding counts per location and only over 10 s or 60 s. The binding (`BURST_LIMITER`, 10/min per network) runs first as a cheap guard. Networks are IPv4 addresses or IPv6 /64s.
 
-| Kind                            | Limit                                                        |
-| ------------------------------- | ------------------------------------------------------------ |
-| Email code start                | 5 / network, 3 / address per 15 min                          |
-| Email code verify               | 20 / network per 15 min; 5 wrong codes / address per 15 min  |
-| Passkey sign-in options         | 30 / network per 15 min                                      |
-| Invite links (preview + redeem) | 20 / network per 15 min                                      |
-| Invite codes                    | 5 / network per 15 min                                       |
-| Admin email codes               | 5 / network, 3 / address per 15 min; 5 wrong codes / address |
+| Kind                            | Limit                                                                                                                                                                                                  |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Email code start                | 5 / network, 3 / address per 15 min; 10 / address per day                                                                                                                                              |
+| Email code verify               | 20 / network; 5 attempts / (address, network); 25 attempts / address, per 15 min. Address counters reset when a new code is sent. Turnstile after the first attempt. Wrong-code replies take ≥ 400 ms. |
+| Passkey sign-in options         | 30 / network per 15 min                                                                                                                                                                                |
+| Invite links (preview + redeem) | 20 / network per 15 min                                                                                                                                                                                |
+| Invite codes                    | 5 / network per 15 min; 1 new invite / address per day (database)                                                                                                                                      |
+| Admin email codes               | Start: 5 / network, 3 / address per 15 min. Verify: 5 attempts / (address, network), 25 / address per 15 min, reset by a new code                                                                      |
 
 Supabase applies its own Auth rate limits per IP, and every call comes from this Worker, so raise them (Authentication › Rate Limits) and leave Supabase's CAPTCHA off: Turnstile is verified here.
 

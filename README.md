@@ -10,17 +10,21 @@ AI photo editing and private passcode galleries, by Midnight Poetry Studio.
 | Admin                | zephyr.midnightpoetry.studio/admin | `apps/admin` (next phase)               |
 | Database and sign-in | Supabase                           | `supabase/`                             |
 
-Status: **phase 1** — foundation and the invite-only landing page with a working invite-request form. See
-[docs/roadmap.md](docs/roadmap.md).
+Status: **phase 2**: accounts (email codes and passkeys), invites and invite codes, the app shell, and the admin
+Sign-ups & invites page, on top of phase 1's foundation and invite-only landing page. See
+[docs/roadmap.md](docs/roadmap.md) and [docs/phase-2.md](docs/phase-2.md).
 
 ## Layout
 
 ```
 apps/
   landing/     Astro site, three.js hero, GSAP + Lenis scroll scenes, invite-request form, landing Worker
-  api/         Hono API Worker (public config, invite requests), reached via service binding
+  api/         Hono API Worker: sessions (httpOnly cookies), sign-in, invites, admin; reached via service binding
+  web/         React + Vite PWA for zephyrapp.midnightpoetry.studio, with its own Worker
+  admin/       React + Vite console built into the landing Worker under /admin
 packages/
-  shared/      Zod schemas, plan limits, settings types (shared by every app and the API)
+  shared/      HTTP contract, zod schemas, plan limits, settings types (shared by every app and the API)
+  ui/          React components on the brand tokens (shared by the app and admin)
   brand/       Colour tokens, icons, logo, mascot poses, sample scenes (exported from design/kit)
 supabase/      Migrations (RLS on every table), seed, SQL tests
 design/kit/    The design kit that drew the mockups; `pnpm brand:export` regenerates packages/brand

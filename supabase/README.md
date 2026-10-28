@@ -107,7 +107,7 @@ Then enable the auth hook and the pg_cron extension in the dashboard.
 
 `20261028100000_accounts.sql` adds the functions the API calls. All are `SECURITY DEFINER`, `search_path = ''` and executable only by `service_role`. Internal helpers (`_*`) aren't executable by any API role.
 
-- **Invites:** `create_invite`, `preview_invite`, `mark_invite_accepted`, `redeem_invite_code`, `list_member_invites`.
+- **Invites:** `create_invite`, `preview_invite`, `redeem_invite_code` (no second link for an email that already has a live invite; one code invite per address a day), `revoke_unsent_invite`, `list_member_invites`. A confirmed account consumes every live invite for its email (`handle_user_confirmed`, replaced here).
   - Tokens arrive as SHA-256 hashes; the raw token only exists in the email.
   - `preview_invite` returns null for unknown, expired, revoked and used tokens alike, and for any token while sign-ups are paused.
   - Member invites are limited per calendar month. An attempt that doesn't create a live invite (already a member, already invited) still records a revoked row, so it counts towards the quota and members can't use invites to probe who has an account.
@@ -115,7 +115,7 @@ Then enable the auth hook and the pg_cron extension in the dashboard.
 - **Admin:** `get_signup_overview`, `update_signup_settings`, `revoke_invite`, `resend_invite`, `create_invite_code`, `revoke_invite_code`, `decide_invite_requests`, `reopen_invite_request`, `list_invites`, `list_invite_requests` (keyset pagination).
   - Each write takes the acting staff id, re-checks the role (Owner or Admin; only an Owner may change the sign-up mode) and writes `audit_log`.
 - **Accounts:** `account_kind`, `user_id_by_email`, `is_staff`, `staff_lookup`, `get_session_profile`, `update_display_name`.
-- **Rate limits:** `rate_limit_hit`, `rate_limit_count`, `rate_limit_record` on `rate_limit_attempts` (HMAC-hashed keys only). The daily purge clears attempts older than 2 days.
+- **Rate limits:** `rate_limit_hit` (counts attempts atomically under an advisory lock; call it _before_ the thing it limits) and `rate_limit_reset` on `rate_limit_attempts` (HMAC-hashed keys only). The daily purge clears attempts older than 2 days.
 
 ### Auth settings to mirror in the dashboard
 

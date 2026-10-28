@@ -3,7 +3,11 @@
 1. **/admin shares the landing origin.** The landing site therefore loads no third-party scripts except Turnstile,
    ships a strict CSP (`apps/landing/scripts/csp.mjs`), and /admin (next phase) will sit behind Cloudflare Access
    with passkeys and an httpOnly cookie scoped to /admin.
-2. **No cross-app sessions.** Cookies are set per exact host, never on `.midnightpoetry.studio`.
+2. **Sessions never reach JavaScript.** The API keeps Supabase tokens in httpOnly, Secure, host-only cookies
+   (`__Host-` cookies with `Path=/`; app SameSite=Lax; admin SameSite=Strict with a 30-minute idle lock), verifies access
+   tokens against the project's JWKS on every request, and refreshes them server-side. Cookies are never set on
+   `.midnightpoetry.studio`. Staff and member accounts are kept apart: each API side rejects the other's users.
+   Admin needs Cloudflare Access (JWT verified, email must match the staff account) plus a passkey.
 3. **Least privilege in Postgres.** RLS on every table; defaults revoked so new tables start closed; `security
    definer` functions pin `search_path = ''`; `audit_log` is append-only (UPDATE/DELETE/TRUNCATE blocked).
 4. **Invite-only is enforced on the server.** Public sign-up is off in Supabase Auth; accounts are created only by

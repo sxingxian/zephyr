@@ -5,6 +5,7 @@
 import { exportJWK, generateKeyPair, type JWK, SignJWT } from 'jose';
 import { vi } from 'vitest';
 import { app } from '../src/app';
+import { CODE_TIMING } from '../src/auth/code-limits';
 import type { Env } from '../src/env';
 
 export const SB = 'https://db.test';
@@ -68,6 +69,8 @@ export interface TokenOpts {
   expIn?: number;
   forged?: boolean;
   aud?: string;
+  /** Seconds since the sign-in (amr timestamp). Default 0. */
+  authAgo?: number;
 }
 export async function sbToken(o: TokenOpts): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
@@ -75,7 +78,7 @@ export async function sbToken(o: TokenOpts): Promise<string> {
   return new SignJWT({
     email: o.email,
     role: 'authenticated',
-    amr: (o.amr ?? ['otp']).map((method) => ({ method, timestamp: now })),
+    amr: (o.amr ?? ['otp']).map((method) => ({ method, timestamp: now - (o.authAgo ?? 0) })),
     session_id: crypto.randomUUID(),
   })
     .setProtectedHeader({ alg: 'ES256', kid: 'sb-1' })
@@ -127,6 +130,8 @@ export interface World {
   /** Refresh tokens GoTrue accepts → user. */
   refresh: Map<string, User>;
   createUserStatus: number;
+  /** In-memory rate_limit_attempts: "kind|key" → attempt times (ms). Synchronous, so atomic like the SQL. */
+  limits: Map<string, number[]>;
 }
 export const world: World = {} as World;
 
@@ -163,9 +168,11 @@ export function resetWorld() {
     passkeyUser: null,
     refresh: new Map(),
     createUserStatus: 200,
+    limits: new Map(),
   } satisfies World);
   limiterOk = true;
   limiterKeys.length = 0;
+  CODE_TIMING.floorMs = 0;
 }
 
 const byEmail = (e: string) => world.users.find((u) => u.email === String(e).toLowerCase());
@@ -204,9 +211,21 @@ const defaultRpc: Record<string, (a: Record<string, unknown>) => unknown> = {
     pendingInvites: 0,
     codes: [],
   }),
-  rate_limit_hit: () => true,
-  rate_limit_count: () => 0,
-  rate_limit_record: () => null,
+  // Mirrors public.rate_limit_hit: count in the window, refuse at the limit without recording.
+  rate_limit_hit: (a) => {
+    const key = `${a.p_kind}|${a.p_key}`;
+    const since = Date.now() - Number(a.p_window_seconds) * 1000;
+    const hits = (world.limits.get(key) ?? []).filter((t) => t > since);
+    if (hits.length >= Number(a.p_limit)) return false;
+    hits.push(Date.now());
+    world.limits.set(key, hits);
+    return true;
+  },
+  rate_limit_reset: (a) => {
+    world.limits.delete(`${a.p_kind}|${a.p_key}`);
+    return null;
+  },
+  revoke_unsent_invite: () => null,
   account_kind: (a) => {
     const u = byEmail(String(a.p_email));
     return !u ? 'none' : u.staff ? 'staff' : 'member';
@@ -388,6 +407,19 @@ export function installFetch() {
       throw new Error(`unexpected fetch ${method} ${url}`);
     }),
   );
+}
+
+// ---- WebAuthn -----------------------------------------------------------------------------------------
+/** A credential JSON whose clientDataJSON says `type` and `origin` (signature checks are Auth's job). */
+export function credential(
+  type: 'webauthn.get' | 'webauthn.create',
+  origin: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const clientDataJSON = Buffer.from(
+    JSON.stringify({ type, challenge: 'abc', origin, crossOrigin: false, ...extra }),
+  ).toString('base64url');
+  return { id: 'cred-1', rawId: 'cred-1', type: 'public-key', response: { clientDataJSON } };
 }
 
 // ---- requests -------------------------------------------------------------------------------------
