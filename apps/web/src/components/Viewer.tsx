@@ -13,7 +13,7 @@ import { useLocation, useNavigate } from 'react-router';
 import { errorMessage } from '../lib/api';
 import { emitLibrary } from '../lib/bus';
 import { cameraName, exposure, longDateTime, relativeDateTime, shortDateTime } from '../lib/format';
-import { bulk, getPhoto, originalUrl, patchPhoto, previewUrl, thumbUrl } from '../lib/library';
+import { bulk, editKey, getPhoto, originalUrl, patchPhoto, previewUrl, thumbUrl } from '../lib/library';
 import { formatBytes, refreshUsage } from '../lib/usage';
 import { AlbumPicker } from './AlbumPicker';
 import { useViewerHost } from './LibraryBits';
@@ -23,10 +23,11 @@ export function viewerKey(
   key: string,
   index: number,
   count: number,
-): { type: 'go'; to: number } | { type: 'info' } | { type: 'close' } | null {
+): { type: 'go'; to: number } | { type: 'info' } | { type: 'close' } | { type: 'edit' } | null {
   if (key === 'ArrowRight') return index >= 0 && index < count - 1 ? { type: 'go', to: index + 1 } : null;
   if (key === 'ArrowLeft') return index > 0 ? { type: 'go', to: index - 1 } : null;
   if (key === 'i' || key === 'I') return { type: 'info' };
+  if (key === 'e' || key === 'E') return { type: 'edit' };
   if (key === 'Escape') return { type: 'close' };
   return null;
 }
@@ -121,6 +122,12 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
     [items, nav, loc.state, list],
   );
 
+  const openEditor = () => {
+    if (!photo) return;
+    const bg = (loc.state as { bg?: string } | null)?.bg ?? '/';
+    setReturnId(photo.id);
+    nav(`/edit/${encodeURIComponent(photo.id)}`, { state: { bg, fromViewer: true } });
+  };
   const toggleInfo = () => {
     infoOpen = !info;
     setInfo(!info);
@@ -134,6 +141,7 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
     if (a.type === 'close') return; // the dialog's cancel event handles Escape
     e.preventDefault();
     if (a.type === 'go') go(a.to);
+    else if (a.type === 'edit') openEditor();
     else toggleInfo();
   };
 
@@ -285,10 +293,16 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
               <Icon name="trash" size={19} />
             </button>
           </div>
-          <button type="button" className="viewer__edit" disabled title="The editor arrives in phase 4">
+          <button
+            type="button"
+            className="viewer__edit"
+            onClick={openEditor}
+            disabled={!photo?.hasPreview}
+            aria-keyshortcuts="e"
+            title={photo && !photo.hasPreview ? 'This file has no preview to edit' : 'Edit (E)'}
+          >
             <Icon name="sliders" size={16} />
             Edit
-            <span className="viewer__soon">Phase 4</span>
           </button>
         </header>
         <div className="viewer__stage" onPointerDown={onPointerDown} onPointerUp={onPointerUp}>
@@ -312,13 +326,17 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
           ) : photo ? (
             <div className="viewer__frame" style={{ '--r': String(ratio) } as CSSProperties}>
               {photo.hasThumb && (
-                <img className="viewer__img viewer__img--thumb" src={thumbUrl(photo.id)} alt="" />
+                <img
+                  className="viewer__img viewer__img--thumb"
+                  src={thumbUrl(photo.id, editKey(photo))}
+                  alt=""
+                />
               )}
               {photo.hasPreview && (
                 <img
                   key={photo.id}
                   className={`viewer__img${previewReady ? ' is-loaded' : ''}`}
-                  src={previewUrl(photo.id)}
+                  src={previewUrl(photo.id, editKey(photo))}
                   alt={photo.filename}
                   onLoad={() => setPreviewReady(true)}
                 />
@@ -356,7 +374,7 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
                 onClick={() => go(items.indexOf(p))}
               >
                 {p.hasThumb ? (
-                  <img src={thumbUrl(p.id)} alt="" loading="lazy" />
+                  <img src={thumbUrl(p.id, editKey(p))} alt="" loading="lazy" />
                 ) : (
                   <Icon name="image" size={14} />
                 )}
@@ -378,9 +396,9 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
           </div>
         )}
         <nav className="viewer__tabs" aria-label="Photo actions">
-          <button type="button" disabled title="Coming soon">
-            <Icon name="share" size={22} />
-            Share
+          <button type="button" onClick={openEditor} disabled={!photo?.hasPreview}>
+            <Icon name="sliders" size={22} />
+            Edit
           </button>
           <button
             type="button"

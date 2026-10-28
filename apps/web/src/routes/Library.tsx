@@ -3,6 +3,7 @@ import { Button, Mascot, Note, useToast } from '@zephyr/ui';
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { AlbumPicker } from '../components/AlbumPicker';
+import { useEditActions } from '../components/editor/LibraryEdit';
 import {
   type BarAction,
   SearchBox,
@@ -18,13 +19,14 @@ import { Shell } from '../components/Shell';
 import { useUploadPicker } from '../components/Uploads';
 import { errorMessage } from '../lib/api';
 import { emitLibrary } from '../lib/bus';
+import { renderQueue } from '../lib/editor/queue';
 import { bulk } from '../lib/library';
 import { type PhotoList, usePhotoList } from '../lib/photos';
 import { type Selection, useSelection } from '../lib/selection';
 import { useSession } from '../lib/session';
 import { refreshUsage, uploadRulesLine, useUsage } from '../lib/usage';
 
-type Filter = 'library' | 'favourites' | 'raw';
+type Filter = 'library' | 'favourites' | 'raw' | 'edited';
 type Sort = NonNullable<PhotoListQuery['sort']>;
 const SORTS: { value: Sort; label: string }[] = [
   { value: 'taken', label: 'Date taken' },
@@ -70,8 +72,9 @@ export function useLibraryActions(list: PhotoList, sel: Selection, extra: BarAct
       toast.show(`Moved ${n(ids.length)} to Trash. You can restore them for 30 days.`, 'good');
     });
 
+  const editing = useEditActions(list, sel);
   const actions: BarAction[] = [
-    { icon: 'sliders', label: 'Edit', soon: SOON },
+    ...editing.actions,
     { icon: 'breeze', label: 'Zephyr AI', soon: SOON },
     { icon: 'folder', label: 'Add to album', onClick: () => setPicker(true) },
     { icon: 'heart', label: allFav ? 'Unfavourite' : 'Favourite', onClick: favourite, busy: busy === 'fav' },
@@ -80,7 +83,10 @@ export function useLibraryActions(list: PhotoList, sel: Selection, extra: BarAct
     { icon: 'trash', label: 'Move to Trash', onClick: trash, busy: busy === 'trash', danger: true },
   ];
   const pickerEl = (
-    <AlbumPicker open={picker} photoIds={ids} onClose={() => setPicker(false)} onDone={() => sel.clear()} />
+    <>
+      <AlbumPicker open={picker} photoIds={ids} onClose={() => setPicker(false)} onDone={() => sel.clear()} />
+      {editing.dialogs}
+    </>
   );
   return { actions, pickerEl };
 }
@@ -177,6 +183,10 @@ export function LibraryPage({ view }: { view: 'library' | 'favourites' }) {
     total: plain && usage ? usage.photoCount : undefined,
   });
   const { prune } = sel;
+  // Edits whose thumbnails were never rendered (a tab closed mid-batch): render them now.
+  useEffect(() => {
+    renderQueue.resume(list.items);
+  }, [list.items]);
   useEffect(() => {
     const have = new Set(list.items.map((p: PhotoItem) => p.id));
     prune((id) => have.has(id));
@@ -197,6 +207,10 @@ export function LibraryPage({ view }: { view: 'library' | 'favourites' }) {
   else if (empty)
     body = q ? (
       <EmptyHint title={`Nothing matches “${q}”`}>Search looks at file names and camera models.</EmptyHint>
+    ) : query.view === 'edited' ? (
+      <EmptyHint title="No edited photos yet">
+        Photos you edit appear here. Originals always stay as they were.
+      </EmptyHint>
     ) : query.view === 'favourites' ? (
       <EmptyHint title="No favourites yet">Tap the heart on a photo to keep it here.</EmptyHint>
     ) : (
@@ -228,6 +242,7 @@ export function LibraryPage({ view }: { view: 'library' | 'favourites' }) {
             options={[
               { value: 'library', label: 'All photos' },
               { value: 'favourites', label: 'Favourites' },
+              { value: 'edited', label: 'Edited' },
               { value: 'raw', label: 'RAW' },
             ]}
           />

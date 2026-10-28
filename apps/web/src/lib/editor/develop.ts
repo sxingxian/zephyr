@@ -1,0 +1,259 @@
+import { type EditRecipe, HUE_BANDS, normalizeRecipe } from '@zephyr/shared/client';
+
+/**
+ * The develop maths, written once in TypeScript as the reference for the GLSL in shaders.ts. Both read the
+ * same `DevelopParams`, built by `developParams`. A browser test renders a small image through the shader
+ * and checks every pixel against `developPixel` (within 2/255).
+ *
+ * Working space: linear-light Rec. 709 / sRGB primaries. Tone and colour-mixer steps run on a perceptual
+ * (gamma 2.2) encoding of luminance or colour, then go back to linear.
+ */
+export interface DevelopParams {
+  /** Exposure multiplier (2^ev, including the RAW baseline). */
+  gain: number;
+  /** White-balance channel multipliers, luminance-normalised. */
+  wb: [number, number, number];
+  highlights: number; // −1…1
+  shadows: number;
+  whites: number;
+  blacks: number;
+  contrast: number;
+  vibrance: number;
+  saturation: number;
+  /** Per band: hue shift (−1…1 → ±30°), saturation (−1…1), luminance (−1…1). */
+  mixer: [number, number, number][];
+  vignette: number; // −1…1
+  /** Output aspect (width / height), for a round vignette. */
+  aspect: number;
+}
+
+export const NEUTRAL: DevelopParams = {
+  gain: 1,
+  wb: [1, 1, 1],
+  highlights: 0,
+  shadows: 0,
+  whites: 0,
+  blacks: 0,
+  contrast: 0,
+  vibrance: 0,
+  saturation: 0,
+  mixer: HUE_BANDS.map(() => [0, 0, 0] as [number, number, number]),
+  vignette: 0,
+  aspect: 1.5,
+};
+
+const LUMA: [number, number, number] = [0.2126, 0.7152, 0.0722];
+export const luma = (r: number, g: number, b: number) => LUMA[0] * r + LUMA[1] * g + LUMA[2] * b;
+
+/** White balance as channel gains from relative temperature and tint (−100…100), keeping luminance. */
+export function whiteBalance(temperature: number, tint: number): [number, number, number] {
+  const t = temperature / 100;
+  const g = tint / 100;
+  const r = Math.exp(0.32 * t);
+  const b = Math.exp(-0.32 * t);
+  const gg = Math.exp(-0.22 * g);
+  const l = luma(r, gg, b);
+  return [r / l, gg / l, b / l];
+}
+
+export function developParams(
+  recipe: EditRecipe | null | undefined,
+  aspect = 1.5,
+  baselineEv = 0,
+): DevelopParams {
+  const r = normalizeRecipe(recipe);
+  const L = r.light ?? {};
+  const C = r.color ?? {};
+  const pct = (v: number | undefined) => (v ?? 0) / 100;
+  return {
+    gain: 2 ** ((L.exposure ?? 0) + baselineEv),
+    wb: whiteBalance(C.temperature ?? 0, C.tint ?? 0),
+    highlights: pct(L.highlights),
+    shadows: pct(L.shadows),
+    whites: pct(L.whites),
+    blacks: pct(L.blacks),
+    contrast: pct(L.contrast),
+    vibrance: pct(C.vibrance),
+    saturation: pct(C.saturation),
+    mixer: HUE_BANDS.map((b) => {
+      const m = r.mixer?.[b];
+      return [pct(m?.hue), pct(m?.saturation), pct(m?.luminance)] as [number, number, number];
+    }),
+    vignette: pct(r.effects?.vignette),
+    aspect,
+  };
+}
+
+const clamp = (x: number, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+export const smoothstep = (e0: number, e1: number, x: number) => {
+  const t = clamp((x - e0) / (e1 - e0));
+  return t * t * (3 - 2 * t);
+};
+const encodeG = (x: number) => Math.max(0, x) ** (1 / 2.2);
+const decodeG = (x: number) => Math.max(0, x) ** 2.2;
+
+/** sRGB transfer functions (exact piecewise). */
+export const toSrgb = (x: number) => {
+  const c = clamp(x);
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055;
+};
+export const fromSrgb = (x: number) => (x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4);
+
+/** Tone curve on perceptual luminance y (0…≈1). `base` is the blurred local luminance, also perceptual. */
+export function tone(y: number, base: number, p: DevelopParams): number {
+  // Local masks: mostly from the neighbourhood, a little from the pixel itself, so edges don't halo.
+  const m = 0.7 * base + 0.3 * y;
+  const wH = smoothstep(0.45, 0.95, m);
+  const wS = 1 - smoothstep(0.05, 0.55, m);
+  // Highlights and shadows: up to ±1.2 stops in their regions, applied as a gain on linear luminance.
+  const stops = 1.2 * (p.highlights * wH + p.shadows * wS);
+  let out = encodeG(decodeG(y) * 2 ** stops);
+  // Whites and blacks move the ends of the curve.
+  out += 0.22 * p.whites * smoothstep(0.55, 1.0, out);
+  out += 0.16 * p.blacks * (1 - smoothstep(0.0, 0.4, out));
+  // Contrast: pivot at middle grey (0.18 linear ≈ 0.459 perceptual).
+  const pivot = 0.4587;
+  const k = 1 + 0.6 * p.contrast;
+  out = pivot + (out - pivot) * k;
+  return Math.max(0, out);
+}
+
+const BAND_HUES = [0, 30, 60, 120, 180, 240, 270, 300]; // degrees: red … magenta
+
+/** Smooth weight of a hue (degrees) for each band: a cosine bump reaching zero at the neighbouring bands. */
+export function bandWeights(h: number): number[] {
+  const n = BAND_HUES.length;
+  const w = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    const c = BAND_HUES[i] as number;
+    const prev = BAND_HUES[(i + n - 1) % n] as number;
+    const next = BAND_HUES[(i + 1) % n] as number;
+    let d = h - c;
+    d = ((((d + 180) % 360) + 360) % 360) - 180;
+    const span = d >= 0 ? (next - c + 360) % 360 || 360 : (c - prev + 360) % 360 || 360;
+    const x = Math.abs(d) / span;
+    w[i] = x < 1 ? 0.5 + 0.5 * Math.cos(Math.PI * x) : 0;
+  }
+  return w;
+}
+
+export function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
+  const mx = Math.max(r, g, b);
+  const mn = Math.min(r, g, b);
+  const d = mx - mn;
+  let h = 0;
+  if (d > 1e-6) {
+    if (mx === r) h = ((g - b) / d) % 6;
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return [h, mx > 1e-6 ? d / mx : 0, mx];
+}
+export function hsvToRgb(h: number, s: number, v: number): [number, number, number] {
+  const hh = (((h % 360) + 360) % 360) / 60;
+  const c = v * s;
+  const x = c * (1 - Math.abs((hh % 2) - 1));
+  const m = v - c;
+  const i = Math.floor(hh);
+  const t: [number, number, number][] = [
+    [c, x, 0],
+    [x, c, 0],
+    [0, c, x],
+    [0, x, c],
+    [x, 0, c],
+    [c, 0, x],
+  ];
+  const [r, g, b] = t[Math.min(5, i)] as [number, number, number];
+  return [r + m, g + m, b + m];
+}
+
+/**
+ * Develops one pixel. `rgb` is linear light after geometry, `localLum` the blurred linear luminance of the
+ * neighbourhood (before exposure), `u, v` the pixel's position over the whole output (0–1, for the vignette).
+ * Returns linear light, ready for detail and sRGB encoding.
+ */
+export function developPixel(
+  rgb: [number, number, number],
+  localLum: number,
+  u: number,
+  v: number,
+  p: DevelopParams,
+): [number, number, number] {
+  let [r, g, b] = rgb;
+  // Exposure and white balance.
+  r *= p.gain * p.wb[0];
+  g *= p.gain * p.wb[1];
+  b *= p.gain * p.wb[2];
+  // Tone on perceptual luminance, applied as a ratio so hue is kept.
+  const lin = luma(r, g, b);
+  const y = encodeG(lin);
+  const base = encodeG(localLum * p.gain);
+  const y2 = tone(y, base, p);
+  const ratio = lin > 1e-5 ? decodeG(y2) / lin : decodeG(y2) / 1e-5;
+  if (lin > 1e-5) {
+    r *= ratio;
+    g *= ratio;
+    b *= ratio;
+  } else {
+    const add = decodeG(y2);
+    r = add;
+    g = add;
+    b = add;
+  }
+  // Vibrance (more on muted colours) and saturation, around luminance.
+  const Y = luma(r, g, b);
+  const mx = Math.max(r, g, b);
+  const mn = Math.min(r, g, b);
+  const sat = mx > 1e-5 ? (mx - mn) / mx : 0;
+  const k = Math.max(0, (1 + p.saturation) * (1 + p.vibrance * (1 - sat)));
+  r = Y + (r - Y) * k;
+  g = Y + (g - Y) * k;
+  b = Y + (b - Y) * k;
+  // Colour mixer, in perceptual HSV.
+  if (p.mixer.some(([a, s, l]) => a || s || l)) {
+    const [h, s, val] = rgbToHsv(encodeG(r), encodeG(g), encodeG(b));
+    const w = bandWeights(h);
+    let dh = 0;
+    let ds = 0;
+    let dl = 0;
+    for (let i = 0; i < w.length; i++) {
+      const m = p.mixer[i] as [number, number, number];
+      const wi = w[i] as number;
+      dh += wi * m[0];
+      ds += wi * m[1];
+      dl += wi * m[2];
+    }
+    const s2 = clamp(s * (1 + ds));
+    const v2 = Math.max(0, val * (1 + 0.5 * dl * s));
+    const [er, eg, eb] = hsvToRgb(h + 30 * dh, s2, v2);
+    r = decodeG(er);
+    g = decodeG(eg);
+    b = decodeG(eb);
+  }
+  // Vignette: an ellipse over the crop, darkening (negative) or lightening (positive) towards the corners.
+  if (p.vignette) {
+    const dx = (u - 0.5) * 2;
+    const dy = (v - 0.5) * 2;
+    const d = Math.sqrt(dx * dx + dy * dy) / Math.SQRT2;
+    const f = 1 + 0.85 * p.vignette * smoothstep(0.35, 1.0, d);
+    r *= f;
+    g *= f;
+    b *= f;
+  }
+  return [Math.max(0, r), Math.max(0, g), Math.max(0, b)];
+}
+
+/** Convenience for tests: develop an sRGB 8-bit pixel with a flat neighbourhood, back to sRGB 8-bit. */
+export function developSrgb8(
+  px: [number, number, number],
+  p: DevelopParams,
+  u = 0.5,
+  v = 0.5,
+  localLum?: number,
+): [number, number, number] {
+  const lin: [number, number, number] = [fromSrgb(px[0] / 255), fromSrgb(px[1] / 255), fromSrgb(px[2] / 255)];
+  const out = developPixel(lin, localLum ?? luma(...lin), u, v, p);
+  return out.map((c) => Math.round(toSrgb(c) * 255)) as [number, number, number];
+}

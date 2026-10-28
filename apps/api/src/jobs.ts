@@ -6,7 +6,15 @@
 import { gotrue } from './auth/gotrue';
 import type { Env } from './env';
 import { logError } from './http';
-import { deleteKeys, deletePrefix, type PurgeItem, parseKey, photoKey, stagingKey } from './library/storage';
+import {
+  deleteKeys,
+  deletePrefix,
+  LIBRARY_LIMITS,
+  type PurgeItem,
+  parseKey,
+  photoKey,
+  stagingKey,
+} from './library/storage';
 import { rpc } from './supabase';
 
 export const JOB_LIMITS = {
@@ -220,28 +228,40 @@ interface PhotoRowState {
   ownerId: string;
   status: 'uploading' | 'ready' | 'trashed' | 'purging';
   activeUpload: boolean;
+  editThumbVersion?: number | null;
+  editPreviewVersion?: number | null;
 }
 
 /**
  * Deletes photo objects (`u/`) nothing accounts for: keys whose photo row is gone or belongs to someone
- * else. Keys of existing photos (including in-flight uploads) and keys of any other shape are left alone;
- * `staging/` isn't swept (an R2 lifecycle rule empties it after 2 days).
+ * else, and edited variants (`edit-<version>-<kind>`) that aren't the version the photo's edit records,
+ * once they're over an hour old (a variant PUT may be between its write and its record). Keys of
+ * existing photos (including in-flight uploads) and keys of any other shape are left alone; `staging/`
+ * isn't swept (an R2 lifecycle rule empties it after 2 days).
  */
-export async function sweepOrphans(env: Env): Promise<number> {
+export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> {
   const cursor = await rpc<string | null>(env, 'get_job_state', { p_key: 'orphan_sweep_cursor' });
   const listed = await env.PHOTOS.list({
     prefix: 'u/',
     limit: JOB_LIMITS.sweepPage,
     ...(cursor ? { cursor } : {}),
   });
-  const parsed = listed.objects.map((o) => ({ key: o.key, k: parseKey(o.key) }));
+  const parsed = listed.objects.map((o) => ({
+    key: o.key,
+    k: parseKey(o.key),
+    uploaded: o.uploaded instanceof Date ? o.uploaded.getTime() : now,
+  }));
   const ids = [...new Set(parsed.flatMap((p) => (p.k ? [p.k.photo] : [])))];
   const rows = ids.length ? await rpc<PhotoRowState[]>(env, 'sweep_photo_rows', { p_ids: ids }) : [];
   const byId = new Map(rows.map((r) => [r.id, r]));
-  const orphans = parsed.flatMap(({ key, k }) => {
+  const orphans = parsed.flatMap(({ key, k, uploaded }) => {
     if (!k) return [];
     const row = byId.get(k.photo);
     if (!row || row.ownerId !== k.owner) return [key];
+    if (k.kind === 'edit') {
+      const recorded = k.variant === 'thumb' ? row.editThumbVersion : row.editPreviewVersion;
+      if (recorded !== k.version && now - uploaded > LIBRARY_LIMITS.editGraceMs) return [key];
+    }
     return [];
   });
   if (orphans.length) await deleteKeys(env.PHOTOS, orphans);

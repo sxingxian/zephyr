@@ -25,6 +25,14 @@
       "name": "UPLOAD_LIMITER",
       "namespace_id": "1002",
       "simple": { "limit": 240, "period": 60 }
+    },
+    {
+      // Edit writes per member (keyed by user id): saves, reverts, bulk paste/apply and recipe changes.
+      // The editor autosaves about once a second while a slider moves; 600 a minute is ample headroom.
+      // Edited-variant PUTs count against UPLOAD_LIMITER instead.
+      "name": "EDIT_LIMITER",
+      "namespace_id": "1003",
+      "simple": { "limit": 600, "period": 60 }
     }
   ],
   // Private photo bucket: no public access, no r2.dev URL. Every byte goes through this Worker.

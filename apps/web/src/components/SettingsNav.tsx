@@ -7,6 +7,7 @@ const ITEMS: { label: string; icon: IconName; to?: string }[] = [
   { label: 'Appearance', icon: 'sun' },
   { label: 'Plan & billing', icon: 'card' },
   { label: 'Privacy & data', icon: 'database' },
+  { label: 'About & licences', icon: 'info', to: '/settings/about' },
 ];
 
 export function SettingsNav() {

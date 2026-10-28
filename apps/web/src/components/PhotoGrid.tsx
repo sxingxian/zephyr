@@ -13,7 +13,7 @@ import {
   useState,
 } from 'react';
 import { dayKey, dayLabel, daysLeft } from '../lib/format';
-import { thumbUrl } from '../lib/library';
+import { editKey, thumbUrl } from '../lib/library';
 import { sortTime } from '../lib/photos';
 import { type GridLayout, gridMove, type Selection } from '../lib/selection';
 
@@ -427,7 +427,7 @@ function Tile({
   const [loaded, setLoaded] = useState(false);
   const raw = FILE_TYPES[p.fileType]?.raw;
   const days = trash ? daysLeft(p.purgeAt) : 0;
-  const name = `${p.filename}${p.favourite ? ', favourite' : ''}${selected ? ', selected' : ''}`;
+  const name = `${p.filename}${p.edit ? ', edited' : ''}${p.favourite ? ', favourite' : ''}${selected ? ', selected' : ''}`;
   return (
     <button
       type="button"
@@ -446,7 +446,7 @@ function Tile({
       <span className="tile__img">
         {p.hasThumb ? (
           <img
-            src={thumbUrl(p.id)}
+            src={thumbUrl(p.id, editKey(p))}
             alt=""
             loading="lazy"
             decoding="async"
@@ -466,6 +466,15 @@ function Tile({
       {p.favourite && !trash && (
         <span className="tile__fav" aria-hidden="true">
           <Icon name="heart" size={16} />
+        </span>
+      )}
+      {p.edit && !trash && (
+        <span
+          className={`tile__edited${p.edit.rendered ? '' : ' tile__edited--pending'}`}
+          title={p.edit.rendered ? 'Edited' : 'Edited · thumbnail updating'}
+          aria-hidden="true"
+        >
+          <Icon name="sliders" size={12} />
         </span>
       )}
       {trash ? (

@@ -117,7 +117,12 @@ export function usePhotoList(query: PhotoListQuery): PhotoList {
           setItems((prev) =>
             prev
               .map((p) => (byId.has(p.id) ? { ...p, ...byId.get(p.id) } : p))
-              .filter((p) => (cur.view === 'favourites' && byId.has(p.id) ? p.favourite : true)),
+              .filter((p) => (cur.view === 'favourites' && byId.has(p.id) ? p.favourite : true))
+              .filter((p) =>
+                cur.view === 'edited' && byId.has(p.id) && 'edit' in (byId.get(p.id) ?? {})
+                  ? Boolean(p.edit)
+                  : true,
+              ),
           );
         } else if (e.type === 'removed') {
           const gone = new Set(e.ids);

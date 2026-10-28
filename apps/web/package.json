@@ -8,10 +8,12 @@
     "build": "tsc --noEmit && vite build && node scripts/csp.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:gl": "node e2e/shader-check.mjs",
     "preview": "wrangler dev",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
+    "@colorhythm/libraw-wasm": "1.1.1",
     "@fontsource-variable/geist": "^5.2.0",
     "@fontsource-variable/geist-mono": "^5.2.0",
     "@simplewebauthn/browser": "^14.0.0",
@@ -20,22 +22,24 @@
     "@zephyr/shared": "workspace:*",
     "@zephyr/ui": "workspace:*",
     "exifr": "^7.1.3",
+    "fflate": "0.8.3",
     "hash-wasm": "^4.12.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-router": "^8.5.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261020.0",
+    "@testing-library/react": "^16.3.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.0",
-    "@testing-library/react": "^16.3.0",
     "jsdom": "^30.1.0",
+    "playwright": "1.63.0",
     "typescript": "6.0.3",
     "vite": "^8.3.0",
-    "vitest": "^4.0.0",
-    "@cloudflare/workers-types": "^5.20261020.0",
     "vite-plugin-pwa": "^2.0.0",
+    "vitest": "^4.0.0",
     "wrangler": "^4.150.0"
   }
 }

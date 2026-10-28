@@ -20,6 +20,8 @@ export const LIBRARY_LIMITS = {
   jsonBodyBytes: 32 * 1024,
   /** R2 deletes take at most 1,000 keys per call. */
   deleteBatch: 1000,
+  /** The orphan sweep leaves edited variants younger than this alone (a PUT may be between write and record). */
+  editGraceMs: 60 * 60 * 1000,
 } as const;
 
 export type PhotoKind = 'original' | 'thumb' | 'preview';
@@ -43,13 +45,49 @@ export const photoKeys = (owner: string, photo: string) => [
   stagingKey(owner, photo, 'preview'),
 ];
 
+/**
+ * `u/<owner>/p/<photo>/edit-<version>-<kind>`: an edited variant rendered from one edit version (phase 4).
+ * Versions never repeat for a photo, so a late PUT for an old version can't land on the current key.
+ */
+export const editKey = (owner: string, photo: string, version: number, kind: VariantKey) =>
+  `u/${owner}/p/${photo}/edit-${version}-${kind}`;
+
 const ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/(original|thumb|preview)$`);
-/** Parses a photo object key (`u/…`), or null for anything else. */
-export function parseKey(key: string): { owner: string; photo: string; kind: PhotoKind } | null {
+const EDIT_KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/edit-([1-9][0-9]{0,9})-(thumb|preview)$`);
+export type ParsedKey =
+  | { owner: string; photo: string; kind: PhotoKind }
+  | { owner: string; photo: string; kind: 'edit'; version: number; variant: VariantKey };
+/** Parses a photo object key (`u/…`, including edited variants), or null for anything else. */
+export function parseKey(key: string): ParsedKey | null {
   const m = KEY_RE.exec(key);
-  return m ? { owner: m[1] as string, photo: m[2] as string, kind: m[3] as PhotoKind } : null;
+  if (m) return { owner: m[1] as string, photo: m[2] as string, kind: m[3] as PhotoKind };
+  const e = EDIT_KEY_RE.exec(key);
+  if (e) {
+    return {
+      owner: e[1] as string,
+      photo: e[2] as string,
+      kind: 'edit',
+      version: Number(e[3]),
+      variant: e[4] as VariantKey,
+    };
+  }
+  return null;
 }
+
+/**
+ * Shared devices: a page started by one member must not keep writing into whoever signs in next. When
+ * the client says whose work this is (X-Zephyr-Expected-User), a different session user gets 409
+ * session_changed. Without the header the request is allowed (older clients). Only ever adds a refusal.
+ * Runs after requireMember.
+ */
+export const expectedUser: MiddlewareHandler<HonoEnv> = async (c, next) => {
+  const expected = c.req.header('X-Zephyr-Expected-User');
+  if (expected !== undefined && expected.trim().toLowerCase() !== c.get('session').userId.toLowerCase()) {
+    return c.json(fail('session_changed'), 409);
+  }
+  await next();
+};
 
 /** A member's key for durable rate limits: an HMAC of the user id, never the id itself. */
 export const memberHash = async (env: Env, userId: string) =>
@@ -106,7 +144,8 @@ const BINARY_TYPES = new Set(['application/octet-stream', 'image/jpeg', 'image/w
 export function libraryGuard(maxJsonBytes: number): MiddlewareHandler<HonoEnv> {
   const json = guardWrite((env) => list(env.APP_ORIGINS), maxJsonBytes);
   return async (c, next) => {
-    if (c.req.method !== 'PUT') return json(c, next);
+    // Saving an edit (PUT …/photos/:id/edit) is the one JSON PUT; every other PUT carries bytes.
+    if (c.req.method !== 'PUT' || /\/edit$/.test(c.req.path)) return json(c, next);
     const origin = c.req.header('Origin');
     if (!origin || !list(c.env.APP_ORIGINS).includes(origin)) return c.json(fail('forbidden'), 403);
     const type = (c.req.header('Content-Type') ?? '').split(';')[0]?.trim().toLowerCase() ?? '';

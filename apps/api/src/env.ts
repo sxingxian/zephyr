@@ -33,6 +33,8 @@ export interface Env {
   BURST_LIMITER: RateLimit;
   /** Per-member limit on upload part and variant PUTs (wrangler.jsonc ratelimits). */
   UPLOAD_LIMITER: RateLimit;
+  /** Per-member limit on edit and recipe writes (saves, reverts, bulk, recipes). */
+  EDIT_LIMITER: RateLimit;
   /** Private photo bucket (zephyr-photos): originals and variants under u/<ownerId>/p/<photoId>/. */
   PHOTOS: R2Bucket;
 }

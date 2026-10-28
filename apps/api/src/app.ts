@@ -8,6 +8,7 @@ import { inviteRoutes } from './routes/invites';
 import { meRoutes } from './routes/me';
 import { photoRoutes } from './routes/photos';
 import { publicRoutes } from './routes/public';
+import { recipeRoutes } from './routes/recipes';
 import { trashRoutes } from './routes/trash';
 import { uploadRoutes } from './routes/uploads';
 import type { HonoEnv } from './types';
@@ -57,6 +58,7 @@ app.route('/api/v1/uploads', uploadRoutes);
 app.route('/api/v1/photos', photoRoutes);
 app.route('/api/v1/albums', albumRoutes);
 app.route('/api/v1/trash', trashRoutes);
+app.route('/api/v1/recipes', recipeRoutes);
 // Admin console (zephyr.midnightpoetry.studio/admin, behind Cloudflare Access).
 app.route('/admin/api', adminRoutes);
 

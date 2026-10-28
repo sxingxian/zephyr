@@ -22,6 +22,8 @@ export const setLimiter = (ok: boolean) => {
 export const limiterKeys: string[] = [];
 /** Whether the per-member upload limiter allows the next PUT. */
 export const uploadLimiter = { ok: true, keys: [] as string[] };
+/** Whether the per-member edit limiter allows the next edit write. */
+export const editLimiter = { ok: true, keys: [] as string[] };
 /** The PHOTOS bucket binding. */
 export const r2 = new MockR2();
 
@@ -52,6 +54,12 @@ export const env: Env = {
     limit: async ({ key }: { key: string }) => {
       uploadLimiter.keys.push(key);
       return { success: uploadLimiter.ok };
+    },
+  } as unknown as RateLimit,
+  EDIT_LIMITER: {
+    limit: async ({ key }: { key: string }) => {
+      editLimiter.keys.push(key);
+      return { success: editLimiter.ok };
     },
   } as unknown as RateLimit,
   PHOTOS: r2 as unknown as R2Bucket,
@@ -192,6 +200,8 @@ export function resetWorld() {
   limiterKeys.length = 0;
   uploadLimiter.ok = true;
   uploadLimiter.keys.length = 0;
+  editLimiter.ok = true;
+  editLimiter.keys.length = 0;
   r2.reset();
   CODE_TIMING.floorMs = 0;
 }

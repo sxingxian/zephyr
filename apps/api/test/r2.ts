@@ -7,6 +7,7 @@ interface Stored {
   bytes: Uint8Array;
   contentType?: string;
   etag: string;
+  uploaded?: Date;
 }
 interface Multipart {
   key: string;
@@ -50,13 +51,19 @@ export class MockR2 {
       size: s.bytes.byteLength,
       etag: s.etag,
       httpEtag: `"${s.etag}"`,
-      uploaded: new Date(),
+      uploaded: s.uploaded ?? new Date(),
       httpMetadata: s.contentType ? { contentType: s.contentType } : {},
       customMetadata: {},
       checksums: {},
       storageClass: 'Standard',
       writeHttpMetadata: () => undefined,
     };
+  }
+
+  /** Makes an object look `ms` older (R2 list's `uploaded`). */
+  backdate(key: string, ms: number) {
+    const s = this.objects.get(key);
+    if (s) s.uploaded = new Date(Date.now() - ms);
   }
 
   async head(key: string) {

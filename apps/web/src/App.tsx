@@ -1,11 +1,13 @@
 import { ToastProvider } from '@zephyr/ui';
 import { useCallback } from 'react';
 import { createBrowserRouter, Outlet, type RouteObject, useLocation, useNavigate } from 'react-router';
+import { EditTray } from './components/editor/EditTray';
 import { PublicOnly, RequireAuth } from './components/Guards';
 import { LibraryHost } from './components/LibraryHost';
 import { UploadProvider } from './components/Uploads';
 import { safeReturnPath } from './lib/returnPath';
 import { SessionProvider, useSession } from './lib/session';
+import { About } from './routes/About';
 import { AccountDeleted } from './routes/AccountScheduled';
 import { AlbumsPage } from './routes/Albums';
 import { InviteFriends } from './routes/Invites';
@@ -17,12 +19,19 @@ import { SignInCode } from './routes/SignInCode';
 import { SignUp } from './routes/SignUp';
 import { TrashPage } from './routes/Trash';
 import { WelcomePasskey } from './routes/WelcomePasskey';
+import './lib/editor';
 import { You } from './routes/You';
 
 /** Uploads (picker, drag & drop, tray) for signed-in members, kept mounted across pages. */
 function Uploads({ children }: { children: React.ReactNode }) {
   const { user } = useSession();
-  return <UploadProvider enabled={Boolean(user && !user.pendingDeletion)}>{children}</UploadProvider>;
+  const on = Boolean(user && !user.pendingDeletion);
+  return (
+    <UploadProvider enabled={on}>
+      {children}
+      {on && <EditTray />}
+    </UploadProvider>
+  );
 }
 
 function Root() {
@@ -59,6 +68,7 @@ export const routes: RouteObject[] = [
           { path: '/favourites', element: null },
           { path: '/albums/:albumId', element: null },
           { path: '/photo/:photoId', element: null },
+          { path: '/edit/:photoId', element: null },
         ],
       },
       { path: '/albums', element: auth(<AlbumsPage />) },
@@ -73,6 +83,7 @@ export const routes: RouteObject[] = [
       { path: '/settings', element: auth(<Security />) },
       { path: '/settings/security', element: auth(<Security />) },
       { path: '/settings/invites', element: auth(<InviteFriends />) },
+      { path: '/settings/about', element: auth(<About />) },
       { path: '/you', element: auth(<You />) },
       { path: '*', element: <NotFound /> },
     ],

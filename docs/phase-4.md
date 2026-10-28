@@ -39,8 +39,13 @@ Out of scope: Zephyr AI (phase 6), local or brush adjustments, saved versions, a
 ## Recipe
 
 ```json
-{"v":1,"light":{"exposure":0.35,"highlights":-42},"color":{"temperature":12},
- "mixer":{"orange":{"saturation":-10}},"crop":{"aspect":"4:5","rect":{"x":0.12,"y":0,"w":0.64,"h":1},"angle":-2.4}}
+{
+  "v": 1,
+  "light": { "exposure": 0.35, "highlights": -42 },
+  "color": { "temperature": 12 },
+  "mixer": { "orange": { "saturation": -10 } },
+  "crop": { "aspect": "4:5", "rect": { "x": 0.12, "y": 0, "w": 0.64, "h": 1 }, "angle": -2.4 }
+}
 ```
 
 - `normalizeRecipe` is the only serialiser, and both the browser and the API run it. It:
@@ -76,6 +81,7 @@ One pipeline renders everything: the live view, edited thumbnails and previews, 
    - Live view: an RGBA8 canvas sized to the screen (at most 2560 px on the long edge); the full source is used only when zoomed to 100% or more.
    - Thumbnails and previews: FBO readback, then `OffscreenCanvas.convertToBlob` (WEBP, falling back to JPEG) within `VARIANT_LIMITS`.
    - Export: rendered in tiles whenever the output exceeds `MAX_TEXTURE_SIZE` or a 64 MP memory budget, then encoded as a JPEG. The canvas re-encode carries no metadata, so exports contain no GPS or camera serial.
+
 - **Performance:** dragging a slider re-runs only the develop and detail passes on a cached geometry texture, at the proxy size. This meets the ≥30 fps target (NFR-PERF-02), checked in the browser test.
 - **Correctness:** the colour maths lives in `apps/web/src/lib/editor/develop.ts` as a CPU reference. The shader is tested against it on a small image in Chromium (Playwright with SwiftShader), with a tolerance of ≤ 2/255.
 - **No WebGL 2:** the editor explains that it needs a newer browser. The library and viewer keep working.

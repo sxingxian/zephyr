@@ -168,6 +168,12 @@ export const putVariant = (uploadId: string, kind: VariantKind, bytes: Blob, sig
   putBytes(LIBRARY_API.uploadVariant(uploadId, kind), bytes, { contentType: bytes.type, signal });
 
 /** Same-origin media URLs (the session cookie authorises them). */
-export const thumbUrl = (id: string) => LIBRARY_API.photoFile(id, 'thumb');
-export const previewUrl = (id: string) => LIBRARY_API.photoFile(id, 'preview');
+/** `editVersion` busts the browser's memory cache once an edited thumbnail exists (the server revalidates anyway). */
+const bust = (v?: number | null) => (v ? `?e=${v}` : '');
+export const thumbUrl = (id: string, editVersion?: number | null) =>
+  `${LIBRARY_API.photoFile(id, 'thumb')}${bust(editVersion)}`;
+export const previewUrl = (id: string, editVersion?: number | null) =>
+  `${LIBRARY_API.photoFile(id, 'preview')}${bust(editVersion)}`;
+/** Cache key of a photo's current edited variants (0 when unedited or not rendered yet). */
+export const editKey = (p: Pick<PhotoItem, 'edit'>) => (p.edit?.rendered ? p.edit.version : 0);
 export const originalUrl = (id: string) => LIBRARY_API.photoFile(id, 'original');

@@ -35,6 +35,27 @@ export interface Photo {
   trashedAt: string | null;
   purgeAfter: string | null;
   publishPending?: boolean;
+  /** Only ever grows (phase 4): each save or revert takes the next number. */
+  editVersion?: number;
+}
+export interface Edit {
+  photoId: string;
+  owner: string;
+  recipe: Record<string, unknown>;
+  version: number;
+  thumbVersion: number | null;
+  thumbBytes: number;
+  previewVersion: number | null;
+  previewBytes: number;
+  updatedAt: string;
+}
+export interface Recipe {
+  id: string;
+  owner: string;
+  name: string;
+  recipe: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
 }
 export interface Upload {
   id: string;
@@ -71,6 +92,8 @@ export const db = {
   albums: new Map<string, Album>(),
   profiles: new Map<string, Profile>(),
   jobState: new Map<string, string | null>(),
+  edits: new Map<string, Edit>(),
+  recipes: new Map<string, Recipe>(),
   /** Every library RPC's p_owner, to prove the Worker only ever passes the session's user. */
   owners: [] as string[],
 };
@@ -81,6 +104,8 @@ export function resetDb() {
   db.albums.clear();
   db.profiles.clear();
   db.jobState.clear();
+  db.edits.clear();
+  db.recipes.clear();
   db.owners.length = 0;
 }
 
@@ -93,10 +118,34 @@ export const profile = (id: string): Profile => {
   return p;
 };
 export const prefix = (owner: string, photo: string) => `u/${owner}/p/${photo}/`;
+export const editKeyOf = (owner: string, photo: string, v: number, kind: 'thumb' | 'preview') =>
+  `${prefix(owner, photo)}edit-${v}-${kind}`;
+const editKeys = (e: Edit | undefined) =>
+  e
+    ? [
+        ...(e.thumbVersion ? [editKeyOf(e.owner, e.photoId, e.thumbVersion, 'thumb')] : []),
+        ...(e.previewVersion ? [editKeyOf(e.owner, e.photoId, e.previewVersion, 'preview')] : []),
+      ]
+    : [];
 const keys = (owner: string, photo: string) => [
   ...['original', 'thumb', 'preview'].map((k) => prefix(owner, photo) + k),
   ...['thumb', 'preview'].map((k) => `staging/${owner}/${photo}/${k}`),
+  ...editKeys(db.edits.get(photo)),
 ];
+const emptyRecipe = (r: Record<string, unknown> | null | undefined) => !r || Object.keys(r).length <= 1;
+const editBytes = (photo: string) => {
+  const e = db.edits.get(photo);
+  return e ? e.thumbBytes + e.previewBytes : 0;
+};
+export function editJson(e: Edit) {
+  return {
+    photoId: e.photoId,
+    recipe: e.recipe,
+    version: e.version,
+    rendered: e.thumbVersion === e.version && e.previewVersion === e.version,
+    updatedAt: e.updatedAt,
+  };
+}
 
 export function photoJson(p: Photo) {
   return {
@@ -111,6 +160,10 @@ export function photoJson(p: Photo) {
     favourite: p.favourite,
     hasThumb: p.thumb > 0,
     hasPreview: p.preview > 0,
+    edit: (() => {
+      const e = db.edits.get(p.id);
+      return e && !emptyRecipe(e.recipe) ? { version: e.version, rendered: editJson(e).rendered } : null;
+    })(),
     ...(p.status === 'trashed' ? { trashedAt: p.trashedAt, purgeAt: p.purgeAfter } : {}),
   };
 }
@@ -131,7 +184,7 @@ export function noDrift(owner: string): boolean {
   const p = profile(owner);
   const stored = [...db.photos.values()]
     .filter((x) => x.owner === owner && x.status !== 'uploading')
-    .reduce((n, x) => n + x.size + x.thumb + x.preview, 0);
+    .reduce((n, x) => n + x.size + x.thumb + x.preview + editBytes(x.id), 0);
   const reserved = [...db.uploads.values()]
     .filter((u) => u.owner === owner)
     .reduce((n, u) => n + u.reserved, 0);
@@ -349,6 +402,7 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
       const items = [...db.photos.values()]
         .filter((p) => p.owner === owner && p.status === status)
         .filter((p) => a.p_view !== 'favourites' || p.favourite)
+        .filter((p) => a.p_view !== 'edited' || !emptyRecipe(db.edits.get(p.id)?.recipe))
         .filter((p) => !album || album.photos.has(p.id))
         .filter((p) => !a.p_q || p.filename.toLowerCase().includes(String(a.p_q).toLowerCase()))
         .map(photoJson);
@@ -361,18 +415,29 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
       const albums = [...db.albums.values()]
         .filter((al) => al.owner === owner && al.photos.has(p.id))
         .map((al) => ({ id: al.id, name: al.name }));
-      return { ...photoJson(p), metadata: p.metadata, albums };
+      const e = db.edits.get(p.id);
+      return {
+        ...photoJson(p),
+        metadata: p.metadata,
+        albums,
+        recipe: e && !emptyRecipe(e.recipe) ? e.recipe : null,
+      };
     },
     photo_file: (a) => {
       const owner = own(a);
       const p = db.photos.get(String(a.p_id));
       if (!p || p.owner !== owner || !['ready', 'trashed'].includes(p.status)) return null;
+      const e = db.edits.get(p.id);
+      const live = e && !emptyRecipe(e.recipe);
       return {
         fileType: p.fileType,
         filename: p.filename,
         sizeBytes: p.size,
         hasThumb: p.thumb > 0,
         hasPreview: p.preview > 0,
+        editVersion: e?.version ?? null,
+        editThumbVersion: live && e.thumbVersion === e.version ? e.version : null,
+        editPreviewVersion: live && e.previewVersion === e.version ? e.version : null,
       };
     },
     patch_photo: (a) => {
@@ -473,7 +538,7 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
         limitBytes: rules.storage,
         trashBytes: mine
           .filter((x) => x.status === 'trashed' || x.status === 'purging')
-          .reduce((n, x) => n + x.size + x.thumb + x.preview, 0),
+          .reduce((n, x) => n + x.size + x.thumb + x.preview + editBytes(x.id), 0),
         photoCount: mine.filter((x) => x.status === 'ready').length,
         plan: p.plan,
         fileTypes: rules.types,
@@ -536,8 +601,9 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
       for (const id of a.p_ids as string[]) {
         const p = db.photos.get(id);
         if (p?.status !== 'purging') continue;
+        profile(p.owner).storage -= p.size + p.thumb + p.preview + editBytes(id);
         db.photos.delete(id);
-        profile(p.owner).storage -= p.size + p.thumb + p.preview;
+        db.edits.delete(id);
         n++;
       }
       return n;
@@ -559,7 +625,17 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
         const p = db.photos.get(id);
         if (!p) return [];
         const activeUpload = [...db.uploads.values()].some((u) => u.photoId === id);
-        return [{ id, ownerId: p.owner, status: p.status, activeUpload }];
+        const e = db.edits.get(id);
+        return [
+          {
+            id,
+            ownerId: p.owner,
+            status: p.status,
+            activeUpload,
+            editThumbVersion: e?.thumbVersion ?? null,
+            editPreviewVersion: e?.previewVersion ?? null,
+          },
+        ];
       }),
     get_job_state: (a) => db.jobState.get(String(a.p_key)) ?? null,
     set_job_state: (a) => {
@@ -568,6 +644,175 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
     },
     purge_rate_limits: () => 0,
     record_cleanup: () => null,
+    ...editorRpc(),
+  };
+}
+
+const readyOf = (a: Args, id: unknown) => {
+  const p = db.photos.get(String(id));
+  return p && p.owner === own(a) && p.status === 'ready' ? p : null;
+};
+
+/** The editor's functions (supabase/migrations/…_editor.sql), same contract, in memory. */
+function editorRpc(): Record<string, (a: Args) => unknown> {
+  const recipeJson = (r: Recipe) => ({
+    id: r.id,
+    name: r.name,
+    recipe: r.recipe,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  });
+  const validRecipe = (r: unknown) =>
+    Boolean(r && typeof r === 'object' && (r as { v?: unknown }).v === 1 && JSON.stringify(r).length <= 4096);
+  const nextVersion = (p: Photo) => {
+    p.editVersion = (p.editVersion ?? 0) + 1;
+    return p.editVersion;
+  };
+  const upsert = (p: Photo, recipe: Record<string, unknown>) => {
+    const v = nextVersion(p);
+    const old = db.edits.get(p.id);
+    const e: Edit = old
+      ? { ...old, recipe, version: v, updatedAt: new Date().toISOString() }
+      : {
+          photoId: p.id,
+          owner: p.owner,
+          recipe,
+          version: v,
+          thumbVersion: null,
+          thumbBytes: 0,
+          previewVersion: null,
+          previewBytes: 0,
+          updatedAt: new Date().toISOString(),
+        };
+    db.edits.set(p.id, e);
+    return e;
+  };
+  const revert = (p: Photo) => {
+    const e = db.edits.get(p.id);
+    if (!e) return [];
+    db.edits.delete(p.id);
+    nextVersion(p);
+    profile(p.owner).storage -= e.thumbBytes + e.previewBytes;
+    return editKeys(e);
+  };
+  return {
+    get_edit: (a) => {
+      const p = readyOf(a, a.p_photo);
+      if (!p) return null;
+      const e = db.edits.get(p.id);
+      return { edit: e ? editJson(e) : null };
+    },
+    save_edit: (a) => {
+      if (!validRecipe(a.p_recipe)) return { status: 'invalid' };
+      const p = readyOf(a, a.p_photo);
+      if (!p) return null;
+      const cur = db.edits.get(p.id);
+      if ((cur?.version ?? null) !== (a.p_base_version ?? null)) {
+        return { status: 'conflict', edit: cur ? editJson(cur) : null };
+      }
+      return { status: 'ok', edit: editJson(upsert(p, a.p_recipe as Record<string, unknown>)) };
+    },
+    delete_edit: (a) => {
+      const p = readyOf(a, a.p_photo);
+      if (!p) return null;
+      return { keys: revert(p) };
+    },
+    record_edit_variant: (a) => {
+      const kind = String(a.p_kind);
+      const bytes = Number(a.p_bytes);
+      const cap = kind === 'thumb' ? 307200 : kind === 'preview' ? 1572864 : 0;
+      if (!cap || !(bytes >= 1 && bytes <= cap)) return { status: 'invalid' };
+      const p = readyOf(a, a.p_photo);
+      const e = p ? db.edits.get(p.id) : undefined;
+      const v = Number(a.p_version);
+      if (!p || !e || e.version !== v) return { status: 'gone' };
+      const oldV = kind === 'thumb' ? e.thumbVersion : e.previewVersion;
+      const oldBytes = kind === 'thumb' ? e.thumbBytes : e.previewBytes;
+      const prof = profile(p.owner);
+      const delta = bytes - oldBytes;
+      if (delta > 0 && prof.storage + prof.reserved + delta > PLANS[prof.plan].storage)
+        return { status: 'storage_full' };
+      if (kind === 'thumb') Object.assign(e, { thumbVersion: v, thumbBytes: bytes });
+      else Object.assign(e, { previewVersion: v, previewBytes: bytes });
+      prof.storage += delta;
+      return {
+        status: 'ok',
+        previousKey: oldV && oldV !== v ? editKeyOf(p.owner, p.id, oldV, kind as 'thumb' | 'preview') : null,
+      };
+    },
+    bulk_edit_state: (a) => {
+      const owner = own(a);
+      const items = (a.p_ids as string[])
+        .map((id) => db.photos.get(id))
+        .filter((p): p is Photo => p?.owner === owner && p.status === 'ready')
+        .map((p) => {
+          const e = db.edits.get(p.id);
+          return { photoId: p.id, version: e?.version ?? null, recipe: e?.recipe ?? null };
+        });
+      return { batchSize: PLANS[profile(owner).plan].batch, items };
+    },
+    apply_bulk_edits: (a) => {
+      const items = a.p_items as {
+        photoId: string;
+        baseVersion: number | null;
+        recipe: Record<string, unknown> | null;
+      }[];
+      if (items.some((it) => it.recipe !== null && !validRecipe(it.recipe))) return { error: 'invalid' };
+      const applied: unknown[] = [];
+      const conflicts: string[] = [];
+      const dropped: string[] = [];
+      for (const it of items) {
+        const p = readyOf(a, it.photoId);
+        if (!p) continue;
+        const cur = db.edits.get(p.id);
+        if ((cur?.version ?? null) !== it.baseVersion) {
+          conflicts.push(p.id);
+          continue;
+        }
+        if (it.recipe === null) {
+          if (!cur) continue;
+          dropped.push(...revert(p));
+          applied.push({ photoId: p.id, edit: null });
+        } else {
+          applied.push({ photoId: p.id, edit: editJson(upsert(p, it.recipe)) });
+        }
+      }
+      return { applied, conflicts, keys: dropped };
+    },
+    list_recipes: (a) => {
+      const owner = own(a);
+      return [...db.recipes.values()].filter((r) => r.owner === owner).map(recipeJson);
+    },
+    create_recipe: (a) => {
+      const owner = own(a);
+      if (!validRecipe(a.p_recipe) || 'crop' in (a.p_recipe as object)) return { error: 'invalid' };
+      if ([...db.recipes.values()].filter((r) => r.owner === owner).length >= 200) return { error: 'limit' };
+      const now = new Date().toISOString();
+      const r: Recipe = {
+        id: crypto.randomUUID(),
+        owner,
+        name: String(a.p_name),
+        recipe: a.p_recipe as Record<string, unknown>,
+        createdAt: now,
+        updatedAt: now,
+      };
+      db.recipes.set(r.id, r);
+      return recipeJson(r);
+    },
+    update_recipe: (a) => {
+      const r = db.recipes.get(String(a.p_id));
+      if (!r || r.owner !== own(a)) return null;
+      if (a.p_name) r.name = String(a.p_name);
+      if (a.p_recipe) r.recipe = a.p_recipe as Record<string, unknown>;
+      r.updatedAt = new Date().toISOString();
+      return recipeJson(r);
+    },
+    delete_recipe: (a) => {
+      const r = db.recipes.get(String(a.p_id));
+      if (!r || r.owner !== own(a)) return null;
+      db.recipes.delete(r.id);
+      return true;
+    },
   };
 }
 

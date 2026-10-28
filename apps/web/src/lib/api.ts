@@ -6,6 +6,8 @@ export class ApiFailure extends Error {
     readonly code: ApiErrorCode | 'network',
     readonly status: number,
     readonly retryAfter?: number,
+    /** The error response body, when it carried more than the code (e.g. 409 conflict → the current edit). */
+    readonly body?: unknown,
   ) {
     super(code);
     this.name = 'ApiFailure';
@@ -36,7 +38,7 @@ export function notifyFailure(failure: ApiFailure, quiet401?: boolean): void {
 }
 
 export interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   /** Don't trigger the global sign-in redirect on 401 (used by the session probe itself). */
   quiet401?: boolean;
@@ -78,7 +80,7 @@ export function toFailure(status: number, body: unknown, retryHeader: string | n
       ? (b.error as ApiErrorCode)
       : fallback(status);
   const retry = Number(retryHeader) || (typeof b?.retryAfter === 'number' ? b.retryAfter : undefined);
-  return new ApiFailure(code, status, code === 'rate_limited' ? retry || 60 : undefined);
+  return new ApiFailure(code, status, code === 'rate_limited' ? retry || 60 : undefined, body ?? undefined);
 }
 function fallback(status: number): ApiErrorCode {
   if (status === 401) return 'unauthenticated';

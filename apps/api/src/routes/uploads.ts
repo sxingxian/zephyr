@@ -19,6 +19,7 @@ import {
   contentLength,
   deleteKeys,
   exactLength,
+  expectedUser,
   LIBRARY_LIMITS,
   libraryGuard,
   memberHash,
@@ -37,18 +38,8 @@ import { requireMember } from './session-helpers';
 export const uploadRoutes = new Hono<HonoEnv>();
 uploadRoutes.use('*', libraryGuard(LIBRARY_LIMITS.uploadCreateBodyBytes));
 uploadRoutes.use('*', requireMember);
-/**
- * Shared devices: a page started by one member must not keep uploading into whoever signs in next. When
- * the client says whose upload this is (X-Zephyr-Expected-User), a different session user gets 409
- * session_changed. Without the header the request is allowed (older clients).
- */
-uploadRoutes.use('*', async (c, next) => {
-  const expected = c.req.header('X-Zephyr-Expected-User');
-  if (expected !== undefined && expected.trim().toLowerCase() !== c.get('session').userId.toLowerCase()) {
-    return c.json(fail('session_changed'), 409);
-  }
-  await next();
-});
+// Shared devices: see expectedUser (X-Zephyr-Expected-User → 409 session_changed).
+uploadRoutes.use('*', expectedUser);
 
 interface UploadRow {
   uploadId: string;
