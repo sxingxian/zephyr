@@ -17,7 +17,7 @@ export type Source =
       width: number;
       height: number;
     }
-  /** Linear RGBA half floats (RAW), top row first. */
+  /** Linear RGBA half floats (RAW, scene-linear: gets the RAW base curve), top row first. */
   | { kind: 'half'; data: Uint16Array; width: number; height: number };
 
 export interface RenderOptions {
@@ -31,7 +31,7 @@ export interface RenderOptions {
   split?: number;
   /** Develop nothing (the "Before" view still applies no geometry either when `raw` is set). */
   before?: boolean;
-  /** Exposure added for RAW sources (their linear data has no camera tone curve). */
+  /** Baseline exposure for RAW sources, applied before their base curve (see rawCommon.ts). */
   baselineEv?: number;
 }
 
@@ -70,6 +70,8 @@ export class Renderer {
   private src: WebGLTexture | null = null;
   private srcSize: Size = { width: 1, height: 1 };
   private srcMipmapped = false;
+  /** The source is scene-linear RAW data: it gets the RAW base curve. */
+  private srcRaw = false;
   private targets = new Map<string, Target>();
   private geomKey = '';
   private lost = false;
@@ -236,6 +238,7 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     this.src = tex;
     this.srcSize = { width: s.width, height: s.height };
+    this.srcRaw = s.kind === 'half';
     this.geomKey = '';
   }
   get hasSource(): boolean {
@@ -291,10 +294,12 @@ export class Renderer {
     baselineEv: number,
   ) {
     const gl = this.gl;
-    const d = developParams(recipe, aspect, baselineEv);
+    const d = developParams(recipe, aspect, baselineEv, this.srcRaw);
     this.draw(this.program('develop', DEVELOP), out, out.w, out.h, (p) => {
       this.bindTex(p, 'u_src', 0, geom.tex);
       this.bindTex(p, 'u_lum', 1, lum.tex);
+      gl.uniform1f(this.u(p, 'u_base'), d.baseGain);
+      gl.uniform1i(this.u(p, 'u_raw'), d.raw ? 1 : 0);
       gl.uniform1f(this.u(p, 'u_gain'), d.gain);
       gl.uniform3f(this.u(p, 'u_wb'), d.wb[0], d.wb[1], d.wb[2]);
       gl.uniform1f(this.u(p, 'u_highlights'), d.highlights);

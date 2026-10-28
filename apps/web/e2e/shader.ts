@@ -5,6 +5,7 @@
 import type { EditRecipe } from '@zephyr/shared/client';
 import { developParams, developPixel, fromSrgb, luma, toSrgb } from '../src/lib/editor/develop';
 import { Renderer } from '../src/lib/editor/gl';
+import { toHalf } from '../src/lib/editor/rawCommon';
 
 type Result = { name: string; maxDiff: number; pixels: number };
 
@@ -77,7 +78,75 @@ function compare(name: string, r: Renderer, src: HTMLCanvasElement, recipe: Edit
   return { name, maxDiff, pixels: w * h };
 }
 
+/** IEEE half float bits → number (the precision the GPU sees). */
+function fromHalf(h: number): number {
+  const e = (h >> 10) & 0x1f;
+  const m = h & 0x3ff;
+  if (e === 0) return m * 2 ** -24;
+  return (1 + m / 1024) * 2 ** (e - 15);
+}
+
+/**
+ * Scene-linear RAW-like data (half floats): a hue sweep across, a 13-stop brightness ramp down (≈ 0.0005…4,
+ * well past white so the shoulder and gamut fit are exercised), a grey strip at the bottom.
+ */
+function makeRaw(w: number, h: number, flat?: [number, number, number]) {
+  const data = new Uint16Array(w * h * 4);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      let rgb: [number, number, number];
+      if (flat) rgb = flat;
+      else {
+        const v = 4 * 2 ** (-13 * (y / h));
+        const s = y > h * 0.85 ? 0 : 0.8;
+        const hue = (x / w) * 6;
+        const k = (n: number) => {
+          const t = (n + hue) % 6;
+          return 1 - s * Math.max(0, Math.min(1, Math.min(t, 4 - t)));
+        };
+        rgb = [v * k(5), v * k(3), v * k(1)];
+      }
+      data[i] = toHalf(rgb[0]);
+      data[i + 1] = toHalf(rgb[1]);
+      data[i + 2] = toHalf(rgb[2]);
+      data[i + 3] = 0x3c00;
+    }
+  return { data, width: w, height: h };
+}
+
+function compareRaw(
+  name: string,
+  r: Renderer,
+  src: { data: Uint16Array; width: number; height: number },
+  recipe: EditRecipe,
+  baselineEv: number,
+): Result {
+  const { width: w, height: h, data } = src;
+  r.setSource({ kind: 'half', data, width: w, height: h });
+  const out = r.renderPixels({ recipe, width: w, height: h, baselineEv });
+  const p = developParams(recipe, w / h, baselineEv, true);
+  let maxDiff = 0;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const lin: [number, number, number] = [
+        fromHalf(data[i] as number),
+        fromHalf(data[i + 1] as number),
+        fromHalf(data[i + 2] as number),
+      ];
+      const d = developPixel(lin, luma(...lin), (x + 0.5) / w, (y + 0.5) / h, p);
+      for (let k = 0; k < 3; k++) {
+        const want = Math.round(toSrgb(d[k] as number) * 255);
+        maxDiff = Math.max(maxDiff, Math.abs(want - (out[i + k] as number)));
+      }
+    }
+  return { name: `RAW ${name}`, maxDiff, pixels: w * h };
+}
+
 async function run() {
+  // Let the page finish loading first: the checks below are long and synchronous.
+  await new Promise((resolve) => setTimeout(resolve, 0));
   const r = new Renderer();
   const results: Result[] = [];
   const grad = makeImage(96, 64);
@@ -121,6 +190,45 @@ async function run() {
         v: 1,
         light: { highlights: -80, shadows: 70 },
       }),
+    );
+  }
+
+  // RAW sources: baseline exposure and the base curve before the recipe.
+  const rawGrad = makeRaw(96, 64);
+  const rawCases: [string, EditRecipe, number][] = [
+    ['neutral', { v: 1 }, 0],
+    ['baseline +1.2 EV', { v: 1 }, 1.2],
+    ['baseline −0.7 EV', { v: 1 }, -0.7],
+    [
+      'edited',
+      {
+        v: 1,
+        light: { exposure: 0.4, contrast: 25, whites: -20, blacks: 15 },
+        color: { temperature: 30, tint: -10, vibrance: 25 },
+        mixer: { orange: { hue: 20, saturation: -30 }, blue: { luminance: 30 } },
+        effects: { vignette: -40 },
+      },
+      0.6,
+    ],
+    ['mono', { v: 1, color: { saturation: -100 } }, 0.3],
+  ];
+  for (const [n, rec, ev] of rawCases) results.push(compareRaw(n, r, rawGrad, rec, ev));
+  for (const tone of [
+    [2.5, 2.2, 1.8],
+    [0.01, 0.012, 0.02],
+    [0.18, 0.16, 0.14],
+  ] as [number, number, number][]) {
+    results.push(
+      compareRaw(
+        `highlights/shadows on ${tone.join(',')}`,
+        r,
+        makeRaw(32, 24, tone),
+        {
+          v: 1,
+          light: { highlights: -80, shadows: 70 },
+        },
+        0.5,
+      ),
     );
   }
 

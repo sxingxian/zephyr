@@ -1,4 +1,5 @@
 import { type EditRecipe, HUE_BANDS, normalizeRecipe } from '@zephyr/shared/client';
+import { rawBase, rawCurve } from './rawCommon';
 
 /**
  * The develop maths, written once in TypeScript as the reference for the GLSL in shaders.ts. Both read the
@@ -7,9 +8,17 @@ import { type EditRecipe, HUE_BANDS, normalizeRecipe } from '@zephyr/shared/clie
  *
  * Working space: linear-light Rec. 709 / sRGB primaries. Tone and colour-mixer steps run on a perceptual
  * (gamma 2.2) encoding of luminance or colour, then go back to linear.
+ *
+ * RAW sources are scene-linear: they first get their baseline exposure and the RAW base curve (rawCommon.ts),
+ * which turns them into the same display-referred linear light a decoded JPEG gives. Every slider then acts
+ * on that, so the same recipe behaves the same on a RAW and on a JPEG.
  */
 export interface DevelopParams {
-  /** Exposure multiplier (2^ev, including the RAW baseline). */
+  /** RAW baseline exposure multiplier (2^baselineEv), applied before the base curve. 1 for other sources. */
+  baseGain: number;
+  /** Apply the RAW base curve (RAW sources only). */
+  raw: boolean;
+  /** The recipe's exposure multiplier (2^ev). */
   gain: number;
   /** White-balance channel multipliers, luminance-normalised. */
   wb: [number, number, number];
@@ -28,6 +37,8 @@ export interface DevelopParams {
 }
 
 export const NEUTRAL: DevelopParams = {
+  baseGain: 1,
+  raw: false,
   gain: 1,
   wb: [1, 1, 1],
   highlights: 0,
@@ -60,13 +71,16 @@ export function developParams(
   recipe: EditRecipe | null | undefined,
   aspect = 1.5,
   baselineEv = 0,
+  raw = false,
 ): DevelopParams {
   const r = normalizeRecipe(recipe);
   const L = r.light ?? {};
   const C = r.color ?? {};
   const pct = (v: number | undefined) => (v ?? 0) / 100;
   return {
-    gain: 2 ** ((L.exposure ?? 0) + baselineEv),
+    baseGain: 2 ** baselineEv,
+    raw,
+    gain: 2 ** (L.exposure ?? 0),
     wb: whiteBalance(C.temperature ?? 0, C.tint ?? 0),
     highlights: pct(L.highlights),
     shadows: pct(L.shadows),
@@ -169,6 +183,12 @@ export function hsvToRgb(h: number, s: number, v: number): [number, number, numb
   return [r + m, g + m, b + m];
 }
 
+/** Baseline exposure, then (RAW only) the base curve: the photo as it looks before any edit. */
+export function developBase(rgb: [number, number, number], p: DevelopParams): [number, number, number] {
+  const c: [number, number, number] = [rgb[0] * p.baseGain, rgb[1] * p.baseGain, rgb[2] * p.baseGain];
+  return p.raw ? rawBase(c) : c;
+}
+
 /**
  * Develops one pixel. `rgb` is linear light after geometry, `localLum` the blurred linear luminance of the
  * neighbourhood (before exposure), `u, v` the pixel's position over the whole output (0–1, for the vignette).
@@ -181,7 +201,10 @@ export function developPixel(
   v: number,
   p: DevelopParams,
 ): [number, number, number] {
-  let [r, g, b] = rgb;
+  let [r, g, b] = developBase(rgb, p);
+  // The neighbourhood goes through the same base development (on its luminance).
+  const lum0 = localLum * p.baseGain;
+  const local = p.raw ? rawCurve(lum0) : lum0;
   // Exposure and white balance.
   r *= p.gain * p.wb[0];
   g *= p.gain * p.wb[1];
@@ -189,7 +212,7 @@ export function developPixel(
   // Tone on perceptual luminance, applied as a ratio so hue is kept.
   const lin = luma(r, g, b);
   const y = encodeG(lin);
-  const base = encodeG(localLum * p.gain);
+  const base = encodeG(local * p.gain);
   const y2 = tone(y, base, p);
   const ratio = lin > 1e-5 ? decodeG(y2) / lin : decodeG(y2) / 1e-5;
   if (lin > 1e-5) {

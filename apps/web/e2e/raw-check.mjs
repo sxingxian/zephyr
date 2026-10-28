@@ -59,7 +59,7 @@ try {
     if (res.preview) save('raw-camera-jpeg', res.preview.png);
     for (const [k, v] of Object.entries(res.shots)) save(`raw-${k}`, v);
     const { shots: _s, preview, ...rest } = res;
-    console.log(JSON.stringify({ ...rest, preview: preview && { w: preview.w, h: preview.h } }, null, 1));
+    console.log(JSON.stringify({ ...rest, preview: preview && { w: preview.w, h: preview.h } }));
   }
 } finally {
   await browser.close();

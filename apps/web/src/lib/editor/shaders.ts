@@ -2,10 +2,15 @@
  * GLSL ES 3.00 for the editor. The develop shader mirrors develop.ts line for line; keep them in step (a
  * browser test compares the two).
  *
+ * The RAW base curve comes from rawCommon.ts (RAW_CURVE_GLSL), generated from the same constants as the CPU
+ * version.
+ *
  * Convention: every off-screen pass maps fragment row 0 to the TOP of the image (uv.y grows downwards), so
  * readPixels returns rows top-first and textures read back the right way up. Only the blit to the visible
  * canvas flips.
  */
+import { RAW_CURVE_GLSL } from './rawCommon';
+
 export const VERT = `#version 300 es
 in vec2 a_pos;
 void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`;
@@ -70,6 +75,8 @@ void main() {
 export const DEVELOP = `${HEAD}
 uniform sampler2D u_src;
 uniform sampler2D u_lum;
+uniform float u_base;   // RAW baseline exposure multiplier (1 for other sources)
+uniform bool u_raw;     // apply the RAW base curve
 uniform float u_gain;
 uniform vec3 u_wb;
 uniform float u_highlights, u_shadows, u_whites, u_blacks, u_contrast;
@@ -80,6 +87,11 @@ uniform vec4 u_region; // this render's part of the whole output (x, y, w, h)
 uniform float u_split; // < 0: off; else output-uv x below which the original is shown
 
 const float BH[8] = float[8](0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0);
+${RAW_CURVE_GLSL}
+vec3 developBase(vec3 c) {
+  c *= u_base;
+  return u_raw ? rawBase(c) : c;
+}
 
 float tone(float y, float base) {
   float m = 0.7 * base + 0.3 * y;
@@ -139,12 +151,15 @@ float bandWeight(float h, int i) {
 
 void main() {
   vec2 uv = fragUv();
-  vec3 src = texture(u_src, uv).rgb;
-  if (u_split >= 0.0 && uv.x < u_split) { o = vec4(toSrgb(src), 1.0); return; }
-  vec3 c = src * u_gain * u_wb;
+  vec3 c = developBase(texture(u_src, uv).rgb);
+  // Split view: the original (as it looks before any edit) on the left.
+  if (u_split >= 0.0 && uv.x < u_split) { o = vec4(toSrgb(c), 1.0); return; }
+  float lum0 = texture(u_lum, uv).r * u_base;
+  float local = u_raw ? rawCurve(lum0) : lum0;
+  c *= u_gain * u_wb;
   float lin = luma(c);
   float y = encG(lin);
-  float base = encG(texture(u_lum, uv).r * u_gain);
+  float base = encG(local * u_gain);
   float y2 = tone(y, base);
   if (lin > 1e-5) c *= decG(y2) / lin; else c = vec3(decG(y2));
   float Y = luma(c);

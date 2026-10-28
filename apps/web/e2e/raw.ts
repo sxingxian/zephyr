@@ -26,6 +26,42 @@ function toDataUrl(px: Uint8Array, w: number, h: number): string {
   );
   return c.toDataURL('image/png');
 }
+/** Luminance percentiles (sRGB 0–255 of linear luminance) and mean saturation of RGBA8 pixels. */
+function stats(px: Uint8ClampedArray | Uint8Array): Record<string, number> {
+  const lin = (v: number) => {
+    const c = v / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  const enc = (x: number) => Math.round(255 * (x <= 0.0031308 ? 12.92 * x : 1.055 * x ** (1 / 2.4) - 0.055));
+  const ls: number[] = [];
+  let sat = 0;
+  let satN = 0;
+  for (let i = 0; i < px.length; i += 4) {
+    const r = px[i] as number;
+    const g = px[i + 1] as number;
+    const b = px[i + 2] as number;
+    const l = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+    ls.push(l);
+    // Saturation only where it isn't dominated by noise (sRGB luminance ≥ 40).
+    const mx = Math.max(r, g, b);
+    if (l >= lin(40) && mx > 0) {
+      sat += (mx - Math.min(r, g, b)) / mx;
+      satN++;
+    }
+  }
+  ls.sort((a, b) => a - b);
+  const q = (p: number) => enc(ls[Math.min(ls.length - 1, Math.floor(p * ls.length))] as number);
+  return {
+    p5: q(0.05),
+    p25: q(0.25),
+    p50: q(0.5),
+    p75: q(0.75),
+    p90: q(0.9),
+    p99: q(0.99),
+    p999: q(0.999),
+    sat: satN ? Math.round((1000 * sat) / satN) / 1000 : 0,
+  };
+}
 const mem = () =>
   (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? 0;
 
@@ -41,6 +77,9 @@ async function run() {
     c.height = Math.round(bmp.height * k);
     (c.getContext('2d') as CanvasRenderingContext2D).drawImage(bmp, 0, 0, c.width, c.height);
     out.preview = { w: bmp.width, h: bmp.height, png: c.toDataURL('image/png') };
+    out.cameraStats = stats(
+      (c.getContext('2d') as CanvasRenderingContext2D).getImageData(0, 0, c.width, c.height).data,
+    );
   }
   const m0 = mem();
   let t = performance.now();
@@ -84,6 +123,7 @@ async function run() {
     t = performance.now();
     const px = gl.renderPixels({ recipe, width: s.width, height: s.height, baselineEv: half.baselineEv });
     shots[`half-${name}`] = toDataUrl(px, s.width, s.height);
+    if (name === 'neutral') out.neutralStats = stats(px);
     out[`render-${name}-ms`] = Math.round(performance.now() - t);
   }
   // Full-size decode rendered with the half-size baseline (what export does), downscaled for viewing.

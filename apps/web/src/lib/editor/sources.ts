@@ -4,6 +4,7 @@ import { originalPreviewUrl } from '../edits';
 import { originalUrl } from '../library';
 import type { Source } from './gl';
 import { decodeRaw } from './raw';
+import { onEditorReset } from './resets';
 
 export interface LoadedSource {
   source: Source;
@@ -96,3 +97,5 @@ export async function loadOriginal(
 export function releaseSource(s: Source | null | undefined): void {
   if (s?.kind === 'bitmap' && 'close' in s.bitmap) (s.bitmap as ImageBitmap).close();
 }
+
+onEditorReset(clearRawBaselines);

@@ -1,4 +1,5 @@
 import { Renderer, type RenderOptions } from './gl';
+import { onEditorReset } from './resets';
 
 /** One off-screen renderer shared by the thumbnail queue and exports (one at a time). */
 let shared: Renderer | null = null;
@@ -22,3 +23,5 @@ export function disposeBackgroundRenderer(): void {
 }
 
 export type { RenderOptions };
+
+onEditorReset(disposeBackgroundRenderer);

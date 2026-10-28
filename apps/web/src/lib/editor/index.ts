@@ -2,6 +2,7 @@ import { onSessionEnd } from '../sessionGuard';
 import { clearCopied } from './clipboard';
 import { renderQueue } from './queue';
 import { stopRawDecoder } from './raw';
+import { runEditorResets } from './resets';
 
 /**
  * Editor state that outlives a page (copied edits, the thumbnail queue, the RAW worker) is dropped when
@@ -15,8 +16,8 @@ export function wireEditorSessionReset(): void {
     clearCopied();
     renderQueue.reset();
     stopRawDecoder();
-    void import('./background').then((m) => m.disposeBackgroundRenderer());
-    void import('./sources').then((m) => m.clearRawBaselines());
+    // The background renderer and the RAW exposure cache, if they were ever loaded.
+    runEditorResets();
   });
 }
 wireEditorSessionReset();

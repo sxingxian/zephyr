@@ -26,7 +26,16 @@ import {
 } from './geometry';
 import { exportName, uniqueNames } from './names';
 import { RenderQueue } from './queue';
-import { halfLut, isTiff, rawBaselineEv, srgb8ToLinear, toHalf } from './rawCommon';
+import {
+  halfLut,
+  isTiff,
+  rawBase,
+  rawBaselineEv,
+  rawCurve,
+  rawCurveInverse,
+  srgb8ToLinear,
+  toHalf,
+} from './rawCommon';
 import { EditSession, HISTORY_LIMIT } from './session';
 
 const close = (a: number, b: number, eps = 1e-6) => expect(Math.abs(a - b)).toBeLessThan(eps);
@@ -190,18 +199,68 @@ describe('RAW helpers', () => {
   });
 });
 
+describe('RAW base curve', () => {
+  it('keeps middle grey, rises steadily and never reaches white', () => {
+    expect(rawCurve(0.18)).toBeCloseTo(0.18, 6);
+    let prev = 0;
+    for (let ev = -14; ev <= 8; ev += 0.25) {
+      const y = rawCurve(0.18 * 2 ** ev);
+      expect(y).toBeGreaterThan(prev);
+      expect(y).toBeLessThan(1);
+      prev = y;
+    }
+  });
+  it('adds midtone contrast and rolls highlights off instead of clipping them', () => {
+    // One stop above grey comes out more than one stop up; scene white and far above stay below 1.
+    expect(Math.log2(rawCurve(0.36) / 0.18)).toBeGreaterThan(1.3);
+    expect(Math.log2(0.18 / rawCurve(0.09))).toBeGreaterThan(1.2);
+    expect(rawCurve(1)).toBeGreaterThan(0.8);
+    expect(rawCurve(16)).toBeLessThan(1);
+  });
+  it('inverts', () => {
+    for (const y of [0.001, 0.02, 0.18, 0.5, 0.9]) expect(rawCurve(rawCurveInverse(y))).toBeCloseTo(y, 6);
+  });
+  it('keeps hue and fits bright colours into gamut', () => {
+    const [r, g, b] = rawBase([0.3, 0.15, 0.05]);
+    expect(r).toBeGreaterThan(g);
+    expect(g).toBeGreaterThan(b);
+    const hot = rawBase([12, 3, 0.5]);
+    expect(Math.max(...hot)).toBeLessThanOrEqual(1 + 1e-9);
+    expect(hot[0]).toBeGreaterThan(hot[2]); // still red, not white
+  });
+  it('applies only to RAW sources, before the recipe', () => {
+    const p = developParams({ v: 1, light: { exposure: 1 } }, 1.5, 0.5, true);
+    close(p.baseGain, 2 ** 0.5);
+    close(p.gain, 2);
+    expect(p.raw).toBe(true);
+    expect(developParams(null).raw).toBe(false);
+    // Neutral RAW = baseline then curve; neutral non-RAW = unchanged.
+    const raw = developPixel([0.09, 0.09, 0.09], 0.09, 0.5, 0.5, developParams(null, 1.5, 1, true));
+    close(raw[1], rawCurve(0.18), 1e-6);
+    const jpeg = developPixel([0.09, 0.09, 0.09], 0.09, 0.5, 0.5, developParams(null));
+    close(jpeg[1], 0.09, 1e-6);
+  });
+});
+
 describe('RAW baseline exposure', () => {
   const fill = (v: number, n = 400) => Array.from({ length: n }, (_, i) => v * (0.5 + (i % 10) / 10));
-  it('matches the camera JPEG’s median brightness, so night stays night', () => {
+  const median = (a: number[]) => [...a].sort((x, y) => x - y)[a.length >> 1] as number;
+  it('puts the RAW median, after the base curve, where the camera JPEG has it', () => {
     const raw = fill(0.04);
-    expect(rawBaselineEv(raw, fill(0.01))).toBe(-1); // −2 EV, clamped at −1
-    expect(rawBaselineEv(raw, fill(0.08))).toBe(1);
-    expect(rawBaselineEv(raw, fill(0.04))).toBe(0);
-    expect(rawBaselineEv(fill(0.001), fill(0.5))).toBe(3); // clamped at +3 EV
+    for (const j of [0.02, 0.05, 0.12]) {
+      const ev = rawBaselineEv(raw, fill(j));
+      expect(rawCurve(median(raw) * 2 ** ev)).toBeCloseTo(median(fill(j)), 2);
+    }
+  });
+  it('clamps to −1…+3 EV, so night stays night', () => {
+    expect(rawBaselineEv(fill(0.04), fill(0.0005))).toBe(-1);
+    expect(rawBaselineEv(fill(0.0005), fill(0.5))).toBe(3);
   });
   it('falls back to the log-average without a usable JPEG', () => {
-    expect(rawBaselineEv(fill(0.1), null)).toBeCloseTo(0.1, 1);
-    expect(rawBaselineEv(fill(0.001), null)).toBe(2);
+    const ev = rawBaselineEv(fill(0.05), null);
+    expect(ev).toBeGreaterThan(0);
+    expect(ev).toBeLessThan(2);
+    expect(rawBaselineEv(fill(0.0001), null)).toBe(2);
     expect(rawBaselineEv(fill(0.04), fill(0.04).slice(0, 10))).toBe(rawBaselineEv(fill(0.04), null));
   });
   it('decodes sRGB', () => {
