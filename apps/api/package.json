@@ -13,7 +13,8 @@
   "dependencies": {
     "@zephyr/shared": "workspace:*",
     "hono": "^4.13.0",
-    "zod": "^4.1.0"
+    "zod": "^4.1.0",
+    "jose": "^6.2.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261020.0",
