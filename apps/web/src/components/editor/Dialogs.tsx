@@ -13,7 +13,7 @@ import { type FormEvent, useEffect, useId, useState } from 'react';
 import { ApiFailure, errorMessage } from '../../lib/api';
 import { SECTION_HINTS, SECTION_LABELS } from '../../lib/editor/controls';
 import type { ExportSize } from '../../lib/editor/exporter';
-import { estimateJpegBytes, exportName } from '../../lib/editor/names';
+import { ExportProblem, estimateJpegBytes, exportName, zipTooBig } from '../../lib/editor/names';
 import { listRecipes } from '../../lib/edits';
 import { formatBytes, formatOf, useUsage } from '../../lib/usage';
 
@@ -304,6 +304,9 @@ export function ExportDialog({
   })();
   const each = estimateJpegBytes(pixels, quality / 100);
   const total = each * photos.length;
+  // A .zip that can't stream to disk is held in memory: too big a one would crash the tab.
+  const streams = typeof (window as { showSaveFilePicker?: unknown }).showSaveFilePicker === 'function';
+  const zipWarn = batch && !streams ? zipTooBig(total, photos.length, size === 'full') : null;
   const run = async (kind: 'download' | 'copy') => {
     setBusy(kind);
     setError(null);
@@ -313,7 +316,8 @@ export function ExportDialog({
       await fn(choice(), (d, t) => setProgress([d, t]));
       onClose();
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') setError(errorMessage(e));
+      if ((e as Error).name === 'AbortError') return;
+      setError(e instanceof ExportProblem ? e.message : errorMessage(e));
     } finally {
       setBusy(null);
     }
@@ -360,7 +364,8 @@ export function ExportDialog({
             kind="primary"
             icon="download"
             busy={busy === 'download'}
-            disabled={Boolean(busy)}
+            disabled={Boolean(busy) || Boolean(zipWarn)}
+            title={zipWarn ?? undefined}
             onClick={() => run('download')}
           >
             {batch ? 'Download .zip' : 'Download'}
@@ -453,6 +458,12 @@ export function ExportDialog({
             onChange={(e) => setName(e.target.value)}
             mono
           />
+        )}
+        {zipWarn && (
+          <p className="ewarn" role="status">
+            <Icon name="alert" size={16} />
+            <span>{zipWarn}</span>
+          </p>
         )}
         <p className="eprivacy">
           <Icon name="shieldCheck" size={16} />

@@ -9,6 +9,7 @@ import { logError } from './http';
 import {
   deleteKeys,
   deletePrefix,
+  isNonCanonicalPhotoKey,
   LIBRARY_LIMITS,
   type PurgeItem,
   parseKey,
@@ -228,13 +229,15 @@ interface PhotoRowState {
   ownerId: string;
   status: 'uploading' | 'ready' | 'trashed' | 'purging';
   activeUpload: boolean;
-  editThumbVersion?: number | null;
-  editPreviewVersion?: number | null;
+  /** The edited-variant objects the photo's edit records (the only `edit-*` keys that count). */
+  editThumbKey?: string | null;
+  editPreviewKey?: string | null;
 }
 
 /**
  * Deletes photo objects (`u/`) nothing accounts for: keys whose photo row is gone or belongs to someone
- * else, and edited variants (`edit-<version>-<kind>`) that aren't the version the photo's edit records,
+ * else, keys whose ids aren't spelled in canonical lower case, and edited variants
+ * (`edit-<version>-<kind>-<nonce>`) that aren't the object the photo's edit records,
  * once they're over an hour old (a variant PUT may be between its write and its record). Keys of
  * existing photos (including in-flight uploads) and keys of any other shape are left alone; `staging/`
  * isn't swept (an R2 lifecycle rule empties it after 2 days).
@@ -255,12 +258,15 @@ export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> 
   const rows = ids.length ? await rpc<PhotoRowState[]>(env, 'sweep_photo_rows', { p_ids: ids }) : [];
   const byId = new Map(rows.map((r) => [r.id, r]));
   const orphans = parsed.flatMap(({ key, k, uploaded }) => {
-    if (!k) return [];
+    // Ids spelled in another case: never recorded or counted, whatever its age.
+    if (!k) return isNonCanonicalPhotoKey(key) ? [key] : [];
     const row = byId.get(k.photo);
     if (!row || row.ownerId !== k.owner) return [key];
     if (k.kind === 'edit') {
-      const recorded = k.variant === 'thumb' ? row.editThumbVersion : row.editPreviewVersion;
-      if (recorded !== k.version && now - uploaded > LIBRARY_LIMITS.editGraceMs) return [key];
+      // Every PUT writes its own key, so a key that isn't the recorded one is never going to be: once it's
+      // older than any PUT can take between its write and its record, it goes.
+      const recorded = k.variant === 'thumb' ? row.editThumbKey : row.editPreviewKey;
+      if (recorded !== key && now - uploaded > LIBRARY_LIMITS.editGraceMs) return [key];
     }
     return [];
   });

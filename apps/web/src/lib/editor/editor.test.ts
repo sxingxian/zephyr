@@ -331,7 +331,7 @@ describe('EditSession', () => {
     expect(save).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(200);
     expect(save).toHaveBeenCalledTimes(1);
-    expect(save).toHaveBeenCalledWith('p1', { v: 1, color: { tint: 12 } }, 3);
+    expect(save).toHaveBeenCalledWith('p1', { v: 1, color: { tint: 12 } }, 3, expect.any(AbortSignal));
     expect(s.getSnapshot().status).toBe('saved');
     expect(s.getSnapshot().version).toBe(4);
     expect(onSaved).toHaveBeenCalledWith('p1', expect.objectContaining({ version: 4 }), {
@@ -345,7 +345,7 @@ describe('EditSession', () => {
     const s = new EditSession('p1', edit(2, { v: 1, light: { exposure: 1 } }), { save: vi.fn(), remove });
     s.revert();
     await s.flush();
-    expect(remove).toHaveBeenCalledWith('p1');
+    expect(remove).toHaveBeenCalledWith('p1', expect.any(AbortSignal));
     expect(s.getSnapshot().version).toBeNull();
     s.undo();
     expect(s.getSnapshot().recipe).toEqual({ v: 1, light: { exposure: 1 } });
@@ -368,7 +368,7 @@ describe('EditSession', () => {
     s.keepMine();
     await vi.runAllTimersAsync();
     await s.flush();
-    expect(save).toHaveBeenLastCalledWith('p1', { v: 1, light: { exposure: 1 } }, 9);
+    expect(save).toHaveBeenLastCalledWith('p1', { v: 1, light: { exposure: 1 } }, 9, expect.any(AbortSignal));
     expect(s.getSnapshot().version).toBe(10);
   });
 
@@ -422,8 +422,8 @@ describe('RenderQueue', () => {
     ]);
     for (let i = 0; i < 5; i++) await settle();
     expect(d.render).toHaveBeenCalledTimes(1);
-    expect(d.put).toHaveBeenCalledWith('a', 'thumb', 5, blob);
-    expect(d.put).toHaveBeenCalledWith('a', 'preview', 5, blob);
+    expect(d.put).toHaveBeenCalledWith('a', 'thumb', 5, blob, 'u1');
+    expect(d.put).toHaveBeenCalledWith('a', 'preview', 5, blob, 'u1');
     expect(d.onRendered).toHaveBeenCalledWith('a', 5);
   });
 
@@ -445,7 +445,7 @@ describe('RenderQueue', () => {
     );
     for (let i = 0; i < 5; i++) await settle();
     expect(d.render).not.toHaveBeenCalled();
-    expect(d.put).toHaveBeenCalledWith('r', 'thumb', 5, own);
+    expect(d.put).toHaveBeenCalledWith('r', 'thumb', 5, own, 'u1');
     // A failed editor render falls back to the stored preview.
     q.enqueue(
       [

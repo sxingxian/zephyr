@@ -295,6 +295,11 @@ export interface EditBulkResult {
   affected: number;
   /** New state per affected photo (null: reverted). The browser renders thumbnails for these. */
   edits: { photoId: string; edit: PhotoEdit | null }[];
+  /**
+   * Photos left unchanged because they kept being edited elsewhere while this request merged into them
+   * (optional for older servers). The client can offer to try them again.
+   */
+  skipped?: string[];
 }
 
 export interface SavedRecipe {

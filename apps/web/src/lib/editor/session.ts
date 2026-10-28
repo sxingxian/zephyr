@@ -7,6 +7,7 @@ import {
   recipeJson,
 } from '@zephyr/shared/client';
 import { ApiFailure, errorMessage } from '../api';
+import { onEditorReset } from './resets';
 
 /**
  * One photo's edit while the editor is open: the current recipe, undo/redo history, and autosave.
@@ -30,14 +31,23 @@ export interface EditSnapshot {
 }
 
 export interface EditDeps {
-  save(photoId: string, recipe: EditRecipe, baseVersion: number | null): Promise<PhotoEdit>;
-  remove(photoId: string): Promise<void>;
+  /** `signal` aborts when the session closes (the member signed out or someone else signed in). */
+  save(
+    photoId: string,
+    recipe: EditRecipe,
+    baseVersion: number | null,
+    signal: AbortSignal,
+  ): Promise<PhotoEdit>;
+  remove(photoId: string, signal: AbortSignal): Promise<void>;
   /** A save landed: render edited thumbnails for this version (null: reverted). */
   onSaved?(photoId: string, edit: PhotoEdit | null, recipe: EditRecipe): void;
   debounceMs?: number;
 }
 
 export const HISTORY_LIMIT = 100;
+
+/** Every open session, so the end of a member's session can close them all (shared devices). */
+const open = new Set<EditSession>();
 
 export class EditSession {
   private recipe: EditRecipe;
@@ -54,12 +64,19 @@ export class EditSession {
   private subs = new Set<() => void>();
   private snap: EditSnapshot;
   private closed = false;
+  private ctrl = new AbortController();
 
+  /**
+   * `owner` is the member who opened the photo. The caller binds it into `deps` (every save names that
+   * member), and the session is closed when that member's session ends.
+   */
   constructor(
     readonly photoId: string,
     initial: PhotoEdit | null,
     private deps: EditDeps,
+    readonly owner: string | null = null,
   ) {
+    open.add(this);
     this.recipe = normalizeRecipe(initial?.recipe ?? EMPTY_RECIPE);
     this.committed = this.recipe;
     this.savedJson = recipeJson(this.recipe);
@@ -149,6 +166,7 @@ export class EditSession {
   async flush(): Promise<void> {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    if (this.closed) return;
     if (this.inflight) {
       await this.inflight;
     }
@@ -180,12 +198,12 @@ export class EditSession {
   private async write(target: EditRecipe, json: string): Promise<void> {
     try {
       if (isEmptyRecipe(target)) {
-        if (this.version !== null) await this.deps.remove(this.photoId);
+        if (this.version !== null) await this.deps.remove(this.photoId, this.ctrl.signal);
         this.version = null;
         this.savedJson = json;
         this.deps.onSaved?.(this.photoId, null, target);
       } else {
-        const edit = await this.deps.save(this.photoId, target, this.version);
+        const edit = await this.deps.save(this.photoId, target, this.version, this.ctrl.signal);
         this.version = edit.version;
         this.savedJson = json;
         this.deps.onSaved?.(this.photoId, edit, target);
@@ -193,6 +211,7 @@ export class EditSession {
       this.status = recipeJson(this.committed) === this.savedJson ? 'saved' : 'pending';
       this.error = null;
     } catch (e) {
+      if (this.closed) return; // aborted because the session ended: nothing to show
       if (e instanceof ApiFailure && e.code === 'conflict') {
         const edit = (e.body as { edit?: PhotoEdit } | undefined)?.edit ?? null;
         this.status = 'conflict';
@@ -240,11 +259,28 @@ export class EditSession {
     return recipeJson(this.committed) !== this.savedJson || this.status === 'saving';
   }
 
-  /** Stops autosave without saving (session ended). */
+  /** Stops autosave and aborts any save in flight, without saving (left the photo, or the session ended). */
   close(): void {
     this.closed = true;
+    open.delete(this);
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    this.ctrl.abort();
     this.subs.clear();
   }
+  get isClosed(): boolean {
+    return this.closed;
+  }
 }
+
+/**
+ * The member's session ended. On a deliberate sign-out the session is still valid, so unsaved edits are
+ * saved first (signing out waits a few seconds at most); otherwise nothing more is sent. Either way every
+ * open session is closed, so no autosave or retry can go out under the next member.
+ */
+export async function closeEditSessions(saveFirst: boolean): Promise<void> {
+  const all = [...open];
+  if (saveFirst) await Promise.all(all.map((s) => s.flush().catch(() => undefined)));
+  for (const s of all) s.close();
+}
+onEditorReset(({ server }) => closeEditSessions(server));

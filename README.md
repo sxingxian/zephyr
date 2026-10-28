@@ -6,13 +6,13 @@ AI photo editing and private passcode galleries, by Midnight Poetry Studio.
 | -------------------- | ---------------------------------- | --------------------------------------- |
 | Landing page         | zephyr.midnightpoetry.studio       | `apps/landing` (Astro)                  |
 | API                  | `/api/*` on both hosts             | `apps/api` (Hono on Cloudflare Workers) |
-| App (PWA)            | zephyrapp.midnightpoetry.studio    | `apps/web` (next phase)                 |
-| Admin                | zephyr.midnightpoetry.studio/admin | `apps/admin` (next phase)               |
+| App (PWA)            | zephyrapp.midnightpoetry.studio    | `apps/web` (React + Vite)               |
+| Admin                | zephyr.midnightpoetry.studio/admin | `apps/admin` (React + Vite)             |
 | Database and sign-in | Supabase                           | `supabase/`                             |
 
-Status: **phase 3**: the photo library (uploads to private storage, library, viewer, albums, trash, account
-deletion) on top of accounts, invites and the invite-only landing page. See [docs/roadmap.md](docs/roadmap.md),
-[docs/phase-2.md](docs/phase-2.md) and [docs/phase-3.md](docs/phase-3.md).
+Status: **phase 4**: the editor (adjustments, crop, recipes, copy/paste and batch edits, RAW decoding, export) on top
+of the photo library, accounts, invites and the invite-only landing page. See [docs/roadmap.md](docs/roadmap.md),
+[docs/phase-2.md](docs/phase-2.md), [docs/phase-3.md](docs/phase-3.md) and [docs/phase-4.md](docs/phase-4.md).
 
 ## Layout
 

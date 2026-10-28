@@ -13,7 +13,7 @@ import {
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { background, fail, logError, rateLimited, readBody } from '../http';
 import { imageInfo } from '../library/files';
-import { contentLength, deleteKeys, editKey, expectedUser, readExact, UUID } from '../library/storage';
+import { contentLength, deleteKeys, expectedUser, newEditKey, readExact, UUID } from '../library/storage';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 
@@ -130,46 +130,60 @@ editRoutes.put('/:id/edit/variants/:kind', async (c) => {
     if (len === null) return c.json(fail('invalid'), 411);
     if (len > limits.maxBytes) return c.json(fail('too_large'), 413);
     if (len < 1) return c.json(fail('invalid'), 400);
-    // Cheap pre-check so a stale render (the common case after quick edits) never touches R2.
-    const current = await rpc<{ edit: PhotoEdit | null } | null>(c.env, 'get_edit', {
+    // Checked before anything is written: a stale render (common after quick edits) or a repeat of one
+    // already stored (a retry, a second tab) never touches R2.
+    const check = await rpc<{ status: 'current' | 'exists' | 'stale' } | null>(c.env, 'edit_variant_check', {
       p_owner: owner,
       p_photo: id,
+      p_version: version,
+      p_kind: kind,
     });
-    if (!current) return c.json(fail('not_found'), 404);
-    if (current.edit?.version !== version) return c.json(fail('conflict'), 410);
+    if (!check) return c.json(fail('not_found'), 404);
+    if (check.status === 'stale') return c.json(fail('conflict'), 410);
+    if (check.status === 'exists') return c.json({ ok: true });
     const bytes = await readExact(c.req.raw.body, len);
     if (!bytes) return c.json(fail('invalid'), 400);
     const info = imageInfo(bytes);
     if (!info) return c.json(fail('invalid'), 415);
     if (info.width > limits.maxEdge || info.height > limits.maxEdge) return c.json(fail('invalid'), 400);
 
-    // Each version has its own key; the database decides (under the storage lock) whether it counts.
-    const key = editKey(owner, id, version, kind);
-    await c.env.PHOTOS.put(key, bytes, {
-      httpMetadata: { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' },
-    });
-    const head = await c.env.PHOTOS.head(key);
-    if (!head) return c.json(fail('server'), 500);
-    const res = await rpc<{
-      status: 'ok' | 'gone' | 'storage_full' | 'invalid';
-      previousKey?: string | null;
-    }>(c.env, 'record_edit_variant', {
-      p_owner: owner,
-      p_photo: id,
-      p_version: version,
-      p_kind: kind,
-      p_bytes: head.size,
-    });
-    if (res.status === 'ok') {
-      if (res.previousKey) await dropLater(c, [res.previousKey], 'edit_variant_replace');
-      return c.json({ ok: true });
+    // This request's own key: nothing else ever writes it, and on any failure only it is deleted, so a
+    // live, counted variant can't be overwritten or removed by another request. The database decides
+    // (under the storage lock) whether it is the one that counts.
+    const key = newEditKey(owner, id, version, kind);
+    let recorded = false;
+    try {
+      await c.env.PHOTOS.put(key, bytes, {
+        httpMetadata: { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' },
+      });
+      const head = await c.env.PHOTOS.head(key);
+      if (!head) return c.json(fail('server'), 500);
+      const res = await rpc<{
+        status: 'ok' | 'exists' | 'gone' | 'storage_full' | 'invalid';
+        previousKey?: string | null;
+      }>(c.env, 'record_edit_variant', {
+        p_owner: owner,
+        p_photo: id,
+        p_version: version,
+        p_kind: kind,
+        p_key: key,
+        p_bytes: head.size,
+      });
+      if (res.status === 'ok') {
+        recorded = true;
+        if (res.previousKey && res.previousKey !== key) {
+          await dropLater(c, [res.previousKey], 'edit_variant_replace');
+        }
+        return c.json({ ok: true });
+      }
+      if (res.status === 'exists') return c.json({ ok: true });
+      if (res.status === 'storage_full') return c.json(fail('storage_full'), 413);
+      if (res.status === 'gone') return c.json(fail('conflict'), 410);
+      return c.json(fail('invalid'), 400);
+    } finally {
+      // Not recorded (lost, duplicate, full, failed or thrown): this object must not stay.
+      if (!recorded) await dropLater(c, [key], 'edit_variant_unstore');
     }
-    // Not counted: this object must not stay. A version that's no longer current reuses nothing, so
-    // deleting its key can't touch a live variant.
-    await dropLater(c, [key], 'edit_variant_unstore');
-    if (res.status === 'storage_full') return c.json(fail('storage_full'), 413);
-    if (res.status === 'gone') return c.json(fail('conflict'), 410);
-    return c.json(fail('invalid'), 400);
   } catch (err) {
     logError(c.get('requestId'), 'edit_variant', err);
     return c.json(fail('server'), 500);
@@ -234,7 +248,13 @@ editRoutes.post('/edits/bulk', async (c) => {
       pending = res.conflicts ?? [];
     }
     await dropLater(c, drop, 'edit_bulk_r2');
-    return c.json({ ok: true, affected: applied.length, edits: applied } satisfies EditBulkResult);
+    // Photos still changing under us after every attempt are left as they are, and the client is told.
+    return c.json({
+      ok: true,
+      affected: applied.length,
+      edits: applied,
+      skipped: pending,
+    } satisfies EditBulkResult);
   } catch (err) {
     logError(c.get('requestId'), 'edit_bulk', err);
     return c.json(fail('server'), 500);

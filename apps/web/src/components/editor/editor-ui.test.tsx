@@ -106,7 +106,7 @@ describe('batch paste', () => {
       ['color'],
       'Pasting',
     );
-    expect(n).toBe(2);
+    expect(n).toEqual({ affected: 2, skipped: 0 });
     expect(bulkBodies[0]).toEqual({
       ids: ['a', 'b'],
       recipe: { v: 1, color: { tint: 5 } },

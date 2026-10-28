@@ -99,6 +99,10 @@ async function stored(owner: string, over: Partial<Photo> = {}) {
   });
   return p;
 }
+const NONCE = 'a'.repeat(32);
+/** Edited-variant keys end in a per-request nonce: look them up by their version/kind prefix. */
+const editObjects = (pfx: string) => [...r2.objects.keys()].filter((k) => k.startsWith(pfx));
+const hasKey = (pfx: string) => editObjects(pfx).length > 0;
 const warm: EditRecipe = { v: 1, light: { exposure: 0.4 }, color: { temperature: 20 } };
 const save = (
   j: Jar,
@@ -234,7 +238,7 @@ describe('edited variants', () => {
     const j = await signedIn(MEI);
     const p = await stored(MEI.id);
     const v = await renderedEdit(j, p.id);
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(true);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(true);
     expect(must(db.edits.get(p.id))).toMatchObject({ thumbBytes: 3000, previewBytes: 9000 });
     expect(noDrift(MEI.id)).toBe(true);
     expect((await read(await call(EDIT_API.photoEdit(p.id), { jar: j }))).edit.rendered).toBe(true);
@@ -269,8 +273,8 @@ describe('edited variants', () => {
     expect(
       (await put(EDIT_API.photoEditVariant(p.id, 'thumb', v2), jpegVariant(512, 384, 2500), j)).status,
     ).toBe(200);
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(false);
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v2, 'thumb'))).toBe(true);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(false);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v2, 'thumb'))).toBe(true);
     expect(
       (await (await call(LIBRARY_API.photoFile(p.id, 'thumb'), { jar: j })).arrayBuffer()).byteLength,
     ).toBe(2500);
@@ -301,7 +305,7 @@ describe('edited variants', () => {
     });
     const res = await put(EDIT_API.photoEditVariant(p.id, 'preview', v1), jpegVariant(2048, 1536, 8000), j);
     expect(res.status).toBe(410);
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v1, 'preview'))).toBe(false);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v1, 'preview'))).toBe(false);
     expect(must(db.edits.get(p.id)).previewBytes).toBe(0);
     expect(noDrift(MEI.id)).toBe(true);
   });
@@ -338,7 +342,7 @@ describe('edited variants', () => {
     const res = await put(EDIT_API.photoEditVariant(p.id, 'preview', v), jpegVariant(2048, 1536, 9000), j);
     expect(res.status).toBe(413);
     expect((await read(res)).error).toBe('storage_full');
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v, 'preview'))).toBe(false);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v, 'preview'))).toBe(false);
     expect(db.edits.get(p.id)?.version).toBe(v);
   });
 
@@ -380,8 +384,8 @@ describe('revert and library views', () => {
     const v = await renderedEdit(j, p.id);
     expect((await call(EDIT_API.photoEdit(p.id), { jar: j, method: 'DELETE' })).status).toBe(204);
     expect(db.edits.has(p.id)).toBe(false);
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(false);
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v, 'preview'))).toBe(false);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(false);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v, 'preview'))).toBe(false);
     expect(noDrift(MEI.id)).toBe(true);
     // A render that was in flight for the reverted version can't come back.
     expect((await put(EDIT_API.photoEditVariant(p.id, 'thumb', v), jpegVariant(10, 10), j)).status).toBe(410);
@@ -450,7 +454,7 @@ describe('bulk paste, apply and revert', () => {
     const v = await renderedEdit(j, a.id);
     const res = await read(await bulk(j, { ids: [a.id, b.id], recipe: null, sections: [] }));
     expect(res).toMatchObject({ ok: true, affected: 1, edits: [{ photoId: a.id, edit: null }] });
-    expect(r2.objects.has(editKeyOf(MEI.id, a.id, v, 'thumb'))).toBe(false);
+    expect(hasKey(editKeyOf(MEI.id, a.id, v, 'thumb'))).toBe(false);
     expect(noDrift(MEI.id)).toBe(true);
   });
 
@@ -579,7 +583,7 @@ describe('clean-up knows about edited variants', () => {
       (await call(LIBRARY_API.photosBulk, { jar: j, body: { ids: [p.id], action: 'delete_forever' } }))
         .status,
     ).toBe(200);
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(false);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(false);
     expect(db.photos.has(p.id)).toBe(false);
     expect(db.edits.has(p.id)).toBe(false);
     expect(profile(MEI.id).storage).toBe(0);
@@ -589,21 +593,21 @@ describe('clean-up knows about edited variants', () => {
     const j = await signedIn(MEI);
     const p = await stored(MEI.id);
     const v = await renderedEdit(j, p.id);
-    const stale = editKeyOf(MEI.id, p.id, v + 5, 'thumb');
-    const fresh = editKeyOf(MEI.id, p.id, v + 6, 'preview');
-    const ghost = editKeyOf(MEI.id, crypto.randomUUID(), 1, 'thumb');
+    const stale = editKeyOf(MEI.id, p.id, v + 5, 'thumb') + NONCE;
+    const fresh = editKeyOf(MEI.id, p.id, v + 6, 'preview') + NONCE;
+    const ghost = editKeyOf(MEI.id, crypto.randomUUID(), 1, 'thumb') + NONCE;
     await r2.put(stale, 'x');
     await r2.put(fresh, 'x');
     await r2.put(ghost, 'x');
     r2.backdate(stale, 2 * 3600_000);
-    r2.backdate(editKeyOf(MEI.id, p.id, v, 'thumb'), 2 * 3600_000);
+    r2.backdate(must(must(db.edits.get(p.id)).thumbKey), 2 * 3600_000);
     const counts = await runCleanup(env);
     expect(counts.orphansDeleted).toBe(2);
     expect(r2.objects.has(stale)).toBe(false);
     expect(r2.objects.has(ghost)).toBe(false);
     expect(r2.objects.has(fresh)).toBe(true);
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(true);
-    expect(r2.objects.has(editKeyOf(MEI.id, p.id, v, 'preview'))).toBe(true);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(true);
+    expect(hasKey(editKeyOf(MEI.id, p.id, v, 'preview'))).toBe(true);
   });
 });
 
@@ -613,5 +617,190 @@ describe('editor constants match the migration', () => {
     expect(migration).toContain(`thumb_bytes between 0 and ${VARIANT_LIMITS.thumb.maxBytes}`);
     expect(migration).toContain(`preview_bytes between 0 and ${VARIANT_LIMITS.preview.maxBytes}`);
     expect(migration).toContain(`>= ${MAX_SAVED_RECIPES} then`);
+  });
+});
+
+// ---- review fixes: canonical ids, one key per PUT, bulk skips -----------------------------------------
+describe('ids must be canonical (lower case)', () => {
+  it('upper-case ids get 404 on every photo route and write nothing', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id, { id: 'abcdef00-1111-4222-8333-444455556666' });
+    const v = await renderedEdit(j, p.id);
+    const before = [...r2.objects.keys()].sort();
+    const up = p.id.toUpperCase();
+    expect(up).not.toBe(p.id);
+    expect(
+      (await put(EDIT_API.photoEditVariant(up, 'preview', v), jpegVariant(2048, 1536, 9000), j)).status,
+    ).toBe(404);
+    expect((await call(LIBRARY_API.photoFile(up, 'preview'), { jar: j })).status).toBe(404);
+    expect((await call(EDIT_API.photoEdit(up), { jar: j })).status).toBe(404);
+    expect((await call(LIBRARY_API.photo(up), { jar: j })).status).toBe(404);
+    expect([...r2.objects.keys()].sort()).toEqual(before);
+    expect(noDrift(MEI.id)).toBe(true);
+  });
+  it('the sweep deletes keys whose ids are spelled in another case, whatever their age', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id);
+    await renderedEdit(j, p.id);
+    // (MEI's id is all digits, so spell the ids with letters explicitly.)
+    const upper = `u/${MEI.id}/p/ABCDEF01-0000-4000-8000-00000000000A/edit-1-preview-${NONCE}`;
+    const upperOwner = `u/ABCDEF02-0000-4000-8000-00000000000B/p/${p.id}/thumb`;
+    await r2.put(upper, 'x');
+    await r2.put(upperOwner, 'x');
+    const live = [...r2.objects.keys()].filter((k) => k !== upper && k !== upperOwner);
+    const counts = await runCleanup(env);
+    expect(counts.orphansDeleted).toBe(2);
+    expect(r2.objects.has(upper)).toBe(false);
+    expect(r2.objects.has(upperOwner)).toBe(false);
+    for (const k of live) expect(r2.objects.has(k)).toBe(true);
+  });
+});
+
+describe('every variant PUT writes its own key', () => {
+  it('a repeat PUT for a recorded version is a no-op 200: nothing written, the live variant untouched (P1)', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id);
+    const v = await renderedEdit(j, p.id);
+    const liveKey = must(must(db.edits.get(p.id)).previewKey);
+    const liveBytes = must(r2.objects.get(liveKey)).bytes.byteLength;
+    // Even with storage nearly full, a duplicate must not be reported as storage_full nor delete anything.
+    profile(MEI.id).storage = 5 * 1024 ** 3 - 10;
+    const objects = r2.objects.size;
+    const res = await put(
+      EDIT_API.photoEditVariant(p.id, 'preview', v),
+      jpegVariant(2048, 1536, 1_500_000),
+      j,
+    );
+    expect(res.status).toBe(200);
+    expect(r2.objects.size).toBe(objects);
+    expect(must(r2.objects.get(liveKey)).bytes.byteLength).toBe(liveBytes);
+    expect(r2.deleted).not.toContain(liveKey);
+    expect(must(db.edits.get(p.id)).previewBytes).toBe(9000);
+  });
+  it('a duplicate recorded between the check and the record deletes only its own object', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id);
+    const edit = (await read(await save(j, p.id, warm, null))).edit;
+    // Two PUTs for the same version race: the first one records while the second is still uploading.
+    const record = world.rpc.record_edit_variant as (a: Record<string, unknown>) => unknown;
+    let first: string | null = null;
+    world.rpc.record_edit_variant = (a) => {
+      if (!first) {
+        first = String(a.p_key);
+        return record(a);
+      }
+      return record(a);
+    };
+    expect(
+      (await put(EDIT_API.photoEditVariant(p.id, 'thumb', edit.version), jpegVariant(512, 384, 3000), j))
+        .status,
+    ).toBe(200);
+    // Second PUT: make the pre-check say "current" (as if it ran before the first recorded).
+    const check = world.rpc.edit_variant_check as (a: Record<string, unknown>) => unknown;
+    world.rpc.edit_variant_check = () => ({ status: 'current' });
+    const res = await put(
+      EDIT_API.photoEditVariant(p.id, 'thumb', edit.version),
+      jpegVariant(512, 384, 2000),
+      j,
+    );
+    world.rpc.edit_variant_check = check;
+    expect(res.status).toBe(200);
+    const thumbs = editObjects(editKeyOf(MEI.id, p.id, edit.version, 'thumb'));
+    expect(thumbs).toEqual([must(first)]);
+    expect(must(db.edits.get(p.id))).toMatchObject({ thumbKey: first, thumbBytes: 3000 });
+    expect(noDrift(MEI.id)).toBe(true);
+  });
+  it('a PUT racing a trash deletes only its own object, never the trashed photo’s variant (P2)', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id);
+    const v = await renderedEdit(j, p.id);
+    const liveKey = must(must(db.edits.get(p.id)).previewKey);
+    const v2 = (await read(await save(j, p.id, { v: 1, light: { exposure: 2 } }, v))).edit.version;
+    const record = world.rpc.record_edit_variant as (a: Record<string, unknown>) => unknown;
+    world.rpc.record_edit_variant = (a) => {
+      must(db.photos.get(p.id)).status = 'trashed'; // the trash lands between the write and the record
+      return record(a);
+    };
+    const res = await put(EDIT_API.photoEditVariant(p.id, 'preview', v2), jpegVariant(2048, 1536, 9000), j);
+    expect(res.status).toBe(410);
+    expect(r2.objects.has(liveKey)).toBe(true);
+    expect(editObjects(editKeyOf(MEI.id, p.id, v2, 'preview'))).toEqual([]);
+  });
+  it('a write that fails before its record leaves the counted variant and its size as they were (P4)', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id);
+    const v = await renderedEdit(j, p.id);
+    const v2 = (await read(await save(j, p.id, { v: 1, light: { exposure: 2 } }, v))).edit.version;
+    const liveKey = must(must(db.edits.get(p.id)).previewKey);
+    world.rpc.record_edit_variant = () => {
+      throw new Error('rpc down');
+    };
+    const res = await put(
+      EDIT_API.photoEditVariant(p.id, 'preview', v2),
+      jpegVariant(2048, 1536, 1_500_000),
+      j,
+    );
+    expect(res.status).toBe(500);
+    // The live object is the one that's counted, byte for byte; this request's object is gone.
+    expect(must(r2.objects.get(liveKey)).bytes.byteLength).toBe(must(db.edits.get(p.id)).previewBytes);
+    expect(editObjects(editKeyOf(MEI.id, p.id, v2, 'preview'))).toEqual([]);
+  });
+  it('the database refuses a key that isn’t this photo’s, version’s and kind’s', () => {
+    const rec = libraryRpc().record_edit_variant as (a: Record<string, unknown>) => { status: string };
+    const p = seedPhoto(MEI.id);
+    db.edits.set(p.id, {
+      photoId: p.id,
+      owner: MEI.id,
+      recipe: { v: 1, light: { exposure: 1 } },
+      version: 1,
+      thumbVersion: null,
+      thumbKey: null,
+      thumbBytes: 0,
+      previewVersion: null,
+      previewKey: null,
+      previewBytes: 0,
+      updatedAt: new Date().toISOString(),
+    });
+    const base = { p_owner: MEI.id, p_photo: p.id, p_version: 1, p_kind: 'thumb', p_bytes: 10 };
+    expect(rec({ ...base, p_key: `${prefix(MEI.id, p.id)}thumb` }).status).toBe('invalid');
+    expect(rec({ ...base, p_key: `${editKeyOf(MEI.id, p.id, 2, 'thumb')}${NONCE}` }).status).toBe('invalid');
+    expect(
+      rec({ ...base, p_key: `${editKeyOf(MEI.id, p.id, 1, 'thumb')}${NONCE.toUpperCase()}` }).status,
+    ).toBe('invalid');
+    expect(rec({ ...base, p_key: `${editKeyOf(MEI.id, p.id, 1, 'thumb')}${NONCE}` }).status).toBe('ok');
+  });
+  it('the sweep keeps the recorded key and deletes an old unrecorded one of the same version', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id);
+    const v = await renderedEdit(j, p.id);
+    const recorded = must(must(db.edits.get(p.id)).thumbKey);
+    const loser = `${editKeyOf(MEI.id, p.id, v, 'thumb')}${'b'.repeat(32)}`;
+    await r2.put(loser, 'x');
+    r2.backdate(loser, 2 * 3600_000);
+    r2.backdate(recorded, 2 * 3600_000);
+    await runCleanup(env);
+    expect(r2.objects.has(loser)).toBe(false);
+    expect(r2.objects.has(recorded)).toBe(true);
+  });
+});
+
+describe('bulk reports photos it had to skip', () => {
+  it('photos still changing after every attempt come back in skipped', async () => {
+    const j = await signedIn(MEI);
+    const a = await stored(MEI.id);
+    const b = await stored(MEI.id);
+    world.rpc.apply_bulk_edits = (args) => {
+      const items = args.p_items as { photoId: string }[];
+      return { applied: [], conflicts: items.map((i) => i.photoId) };
+    };
+    const res = await call(EDIT_API.editsBulk, {
+      jar: j,
+      method: 'POST',
+      body: { ids: [a.id, b.id], recipe: warm, sections: ['light', 'color'] },
+    });
+    expect(res.status).toBe(200);
+    const body = await read(res);
+    expect(body.affected).toBe(0);
+    expect([...body.skipped].sort()).toEqual([a.id, b.id].sort());
   });
 });

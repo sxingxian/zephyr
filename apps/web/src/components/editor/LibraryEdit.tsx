@@ -2,8 +2,11 @@ import { type EditSection, EMPTY_RECIPE, type PhotoItem, RECIPE_SECTIONS } from 
 import { useToast } from '@zephyr/ui';
 import { useMemo, useState } from 'react';
 import { errorMessage } from '../../lib/api';
-import { applyToPhotos } from '../../lib/editor/batch';
+import { applyToPhotos, skippedNote } from '../../lib/editor/batch';
 import { copyEdits, useCopied } from '../../lib/editor/clipboard';
+import { startExportJob } from '../../lib/editor/exportJob';
+import { cleanExportName, ExportProblem, exportName } from '../../lib/editor/names';
+import { pickZipSink } from '../../lib/editor/zipSink';
 import { getEdit, originalThumbUrl } from '../../lib/edits';
 import type { PhotoList } from '../../lib/photos';
 import type { Selection } from '../../lib/selection';
@@ -14,6 +17,10 @@ import { ApplyRecipeDialog, type ExportChoice, ExportDialog, PasteDialog } from 
 
 const PLAN = { free: 'Free', pro: 'Pro', studio: 'Studio' } as const;
 const n = (k: number) => `${k} photo${k === 1 ? '' : 's'}`;
+const withSkipped = (msg: string, skipped: number) => {
+  const note = skippedNote(skipped);
+  return note ? `${msg} · ${note}` : msg;
+};
 
 /** Selection-bar actions for editing: copy, paste, apply a recipe, revert, export. */
 export function useEditActions(list: PhotoList, sel: Selection) {
@@ -49,7 +56,7 @@ export function useEditActions(list: PhotoList, sel: Selection) {
     setBusy('revert');
     try {
       const k = await applyToPhotos(edited, null, [], `Reverting ${n(edited.length)}`);
-      toast.show(`Reverted ${n(k)} to their originals`, 'good');
+      toast.show(withSkipped(`Reverted ${n(k.affected)} to their originals`, k.skipped), 'good');
     } catch (err) {
       toast.show(errorMessage(err), 'bad');
     } finally {
@@ -102,30 +109,51 @@ export function useEditActions(list: PhotoList, sel: Selection) {
     c: ExportChoice,
     progress: (d: number, t: number) => void,
   ) => {
-    const { exportZip, renderExport, saveBlob, exportName } = await import('../../lib/editor/exporter');
-    if (kind === 'download') {
-      if (photos.length === 1) {
-        const p = photos[0] as PhotoItem;
-        await saveBlob(
-          await renderExport(p, null, { size: c.size, quality: c.quality }),
-          c.name || exportName(p.filename),
-        );
+    // Several photos download as one .zip. Where the browser can, ask where to save it first (the picker
+    // needs this click), so the zip streams to disk instead of being held in memory.
+    const zipName = `zephyr-export-${photos.length}.zip`;
+    const sink = kind === 'download' && photos.length > 1 ? await pickZipSink(zipName) : null;
+    // Belongs to the member who started it: stops if their session ends; results only go to them.
+    const job = startExportJob();
+    try {
+      const { exportZip, renderExport, saveBlob } = await import('../../lib/editor/exporter');
+      const o = { size: c.size, quality: c.quality, signal: job.signal };
+      if (kind === 'download') {
+        if (photos.length === 1) {
+          const p = photos[0] as PhotoItem;
+          const blob = await renderExport(p, null, o);
+          job.check();
+          await saveBlob(blob, cleanExportName(c.name, p.filename));
+        } else {
+          const zip = await exportZip(photos, { ...o, onProgress: progress }, sink);
+          job.check();
+          if (zip) await saveBlob(zip, zipName);
+        }
       } else {
-        const zip = await exportZip(photos, { size: c.size, quality: c.quality, onProgress: progress });
-        await saveBlob(zip, `zephyr-export-${photos.length}.zip`);
+        for (let i = 0; i < photos.length; i++) {
+          const p = photos[i] as PhotoItem;
+          const blob = await renderExport(p, null, o);
+          job.check();
+          const name = photos.length === 1 ? cleanExportName(c.name, p.filename) : exportName(p.filename);
+          const res = await uploads.add(
+            [new File([blob], name, { type: 'image/jpeg', lastModified: Date.now() })],
+            {
+              expectedOwner: job.owner,
+            },
+          );
+          if (res !== 'queued') throw new ExportProblem('You were signed out, so the copies weren’t saved.');
+          progress(i + 1, photos.length);
+        }
+        toast.show(
+          `Saving ${photos.length === 1 ? 'a copy' : `${photos.length} copies`} to your library`,
+          'good',
+        );
       }
-    } else {
-      for (let i = 0; i < photos.length; i++) {
-        const p = photos[i] as PhotoItem;
-        const blob = await renderExport(p, null, { size: c.size, quality: c.quality });
-        const name = photos.length === 1 ? c.name || exportName(p.filename) : exportName(p.filename);
-        await uploads.add([new File([blob], name, { type: 'image/jpeg', lastModified: Date.now() })]);
-        progress(i + 1, photos.length);
-      }
-      toast.show(
-        `Saving ${photos.length === 1 ? 'a copy' : `${photos.length} copies`} to your library`,
-        'good',
-      );
+    } catch (e) {
+      if (sink && (e as Error).name !== 'AbortError') await sink.abort().catch(() => undefined);
+      throw e;
+    } finally {
+      job.finish();
     }
   };
 
@@ -146,7 +174,7 @@ export function useEditActions(list: PhotoList, sel: Selection) {
             sections,
             `Pasting edits to ${n(photos.length)}`,
           );
-          toast.show(`Pasted edits to ${n(k)}`, 'good');
+          toast.show(withSkipped(`Pasted edits to ${n(k.affected)}`, k.skipped), 'good');
         }}
       />
       <ApplyRecipeDialog
@@ -155,7 +183,7 @@ export function useEditActions(list: PhotoList, sel: Selection) {
         onClose={() => setDialog(null)}
         onApply={async (r, name) => {
           const k = await applyToPhotos(photos, r, [...RECIPE_SECTIONS], `Applying “${name}”`);
-          toast.show(`Applied “${name}” to ${n(k)}`, 'good');
+          toast.show(withSkipped(`Applied “${name}” to ${n(k.affected)}`, k.skipped), 'good');
         }}
       />
       <ExportDialog

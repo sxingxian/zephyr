@@ -68,6 +68,7 @@ export function EditTray() {
                 : s.failed
                   ? `${s.failed} thumbnail${s.failed === 1 ? '' : 's'} didn’t update`
                   : 'All thumbnails updated'}
+              {s.job.note ? ` · ${s.job.note}` : ''}
             </span>
           </span>
         </div>

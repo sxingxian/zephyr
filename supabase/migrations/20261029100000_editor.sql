@@ -8,8 +8,10 @@
 --
 -- Versions: photos.edit_version only ever grows. Each save and each revert takes the next number, so an
 -- edited variant rendered for an older version (or for an edit that was reverted and redone) can never be
--- recorded against the current one. Edited variants live at u/<owner>/p/<photo>/edit-<version>-<kind>;
--- photo_edits records which version of each kind is stored and its measured size.
+-- recorded against the current one. Each edited-variant PUT writes its own object,
+-- u/<owner>/p/<photo>/edit-<version>-<kind>-<nonce> (128-bit random hex), so no request can overwrite or
+-- delete an object another request stored; photo_edits records the one key per kind that counts, the
+-- version it was rendered from and its measured size.
 --
 -- Usage invariant (extends the library one; tested in supabase/tests/40_editor_test.sql):
 --   profiles.storage_bytes = Σ photos (size + thumb + preview) over ready, trashed, purging
@@ -28,12 +30,14 @@ create table public.photo_edits (
   version integer not null check (version >= 1),
   -- The version each stored edited variant was rendered from (null: none stored) and its measured size.
   thumb_version integer check (thumb_version >= 1),
+  thumb_key text,
   thumb_bytes integer not null default 0 check (thumb_bytes between 0 and 307200),
   preview_version integer check (preview_version >= 1),
+  preview_key text,
   preview_bytes integer not null default 0 check (preview_bytes between 0 and 1572864),
   updated_at timestamptz not null default now(),
-  constraint photo_edits_thumb_pair check ((thumb_version is null) = (thumb_bytes = 0)),
-  constraint photo_edits_preview_pair check ((preview_version is null) = (preview_bytes = 0))
+  constraint photo_edits_thumb_pair check ((thumb_version is null) = (thumb_bytes = 0) and (thumb_version is null) = (thumb_key is null)),
+  constraint photo_edits_preview_pair check ((preview_version is null) = (preview_bytes = 0) and (preview_version is null) = (preview_key is null))
 );
 alter table public.photo_edits enable row level security;
 create index photo_edits_owner on public.photo_edits (owner_id);
@@ -67,9 +71,15 @@ create trigger photo_edits_same_owner before insert or update of photo_id, owner
 -- ---------------------------------------------------------------------------------------------
 -- Internal helpers
 -- ---------------------------------------------------------------------------------------------
-create function public._edit_key(p_owner uuid, p_photo uuid, p_version integer, p_kind text) returns text
+-- True when p_key is a well-formed edited-variant key for this owner, photo, version and kind:
+-- <canonical prefix>edit-<version>-<kind>-<32 lower-case hex>. The prefix comes from the uuids' own text
+-- form (always lower case), so a key built from a differently spelled id can never be recorded.
+create function public._edit_key_ok(p_owner uuid, p_photo uuid, p_version integer, p_kind text, p_key text) returns boolean
 language sql immutable set search_path = '' as $$
-  select public._r2_prefix(p_owner, p_photo) || 'edit-' || p_version::text || '-' || p_kind;
+  select p_key is not null
+     and left(p_key, length(public._r2_prefix(p_owner, p_photo) || 'edit-' || p_version::text || '-' || p_kind || '-'))
+         = public._r2_prefix(p_owner, p_photo) || 'edit-' || p_version::text || '-' || p_kind || '-'
+     and substr(p_key, length(public._r2_prefix(p_owner, p_photo) || 'edit-' || p_version::text || '-' || p_kind || '-') + 1) ~ '^[0-9a-f]{32}$';
 $$;
 
 -- An edit that changes nothing (the photo looks like its original).
@@ -93,9 +103,9 @@ $$;
 create function public._edit_keys(e public.photo_edits) returns jsonb
 language sql stable set search_path = '' as $$
   select coalesce(jsonb_agg(k), '[]'::jsonb) from (
-    select public._edit_key(e.owner_id, e.photo_id, e.thumb_version, 'thumb') k where e.thumb_version is not null
+    select e.thumb_key k where e.thumb_key is not null
     union all
-    select public._edit_key(e.owner_id, e.photo_id, e.preview_version, 'preview') where e.preview_version is not null
+    select e.preview_key where e.preview_key is not null
   ) x;
 $$;
 
@@ -221,15 +231,15 @@ language sql stable security definer set search_path = '' as $$
   where p.id = p_id and p.owner_id = p_owner and p.status in ('ready', 'trashed');
 $$;
 
--- The media route also learns which edited variants are current: editThumbVersion / editPreviewVersion
--- are set only when that kind was rendered from the current, non-neutral edit.
+-- The media route also learns which edited variants are current: editThumbKey / editPreviewKey (the
+-- recorded object) are set only when that kind was rendered from the current, non-neutral edit.
 create or replace function public.photo_file(p_owner uuid, p_id uuid) returns jsonb
 language sql stable security definer set search_path = '' as $$
   select jsonb_build_object('fileType', p.file_type, 'filename', p.filename, 'sizeBytes', p.size_bytes,
                             'hasThumb', p.has_thumb, 'hasPreview', p.has_preview,
                             'editVersion', e.version,
-                            'editThumbVersion', case when e.thumb_version = e.version and not public._recipe_empty(e.recipe) then e.version end,
-                            'editPreviewVersion', case when e.preview_version = e.version and not public._recipe_empty(e.recipe) then e.version end)
+                            'editThumbKey', case when e.thumb_version = e.version and not public._recipe_empty(e.recipe) then e.thumb_key end,
+                            'editPreviewKey', case when e.preview_version = e.version and not public._recipe_empty(e.recipe) then e.preview_key end)
   from public.photos p left join public.photo_edits e on e.photo_id = p.id
   where p.id = p_id and p.owner_id = p_owner and p.status in ('ready', 'trashed');
 $$;
@@ -287,8 +297,8 @@ language sql stable security definer set search_path = '' as $$
   select coalesce(jsonb_agg(jsonb_build_object(
            'id', p.id, 'ownerId', p.owner_id, 'status', p.status,
            'activeUpload', exists (select 1 from public.uploads u where u.photo_id = p.id),
-           'editThumbVersion', e.thumb_version,
-           'editPreviewVersion', e.preview_version)), '[]'::jsonb)
+           'editThumbKey', e.thumb_key,
+           'editPreviewKey', e.preview_key)), '[]'::jsonb)
     from public.photos p left join public.photo_edits e on e.photo_id = p.id
    where p.id = any (p_ids[1:1000]);
 $$;
@@ -353,12 +363,26 @@ begin
 end;
 $$;
 
--- Records an edited variant the Worker stored at _edit_key(owner, photo, version, kind) and measured in
--- R2. Under the owner's storage lock, and only while p_version is the photo's current edit version.
--- Returns {status: 'ok', previousKey} (the replaced object to delete, or null) | {status: 'gone'} (the
--- edit changed, was reverted, or the photo isn't ready: the Worker deletes its object) |
--- {status: 'storage_full'} | {status: 'invalid'}.
-create function public.record_edit_variant(p_owner uuid, p_photo uuid, p_version integer, p_kind text, p_bytes integer)
+-- Before a variant PUT writes anything: {status: 'current'} (store it) | {status: 'exists'} (this version
+-- of this kind is already recorded: nothing to do) | {status: 'stale'} (not the current edit version), or
+-- null if the photo isn't a ready photo of this owner.
+create function public.edit_variant_check(p_owner uuid, p_photo uuid, p_version integer, p_kind text) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select jsonb_build_object('status',
+           case when e.photo_id is null or e.version <> p_version then 'stale'
+                when (case p_kind when 'thumb' then e.thumb_version else e.preview_version end) = p_version then 'exists'
+                else 'current' end)
+    from public.photos p left join public.photo_edits e on e.photo_id = p.id
+   where p.id = p_photo and p.owner_id = p_owner and p.status = 'ready' and p_kind in ('thumb', 'preview');
+$$;
+
+-- Records an edited variant the Worker stored at p_key (its own, never-reused key; see _edit_key_ok) and
+-- measured in R2. Under the owner's storage lock, and only while p_version is the photo's current edit
+-- version. Returns {status: 'ok', previousKey} (the replaced object to delete, or null) |
+-- {status: 'exists'} (the same version of this kind was recorded meanwhile: the Worker deletes its own
+-- object and succeeds) | {status: 'gone'} (the edit changed, was reverted, or the photo isn't ready: the
+-- Worker deletes its own object) | {status: 'storage_full'} | {status: 'invalid'}.
+create function public.record_edit_variant(p_owner uuid, p_photo uuid, p_version integer, p_kind text, p_key text, p_bytes integer)
 returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
@@ -366,11 +390,13 @@ declare
   prof record;
   rules record;
   old_v integer;
+  old_key text;
   old_bytes integer;
   delta bigint;
 begin
-  if p_kind not in ('thumb', 'preview') or p_bytes is null
-     or p_bytes not between 1 and (case p_kind when 'thumb' then 307200 else 1572864 end) then
+  if p_kind not in ('thumb', 'preview') or p_bytes is null or p_version is null
+     or p_bytes not between 1 and (case p_kind when 'thumb' then 307200 else 1572864 end)
+     or not public._edit_key_ok(p_owner, p_photo, p_version, p_kind, p_key) then
     return jsonb_build_object('status', 'invalid');
   end if;
   perform public._lock_storage(p_owner);
@@ -379,10 +405,12 @@ begin
   select * into e from public.photo_edits where photo_id = p_photo for update;
   if not found or e.version <> p_version then return jsonb_build_object('status', 'gone'); end if;
   if p_kind = 'thumb' then
-    old_v := e.thumb_version; old_bytes := e.thumb_bytes;
+    old_v := e.thumb_version; old_key := e.thumb_key; old_bytes := e.thumb_bytes;
   else
-    old_v := e.preview_version; old_bytes := e.preview_bytes;
+    old_v := e.preview_version; old_key := e.preview_key; old_bytes := e.preview_bytes;
   end if;
+  -- Checked before the quota, so a duplicate PUT never reports storage_full for a variant that's stored.
+  if old_v = p_version then return jsonb_build_object('status', 'exists'); end if;
   delta := p_bytes - old_bytes;
   select p.plan_id, p.storage_bytes, p.reserved_bytes into prof from public.profiles p where p.id = p_owner for update;
   select * into rules from public._plan_rules(prof.plan_id);
@@ -390,14 +418,12 @@ begin
     return jsonb_build_object('status', 'storage_full');
   end if;
   if p_kind = 'thumb' then
-    update public.photo_edits set thumb_version = p_version, thumb_bytes = p_bytes where photo_id = p_photo;
+    update public.photo_edits set thumb_version = p_version, thumb_key = p_key, thumb_bytes = p_bytes where photo_id = p_photo;
   else
-    update public.photo_edits set preview_version = p_version, preview_bytes = p_bytes where photo_id = p_photo;
+    update public.photo_edits set preview_version = p_version, preview_key = p_key, preview_bytes = p_bytes where photo_id = p_photo;
   end if;
   update public.profiles set storage_bytes = storage_bytes + delta where id = p_owner;
-  return jsonb_build_object('status', 'ok',
-    'previousKey', case when old_v is not null and old_v <> p_version
-                        then public._edit_key(p_owner, p_photo, old_v, p_kind) end);
+  return jsonb_build_object('status', 'ok', 'previousKey', old_key);
 end;
 $$;
 
@@ -559,7 +585,7 @@ revoke all on public.photo_edits, public.recipes from anon, authenticated;
 revoke execute on all functions in schema public from public, anon, authenticated;
 revoke execute on function
   public._edit_same_owner(),
-  public._edit_key(uuid, uuid, integer, text),
+  public._edit_key_ok(uuid, uuid, integer, text, text),
   public._recipe_empty(jsonb),
   public._edit_json(public.photo_edits),
   public._edit_keys(public.photo_edits),
@@ -579,7 +605,8 @@ grant execute on function
   public.get_edit(uuid, uuid),
   public.save_edit(uuid, uuid, jsonb, integer),
   public.delete_edit(uuid, uuid),
-  public.record_edit_variant(uuid, uuid, integer, text, integer),
+  public.edit_variant_check(uuid, uuid, integer, text),
+  public.record_edit_variant(uuid, uuid, integer, text, text, integer),
   public.bulk_edit_state(uuid, uuid[]),
   public.apply_bulk_edits(uuid, jsonb),
   public.list_recipes(uuid),

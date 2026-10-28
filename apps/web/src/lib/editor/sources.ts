@@ -3,7 +3,7 @@ import { ApiFailure } from '../api';
 import { originalPreviewUrl } from '../edits';
 import { originalUrl } from '../library';
 import type { Source } from './gl';
-import { decodeRaw } from './raw';
+import { decodeRaw, RawTooLargeForFull } from './raw';
 import { onEditorReset } from './resets';
 
 export interface LoadedSource {
@@ -11,6 +11,8 @@ export interface LoadedSource {
   baselineEv: number;
   /** 'preview' (≤ 2048 px stored preview), 'half' (RAW half size) or 'full'. */
   quality: 'preview' | 'half' | 'full';
+  /** A full size decode was asked for but the RAW is too big for this device: this is the half-size one. */
+  limited?: boolean;
 }
 
 async function fetchBlob(url: string, signal?: AbortSignal): Promise<Blob> {
@@ -75,10 +77,19 @@ export async function loadOriginal(
     let baselineEv = baselines.get(key);
     if (opts.full && baselineEv === undefined) {
       // No editing session measured it yet: run the half-size pass first, for the same number.
-      baselineEv = (await decodeRaw(buf.slice(0), true)).baselineEv;
+      baselineEv = (await decodeRaw(buf.slice(0), true, opts.signal)).baselineEv;
       baselines.set(key, baselineEv);
     }
-    const raw = await decodeRaw(buf, !opts.full);
+    let raw: Awaited<ReturnType<typeof decodeRaw>>;
+    let limited = false;
+    try {
+      raw = await decodeRaw(opts.full ? buf.slice(0) : buf, !opts.full, opts.signal);
+    } catch (e) {
+      if (!(opts.full && e instanceof RawTooLargeForFull)) throw e;
+      // Too big to develop at full size in this browser's memory: the half-size decode still works.
+      raw = await decodeRaw(buf, true, opts.signal);
+      limited = true;
+    }
     if (!opts.full) {
       baselineEv = raw.baselineEv;
       baselines.set(key, baselineEv);
@@ -88,7 +99,8 @@ export async function loadOriginal(
     return {
       source: { kind: 'half', data: raw.data, width: raw.width, height: raw.height },
       baselineEv: baselineEv ?? raw.baselineEv,
-      quality: opts.full ? 'full' : 'half',
+      quality: opts.full && !limited ? 'full' : 'half',
+      limited,
     };
   }
   return { source: await bitmapSource(blob, opts.maxEdge), baselineEv: 0, quality: 'full' };

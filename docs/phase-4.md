@@ -100,7 +100,15 @@ One pipeline renders everything: the live view, edited thumbnails and previews, 
   - Opening a RAW shows its stored preview straight away (the camera JPEG from phase 3).
   - A half-size decode (fast, about 6 MP for 24 MP files) replaces it for editing.
   - Export does a full-size decode.
-  - All decodes use camera white balance, linear 16-bit output and no auto-brightness. The demosaic is AHD for exports and the half-size path for editing.
+  - All decodes use camera white balance and linear 16-bit output. The demosaic is AHD for exports and the half-size path for editing.
+  - **Development:** a baseline exposure (−1 to +3 EV) puts the RAW's median brightness where the camera's own JPEG
+    has it, so a RAW opens exposed the way it was shot. A filmic base tone curve then follows (contrast around middle
+    grey, a soft highlight shoulder, a gentle toe), with out-of-gamut colours eased towards luminance rather than clipped.
+    Both happen before the recipe, so sliders act on a RAW the way they act on a JPEG. The baseline is computed once
+    per photo from the half-size decode and reused by exports. Without a usable embedded JPEG, it falls back to a
+    log-average target.
+  - Full-size decodes that would exceed the WebAssembly memory budget fall back to half size with a message. Any decode
+    failure terminates the worker.
 - **Original download:** RAW originals reach the browser through the existing owner-only `GET /photos/:id/original`, which is `no-store`. Nothing is cached to disk.
 
 ## Saving edits and edited thumbnails
@@ -110,7 +118,10 @@ One pipeline renders everything: the live view, edited thumbnails and previews, 
   - Revert to original is `DELETE /photos/:id/edit`. It is one undoable step while the editor is open.
 - **Edited thumbnails:** after each save the browser renders an edited thumb and preview from the stored 2048 px preview and uploads them to `PUT /photos/:id/edit/variants/:kind?v=<version>`.
   - Each variant is checked like the phase 3 variants: type signature, byte cap and pixel dimensions.
-  - Each version writes to its own key, `u/<owner>/p/<photo>/edit-<version>-<kind>`. It is recorded under the owner's storage lock only if that version is still current. The previous key is then returned for deletion; otherwise the new object is deleted and the request gets 410. The bytes are measured from R2, never trusted from the client.
+  - Each upload writes to its own key, `u/<owner>/p/<photo>/edit-<version>-<kind>-<nonce>`. It is recorded under the owner's storage lock only if that version is still current and not already recorded.
+    - When it wins, the previous key is returned for deletion.
+    - Otherwise only this upload's own object is deleted. The request gets 410 for a stale version, or 200 if the same version was already recorded.
+    - The bytes are measured from R2, never trusted from the client. Photo ids in keys are always canonical lower case.
   - Edited variants count toward storage. When storage is full the edit is still saved, and the grid shows the original with an edited badge.
   - The edit row records `rendered` once both variants exist for the current version.
 - **Serving:**
@@ -136,7 +147,7 @@ One pipeline renders everything: the live view, edited thumbnails and previews, 
   - `list_recipes`, `create_recipe`, `update_recipe`, `delete_recipe`.
 - **Existing jobs:**
   - Photo purge and account purge also delete edit variant keys.
-  - The orphan sweep learns the `edit-<n>-<kind>` keys and deletes any object that isn't the recorded key for its photo, skipping objects less than an hour old.
+  - The orphan sweep learns the edit variant keys and deletes any object that isn't the recorded key for its photo, skipping objects less than an hour old. Keys with non-canonical ids are treated as orphans.
   - `storage_bytes` includes edit variant bytes.
 - **Photo list:** gets an `edited` view and returns `edit { version, rendered }`. Photo detail returns the recipe.
 

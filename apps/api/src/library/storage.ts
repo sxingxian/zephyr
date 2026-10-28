@@ -9,7 +9,12 @@ import { fail, guardWrite } from '../http';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 
-export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * Ids in paths must be in canonical (lower-case) form. Object keys are built from them, and the database
+ * builds keys from uuid::text, which is always lower case: accepting another spelling would let a request
+ * store objects under keys nothing records, counts or deletes. Ids the API hands out are always lower case.
+ */
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Per-member limits (documented in apps/api/README.md). */
 export const LIBRARY_LIMITS = {
@@ -46,18 +51,33 @@ export const photoKeys = (owner: string, photo: string) => [
 ];
 
 /**
- * `u/<owner>/p/<photo>/edit-<version>-<kind>`: an edited variant rendered from one edit version (phase 4).
- * Versions never repeat for a photo, so a late PUT for an old version can't land on the current key.
+ * `u/<owner>/p/<photo>/edit-<version>-<kind>-<nonce>`: an edited variant rendered from one edit version
+ * (phase 4). Every PUT writes its own key (128-bit random nonce), so no request can overwrite or delete an
+ * object another request stored; the database records the one key per kind that counts.
  */
-export const editKey = (owner: string, photo: string, version: number, kind: VariantKey) =>
-  `u/${owner}/p/${photo}/edit-${version}-${kind}`;
+export function newEditKey(owner: string, photo: string, version: number, kind: VariantKey): string {
+  const nonce = [...crypto.getRandomValues(new Uint8Array(16))]
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return `u/${owner}/p/${photo}/edit-${version}-${kind}-${nonce}`;
+}
 
 const ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/(original|thumb|preview)$`);
-const EDIT_KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/edit-([1-9][0-9]{0,9})-(thumb|preview)$`);
+const EDIT_KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/edit-([1-9][0-9]{0,9})-(thumb|preview)-[0-9a-f]{32}$`);
+/** A photo key whose ids are spelled in any case: one that only matches this was never written canonically. */
+const ANY_CASE_PHOTO_KEY_RE = new RegExp(`^u/${ID}/p/${ID}/`, 'i');
+const CANONICAL_PHOTO_KEY_RE = new RegExp(`^u/${ID}/p/${ID}/`);
 export type ParsedKey =
   | { owner: string; photo: string; kind: PhotoKind }
   | { owner: string; photo: string; kind: 'edit'; version: number; variant: VariantKey };
+/**
+ * True for a `u/<owner>/p/<photo>/…` key whose ids aren't in canonical lower-case form. Nothing records,
+ * counts or serves such a key, so the orphan sweep deletes it.
+ */
+export function isNonCanonicalPhotoKey(key: string): boolean {
+  return ANY_CASE_PHOTO_KEY_RE.test(key) && !CANONICAL_PHOTO_KEY_RE.test(key);
+}
 /** Parses a photo object key (`u/…`, including edited variants), or null for anything else. */
 export function parseKey(key: string): ParsedKey | null {
   const m = KEY_RE.exec(key);

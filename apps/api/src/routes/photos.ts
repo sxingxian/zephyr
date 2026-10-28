@@ -12,15 +12,7 @@ import {
 import { type Context, Hono } from 'hono';
 import { fail, logError, readBody } from '../http';
 import { contentDisposition, downloadName, parseRange } from '../library/files';
-import {
-  editKey,
-  LIBRARY_LIMITS,
-  libraryGuard,
-  type PurgeItem,
-  photoKey,
-  purgeNow,
-  UUID,
-} from '../library/storage';
+import { LIBRARY_LIMITS, libraryGuard, type PurgeItem, photoKey, purgeNow, UUID } from '../library/storage';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 import { editRoutes } from './edits';
@@ -137,9 +129,10 @@ interface PhotoFile {
   sizeBytes: number;
   hasThumb: boolean;
   hasPreview: boolean;
-  /** Set when that kind's edited variant was rendered from the current edit (phase 4). */
-  editThumbVersion?: number | null;
-  editPreviewVersion?: number | null;
+  /** The current edit version (phase 4), and the recorded object of each kind rendered from it. */
+  editVersion?: number | null;
+  editThumbKey?: string | null;
+  editPreviewKey?: string | null;
 }
 
 /** If-None-Match lists this tag (or `*`). */
@@ -175,16 +168,14 @@ photoRoutes.get('/:id/:kind', async (c) => {
 
     if (kind !== 'original') {
       // The edited variant when it was rendered from the current edit, unless ?original=1 (compare views).
-      const editV =
-        c.req.query('original') === '1'
-          ? null
-          : kind === 'thumb'
-            ? file.editThumbVersion
-            : file.editPreviewVersion;
+      // The key comes from the database, never from the request.
+      const editK =
+        c.req.query('original') === '1' ? null : kind === 'thumb' ? file.editThumbKey : file.editPreviewKey;
+      const editV = file.editVersion;
       let source: { key: string; tag: (etag: string) => string } | null = null;
-      let meta = editV ? await c.env.PHOTOS.head(editKey(owner, id, editV, kind)) : null;
-      if (editV && meta) {
-        source = { key: editKey(owner, id, editV, kind), tag: (e) => `"${e}-e${editV}"` };
+      let meta = editK && editV ? await c.env.PHOTOS.head(editK) : null;
+      if (editK && editV && meta) {
+        source = { key: editK, tag: (e) => `"${e}-e${editV}"` };
       } else if (kind === 'thumb' ? file.hasThumb : file.hasPreview) {
         meta = await c.env.PHOTOS.head(key);
         if (meta) source = { key, tag: (e) => `"${e}"` };

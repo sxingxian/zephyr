@@ -95,8 +95,15 @@ export const restoreAccount = () => api<SessionResponse>(LIBRARY_API.restoreAcco
  */
 export const EXPECTED_USER_HEADER = 'x-zephyr-expected-user';
 export function expectedUser(): Record<string, string> {
-  const id = sessionUserId();
-  return id ? { [EXPECTED_USER_HEADER]: id } : {};
+  return ownerHeader(sessionUserId());
+}
+/**
+ * The header for work that belongs to a given member (captured when the work began). Long-running work, like
+ * an autosave or a background render, sends the member it was started for rather than whoever is signed in
+ * when the request finally goes out.
+ */
+export function ownerHeader(owner: string | null | undefined): Record<string, string> {
+  return owner ? { [EXPECTED_USER_HEADER]: owner } : {};
 }
 export const createUploads = (body: UploadCreateBody) =>
   api<UploadCreateResult>(LIBRARY_API.uploads, { body, headers: expectedUser() });
@@ -114,7 +121,13 @@ export const completeUpload = (uploadId: string, body: UploadCompleteBody) =>
 export function putBytes(
   path: string,
   body: Blob,
-  opts: { contentType: string; signal?: AbortSignal; onProgress?: (sent: number) => void },
+  opts: {
+    contentType: string;
+    signal?: AbortSignal;
+    onProgress?: (sent: number) => void;
+    /** Send for this member (default: whoever is signed in now). */
+    owner?: string;
+  },
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     if (opts.signal?.aborted) return reject(new DOMException('Aborted', 'AbortError'));
@@ -125,7 +138,8 @@ export function putBytes(
     xhr.open('PUT', path);
     xhr.setRequestHeader('content-type', opts.contentType);
     xhr.setRequestHeader('accept', 'application/json');
-    for (const [k, v] of Object.entries(expectedUser())) xhr.setRequestHeader(k, v);
+    const who = opts.owner !== undefined ? ownerHeader(opts.owner) : expectedUser();
+    for (const [k, v] of Object.entries(who)) xhr.setRequestHeader(k, v);
     xhr.upload.onprogress = (e) => opts.onProgress?.(e.loaded);
     xhr.onload = () => {
       done();

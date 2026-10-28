@@ -44,8 +44,10 @@ export interface Edit {
   recipe: Record<string, unknown>;
   version: number;
   thumbVersion: number | null;
+  thumbKey: string | null;
   thumbBytes: number;
   previewVersion: number | null;
+  previewKey: string | null;
   previewBytes: number;
   updatedAt: string;
 }
@@ -118,15 +120,15 @@ export const profile = (id: string): Profile => {
   return p;
 };
 export const prefix = (owner: string, photo: string) => `u/${owner}/p/${photo}/`;
+/** The prefix every edited-variant key of this version and kind starts with (a nonce follows). */
 export const editKeyOf = (owner: string, photo: string, v: number, kind: 'thumb' | 'preview') =>
-  `${prefix(owner, photo)}edit-${v}-${kind}`;
+  `${prefix(owner, photo)}edit-${v}-${kind}-`;
+const editKeyOk = (owner: string, photo: string, v: number, kind: string, key: unknown) =>
+  typeof key === 'string' &&
+  key.startsWith(`${prefix(owner, photo)}edit-${v}-${kind}-`) &&
+  /^[0-9a-f]{32}$/.test(key.slice(`${prefix(owner, photo)}edit-${v}-${kind}-`.length));
 const editKeys = (e: Edit | undefined) =>
-  e
-    ? [
-        ...(e.thumbVersion ? [editKeyOf(e.owner, e.photoId, e.thumbVersion, 'thumb')] : []),
-        ...(e.previewVersion ? [editKeyOf(e.owner, e.photoId, e.previewVersion, 'preview')] : []),
-      ]
-    : [];
+  e ? [...(e.thumbKey ? [e.thumbKey] : []), ...(e.previewKey ? [e.previewKey] : [])] : [];
 const keys = (owner: string, photo: string) => [
   ...['original', 'thumb', 'preview'].map((k) => prefix(owner, photo) + k),
   ...['thumb', 'preview'].map((k) => `staging/${owner}/${photo}/${k}`),
@@ -436,8 +438,8 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
         hasThumb: p.thumb > 0,
         hasPreview: p.preview > 0,
         editVersion: e?.version ?? null,
-        editThumbVersion: live && e.thumbVersion === e.version ? e.version : null,
-        editPreviewVersion: live && e.previewVersion === e.version ? e.version : null,
+        editThumbKey: live && e.thumbVersion === e.version ? e.thumbKey : null,
+        editPreviewKey: live && e.previewVersion === e.version ? e.previewKey : null,
       };
     },
     patch_photo: (a) => {
@@ -632,8 +634,8 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
             ownerId: p.owner,
             status: p.status,
             activeUpload,
-            editThumbVersion: e?.thumbVersion ?? null,
-            editPreviewVersion: e?.previewVersion ?? null,
+            editThumbKey: e?.thumbKey ?? null,
+            editPreviewKey: e?.previewKey ?? null,
           },
         ];
       }),
@@ -679,8 +681,10 @@ function editorRpc(): Record<string, (a: Args) => unknown> {
           recipe,
           version: v,
           thumbVersion: null,
+          thumbKey: null,
           thumbBytes: 0,
           previewVersion: null,
+          previewKey: null,
           previewBytes: 0,
           updatedAt: new Date().toISOString(),
         };
@@ -717,28 +721,38 @@ function editorRpc(): Record<string, (a: Args) => unknown> {
       if (!p) return null;
       return { keys: revert(p) };
     },
+    edit_variant_check: (a) => {
+      const p = readyOf(a, a.p_photo);
+      const kind = String(a.p_kind);
+      if (!p || (kind !== 'thumb' && kind !== 'preview')) return null;
+      const e = db.edits.get(p.id);
+      const v = Number(a.p_version);
+      if (!e || e.version !== v) return { status: 'stale' };
+      return { status: (kind === 'thumb' ? e.thumbVersion : e.previewVersion) === v ? 'exists' : 'current' };
+    },
     record_edit_variant: (a) => {
       const kind = String(a.p_kind);
       const bytes = Number(a.p_bytes);
+      const v = Number(a.p_version);
       const cap = kind === 'thumb' ? 307200 : kind === 'preview' ? 1572864 : 0;
       if (!cap || !(bytes >= 1 && bytes <= cap)) return { status: 'invalid' };
+      if (!editKeyOk(own(a), String(a.p_photo), v, kind, a.p_key)) return { status: 'invalid' };
       const p = readyOf(a, a.p_photo);
       const e = p ? db.edits.get(p.id) : undefined;
-      const v = Number(a.p_version);
       if (!p || !e || e.version !== v) return { status: 'gone' };
       const oldV = kind === 'thumb' ? e.thumbVersion : e.previewVersion;
+      const oldKey = kind === 'thumb' ? e.thumbKey : e.previewKey;
+      if (oldV === v) return { status: 'exists' };
       const oldBytes = kind === 'thumb' ? e.thumbBytes : e.previewBytes;
       const prof = profile(p.owner);
       const delta = bytes - oldBytes;
       if (delta > 0 && prof.storage + prof.reserved + delta > PLANS[prof.plan].storage)
         return { status: 'storage_full' };
-      if (kind === 'thumb') Object.assign(e, { thumbVersion: v, thumbBytes: bytes });
-      else Object.assign(e, { previewVersion: v, previewBytes: bytes });
+      const key = String(a.p_key);
+      if (kind === 'thumb') Object.assign(e, { thumbVersion: v, thumbKey: key, thumbBytes: bytes });
+      else Object.assign(e, { previewVersion: v, previewKey: key, previewBytes: bytes });
       prof.storage += delta;
-      return {
-        status: 'ok',
-        previousKey: oldV && oldV !== v ? editKeyOf(p.owner, p.id, oldV, kind as 'thumb' | 'preview') : null,
-      };
+      return { status: 'ok', previousKey: oldKey };
     },
     bulk_edit_state: (a) => {
       const owner = own(a);

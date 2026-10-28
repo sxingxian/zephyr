@@ -10,7 +10,7 @@
 import { LibRaw } from '@colorhythm/libraw-wasm';
 import wasmUrl from '@colorhythm/libraw-wasm/libraw.wasm?url';
 import { largestEmbeddedJpeg, RAW_SCAN_BYTES } from '../uploads/raw';
-import { halfLut, isTiff, MAX_RAW_PIXELS, rawBaselineEv, srgb8ToLinear } from './rawCommon';
+import { fullDecodeFits, halfLut, isTiff, MAX_RAW_PIXELS, rawBaselineEv, srgb8ToLinear } from './rawCommon';
 
 /** Linear luminances of the camera's embedded JPEG (downscaled), or null if there isn't a usable one. */
 async function cameraLuma(buf: ArrayBuffer): Promise<number[] | null> {
@@ -63,7 +63,10 @@ ctx.onmessage = async (e: MessageEvent<{ id: number; buf: ArrayBuffer; half: boo
     d = new LibRaw();
     await d.waitUntilReady();
     d.open(buf);
-    if (d.getRawWidth() * d.getRawHeight() > MAX_RAW_PIXELS) throw new Error('too large');
+    const rw = d.getRawWidth();
+    const rh = d.getRawHeight();
+    if (rw * rh > MAX_RAW_PIXELS) throw new Error('too large');
+    if (!half && !fullDecodeFits(rw, rh, buf.byteLength)) throw new Error('memory');
     d.setUseCameraWb(1);
     d.setOutputColor(1); // sRGB primaries
     d.setOutputBps(16);

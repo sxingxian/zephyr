@@ -112,6 +112,9 @@ interface Rec extends UploadItem {
   needsCreate: boolean;
 }
 
+/** What `add` did: queued the files, or refused because nobody (or someone else) is signed in. */
+export type AddResult = 'queued' | 'signed_out' | 'owner_changed';
+
 const BUSY: UploadState[] = ['hashing', 'queued', 'waiting', 'uploading', 'paused'];
 export const CONCURRENCY = 3;
 
@@ -270,10 +273,17 @@ export class UploadManager {
   }
 
   // ------------------------------------------------------------ public actions
-  /** Adds files to the queue. Files the plan can't take are marked straight away, without a request. */
-  async add(files: File[]): Promise<void> {
+  /**
+   * Adds files to the queue. Files the plan can't take are marked straight away, without a request.
+   *
+   * `expectedOwner`: the member the files belong to (an export started earlier). If anyone else is signed
+   * in now, nothing is queued and the result says why.
+   */
+  async add(files: File[], opts: { expectedOwner?: string } = {}): Promise<AddResult> {
     const owner = this.deps.owner();
-    if (!files.length || !owner) return;
+    if (!owner) return 'signed_out';
+    if (opts.expectedOwner !== undefined && opts.expectedOwner !== owner) return 'owner_changed';
+    if (!files.length) return 'queued';
     const epoch = this.epoch;
     try {
       this.rules = (await this.deps.rules()) ?? this.rules;
@@ -281,7 +291,7 @@ export class UploadManager {
       // Let the server decide.
     }
     // Signed out (or someone else signed in) while the plan was loading: queue nothing.
-    if (epoch !== this.epoch || this.deps.owner() !== owner) return;
+    if (epoch !== this.epoch || this.deps.owner() !== owner) return 'owner_changed';
     for (const file of files) {
       this.seq += 1;
       const rec: Rec = {
@@ -315,6 +325,7 @@ export class UploadManager {
     }
     this.notify();
     void this.hashLoop();
+    return 'queued';
   }
 
   pauseAll(): void {

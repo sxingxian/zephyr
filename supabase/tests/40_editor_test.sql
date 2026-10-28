@@ -23,6 +23,14 @@ $$;
 create function pg_temp.all_ok() returns boolean language sql as $$
   select bool_and(pg_temp.no_drift(id)) from public.profiles
 $$;
+-- The edited-variant key a PUT for (owner, photo, version, kind) would write: a fixed nonce per version and
+-- kind (md5 is 32 lower-case hex) so tests can name it.
+create function pg_temp.k(o uuid, p uuid, v integer, kind text) returns text language sql as $$
+  select 'u/' || o || '/p/' || p || '/edit-' || v || '-' || kind || '-' || md5(v::text || kind)
+$$;
+create function pg_temp.rec(o uuid, p uuid, v integer, kind text, bytes integer) returns jsonb language sql as $$
+  select public.record_edit_variant(o, p, v, kind, pg_temp.k(o, p, v, kind), bytes)
+$$;
 -- A ready photo (as a finished upload leaves it), with usage kept in step.
 create function pg_temp.photo(o uuid, n text) returns uuid language plpgsql as $$
 declare id uuid;
@@ -72,27 +80,43 @@ do $$ begin
 end $$;
 
 -- ---- Edited variants and usage ------------------------------------------------------------------------
-select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 1, 'thumb', 5000) ->> 'status' = 'gone',
+select pg_temp.ok(pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 1, 'thumb', 5000) ->> 'status' = 'gone',
   'record_edit_variant: an old version → gone');
-select pg_temp.ok(record_edit_variant(pg_temp.i('wei'), pg_temp.i('p1'), 2, 'thumb', 5000) ->> 'status' = 'gone',
+select pg_temp.ok(pg_temp.rec(pg_temp.i('wei'), pg_temp.i('p1'), 2, 'thumb', 5000) ->> 'status' = 'gone',
   'record_edit_variant: other owner → gone');
-select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', 400000) ->> 'status' = 'invalid'
-  and record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'original', 10) ->> 'status' = 'invalid',
+select pg_temp.ok(pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', 400000) ->> 'status' = 'invalid'
+  and pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'original', 10) ->> 'status' = 'invalid',
   'record_edit_variant: over the cap or an unknown kind → invalid');
 select pg_temp.ok((select v ->> 'status' = 'ok' and v -> 'previousKey' = 'null'::jsonb
-  from (select record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', 5000) v) x), 'records the current version''s thumb');
+  from (select pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', 5000) v) x), 'records the current version''s thumb');
 select pg_temp.ok((get_edit(pg_temp.i('mei'), pg_temp.i('p1')) #>> '{edit,rendered}')::boolean = false, 'not rendered until both kinds exist');
-select record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'preview', 60000);
+select pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'preview', 60000);
 select pg_temp.ok((get_edit(pg_temp.i('mei'), pg_temp.i('p1')) #>> '{edit,rendered}')::boolean, 'rendered once both kinds exist');
 select pg_temp.ok((select storage_bytes = 3 * 1300 + 65000 from public.profiles where id = pg_temp.i('mei')) and pg_temp.all_ok(),
   'edited variants count toward storage (no drift)');
-select pg_temp.ok((select v ->> 'status' = 'ok' and v -> 'previousKey' = 'null'::jsonb
-  from (select record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', 4000) v) x)
-  and pg_temp.all_ok(), 'the same version recorded again replaces the size and names no previous key');
+select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb',
+    'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/edit-2-thumb-' || md5('another request'), 4000) ->> 'status' = 'exists'
+  and (select thumb_key = pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb') and thumb_bytes = 5000
+         from public.photo_edits where photo_id = pg_temp.i('p1'))
+  and pg_temp.all_ok(), 'a second object for an already recorded version is not recorded (exists): the first stays, bytes unchanged');
+select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', 'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/edit-2-thumb', 10) ->> 'status' = 'invalid'
+  and record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb'), 10) ->> 'status' = 'invalid'
+  and record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', upper(pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb')), 10) ->> 'status' = 'invalid'
+  and record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', pg_temp.k(pg_temp.i('wei'), pg_temp.i('p1'), 2, 'thumb'), 10) ->> 'status' = 'invalid'
+  and record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'preview'), 10) ->> 'status' = 'invalid'
+  and record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb', pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb') || 'x', 10) ->> 'status' = 'invalid',
+  'record_edit_variant only accepts this owner''s, photo''s, version''s and kind''s canonical key with a 32-hex nonce');
+select pg_temp.ok(edit_variant_check(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb') ->> 'status' = 'exists'
+  and edit_variant_check(pg_temp.i('mei'), pg_temp.i('p1'), 1, 'thumb') ->> 'status' = 'stale'
+  and edit_variant_check(pg_temp.i('wei'), pg_temp.i('p1'), 2, 'thumb') is null
+  and edit_variant_check(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'original') is null,
+  'edit_variant_check: exists / stale; another owner or a bad kind → null');
 select save_edit(pg_temp.i('mei'), pg_temp.i('p1'), '{"v":1,"light":{"exposure":1}}', 2);
 select pg_temp.ok((get_edit(pg_temp.i('mei'), pg_temp.i('p1')) #>> '{edit,rendered}')::boolean = false, 'a new save is not rendered yet');
-select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb', 3000) ->> 'previousKey'
-  = 'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/edit-2-thumb', 'a new version''s variant names the replaced key');
+select pg_temp.ok(edit_variant_check(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb') ->> 'status' = 'current',
+  'edit_variant_check: the current version, not yet stored → current');
+select pg_temp.ok(pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb', 3000) ->> 'previousKey'
+  = pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'thumb'), 'a new version''s variant names the replaced key');
 select pg_temp.ok(pg_temp.all_ok(), 'no drift after replacing a variant');
 
 -- ---- Library views ------------------------------------------------------------------------------------
@@ -107,22 +131,24 @@ select pg_temp.ok((select jsonb_agg(v ->> 'id') = jsonb_build_array(pg_temp.i('p
   from jsonb_array_elements(list_photos(pg_temp.i('mei'), 'edited') -> 'items') v), 'the edited view lists only non-neutral edits');
 select pg_temp.ok(get_photo(pg_temp.i('mei'), pg_temp.i('p1')) -> 'recipe' = '{"v":1,"light":{"exposure":1}}'::jsonb
   and get_photo(pg_temp.i('mei'), pg_temp.i('p3')) -> 'recipe' = 'null'::jsonb, 'photo detail carries the recipe');
-select pg_temp.ok((select v ->> 'editThumbVersion' = '3' and v -> 'editPreviewVersion' = 'null'::jsonb
-  from (select photo_file(pg_temp.i('mei'), pg_temp.i('p1')) v) x), 'photo_file names only the kinds rendered from the current edit');
+select pg_temp.ok((select v ->> 'editThumbKey' = pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb')
+    and v -> 'editPreviewKey' = 'null'::jsonb and (v ->> 'editVersion')::int = 3
+  from (select photo_file(pg_temp.i('mei'), pg_temp.i('p1')) v) x), 'photo_file names only the recorded objects rendered from the current edit');
 select pg_temp.ok(_photo_keys(pg_temp.i('mei'), pg_temp.i('p1')) @> jsonb_build_array(
-  'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/edit-3-thumb',
-  'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/edit-2-preview'), 'a photo''s keys include its recorded edited variants');
-select pg_temp.ok((select (v ->> 'editThumbVersion')::int = 3 and (v ->> 'editPreviewVersion')::int = 2
-  from jsonb_array_elements(sweep_photo_rows(array[pg_temp.i('p1')])) v), 'sweep_photo_rows reports the recorded versions');
+  pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb'),
+  pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'preview')), 'a photo''s keys include its recorded edited variants');
+select pg_temp.ok((select v ->> 'editThumbKey' = pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb')
+    and v ->> 'editPreviewKey' = pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 2, 'preview')
+  from jsonb_array_elements(sweep_photo_rows(array[pg_temp.i('p1')])) v), 'sweep_photo_rows reports the recorded keys');
 
 -- ---- Quota --------------------------------------------------------------------------------------------
 -- Pad Mei's usage to 3,000 bytes under the free plan's 5 GB, check, then take the pad back off.
 create temp table pad as select 5368709120 - 3000 - storage_bytes as n from public.profiles where id = '40000000-0000-0000-0000-000000000001';
 update public.profiles set storage_bytes = storage_bytes + (select n from pad) where id = pg_temp.i('mei');
-select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'preview', 70000) ->> 'status' = 'storage_full',
+select pg_temp.ok(pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'preview', 70000) ->> 'status' = 'storage_full',
   'a variant that would pass the plan''s storage → storage_full');
-select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb', 2000) ->> 'status' = 'ok',
-  'a smaller replacement still fits when full');
+select pg_temp.ok(pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb', 2000) ->> 'status' = 'exists',
+  'a repeat of a recorded variant is "exists" even when storage is full, never storage_full');
 update public.profiles set storage_bytes = storage_bytes - (select n from pad) where id = pg_temp.i('mei');
 select pg_temp.ok(pg_temp.all_ok(), 'no drift after the quota checks');
 
@@ -134,17 +160,17 @@ select pg_temp.ok(get_edit(pg_temp.i('mei'), pg_temp.i('p1')) = '{"edit": null}'
 select pg_temp.ok(delete_edit(pg_temp.i('mei'), pg_temp.i('p1')) = '{"keys": []}'::jsonb, 'reverting again is a no-op');
 select pg_temp.ok(save_edit(pg_temp.i('mei'), pg_temp.i('p1'), '{"v":1,"color":{"tint":4}}', null) #>> '{edit,version}' = '5',
   'versions never repeat after a revert');
-select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb', 100) ->> 'status' = 'gone',
+select pg_temp.ok(pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 3, 'thumb', 100) ->> 'status' = 'gone',
   'a variant rendered before the revert can''t be recorded');
 
 -- ---- Trash --------------------------------------------------------------------------------------------
-select record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 5, 'thumb', 900);
+select pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 5, 'thumb', 900);
 select bulk_photos(pg_temp.i('mei'), array[pg_temp.i('p1')], 'trash');
 select pg_temp.ok(save_edit(pg_temp.i('mei'), pg_temp.i('p1'), '{"v":1}', 5) is null and get_edit(pg_temp.i('mei'), pg_temp.i('p1')) is null
   and delete_edit(pg_temp.i('mei'), pg_temp.i('p1')) is null, 'a photo in the Trash can''t be edited');
-select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 5, 'preview', 900) ->> 'status' = 'gone', 'nor get variants');
+select pg_temp.ok(pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p1'), 5, 'preview', 900) ->> 'status' = 'gone', 'nor get variants');
 select pg_temp.ok((get_usage(pg_temp.i('mei')) ->> 'trashBytes')::bigint = 1300 + 900, 'Trash bytes include edited variants');
-select pg_temp.ok((select bool_or(x ? ('u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/edit-5-thumb'))
+select pg_temp.ok((select bool_or(x ? pg_temp.k(pg_temp.i('mei'), pg_temp.i('p1'), 5, 'thumb'))
   from (select jsonb_array_elements(bulk_photos(pg_temp.i('mei'), array[pg_temp.i('p1')], 'delete_forever') -> 'purge') -> 'keys' x) y),
   'purging a photo lists its edited variants');
 select pg_temp.ok(confirm_photo_purges(array[pg_temp.i('p1')]) = 1, 'confirm the purge');
@@ -162,7 +188,7 @@ select pg_temp.ok((select v -> 'conflicts' = jsonb_build_array(pg_temp.i('p2')) 
     jsonb_build_object('photoId', pg_temp.i('w1'), 'baseVersion', null, 'recipe', '{"v":1}'::jsonb))) v) x),
   'bulk apply: a photo whose edit moved on is a conflict; another member''s photo is ignored');
 select pg_temp.ok(get_edit(pg_temp.i('wei'), pg_temp.i('w1')) = '{"edit": null}'::jsonb, 'the other member''s photo is untouched');
-select record_edit_variant(pg_temp.i('mei'), pg_temp.i('p3'), (get_edit(pg_temp.i('mei'), pg_temp.i('p3')) #>> '{edit,version}')::int, 'preview', 7000);
+select pg_temp.rec(pg_temp.i('mei'), pg_temp.i('p3'), (get_edit(pg_temp.i('mei'), pg_temp.i('p3')) #>> '{edit,version}')::int, 'preview', 7000);
 select pg_temp.ok((select jsonb_array_length(v -> 'keys') = 1 and v #> '{applied,0,edit}' = 'null'::jsonb
   from (select apply_bulk_edits(pg_temp.i('mei'), jsonb_build_array(
     jsonb_build_object('photoId', pg_temp.i('p3'), 'baseVersion', (get_edit(pg_temp.i('mei'), pg_temp.i('p3')) #>> '{edit,version}')::int, 'recipe', null))) v) x)
@@ -198,7 +224,7 @@ select pg_temp.ok(not exists (
   'service_role calls entry points, not helpers');
 select pg_temp.ok((select bool_and(p.prosecdef and p.proconfig @> array['search_path=""'])
   from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-  where n.nspname = 'public' and p.proname in ('get_edit', 'save_edit', 'delete_edit', 'record_edit_variant', 'bulk_edit_state',
+  where n.nspname = 'public' and p.proname in ('get_edit', 'save_edit', 'delete_edit', 'edit_variant_check', 'record_edit_variant', 'bulk_edit_state',
     'apply_bulk_edits', 'list_recipes', 'create_recipe', 'update_recipe', 'delete_recipe')), 'entry points are security definer with an empty search_path');
 set local role authenticated;
 do $$ begin

@@ -50,4 +50,21 @@
       after deletion (with backoff and an audit alert after repeated failures) and orphaned objects. R2 lifecycle
       rules abort unfinished multipart uploads after one day and delete leftover `staging/` objects after two.
 
+12. **Editor (phase 4):**
+    - **Recipes:** numbers, enums and booleans only, checked strictly (unknown keys, including `__proto__`, are
+      rejected), clamped and rounded by the shared `normalizeRecipe`, and capped at 4 KB in both the API and the
+      database. Recipe names are plain text with control characters stripped.
+    - **Versions:** every save and revert takes a new version, and a save based on an older version gets 409.
+    - **Edited thumbnails and previews:** each upload goes to its own random key. It is recorded under the storage
+      lock only if its version is still current, measured from R2, and counted toward storage; a losing upload
+      deletes only its own object. The orphan sweep removes anything not recorded, and ids in keys are always
+      canonical lower case.
+    - **Untrusted files:** images and RAWs are decoded only in the browser: LibRaw runs in a Worker from a
+      same-origin WebAssembly file, with a signature check, a size cap and a time limit. The server never decodes
+      images.
+    - **Exports:** made on the device with no metadata, and file names are cleaned. Save as copy is bound to the
+      member who started it and is cancelled if the session ends.
+    - **Shared devices:** the edit clipboard, the render queue, open edit sessions, exports and the RAW worker are
+      reset with the upload queue when the session ends.
+
 Later phases add passcode galleries, ads isolation, CSAM scanning and face-data opt-in. See the design decisions doc.

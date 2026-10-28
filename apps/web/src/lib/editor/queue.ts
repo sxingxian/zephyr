@@ -9,6 +9,8 @@ import { ApiFailure, errorMessage } from '../api';
 import { emitLibrary } from '../bus';
 import { getEdit, putEditVariant } from '../edits';
 import { sessionUserId } from '../sessionGuard';
+import { encodeVariant } from './encode';
+import * as geometry from './geometry';
 
 /**
  * Background queue that renders edited thumbnails and previews on this device and uploads them for the
@@ -33,6 +35,8 @@ export interface RenderJob {
   label: string;
   /** Undoes the batch (puts each photo's previous edit back). */
   undo?: () => Promise<void>;
+  /** Extra line for the tray, e.g. photos skipped because they changed elsewhere. */
+  note?: string;
 }
 export interface QueueSnapshot {
   items: RenderItem[];
@@ -52,7 +56,8 @@ export interface QueueDeps {
   /** Renders the photo's stored preview through the recipe (thumbnail ≤ 512 px, preview ≤ 2048 px). */
   render(photoId: string, recipe: EditRecipe): Promise<Rendered>;
   getEdit(photoId: string): Promise<PhotoEdit | null>;
-  put(photoId: string, kind: VariantKind, version: number, blob: Blob): Promise<void>;
+  /** Uploads one variant on behalf of `owner` (the member who queued it). */
+  put(photoId: string, kind: VariantKind, version: number, blob: Blob, owner: string): Promise<void>;
   onRendered?(photoId: string, version: number): void;
 }
 
@@ -97,10 +102,10 @@ export class RenderQueue {
   }
 
   /** Starts a visible batch (replaces the finished one in the tray). */
-  startJob(label: string, undo?: () => Promise<void>): RenderJob {
+  startJob(label: string, undo?: () => Promise<void>, note?: string): RenderJob {
     for (const [id, r] of this.recs)
       if (r.visible && r.state !== 'pending' && r.state !== 'processing') this.recs.delete(id);
-    this.job = { id: ++this.jobSeq, label, undo };
+    this.job = { id: ++this.jobSeq, label, undo, note };
     this.emit();
     return this.job;
   }
@@ -122,9 +127,11 @@ export class RenderQueue {
       rendered?: Promise<Rendered>;
     }[],
     visible: boolean,
+    /** The member the work belongs to (an open editor's member). Nothing is queued if someone else is signed in. */
+    forOwner?: string,
   ): void {
     const owner = this.deps.owner();
-    if (!owner) return;
+    if (!owner || (forOwner !== undefined && forOwner !== owner)) return;
     for (const it of items) {
       const have = this.recs.get(it.photoId);
       if (have && have.version > it.version) continue;
@@ -227,7 +234,7 @@ export class RenderQueue {
         const b = out[kind];
         if (!b) continue;
         if (r.owner !== this.deps.owner() || epoch !== this.epoch) return;
-        await this.deps.put(r.photoId, kind, version, b);
+        await this.deps.put(r.photoId, kind, version, b, r.owner);
       }
       r.state = 'completed';
       this.deps.onRendered?.(r.photoId, version);
@@ -262,16 +269,16 @@ export class RenderQueue {
 
 // ------------------------------------------------------------ app instance
 /**
- * Renders edited variants (preview ≤ 2048 px, thumbnail ≤ 512 px) from whatever source `gl` holds. The pixel
- * reads happen synchronously, so the source may change straight after; only encoding is async.
+ * Renders edited variants (preview ≤ 2048 px, thumbnail ≤ 512 px) from whatever source `gl` holds. Both
+ * pixel reads happen synchronously, before this returns, so the editor can switch photos straight after
+ * without the variants picking up the next photo; only the encoding is async.
  */
-export async function renderVariantsFrom(
+export function renderVariantsFrom(
   gl: import('./gl').Renderer,
   recipe: EditRecipe,
   baselineEv: number,
 ): Promise<Rendered> {
-  const [geo, { encodeVariant }] = await Promise.all([import('./geometry'), import('./encode')]);
-  return renderVariantsSync(gl, recipe, baselineEv, geo, encodeVariant);
+  return renderVariantsSync(gl, recipe, baselineEv, geometry, encodeVariant);
 }
 export function renderVariantsSync(
   gl: import('./gl').Renderer,
@@ -291,17 +298,15 @@ export function renderVariantsSync(
 
 /** Batch path: the stored preview (camera JPEG for a RAW) through the recipe. */
 async function renderWithGpu(photoId: string, recipe: EditRecipe): Promise<Rendered> {
-  const [{ withRenderer }, { loadPreview, releaseSource }, geo, { encodeVariant }] = await Promise.all([
+  const [{ withRenderer }, { loadPreview, releaseSource }] = await Promise.all([
     import('./background'),
     import('./sources'),
-    import('./geometry'),
-    import('./encode'),
   ]);
   return withRenderer(async (gl) => {
     const loaded = await loadPreview(photoId, Math.min(gl.maxTexture, 4096));
     try {
       gl.setSource(loaded.source);
-      return await renderVariantsSync(gl, recipe, 0, geo, encodeVariant);
+      return await renderVariantsSync(gl, recipe, 0, geometry, encodeVariant);
     } finally {
       releaseSource(loaded.source);
     }
@@ -312,7 +317,7 @@ export const renderQueue = new RenderQueue({
   owner: sessionUserId,
   render: renderWithGpu,
   getEdit: (id) => getEdit(id),
-  put: (id, kind, version, blob) => putEditVariant(id, kind, version, blob),
+  put: (id, kind, version, blob, owner) => putEditVariant(id, kind, version, blob, undefined, owner),
   onRendered: (id, version) =>
     emitLibrary({ type: 'updated', photos: [{ id, edit: { version, rendered: true } }] }),
 });

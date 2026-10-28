@@ -28,8 +28,10 @@ import { errorMessage } from '../../lib/api';
 import { emitLibrary } from '../../lib/bus';
 import { copyEdits, useCopied } from '../../lib/editor/clipboard';
 import { renderExport, saveBlob } from '../../lib/editor/exporter';
+import { startExportJob } from '../../lib/editor/exportJob';
 import { aspectFor, centredRect, FULL, orientedSize, outputSize } from '../../lib/editor/geometry';
 import { Renderer, supportsEditor } from '../../lib/editor/gl';
+import { cleanExportName, ExportProblem } from '../../lib/editor/names';
 import { type Rendered, renderQueue, renderVariantsFrom } from '../../lib/editor/queue';
 import { EditSession } from '../../lib/editor/session';
 import { isRaw, loadOriginal, loadPreview, releaseSource } from '../../lib/editor/sources';
@@ -43,6 +45,7 @@ import {
   saveEdit,
 } from '../../lib/edits';
 import { getPhoto } from '../../lib/library';
+import { sessionUserId } from '../../lib/sessionGuard';
 import { uploads } from '../../lib/uploads';
 import { useViewerHost } from '../LibraryBits';
 import { CropOverlay } from './CropOverlay';
@@ -194,33 +197,42 @@ export function Editor({ photoId }: { photoId: string }) {
               updatedAt: '',
             }
           : null;
-        const s = new EditSession(photoId, initial, {
-          save: (id, r, base) => saveEdit(id, r, base),
-          remove: (id) => deleteEdit(id),
-          onSaved: (id, edit, r) => {
-            emitLibrary({
-              type: 'updated',
-              photos: [{ id, edit: edit ? { version: edit.version, rendered: false } : null }],
-            });
-            if (edit) {
-              // A RAW open in the editor renders its variants from the LibRaw decode on screen, so the grid
-              // matches what the member saw. Anything else renders from the stored preview in the queue.
-              const held = srcRef.current;
-              const gl = renderer.current;
-              let rendered: Promise<Rendered> | undefined;
-              if (
-                gl?.hasSource &&
-                held?.photoId === id &&
-                (held.quality === 'half' || held.quality === 'full')
-              )
-                rendered = renderVariantsFrom(gl, r, held.baselineEv);
-              renderQueue.enqueue(
-                [{ photoId: id, name: p.filename, version: edit.version, recipe: r, rendered }],
-                false,
-              );
-            } else renderQueue.forget(id);
+        // Every save names the member who opened the photo, never whoever is signed in when it goes out.
+        const owner = sessionUserId();
+        if (!owner) return;
+        const s = new EditSession(
+          photoId,
+          initial,
+          {
+            save: (id, r, base, signal) => saveEdit(id, r, base, owner, signal),
+            remove: (id, signal) => deleteEdit(id, owner, signal),
+            onSaved: (id, edit, r) => {
+              emitLibrary({
+                type: 'updated',
+                photos: [{ id, edit: edit ? { version: edit.version, rendered: false } : null }],
+              });
+              if (edit) {
+                // A RAW open in the editor renders its variants from the LibRaw decode on screen, so the grid
+                // matches what the member saw. Anything else renders from the stored preview in the queue.
+                const held = srcRef.current;
+                const gl = renderer.current;
+                let rendered: Promise<Rendered> | undefined;
+                if (
+                  gl?.hasSource &&
+                  held?.photoId === id &&
+                  (held.quality === 'half' || held.quality === 'full')
+                )
+                  rendered = renderVariantsFrom(gl, r, held.baselineEv);
+                renderQueue.enqueue(
+                  [{ photoId: id, name: p.filename, version: edit.version, recipe: r, rendered }],
+                  false,
+                  owner,
+                );
+              } else renderQueue.forget(id);
+            },
           },
-        });
+          owner,
+        );
         setSession(s);
       })
       .catch((e) => {
@@ -573,17 +585,31 @@ export function Editor({ photoId }: { photoId: string }) {
     c: { size: Parameters<typeof renderExport>[2]['size']; quality: number; name: string },
   ) => {
     if (!photo) return;
-    await session?.flush();
-    const blob = await renderExport(photo, recipe, { size: c.size, quality: c.quality });
-    const fname =
-      c.name.toLowerCase().endsWith('.jpg') || c.name.toLowerCase().endsWith('.jpeg')
-        ? c.name
-        : `${c.name}.jpg`;
-    if (kind === 'download') {
-      await saveBlob(blob, fname, phone);
-    } else {
-      await uploads.add([new File([blob], fname, { type: 'image/jpeg', lastModified: Date.now() })]);
-      toast.show('Saving a copy to your library. Watch the upload tray.', 'good');
+    // The export belongs to the member who started it: it stops if their session ends, and its result is
+    // only saved or uploaded for them.
+    const job = startExportJob();
+    try {
+      await session?.flush();
+      job.check();
+      const blob = await renderExport(photo, recipe, {
+        size: c.size,
+        quality: c.quality,
+        signal: job.signal,
+      });
+      job.check();
+      const fname = cleanExportName(c.name, photo.filename);
+      if (kind === 'download') {
+        await saveBlob(blob, fname, phone);
+      } else {
+        const res = await uploads.add(
+          [new File([blob], fname, { type: 'image/jpeg', lastModified: Date.now() })],
+          { expectedOwner: job.owner },
+        );
+        if (res !== 'queued') throw new ExportProblem('You were signed out, so the copy wasn’t saved.');
+        toast.show('Saving a copy to your library. Watch the upload tray.', 'good');
+      }
+    } finally {
+      job.finish();
     }
   };
 

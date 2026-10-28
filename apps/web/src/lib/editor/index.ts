@@ -12,12 +12,15 @@ let wired = false;
 export function wireEditorSessionReset(): void {
   if (wired) return;
   wired = true;
-  onSessionEnd(() => {
+  onSessionEnd(async ({ server }) => {
     clearCopied();
     renderQueue.reset();
     stopRawDecoder();
-    // The background renderer and the RAW exposure cache, if they were ever loaded.
-    runEditorResets();
+    // Open edit sessions (saved first on a deliberate sign-out), running exports, the background renderer
+    // and the RAW exposure cache, if they were ever loaded.
+    await runEditorResets({ server });
+    // A last save may have queued a thumbnail render: drop it too.
+    renderQueue.reset();
   });
 }
 wireEditorSessionReset();

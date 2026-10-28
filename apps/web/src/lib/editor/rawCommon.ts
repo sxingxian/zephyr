@@ -1,6 +1,18 @@
 /** Shared by the RAW worker and its tests. */
 export const MAX_RAW_PIXELS = 100_000_000;
 
+/**
+ * LibRaw's WebAssembly memory can grow to 2 GB. A full-size decode holds, per pixel: the raw data (2 B),
+ * LibRaw's working image (4 × 2 B) and its 16-bit RGB output (6 B); the file itself is also in memory.
+ * Full-size decodes that would need more than 1.5 GB are refused, so the decoder never runs out of memory
+ * part-way; the editor's half-size decode needs a quarter of that.
+ */
+export const RAW_FULL_BYTES_PER_PIXEL = 16;
+export const RAW_WASM_BUDGET = 1_500_000_000;
+export function fullDecodeFits(rawWidth: number, rawHeight: number, fileBytes = 0): boolean {
+  return rawWidth * rawHeight * RAW_FULL_BYTES_PER_PIXEL + fileBytes <= RAW_WASM_BUDGET;
+}
+
 /** CR2, NEF and ARW are TIFF containers: "II*\0" (little-endian) or "MM\0*" (big-endian). */
 export function isTiff(b: Uint8Array): boolean {
   return (
