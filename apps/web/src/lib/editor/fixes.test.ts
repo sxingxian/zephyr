@@ -199,6 +199,20 @@ describe('export file names', () => {
     expect(cleanExportName(`${'a'.repeat(300)}.jpg`, 'x').length).toBe(124);
     expect(exportName('IMG‮1.CR2')).toBe('IMG_1-edited.jpg');
   });
+  it('guards Windows device names, invisible characters and split emoji', () => {
+    expect(cleanExportName('CON', 'x')).toBe('_CON.jpg');
+    expect(cleanExportName('nul.jpg', 'x')).toBe('_nul.jpg');
+    expect(cleanExportName('COM1.jpeg', 'x')).toBe('_COM1.jpeg');
+    expect(cleanExportName('conin$', 'x')).toBe('_conin$.jpg');
+    expect(cleanExportName('console', 'x')).toBe('console.jpg');
+    expect(cleanExportName('a\u00adb\u2060c\u2028d\u3164e\u{E0041}f', 'x')).toBe('abcdef.jpg');
+    expect(cleanExportName('lone\ud800half', 'x')).toBe('lonehalf.jpg');
+    const cut = cleanExportName(`x${'😀'.repeat(200)}`, 'y');
+    expect([...cut.replace(/\.jpg$/, '')]).toHaveLength(120);
+    expect(cut.isWellFormed?.() ?? !/[\ud800-\udfff](?![\udc00-\udfff])/.test(cut)).toBe(true);
+    expect(exportName('exe      .CR2')).toBe('exe-edited.jpg');
+    expect(cleanExportName('my    edit', 'x')).toBe('my edit.jpg');
+  });
   it('caps an in-memory zip by estimated size and by count at full size', () => {
     expect(zipTooBig(ZIP_MEMORY_LIMIT + 1, 10, false)).toMatch(/too much/);
     expect(zipTooBig(10_000_000, ZIP_FULL_SIZE_LIMIT + 1, true)).toMatch(/Long edge 2048/);

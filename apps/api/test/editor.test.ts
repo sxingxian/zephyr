@@ -741,9 +741,26 @@ describe('every variant PUT writes its own key', () => {
       j,
     );
     expect(res.status).toBe(500);
-    // The live object is the one that's counted, byte for byte; this request's object is gone.
+    // The live object is the one that's counted, byte for byte. This request's object is left for the
+    // orphan sweep: the record call failed, so the database might have committed it.
     expect(must(r2.objects.get(liveKey)).bytes.byteLength).toBe(must(db.edits.get(p.id)).previewBytes);
-    expect(editObjects(editKeyOf(MEI.id, p.id, v2, 'preview'))).toEqual([]);
+    expect(editObjects(editKeyOf(MEI.id, p.id, v2, 'preview'))).toHaveLength(1);
+  });
+  it('a record that commits but then fails in transit keeps the object the database recorded', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id);
+    const v = await renderedEdit(j, p.id);
+    const v2 = (await read(await save(j, p.id, { v: 1, light: { exposure: 2 } }, v))).edit.version;
+    const record = world.rpc.record_edit_variant as (a: Record<string, unknown>) => unknown;
+    world.rpc.record_edit_variant = (a) => {
+      record(a); // committed…
+      throw new Error('timeout'); // …but the reply never arrived
+    };
+    const res = await put(EDIT_API.photoEditVariant(p.id, 'preview', v2), jpegVariant(2048, 1536, 9000), j);
+    expect(res.status).toBe(500);
+    const recorded = must(must(db.edits.get(p.id)).previewKey);
+    expect(recorded.includes(`edit-${v2}-preview-`)).toBe(true);
+    expect(r2.objects.has(recorded)).toBe(true);
   });
   it('the database refuses a key that isn’t this photo’s, version’s and kind’s', () => {
     const rec = libraryRpc().record_edit_variant as (a: Record<string, unknown>) => { status: string };

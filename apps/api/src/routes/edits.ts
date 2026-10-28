@@ -152,12 +152,17 @@ editRoutes.put('/:id/edit/variants/:kind', async (c) => {
     // (under the storage lock) whether it is the one that counts.
     const key = newEditKey(owner, id, version, kind);
     let recorded = false;
+    // Set while the record call is in flight: if it throws (a timeout, a dropped connection) the database
+    // may still have committed, so the object is left for the orphan sweep, which removes it after an hour
+    // only if it turns out not to be the recorded key.
+    let outcomeUnknown = false;
     try {
       await c.env.PHOTOS.put(key, bytes, {
         httpMetadata: { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' },
       });
       const head = await c.env.PHOTOS.head(key);
       if (!head) return c.json(fail('server'), 500);
+      outcomeUnknown = true;
       const res = await rpc<{
         status: 'ok' | 'exists' | 'gone' | 'storage_full' | 'invalid';
         previousKey?: string | null;
@@ -169,6 +174,7 @@ editRoutes.put('/:id/edit/variants/:kind', async (c) => {
         p_key: key,
         p_bytes: head.size,
       });
+      outcomeUnknown = false;
       if (res.status === 'ok') {
         recorded = true;
         if (res.previousKey && res.previousKey !== key) {
@@ -181,8 +187,9 @@ editRoutes.put('/:id/edit/variants/:kind', async (c) => {
       if (res.status === 'gone') return c.json(fail('conflict'), 410);
       return c.json(fail('invalid'), 400);
     } finally {
-      // Not recorded (lost, duplicate, full, failed or thrown): this object must not stay.
-      if (!recorded) await dropLater(c, [key], 'edit_variant_unstore');
+      // Definitely not recorded (lost, duplicate, full, invalid, or failed before the record call): this
+      // object must not stay.
+      if (!recorded && !outcomeUnknown) await dropLater(c, [key], 'edit_variant_unstore');
     }
   } catch (err) {
     logError(c.get('requestId'), 'edit_variant', err);

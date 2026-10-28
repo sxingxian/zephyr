@@ -6,13 +6,26 @@
 // biome-ignore lint/suspicious/noControlCharactersInRegex: strip control characters
 const UNSAFE = /[\u0000-\u001f\u007f-\u009f<>:"/\\|?*\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]+/g;
 const MAX_BASE = 120;
+/** Invisible format characters, line and paragraph separators, and Hangul fillers. */
+const INVISIBLE = /[\p{Cf}\p{Zl}\p{Zp}\u115f\u1160\u3164\uffa0]+/gu;
+/** Half of a surrogate pair with no partner (not valid text; matched without the u flag on purpose). */
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+/** Names Windows reserves for devices, with or without an extension. */
+const RESERVED = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)$/i;
 function cleanBase(s: string): string {
-  return s
+  const cleaned = s
+    .replace(LONE_SURROGATE, '')
     .normalize('NFC')
     .replace(UNSAFE, '_')
-    .replace(/^[\s.]+|[\s.]+$/g, '')
+    .replace(INVISIBLE, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s.]+|[\s.]+$/g, '');
+  // Cut by code points so an emoji is never split in half.
+  const cut = [...cleaned]
     .slice(0, MAX_BASE)
+    .join('')
     .replace(/[\s.]+$/, '');
+  return RESERVED.test(cut) ? `_${cut}` : cut;
 }
 
 /** "IMG_2041.CR2" → "IMG_2041-edited.jpg", with anything unsafe for a file name removed. */

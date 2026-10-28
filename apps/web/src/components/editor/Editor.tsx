@@ -183,9 +183,12 @@ export function Editor({ photoId }: { photoId: string }) {
     setLoadError(null);
     setSession(null);
     setHover(null);
+    // Every save names the member who opened the photo, never whoever is signed in when it goes out. Taken
+    // before the photo loads, so a session that changes while it loads can't adopt this photo.
+    const owner = sessionUserId();
     getPhoto(photoId, c.signal)
       .then((p) => {
-        if (c.signal.aborted) return;
+        if (c.signal.aborted || !owner || sessionUserId() !== owner) return;
         if (p.trashedAt) throw new Error('This photo is in the Trash. Restore it to edit.');
         setPhoto(p);
         const initial: PhotoEdit | null = p.edit
@@ -197,9 +200,6 @@ export function Editor({ photoId }: { photoId: string }) {
               updatedAt: '',
             }
           : null;
-        // Every save names the member who opened the photo, never whoever is signed in when it goes out.
-        const owner = sessionUserId();
-        if (!owner) return;
         const s = new EditSession(
           photoId,
           initial,

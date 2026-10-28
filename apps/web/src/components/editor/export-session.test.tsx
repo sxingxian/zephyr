@@ -21,6 +21,11 @@ vi.mock('../../lib/editor/exporter', () => ({
   saveBlob: vi.fn(),
 }));
 
+const sinkAbort = vi.fn(async () => undefined);
+vi.mock('../../lib/editor/zipSink', () => ({
+  pickZipSink: vi.fn(async () => ({ write: vi.fn(), close: vi.fn(), abort: sinkAbort })),
+}));
+
 const { useEditActions } = await import('./LibraryEdit');
 
 const photo: PhotoItem = {
@@ -37,9 +42,10 @@ const photo: PhotoItem = {
   hasPreview: true,
   edit: null,
 };
-function Harness() {
-  const list = { items: [photo] } as unknown as PhotoList;
-  const sel = { selected: new Set(['p1']) } as unknown as Selection;
+function Harness({ two = false }: { two?: boolean }) {
+  const items = two ? [photo, { ...photo, id: 'p2', filename: 'IMG_2.JPG' }] : [photo];
+  const list = { items } as unknown as PhotoList;
+  const sel = { selected: new Set(items.map((p) => p.id)) } as unknown as Selection;
   const { actions, dialogs } = useEditActions(list, sel);
   const exp = actions.find((a) => a.label === 'Export');
   return (
@@ -116,5 +122,21 @@ describe('Save as copy across a session change', () => {
     expect(add.mock.calls[0]?.[1]).toEqual({ expectedOwner: 'u1' });
     const files = (add.mock.calls[0]?.[0] ?? []) as File[];
     expect(files[0]?.name).toBe('IMG_1-edited.jpg');
+  });
+});
+
+describe('Zip export with nobody signed in', () => {
+  it('abandons the file picked for the zip instead of leaving it empty on disk', async () => {
+    render(
+      <ToastProvider>
+        <Harness two />
+      </ToastProvider>,
+    );
+    fireEvent.click(screen.getByText('open export'));
+    const download = await screen.findByRole('button', { name: /Download/ });
+    setSessionUserId(null); // the session ended while the dialog was open
+    fireEvent.click(download);
+    await waitFor(() => expect(sinkAbort).toHaveBeenCalledTimes(1));
+    expect(seen).toHaveLength(0);
   });
 });

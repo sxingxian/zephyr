@@ -114,7 +114,14 @@ export function useEditActions(list: PhotoList, sel: Selection) {
     const zipName = `zephyr-export-${photos.length}.zip`;
     const sink = kind === 'download' && photos.length > 1 ? await pickZipSink(zipName) : null;
     // Belongs to the member who started it: stops if their session ends; results only go to them.
-    const job = startExportJob();
+    let job: ReturnType<typeof startExportJob>;
+    try {
+      job = startExportJob();
+    } catch (err) {
+      // Nobody is signed in any more: don't leave an empty file behind in the folder they picked.
+      await sink?.abort().catch(() => {});
+      throw err;
+    }
     try {
       const { exportZip, renderExport, saveBlob } = await import('../../lib/editor/exporter');
       const o = { size: c.size, quality: c.quality, signal: job.signal };
