@@ -34,6 +34,7 @@ export interface Photo {
   createdAt: string;
   trashedAt: string | null;
   purgeAfter: string | null;
+  publishPending?: boolean;
 }
 export interface Upload {
   id: string;
@@ -92,8 +93,10 @@ export const profile = (id: string): Profile => {
   return p;
 };
 export const prefix = (owner: string, photo: string) => `u/${owner}/p/${photo}/`;
-const keys = (owner: string, photo: string) =>
-  ['original', 'thumb', 'preview', 'staging-thumb', 'staging-preview'].map((k) => prefix(owner, photo) + k);
+const keys = (owner: string, photo: string) => [
+  ...['original', 'thumb', 'preview'].map((k) => prefix(owner, photo) + k),
+  ...['thumb', 'preview'].map((k) => `staging/${owner}/${photo}/${k}`),
+];
 
 export function photoJson(p: Photo) {
   return {
@@ -325,6 +328,7 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
         thumb: Math.min(Number(a.p_thumb_bytes ?? 0), 307200),
         preview: Math.min(Number(a.p_preview_bytes ?? 0), 1572864),
       });
+      p.publishPending = p.thumb > 0 || p.preview > 0;
       prof.storage += p.size + p.thumb + p.preview;
       return { status: 'ready', photo: photoJson(p) };
     },
@@ -488,26 +492,35 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
       p.deletionDue = null;
       return true;
     },
+    // Claims like the SQL: rows and reservation go first, then the Worker cleans R2.
     due_expired_uploads: () =>
       [...db.uploads.values()]
         .filter((u) => u.expiresAt <= Date.now())
-        .map((u) => ({
-          uploadId: u.id,
-          r2Key: u.r2Key,
-          r2UploadId: u.r2UploadId,
-          keys: keys(u.owner, u.photoId),
-        })),
-    confirm_expired_uploads: (a) => {
-      let n = 0;
-      for (const id of a.p_ids as string[]) {
-        const u = db.uploads.get(id);
-        if (!u || u.expiresAt > Date.now()) continue;
-        db.uploads.delete(id);
-        db.photos.delete(u.photoId);
-        profile(u.owner).reserved -= u.reserved;
-        n++;
+        .map((u) => {
+          db.uploads.delete(u.id);
+          db.photos.delete(u.photoId);
+          profile(u.owner).reserved -= u.reserved;
+          return { uploadId: u.id, r2Key: u.r2Key, r2UploadId: u.r2UploadId, keys: keys(u.owner, u.photoId) };
+        }),
+    due_publishes: () =>
+      [...db.photos.values()]
+        .filter((p) => p.publishPending && (p.status === 'ready' || p.status === 'trashed'))
+        .map((p) => ({ photoId: p.id, ownerId: p.owner, thumbBytes: p.thumb, previewBytes: p.preview })),
+    finish_publish: (a) => {
+      const p = db.photos.get(String(a.p_photo));
+      if (!p || p.owner !== own(a) || !p.publishPending) return null;
+      let freed = 0;
+      if (a.p_lost_thumb) {
+        freed += p.thumb;
+        p.thumb = 0;
       }
-      return n;
+      if (a.p_lost_preview) {
+        freed += p.preview;
+        p.preview = 0;
+      }
+      p.publishPending = false;
+      profile(p.owner).storage -= freed;
+      return true;
     },
     due_photo_purges: () => {
       for (const p of db.photos.values()) {
@@ -535,6 +548,7 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
         .map(([id]) => ({
           ownerId: id,
           prefix: `u/${id}/`,
+          stagingPrefix: `staging/${id}/`,
           uploads: [...db.uploads.values()]
             .filter((u) => u.owner === id && u.r2UploadId)
             .map((u) => ({ r2Key: u.r2Key, r2UploadId: u.r2UploadId })),

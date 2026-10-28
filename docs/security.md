@@ -47,7 +47,7 @@
     - **Shared devices:** the upload queue belongs to the user who started it. Sign-out, a 401 or a change of user
       aborts it and deletes its open uploads, then reloads the page so no photo data stays in memory.
     - **Retention:** a 15-minute Cron Trigger purges expired uploads, trash older than 30 days, accounts 30 days
-      after deletion (with backoff and an audit alert after repeated failures) and orphaned objects. An R2 lifecycle
-      rule aborts unfinished multipart uploads after one day.
+      after deletion (with backoff and an audit alert after repeated failures) and orphaned objects. R2 lifecycle
+      rules abort unfinished multipart uploads after one day and delete leftover `staging/` objects after two.
 
 Later phases add passcode galleries, ads isolation, CSAM scanning and face-data opt-in. See the design decisions doc.

@@ -120,7 +120,10 @@ to `audit_log` without personal data. It:
    skipping any photo with an upload still in progress.
 5. Deletes rate-limit rows older than 2 days (pg_cron already does this; the job is idempotent).
 
-An R2 lifecycle rule also aborts incomplete multipart uploads after one day (see setup.md).
+Thumbnails and previews are written to `staging/<ownerId>/<photoId>/<kind>` until their upload completes; only the
+completion that wins the database claim copies them to the photo's own keys. If that copy fails, the photo stays
+marked as pending and the job retries it. R2 lifecycle rules abort incomplete multipart uploads after one day and
+delete anything under `staging/` after two (see setup.md).
 
 ## Security notes
 

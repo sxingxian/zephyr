@@ -114,6 +114,31 @@ select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000003', (selec
 select pg_temp.ok((select thumb_bytes = 307200 and preview_bytes = 0 from public.photos where id = (select (v #>> '{results,0,photoId}')::uuid from t where k = 'vs')),
   'complete_upload counts the measured sizes, clamped to the variant caps (not uploads.variants)');
 select pg_temp.ok(pg_temp.all_ok(), 'no drift with measured variant sizes');
+-- Expiry is checked against the wall clock once the lock is held, not the transaction start.
+insert into t select 'ck', create_uploads('20000000-0000-0000-0000-000000000003', jsonb_build_array(pg_temp.file('ck.jpg', 100, 'jpeg', 'clock')));
+select record_part('20000000-0000-0000-0000-000000000003', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'ck'), 1, 'e1');
+update public.uploads set expires_at = clock_timestamp() where id = (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'ck');
+select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000003', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'ck'), '{}', 0, 0) ->> 'status' = 'expired',
+  'complete_upload: expired by the wall clock even though the transaction began earlier');
+select pg_temp.ok((select v ->> 'r2Key' is not null from (select jsonb_array_elements(due_expired_uploads(10)) v) x
+                    where v ->> 'uploadId' = (select v #>> '{results,0,uploadId}' from t where k = 'ck')), 'the expiry job claims it instead');
+select pg_temp.ok(not exists (select 1 from public.photos where id = (select (v #>> '{results,0,photoId}')::uuid from t where k = 'ck'))
+  and pg_temp.all_ok(), 'claimed expired upload: rows gone, reservation released');
+-- Publishing: counted variants stay pending until the copy is confirmed; a lost staged copy is dropped.
+select pg_temp.ok((select publish_pending from public.photos where id = (select (v #>> '{results,0,photoId}')::uuid from t where k = 'vs')),
+  'a completed photo with variants is publish_pending');
+select pg_temp.ok((select bool_or(e ->> 'photoId' = (select v #>> '{results,0,photoId}' from t where k = 'vs') and (e ->> 'thumbBytes')::int = 307200)
+  from jsonb_array_elements(due_publishes(100)) e), 'due_publishes lists it with its counted bytes');
+select pg_temp.ok(finish_publish('20000000-0000-0000-0000-000000000002', (select (v #>> '{results,0,photoId}')::uuid from t where k = 'vs'), true, false) is null,
+  'finish_publish: other owner → null');
+select pg_temp.ok(finish_publish('20000000-0000-0000-0000-000000000003', (select (v #>> '{results,0,photoId}')::uuid from t where k = 'vs'), true, false),
+  'finish_publish with the thumb lost');
+select pg_temp.ok((select not publish_pending and not has_thumb and thumb_bytes = 0 from public.photos where id = (select (v #>> '{results,0,photoId}')::uuid from t where k = 'vs'))
+  and (select storage_bytes = 100 from public.profiles where id = '20000000-0000-0000-0000-000000000003'),
+  'a lost variant is dropped and its bytes leave usage');
+select pg_temp.ok(finish_publish('20000000-0000-0000-0000-000000000003', (select (v #>> '{results,0,photoId}')::uuid from t where k = 'vs'), false, false) is null,
+  'finish_publish only applies once');
+select pg_temp.ok(pg_temp.all_ok(), 'no drift after finish_publish');
 select pg_temp.ok(pg_temp.all_ok(), 'no drift after completion');
 
 -- ---- Duplicates -----------------------------------------------------------------------------------------
@@ -150,7 +175,8 @@ select pg_temp.ok(pg_temp.all_ok(), 'no drift after quota checks');
 
 -- ---- Abort and expiry ---------------------------------------------------------------------------------
 insert into t select 'ab', abort_upload('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,6,uploadId}')::uuid from t where k = 'r1'));
-select pg_temp.ok((select jsonb_array_length(v -> 'keys') = 5 and v ->> 'r2Key' like '%/original' from t where k = 'ab'),
+select pg_temp.ok((select jsonb_array_length(v -> 'keys') = 5 and v ->> 'r2Key' like '%/original'
+    and v #>> '{keys,3}' like 'staging/20000000-0000-0000-0000-000000000001/%/thumb' from t where k = 'ab'),
   'abort_upload claims the upload and returns the keys to delete (original, variants, staging)');
 select pg_temp.ok(abort_upload('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,6,uploadId}')::uuid from t where k = 'r1')) is null,
   'a second abort (lost race) gets nothing to delete');
@@ -163,8 +189,8 @@ select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000002', (selec
   'expired upload: complete → expired');
 insert into t select 'due', due_expired_uploads(100);
 select pg_temp.ok((select jsonb_array_length(v) = 2 and v #>> '{0,keys,0}' like 'u/20000000-0000-0000-0000-000000000002/p/%/original' from t where k = 'due'),
-  'due_expired_uploads lists only expired uploads, with their keys');
-select pg_temp.ok(confirm_expired_uploads((select array_agg((e ->> 'uploadId')::uuid) from t, jsonb_array_elements(v) e where k = 'due')) = 2, 'confirm_expired_uploads');
+  'due_expired_uploads claims only expired uploads and returns their keys');
+select pg_temp.ok(jsonb_array_length(due_expired_uploads(100)) = 0, 'due_expired_uploads claims: the same uploads are not handed out twice');
 select pg_temp.ok((select reserved_bytes = 0 from public.profiles where id = '20000000-0000-0000-0000-000000000002')
   and not exists (select 1 from public.photos where owner_id = '20000000-0000-0000-0000-000000000002'), 'expired uploads release their reservation');
 select pg_temp.ok(pg_temp.all_ok(), 'no drift after expiry');
@@ -328,6 +354,7 @@ select pg_temp.ok((select jsonb_array_length(r) = 2
                               (select (v #>> '{results,0,photoId}')::uuid from t where k = 'vs'), gen_random_uuid()]) r),
   'sweep_photo_rows: known photos with their active-upload flag; unknown ids are absent');
 select set_job_state('orphan_sweep_cursor', 'abc');
+select set_job_state('orphan_sweep_cursor', repeat('d', 8192));
 select set_job_state('orphan_sweep_cursor', 'def');
 select pg_temp.ok(get_job_state('orphan_sweep_cursor') = 'def', 'job state round-trips');
 do $$ begin

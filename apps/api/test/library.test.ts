@@ -280,7 +280,7 @@ describe('uploads', () => {
     expect(r2.objects.size).toBe(0);
     const ok = await put(thumb, webpVariant(512, 288), { jar: j, type: 'image/webp' });
     expect(ok.status).toBe(200);
-    expect(must(r2.objects.get(`${prefix(MEI.id, d.photoId)}staging-thumb`)).contentType).toBe('image/webp');
+    expect(must(r2.objects.get(`staging/${MEI.id}/${d.photoId}/thumb`)).contentType).toBe('image/webp');
     expect(r2.objects.has(`${prefix(MEI.id, d.photoId)}thumb`)).toBe(false);
     expect(must(db.uploads.get(d.uploadId)).variants.thumb).toBe(4000);
   });
@@ -658,6 +658,8 @@ describe('trash and clean-up', () => {
         accountsPurged: 0,
         objectsDeleted: 5,
         orphansDeleted: 0,
+        variantsPublished: 0,
+        variantsLost: 0,
         rateLimitRows: 0,
       },
     });
@@ -942,7 +944,7 @@ describe('variants can’t outlive or overwrite their upload (HIGH-1)', () => {
     expect((await read(res)).photo).toMatchObject({ hasThumb: true, hasPreview: false });
     expect(must(db.photos.get(d.photoId))).toMatchObject({ thumb: 5000, preview: 0 });
     expect(must(r2.objects.get(`${prefix(MEI.id, d.photoId)}thumb`)).bytes.byteLength).toBe(5000);
-    expect(r2.objects.has(`${prefix(MEI.id, d.photoId)}staging-thumb`)).toBe(false);
+    expect(r2.objects.has(`staging/${MEI.id}/${d.photoId}/thumb`)).toBe(false);
   });
 
   it('a variant PUT after completion is refused and touches nothing', async () => {
@@ -961,8 +963,10 @@ describe('variants can’t outlive or overwrite their upload (HIGH-1)', () => {
   it('the orphan sweep deletes unaccounted objects a page at a time, sparing in-flight uploads', async () => {
     const j = await signedIn(MEI);
     const kept = await storedPhoto(MEI.id);
-    const ready = `${prefix(MEI.id, kept.photo.id)}staging-thumb`; // stale staging copy of a finished photo
-    await r2.put(ready, 'x');
+    // A stale staged copy of a finished photo: not swept (the staging/ lifecycle rule handles it).
+    await r2.put(`staging/${MEI.id}/${kept.photo.id}/thumb`, 'x');
+    // Old-style or unknown shapes under u/ are left alone too.
+    await r2.put(`${prefix(MEI.id, kept.photo.id)}staging-thumb`, 'x');
     const inflight = await createUpload(j, 'e.jpg', jpegFile(100));
     await put(LIBRARY_API.uploadVariant(inflight.uploadId, 'thumb'), jpegVariant(10, 10), { jar: j });
     const ghost = crypto.randomUUID();
@@ -975,12 +979,15 @@ describe('variants can’t outlive or overwrite their upload (HIGH-1)', () => {
     expect(first.orphansDeleted).toBeGreaterThan(0);
     expect(db.jobState.get('orphan_sweep_cursor')).toBeTruthy();
     const second = await runCleanup(env);
-    expect(first.orphansDeleted + second.orphansDeleted).toBe(1203);
+    expect(first.orphansDeleted + second.orphansDeleted).toBe(1202);
     expect(db.jobState.get('orphan_sweep_cursor')).toBeNull();
     expect([...r2.objects.keys()].sort()).toEqual(
       [
-        ...['original', 'thumb', 'preview'].map((k) => `${prefix(MEI.id, kept.photo.id)}${k}`),
-        `${prefix(MEI.id, inflight.photoId)}staging-thumb`,
+        ...['original', 'thumb', 'preview', 'staging-thumb'].map(
+          (k) => `${prefix(MEI.id, kept.photo.id)}${k}`,
+        ),
+        `staging/${MEI.id}/${kept.photo.id}/thumb`,
+        `staging/${MEI.id}/${inflight.photoId}/thumb`,
         'u/not-a-library-key',
       ].sort(),
     );
@@ -1122,5 +1129,159 @@ describe('uploads pinned to the expected user (shared devices)', () => {
     ).toBe(200);
     expect((await call(LIBRARY_API.upload(d.uploadId), { jar: mei, headers: as(MEI.id) })).status).toBe(200);
     expect((await call(LIBRARY_API.upload(d.uploadId), { jar: mei })).status).toBe(200);
+  });
+});
+
+// ---- re-review Low items ---------------------------------------------------------------------------------
+describe('staging prefix and late PUTs (L1)', () => {
+  it('a late variant PUT unstages its copy under waitUntil', async () => {
+    const j = await signedIn(MEI);
+    const d = await createUpload(j, 'a.jpg', jpegFile(100));
+    world.rpc.record_variant = () => null; // completed/aborted between the check and the write
+    const pending: Promise<unknown>[] = [];
+    const ctx = {
+      waitUntil: (p: Promise<unknown>) => pending.push(p),
+      passThroughOnException: () => undefined,
+    };
+    const res = await app.request(
+      `${APP}${LIBRARY_API.uploadVariant(d.uploadId, 'thumb')}`,
+      {
+        method: 'PUT',
+        headers: {
+          'CF-Connecting-IP': '203.0.113.7',
+          'Content-Type': 'image/jpeg',
+          Origin: APP,
+          Cookie: [...j.cookies].map(([k, v]) => `${k}=${v}`).join('; '),
+          'Content-Length': '2000',
+        },
+        body: jpegVariant(100, 100),
+      },
+      env,
+      ctx as unknown as ExecutionContext,
+    );
+    expect(res.status).toBe(410);
+    expect(pending).toHaveLength(1);
+    await Promise.all(pending);
+    expect(r2.objects.has(`staging/${MEI.id}/${d.photoId}/thumb`)).toBe(false);
+    expect(r2.deleted).toContain(`staging/${MEI.id}/${d.photoId}/thumb`);
+  });
+
+  it('an account purge also empties staging/<owner>/', async () => {
+    await r2.put(`staging/${MEI.id}/${crypto.randomUUID()}/thumb`, 'x');
+    await r2.put(`staging/${WEI.id}/${crypto.randomUUID()}/thumb`, 'x');
+    profile(MEI.id).deletionDue = new Date(Date.now() - 1000).toISOString();
+    expect((await runCleanup(env)).accountsPurged).toBe(1);
+    expect([...r2.objects.keys()].filter((k) => k.startsWith(`staging/${MEI.id}/`))).toEqual([]);
+    expect([...r2.objects.keys()].filter((k) => k.startsWith(`staging/${WEI.id}/`))).toHaveLength(1);
+  });
+});
+
+describe('expiry claims like abort (L2)', () => {
+  it('complete racing the expiry job never leaves a ready photo without files', async () => {
+    const j = await signedIn(MEI);
+    const file = jpegFile(100);
+    const d = await createUpload(j, 'h.jpg', file);
+    expect((await put(LIBRARY_API.uploadPart(d.uploadId, 1), file, { jar: j })).status).toBe(200);
+    const realHead = r2.head.bind(r2);
+    let releaseHead!: () => void;
+    const headGate = new Promise<void>((r) => {
+      releaseHead = r;
+    });
+    let inHead!: () => void;
+    const headReached = new Promise<void>((r) => {
+      inHead = r;
+    });
+    vi.spyOn(r2, 'head').mockImplementation(async (k: string) => {
+      const h = await realHead(k);
+      inHead();
+      await headGate;
+      return h;
+    });
+    const completing = call(LIBRARY_API.uploadComplete(d.uploadId), { jar: j, body: { metadata: {} } });
+    await headReached;
+    must(db.uploads.get(d.uploadId)).expiresAt = Date.now() - 1;
+    const counts = await runCleanup(env);
+    expect(counts.uploadsAborted).toBe(1);
+    releaseHead();
+    expect((await completing).status).toBe(404);
+    expect(db.photos.has(d.photoId)).toBe(false);
+    expect(objectsUnder(MEI.id)).toEqual([]);
+    expect(noDrift(MEI.id)).toBe(true);
+    // Claimed once: a second run has nothing to abort.
+    vi.restoreAllMocks();
+    expect((await runCleanup(env)).uploadsAborted).toBe(0);
+  });
+});
+
+describe('publishing variants after a failure (L3)', () => {
+  async function completeWithFailedPublish(name: string) {
+    const j = await signedIn(MEI);
+    const file = jpegFile(100, name.length);
+    const d = await createUpload(j, name, file);
+    await put(LIBRARY_API.uploadPart(d.uploadId, 1), file, { jar: j });
+    await put(LIBRARY_API.uploadVariant(d.uploadId, 'thumb'), jpegVariant(100, 100, 3000), { jar: j });
+    const realPut = r2.put.bind(r2);
+    const spy = vi.spyOn(r2, 'put').mockImplementation(async (key: string, value: unknown, opts) => {
+      if (key === `${prefix(MEI.id, d.photoId)}thumb`) throw new Error('R2 down');
+      return realPut(key, value, opts);
+    });
+    const res = await call(LIBRARY_API.uploadComplete(d.uploadId), { jar: j, body: { metadata: {} } });
+    spy.mockRestore();
+    expect(res.status).toBe(200);
+    const photo = must(db.photos.get(d.photoId));
+    expect(photo).toMatchObject({ publishPending: true, thumb: 3000 });
+    expect(r2.objects.has(`${prefix(MEI.id, d.photoId)}thumb`)).toBe(false);
+    expect(r2.objects.has(`staging/${MEI.id}/${d.photoId}/thumb`)).toBe(true);
+    return d;
+  }
+
+  it('the job copies the staged variant, confirms and unstages it', async () => {
+    const d = await completeWithFailedPublish('p1.jpg');
+    // The sweep never touches staging, even for pending photos.
+    const counts = await runCleanup(env);
+    expect(counts).toMatchObject({ variantsPublished: 1, variantsLost: 0 });
+    expect(must(r2.objects.get(`${prefix(MEI.id, d.photoId)}thumb`)).bytes.byteLength).toBe(3000);
+    expect(r2.objects.has(`staging/${MEI.id}/${d.photoId}/thumb`)).toBe(false);
+    expect(must(db.photos.get(d.photoId))).toMatchObject({ publishPending: false, thumb: 3000 });
+    expect(noDrift(MEI.id)).toBe(true);
+  });
+
+  it('a lost staged copy drops the variant and its counted bytes', async () => {
+    const d = await completeWithFailedPublish('p2.jpg');
+    const before = must(db.profiles.get(MEI.id)).storage;
+    r2.objects.delete(`staging/${MEI.id}/${d.photoId}/thumb`); // the lifecycle rule got there first
+    const counts = await runCleanup(env);
+    expect(counts.variantsLost).toBe(1);
+    expect(must(db.photos.get(d.photoId))).toMatchObject({ publishPending: false, thumb: 0 });
+    expect(must(db.profiles.get(MEI.id)).storage).toBe(before - 3000);
+    expect(noDrift(MEI.id)).toBe(true);
+    const thumb = await call(LIBRARY_API.photoFile(d.photoId, 'thumb'), { jar: await signedIn(MEI) });
+    expect(thumb.status).toBe(404);
+  });
+
+  it('a staged copy of the wrong size waits for a later run', async () => {
+    const d = await completeWithFailedPublish('p3.jpg');
+    await r2.put(`staging/${MEI.id}/${d.photoId}/thumb`, jpegVariant(10, 10, 999));
+    const counts = await runCleanup(env);
+    expect(counts).toMatchObject({ variantsPublished: 0, variantsLost: 0 });
+    expect(must(db.photos.get(d.photoId)).publishPending).toBe(true);
+    expect(r2.objects.has(`staging/${MEI.id}/${d.photoId}/thumb`)).toBe(true);
+  });
+});
+
+describe('sweep cursor (L4)', () => {
+  it('resets the cursor instead of freezing when it can’t be stored', async () => {
+    for (let i = 0; i < 1005; i++) await r2.put(`${prefix(MEI.id, crypto.randomUUID())}original`, 'x');
+    const saved: (string | null)[] = [];
+    world.rpc.set_job_state = (a) => {
+      if (a.p_value !== null) return new Response('{"code":"23514"}', { status: 400 });
+      saved.push(null);
+      db.jobState.set('orphan_sweep_cursor', null);
+      return null;
+    };
+    const counts = await runCleanup(env);
+    expect(counts.orphansDeleted).toBe(1000);
+    expect(saved).toEqual([null]);
+    expect(db.jobState.get('orphan_sweep_cursor')).toBeNull();
   });
 });

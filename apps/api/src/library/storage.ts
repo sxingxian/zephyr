@@ -22,30 +22,33 @@ export const LIBRARY_LIMITS = {
   deleteBatch: 1000,
 } as const;
 
-export type ObjectKind = 'original' | 'thumb' | 'preview' | 'staging-thumb' | 'staging-preview';
-export const OBJECT_KINDS: readonly ObjectKind[] = [
-  'original',
-  'thumb',
-  'preview',
-  'staging-thumb',
-  'staging-preview',
+export type PhotoKind = 'original' | 'thumb' | 'preview';
+export type VariantKey = 'thumb' | 'preview';
+
+/** `u/<owner>/p/<photo>/<kind>`: grouped by owner so an account purge can delete by prefix. */
+export const photoKey = (owner: string, photo: string, kind: PhotoKind) => `u/${owner}/p/${photo}/${kind}`;
+/**
+ * `staging/<owner>/<photo>/<kind>`: where variant PUTs land. Only a completion that won the database claim
+ * copies them to the photo's keys, so a late or racing PUT can never overwrite a finished photo's files.
+ * A separate top-level prefix, so an R2 lifecycle rule can delete anything left there after 2 days.
+ */
+export const stagingKey = (owner: string, photo: string, kind: VariantKey) =>
+  `staging/${owner}/${photo}/${kind}`;
+/** Every key a photo may have, in public._photo_keys order. */
+export const photoKeys = (owner: string, photo: string) => [
+  photoKey(owner, photo, 'original'),
+  photoKey(owner, photo, 'thumb'),
+  photoKey(owner, photo, 'preview'),
+  stagingKey(owner, photo, 'thumb'),
+  stagingKey(owner, photo, 'preview'),
 ];
 
-/**
- * `u/<owner>/p/<photo>/<kind>`: grouped by owner so an account purge can delete by prefix. Variant PUTs
- * write `staging-<kind>`; only a completion that won the database claim copies them to `<kind>`, so a
- * late or racing PUT can never overwrite a finished photo's files.
- */
-export const photoKey = (owner: string, photo: string, kind: ObjectKind) => `u/${owner}/p/${photo}/${kind}`;
-/** Every key a photo may have (as public._photo_keys). */
-export const photoKeys = (owner: string, photo: string) => OBJECT_KINDS.map((k) => photoKey(owner, photo, k));
-
 const ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
-const KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/(${OBJECT_KINDS.join('|')})$`);
-/** Parses a library object key, or null for anything else. */
-export function parseKey(key: string): { owner: string; photo: string; kind: ObjectKind } | null {
+const KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/(original|thumb|preview)$`);
+/** Parses a photo object key (`u/…`), or null for anything else. */
+export function parseKey(key: string): { owner: string; photo: string; kind: PhotoKind } | null {
   const m = KEY_RE.exec(key);
-  return m ? { owner: m[1] as string, photo: m[2] as string, kind: m[3] as ObjectKind } : null;
+  return m ? { owner: m[1] as string, photo: m[2] as string, kind: m[3] as PhotoKind } : null;
 }
 
 /** A member's key for durable rate limits: an HMAC of the user id, never the id itself. */

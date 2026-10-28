@@ -28,8 +28,9 @@
     }
   ],
   // Private photo bucket: no public access, no r2.dev URL. Every byte goes through this Worker.
-  // Give it a lifecycle rule "abort incomplete multipart uploads after 1 day" (R2 › bucket › Settings ›
-  // Object lifecycle rules), so multipart parts the clean-up job can't reach never linger.
+  // Give it two lifecycle rules (R2 › bucket › Settings › Object lifecycle rules): "abort incomplete
+  // multipart uploads after 1 day", so parts the clean-up job can't reach never linger, and "delete objects
+  // with prefix staging/ after 2 days", which empties leftover staged variants (src/library/storage.ts).
   "r2_buckets": [{ "binding": "PHOTOS", "bucket_name": "zephyr-photos" }],
   // Library clean-up jobs (src/jobs.ts): expired uploads, Trash purges, account purges.
   "triggers": { "crons": ["*/15 * * * *"] },

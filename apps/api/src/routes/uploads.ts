@@ -13,7 +13,7 @@ import {
   type VariantKind,
 } from '@zephyr/shared';
 import { type Context, Hono } from 'hono';
-import { fail, limitHit, logError, rateLimited, readBody } from '../http';
+import { background, fail, limitHit, logError, rateLimited, readBody } from '../http';
 import { fileTypeFromName, imageInfo, SIGNATURE_BYTES, signatureMatches } from '../library/files';
 import {
   contentLength,
@@ -26,6 +26,7 @@ import {
   photoKey,
   photoKeys,
   readExact,
+  stagingKey,
   UUID,
 } from '../library/storage';
 import { rpc } from '../supabase';
@@ -267,7 +268,7 @@ uploadRoutes.put('/:id/variants/:kind', async (c) => {
     if (!info) return c.json(fail('invalid'), 415);
     if (info.width > limits.maxEdge || info.height > limits.maxEdge) return c.json(fail('invalid'), 400);
     // Staged, never the photo's own key: only a completion that wins the claim publishes it.
-    const staged = photoKey(ownerOf(c), up.photoId, `staging-${kind}`);
+    const staged = stagingKey(ownerOf(c), up.photoId, kind);
     await c.env.PHOTOS.put(staged, bytes, {
       httpMetadata: { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' },
     });
@@ -278,8 +279,16 @@ uploadRoutes.put('/:id/variants/:kind', async (c) => {
       p_bytes: bytes.byteLength,
     });
     if (!recorded) {
-      // Completed, aborted or expired meanwhile: nothing will count or publish this copy.
-      await c.env.PHOTOS.delete(staged);
+      // Completed, aborted or expired meanwhile: nothing will count or publish this copy. The delete
+      // runs under waitUntil, so a client hanging up can't skip it (the lifecycle rule is the backstop).
+      const requestId = c.get('requestId');
+      await background(c, async () => {
+        try {
+          await c.env.PHOTOS.delete(staged);
+        } catch (err) {
+          logError(requestId, 'upload_variant_unstage', err);
+        }
+      });
       return c.json(fail('upload_expired'), 410);
     }
     return c.json({ ok: true });
@@ -348,8 +357,8 @@ uploadRoutes.post('/:id/complete', async (c) => {
     // Measure the staged variants ourselves: their real sizes are what gets counted.
     const owner = ownerOf(c);
     const variants = {
-      thumb: await readStaged(c, photoKey(owner, up.photoId, 'staging-thumb'), 'thumb'),
-      preview: await readStaged(c, photoKey(owner, up.photoId, 'staging-preview'), 'preview'),
+      thumb: await readStaged(c, stagingKey(owner, up.photoId, 'thumb'), 'thumb'),
+      preview: await readStaged(c, stagingKey(owner, up.photoId, 'preview'), 'preview'),
     };
     const res = await rpc<CompleteResult | null>(c.env, 'complete_upload', {
       p_owner: owner,
@@ -361,21 +370,31 @@ uploadRoutes.post('/:id/complete', async (c) => {
     if (!res) return c.json(fail('not_found'), 404);
     switch (res.status) {
       case 'ready':
-        // This request won the claim: publish exactly the bytes that were counted.
-        try {
-          for (const kind of ['thumb', 'preview'] as const) {
-            const v = variants[kind];
-            if (v)
-              await c.env.PHOTOS.put(photoKey(owner, up.photoId, kind), v.bytes, {
-                httpMetadata: { contentType: v.type },
-              });
+        // This request won the claim: publish exactly the bytes that were counted, confirm, then unstage.
+        // If any step fails the photo stays publish_pending and the clean-up job finishes the copy.
+        if (variants.thumb || variants.preview) {
+          try {
+            for (const kind of ['thumb', 'preview'] as const) {
+              const v = variants[kind];
+              if (v) {
+                await c.env.PHOTOS.put(photoKey(owner, up.photoId, kind), v.bytes, {
+                  httpMetadata: { contentType: v.type },
+                });
+              }
+            }
+            await rpc(c.env, 'finish_publish', {
+              p_owner: owner,
+              p_photo: up.photoId,
+              p_lost_thumb: false,
+              p_lost_preview: false,
+            });
+            await deleteKeys(c.env.PHOTOS, [
+              stagingKey(owner, up.photoId, 'thumb'),
+              stagingKey(owner, up.photoId, 'preview'),
+            ]);
+          } catch (err) {
+            logError(c.get('requestId'), 'upload_publish_variants', err);
           }
-          await deleteKeys(c.env.PHOTOS, [
-            photoKey(owner, up.photoId, 'staging-thumb'),
-            photoKey(owner, up.photoId, 'staging-preview'),
-          ]);
-        } catch (err) {
-          logError(c.get('requestId'), 'upload_publish_variants', err);
         }
         return c.json({ ok: true, photo: res.photo } satisfies UploadCompleteResult);
       case 'duplicate': {
