@@ -3,6 +3,7 @@
  * from '@zephyr/shared/client' so they don't ship the validation library.
  */
 export * from './api-types';
+export * from './edit-types';
 export * from './invite-constants';
 export * from './library-types';
 export * from './plans';

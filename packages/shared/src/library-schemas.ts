@@ -46,7 +46,7 @@ export const photoMetadataSchema = z
   .partial();
 export const uploadCompleteSchema = z.object({ metadata: photoMetadataSchema });
 export const photoListQuerySchema = z.object({
-  view: z.enum(['library', 'favourites', 'raw', 'trash']).optional(),
+  view: z.enum(['library', 'favourites', 'raw', 'edited', 'trash']).optional(),
   albumId: uuid.optional(),
   q: z.string().trim().max(100).optional(),
   from: z.iso.date().optional(),

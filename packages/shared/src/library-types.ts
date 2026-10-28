@@ -114,16 +114,20 @@ export interface PhotoItem {
   favourite: boolean;
   hasThumb: boolean;
   hasPreview: boolean;
+  /** Phase 4: the photo's edit, if any. `rendered` means /thumb and /preview already show it. */
+  edit?: { version: number; rendered: boolean } | null;
   /** Only set for items in the Trash. */
   trashedAt?: string | null;
   purgeAt?: string | null;
 }
 export interface PhotoDetail extends PhotoItem {
   metadata: PhotoMetadata;
+  /** Phase 4: the full edit recipe (null when the photo is unedited). */
+  recipe?: import('./edit-types').EditRecipe | null;
   albums: { id: string; name: string }[];
 }
 export interface PhotoListQuery {
-  view?: 'library' | 'favourites' | 'raw' | 'trash';
+  view?: 'library' | 'favourites' | 'raw' | 'edited' | 'trash';
   albumId?: string;
   q?: string;
   from?: string; // ISO date

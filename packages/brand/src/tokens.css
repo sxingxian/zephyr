@@ -22,6 +22,7 @@
   --bad: #B4232F;
   --badTint: #FBE4E6;
   --canvas: #E3E5E9;
+  --editor: #E2E2E2;
   --scrim: rgba(13,17,23,0.42);
   --shadow: 0 1px 2px rgba(13,17,23,0.05), 0 10px 30px rgba(13,17,23,0.07);
   --glass: rgba(255,255,255,0.78);
@@ -51,6 +52,7 @@
     --bad: #FF8A94;
     --badTint: #3A1A1F;
     --canvas: #1B1D22;
+    --editor: #1E1E1E;
     --scrim: rgba(0,0,0,0.6);
     --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 32px rgba(0,0,0,0.35);
     --glass: rgba(20,24,31,0.78);
@@ -80,6 +82,7 @@
   --bad: #FF8A94;
   --badTint: #3A1A1F;
   --canvas: #1B1D22;
+  --editor: #1E1E1E;
   --scrim: rgba(0,0,0,0.6);
   --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 32px rgba(0,0,0,0.35);
   --glass: rgba(20,24,31,0.78);

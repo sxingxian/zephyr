@@ -12,7 +12,7 @@ const LIGHT = {
   line: 'rgba(13,17,23,0.09)', line2: 'rgba(13,17,23,0.16)', hover: 'rgba(13,17,23,0.05)',
   acc: '#2D5FD3', accInk: '#1F4BB5', accTint: '#E5ECFB', pri: '#0D1117', onPri: '#FFFFFF',
   good: '#1F7A4D', goodTint: '#E3F2EA', warn: '#A0461C', warnTint: '#FBEAE0', bad: '#B4232F', badTint: '#FBE4E6',
-  canvas: '#E3E5E9', scrim: 'rgba(13,17,23,0.42)', shadow: '0 1px 2px rgba(13,17,23,0.05), 0 10px 30px rgba(13,17,23,0.07)',
+  canvas: '#E3E5E9', editor: '#E2E2E2', scrim: 'rgba(13,17,23,0.42)', shadow: '0 1px 2px rgba(13,17,23,0.05), 0 10px 30px rgba(13,17,23,0.07)',
   glass: 'rgba(255,255,255,0.78)'
 };
 const DARK = {
@@ -20,7 +20,7 @@ const DARK = {
   line: 'rgba(241,243,247,0.08)', line2: 'rgba(241,243,247,0.16)', hover: 'rgba(241,243,247,0.06)',
   acc: '#8DB0FF', accInk: '#A9C3FF', accTint: '#1B2540', pri: '#F1F3F7', onPri: '#0A0C10',
   good: '#7FD3A6', goodTint: '#13291F', warn: '#F2A47C', warnTint: '#33201A', bad: '#FF8A94', badTint: '#3A1A1F',
-  canvas: '#1B1D22', scrim: 'rgba(0,0,0,0.6)', shadow: '0 1px 2px rgba(0,0,0,0.4), 0 12px 32px rgba(0,0,0,0.35)',
+  canvas: '#1B1D22', editor: '#1E1E1E', scrim: 'rgba(0,0,0,0.6)', shadow: '0 1px 2px rgba(0,0,0,0.4), 0 12px 32px rgba(0,0,0,0.35)',
   glass: 'rgba(20,24,31,0.78)'
 };
 // Mascot / illustration palette (pastel, flat — Zeno's style, Zephyr's own colours)
