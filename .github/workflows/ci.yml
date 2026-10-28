@@ -1,9 +1,10 @@
 name: CI
 
+# Pull requests are switched off, so every pushed branch is checked before it's fast-forwarded into main.
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: ['**']
 
 permissions:
   contents: read
