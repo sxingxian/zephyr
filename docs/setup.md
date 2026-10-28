@@ -50,6 +50,8 @@ Nothing here is committed; each value goes into Cloudflare, Supabase, Resend or 
 4. **R2 (photo storage):** create a bucket named `zephyr-photos` in the region closest to your users. Leave
    public access **off** and don't enable the r2.dev URL: every image is served by the API after an ownership
    check. No R2 API tokens or CORS rules are needed, because uploads go through the API Worker's binding.
+   Under _Settings › Object lifecycle rules_, add a rule for the whole bucket that aborts incomplete multipart
+   uploads after **1 day**. The clean-up job aborts the uploads it knows about; this rule catches any it missed.
 5. Create an API token with _Workers Scripts: Edit_, _Workers Routes: Edit_, _Workers R2 Storage: Edit_ and
    _Zone: Read_ on midnightpoetry.studio.
 6. Deploy order: the API (`zephyr-api`, which also runs the 15-minute clean-up job), then the landing Worker (custom domain `zephyr.midnightpoetry.studio`,

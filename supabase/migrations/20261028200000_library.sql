@@ -7,6 +7,9 @@
 -- Usage invariant (tested in supabase/tests/30_library_test.sql), kept under a per-owner advisory lock:
 --   profiles.storage_bytes  = Σ size_bytes + thumb_bytes + preview_bytes over photos in ready, trashed, purging
 --   profiles.reserved_bytes = Σ uploads.reserved_bytes
+-- Variants are uploaded to per-upload staging keys (…/staging-thumb, …/staging-preview) and copied to the
+-- photo's keys only after complete_upload claims the upload, so a late variant PUT can never overwrite a
+-- finished photo's files. _photo_keys lists all five keys a photo may have.
 -- R2 objects are deleted before the rows that account for them: the job and bulk paths move photos to
 -- 'purging' (hidden everywhere, still counted, can't be restored), the Worker deletes the objects, then a
 -- confirm_* function removes the rows and the usage.
@@ -21,6 +24,9 @@ alter table public.profiles
   add column reserved_bytes bigint not null default 0 check (reserved_bytes >= 0),
   add column deletion_requested_at timestamptz,
   add column deletion_due timestamptz,
+  -- Account purge bookkeeping (due_account_purges): failed attempts back off for an hour.
+  add column purge_attempts integer not null default 0 check (purge_attempts >= 0),
+  add column purge_attempted_at timestamptz,
   add constraint profiles_deletion_pair check ((deletion_requested_at is null) = (deletion_due is null));
 
 create table public.photos (
@@ -105,6 +111,14 @@ create table public.album_photos (
 alter table public.album_photos enable row level security;
 create index album_photos_photo on public.album_photos (photo_id);
 
+-- Small key/value store for the clean-up jobs (e.g. the orphan sweep's R2 list cursor).
+create table public.job_state (
+  key text primary key check (key in ('orphan_sweep_cursor')),
+  value text check (length(value) <= 2048),
+  updated_at timestamptz not null default now()
+);
+alter table public.job_state enable row level security;
+
 -- An album only ever holds (and shows as its cover) its owner's photos, whoever writes the row.
 create function public._album_photo_same_owner() returns trigger
 language plpgsql set search_path = '' as $$
@@ -161,9 +175,8 @@ $$;
 
 create function public._photo_keys(p_owner uuid, p_photo uuid) returns jsonb
 language sql immutable set search_path = '' as $$
-  select jsonb_build_array(public._r2_prefix(p_owner, p_photo) || 'original',
-                           public._r2_prefix(p_owner, p_photo) || 'thumb',
-                           public._r2_prefix(p_owner, p_photo) || 'preview');
+  select jsonb_agg(public._r2_prefix(p_owner, p_photo) || k order by o)
+    from unnest(array['original', 'thumb', 'preview', 'staging-thumb', 'staging-preview']) with ordinality as t(k, o);
 $$;
 
 -- Keeps only known EXIF keys with sane types and ranges (mirrors photoMetadataSchema). Never GPS.
@@ -416,11 +429,14 @@ language sql volatile security definer set search_path = '' as $$
   returning true;
 $$;
 
--- Finishes an upload after the Worker completed the R2 object and checked its size. Returns
+-- Finishes an upload after the Worker completed the R2 object and checked its size. p_thumb_bytes and
+-- p_preview_bytes are the sizes of the staged variants the Worker read from R2 (0 if absent); they are
+-- what gets counted, never the sizes the browser reported. Returns
 -- {status: 'ready', photo} | {status: 'duplicate', photoId} (the same file finished first in another
 -- upload: this one is removed and the Worker deletes its objects) | {status: 'expired' | 'incomplete'},
 -- or null if it isn't this owner's upload.
-create function public.complete_upload(p_owner uuid, p_upload uuid, p_metadata jsonb) returns jsonb
+create function public.complete_upload(p_owner uuid, p_upload uuid, p_metadata jsonb,
+  p_thumb_bytes integer, p_preview_bytes integer) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   u public.uploads;
@@ -448,8 +464,8 @@ begin
     return jsonb_build_object('status', 'duplicate', 'photoId', existing);
   end if;
   md := public._clean_metadata(p_metadata);
-  v_thumb := coalesce((u.variants ->> 'thumb')::integer, 0);
-  v_preview := coalesce((u.variants ->> 'preview')::integer, 0);
+  v_thumb := least(greatest(coalesce(p_thumb_bytes, 0), 0), 307200);
+  v_preview := least(greatest(coalesce(p_preview_bytes, 0), 0), 1572864);
   update public.photos
      set status = 'ready',
          metadata = md,
@@ -469,9 +485,11 @@ begin
 end;
 $$;
 
--- Removes an unfinished upload and releases its reservation, after the Worker aborted the R2 upload and
--- deleted any variants. Returns true, or null if it isn't this owner's upload.
-create function public.abort_upload(p_owner uuid, p_upload uuid) returns boolean
+-- Claims an unfinished upload for removal: deletes the rows and releases the reservation under the
+-- storage lock, and only then returns what the Worker must clean up in R2 ({r2Key, r2UploadId, keys}).
+-- Null if it isn't this owner's upload or a concurrent complete/abort got there first, in which case the
+-- Worker deletes nothing (leftovers from a lost race go to the orphan sweep).
+create function public.abort_upload(p_owner uuid, p_upload uuid) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare u public.uploads;
 begin
@@ -481,7 +499,8 @@ begin
   delete from public.photos where id = u.photo_id and status = 'uploading'; -- cascades to the upload
   delete from public.uploads where id = u.id;
   update public.profiles set reserved_bytes = reserved_bytes - u.reserved_bytes where id = p_owner;
-  return true;
+  return jsonb_build_object('r2Key', u.r2_key, 'r2UploadId', u.r2_upload_id,
+                            'keys', public._photo_keys(p_owner, u.photo_id));
 end;
 $$;
 
@@ -869,18 +888,65 @@ $$;
 -- Accounts whose deletion is due: [{ownerId, prefix, uploads: [{r2Key, r2UploadId}]}]. The Worker aborts
 -- the open multipart uploads, deletes every object under the prefix (over several runs if needed), then
 -- the Auth user, which cascades to the profile, photos, uploads and albums.
+-- Each pick counts as an attempt; accounts attempted in the last hour are skipped so one failing account
+-- can't stall the queue, and the fifth failed attempt raises an audit alert. account_purge_progress
+-- resets the count when a run made progress without finishing (very large accounts).
 create function public.due_account_purges(p_limit integer) returns jsonb
-language sql stable security definer set search_path = '' as $$
-  select coalesce(jsonb_agg(jsonb_build_object(
-           'ownerId', x.id,
-           'prefix', 'u/' || x.id::text || '/',
-           'uploads', coalesce((select jsonb_agg(jsonb_build_object('r2Key', u.r2_key, 'r2UploadId', u.r2_upload_id))
-                                  from public.uploads u where u.owner_id = x.id and u.r2_upload_id is not null), '[]'::jsonb))
-         order by x.deletion_due), '[]'::jsonb)
+language plpgsql volatile security definer set search_path = '' as $$
+declare
+  picked uuid[];
+  r record;
+begin
+  select array_agg(x.id order by x.deletion_due) into picked
     from (select p.id, p.deletion_due from public.profiles p
            where p.deletion_due <= now()
+             and (p.purge_attempted_at is null or p.purge_attempted_at <= now() - interval '1 hour')
              and not exists (select 1 from public.staff s where s.user_id = p.id)
-           order by p.deletion_due limit least(greatest(coalesce(p_limit, 10), 1), 100)) x;
+           order by p.deletion_due limit least(greatest(coalesce(p_limit, 10), 1), 100)
+           for update skip locked) x;
+  if picked is null then return '[]'::jsonb; end if;
+  for r in update public.profiles set purge_attempts = purge_attempts + 1, purge_attempted_at = now()
+            where id = any (picked) returning id, purge_attempts loop
+    if r.purge_attempts = 5 then
+      perform public._audit(null, 'jobs.account_purge_failing', r.id::text, jsonb_build_object('attempts', r.purge_attempts));
+    end if;
+  end loop;
+  return (select coalesce(jsonb_agg(jsonb_build_object(
+           'ownerId', p.id,
+           'prefix', 'u/' || p.id::text || '/',
+           'uploads', coalesce((select jsonb_agg(jsonb_build_object('r2Key', u.r2_key, 'r2UploadId', u.r2_upload_id))
+                                  from public.uploads u where u.owner_id = p.id and u.r2_upload_id is not null), '[]'::jsonb))
+         order by p.deletion_due), '[]'::jsonb)
+    from public.profiles p where p.id = any (picked));
+end;
+$$;
+
+-- A purge run deleted objects without failing but didn't finish: try again next run, not in an hour.
+create function public.account_purge_progress(p_owner uuid) returns void
+language sql volatile security definer set search_path = '' as $$
+  update public.profiles set purge_attempts = 0, purge_attempted_at = null
+   where id = p_owner and deletion_due <= now();
+$$;
+
+-- Orphan sweep: for photo ids seen in R2, what the database knows: [{id, ownerId, status, activeUpload}].
+-- Ids with no row are absent (their objects are orphans).
+create function public.sweep_photo_rows(p_ids uuid[]) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'id', p.id, 'ownerId', p.owner_id, 'status', p.status,
+           'activeUpload', exists (select 1 from public.uploads u where u.photo_id = p.id))), '[]'::jsonb)
+    from public.photos p where p.id = any (p_ids[1:1000]);
+$$;
+
+create function public.get_job_state(p_key text) returns text
+language sql stable security definer set search_path = '' as $$
+  select value from public.job_state where key = p_key;
+$$;
+
+create function public.set_job_state(p_key text, p_value text) returns void
+language sql volatile security definer set search_path = '' as $$
+  insert into public.job_state (key, value, updated_at) values (p_key, p_value, now())
+  on conflict (key) do update set value = excluded.value, updated_at = now();
 $$;
 
 -- Old rate-limit rows (pg_cron's daily purge does the same; this is idempotent).
@@ -901,7 +967,7 @@ declare k text;
 begin
   if p_details is null or jsonb_typeof(p_details) <> 'object' then return; end if;
   for k in select jsonb_object_keys(p_details) loop
-    if k not in ('uploadsAborted', 'photosPurged', 'accountsPurged', 'objectsDeleted', 'rateLimitRows')
+    if k not in ('uploadsAborted', 'photosPurged', 'accountsPurged', 'objectsDeleted', 'orphansDeleted', 'rateLimitRows')
        or jsonb_typeof(p_details -> k) <> 'number' then
       raise exception 'bad cleanup details' using errcode = 'invalid_parameter_value';
     end if;
@@ -913,7 +979,7 @@ $$;
 -- ---------------------------------------------------------------------------------------------
 -- Privileges: service_role only. Internal helpers (_*) are callable by no role but their owner.
 -- ---------------------------------------------------------------------------------------------
-revoke all on public.photos, public.uploads, public.albums, public.album_photos from anon, authenticated;
+revoke all on public.photos, public.uploads, public.albums, public.album_photos, public.job_state from anon, authenticated;
 revoke execute on all functions in schema public from public, anon, authenticated;
 revoke execute on function
   public._album_photo_same_owner(),
@@ -934,7 +1000,7 @@ grant execute on function
   public.set_upload_r2(uuid, uuid, text),
   public.record_part(uuid, uuid, integer, text),
   public.record_variant(uuid, uuid, text, integer),
-  public.complete_upload(uuid, uuid, jsonb),
+  public.complete_upload(uuid, uuid, jsonb, integer, integer),
   public.abort_upload(uuid, uuid),
   public.list_photos(uuid, text, uuid, text, date, date, text, text, integer),
   public.get_photo(uuid, uuid),
@@ -956,6 +1022,10 @@ grant execute on function
   public.due_photo_purges(integer),
   public.confirm_photo_purges(uuid[]),
   public.due_account_purges(integer),
+  public.account_purge_progress(uuid),
+  public.sweep_photo_rows(uuid[]),
+  public.get_job_state(text),
+  public.set_job_state(text, text),
   public.purge_rate_limits(),
   public.record_cleanup(jsonb)
 to service_role;

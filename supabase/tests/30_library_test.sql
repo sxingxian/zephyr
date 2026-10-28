@@ -33,7 +33,7 @@ begin
   end loop;
   perform public.record_variant(o, u, 'thumb', 20000);
   perform public.record_variant(o, u, 'preview', 400000);
-  return public.complete_upload(o, u, md);
+  return public.complete_upload(o, u, md, 20000, 400000);
 end $$;
 
 -- Mei (free), Wei (pro), Ana (free; deletes her account), and a staff member.
@@ -83,7 +83,7 @@ select pg_temp.ok(get_upload('20000000-0000-0000-0000-000000000002', (select (v 
 select pg_temp.ok(set_upload_r2('20000000-0000-0000-0000-000000000002', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1'), 'r2-x') is null, 'set_upload_r2: other owner → null');
 select pg_temp.ok(record_part('20000000-0000-0000-0000-000000000002', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1'), 1, 'e') is null, 'record_part: other owner → null');
 select pg_temp.ok(record_variant('20000000-0000-0000-0000-000000000002', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1'), 'thumb', 10) is null, 'record_variant: other owner → null');
-select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000002', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1'), '{}') is null, 'complete_upload: other owner → null');
+select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000002', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1'), '{}', 0, 0) is null, 'complete_upload: other owner → null');
 select pg_temp.ok(abort_upload('20000000-0000-0000-0000-000000000002', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1')) is null, 'abort_upload: other owner → null');
 select pg_temp.ok((select count(*) = 2 from public.uploads where owner_id = '20000000-0000-0000-0000-000000000001'), 'other owners changed nothing');
 
@@ -93,7 +93,7 @@ select pg_temp.ok(set_upload_r2('20000000-0000-0000-0000-000000000001', (select 
 select pg_temp.ok(record_part('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1'), 2, 'e') is null, 'record_part: part number out of range → null');
 select pg_temp.ok(record_variant('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1'), 'thumb', 400000) is null, 'record_variant: over the thumb cap → null');
 select pg_temp.ok(record_variant('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1'), 'original', 10) is null, 'record_variant: unknown kind → null');
-select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,6,uploadId}')::uuid from t where k = 'r1'), '{}') ->> 'status' = 'incomplete', 'complete before every part → incomplete');
+select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,6,uploadId}')::uuid from t where k = 'r1'), '{}', 0, 0) ->> 'status' = 'incomplete', 'complete before every part → incomplete');
 insert into t select 'c1', pg_temp.finish('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1'),
   '{"width": 6000, "height": 4000, "takenAt": "2026-06-01T10:00:00+08:00", "cameraMake": "  FUJIFILM\u0007 ", "cameraModel": "X-T5",
     "iso": 400, "aperture": 2.8, "orientation": 9, "lens": 42, "GPSLatitude": 1.3, "takenAtBad": "x", "focalLengthMm": -1}');
@@ -105,6 +105,15 @@ select pg_temp.ok((select metadata = '{"width": 6000, "height": 4000, "takenAt":
 select pg_temp.ok((select storage_bytes = 5000000 + 20000 + 400000 and reserved_bytes = 20000000 + 1880064
   from public.profiles where id = '20000000-0000-0000-0000-000000000001'), 'completion turns the reservation into usage');
 select pg_temp.ok(not exists (select 1 from public.uploads where id = (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'r1')), 'the upload row is gone');
+-- Variant sizes counted are the ones the Worker measured in R2, clamped to the caps; the browser's are ignored.
+insert into t select 'vs', create_uploads('20000000-0000-0000-0000-000000000003', jsonb_build_array(pg_temp.file('v.jpg', 100, 'jpeg', 'vsize')));
+select record_part('20000000-0000-0000-0000-000000000003', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'vs'), 1, 'e1');
+select record_variant('20000000-0000-0000-0000-000000000003', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'vs'), 'thumb', 10);
+select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000003', (select (v #>> '{results,0,uploadId}')::uuid from t where k = 'vs'), '{}', 999999999, 0) #>> '{photo,hasPreview}' = 'false',
+  'complete_upload: an absent preview is not counted');
+select pg_temp.ok((select thumb_bytes = 307200 and preview_bytes = 0 from public.photos where id = (select (v #>> '{results,0,photoId}')::uuid from t where k = 'vs')),
+  'complete_upload counts the measured sizes, clamped to the variant caps (not uploads.variants)');
+select pg_temp.ok(pg_temp.all_ok(), 'no drift with measured variant sizes');
 select pg_temp.ok(pg_temp.all_ok(), 'no drift after completion');
 
 -- ---- Duplicates -----------------------------------------------------------------------------------------
@@ -140,13 +149,17 @@ select pg_temp.ok((select storage_bytes + reserved_bytes <= 5::bigint * 10737418
 select pg_temp.ok(pg_temp.all_ok(), 'no drift after quota checks');
 
 -- ---- Abort and expiry ---------------------------------------------------------------------------------
-select pg_temp.ok(abort_upload('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,6,uploadId}')::uuid from t where k = 'r1')), 'abort_upload');
+insert into t select 'ab', abort_upload('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,6,uploadId}')::uuid from t where k = 'r1'));
+select pg_temp.ok((select jsonb_array_length(v -> 'keys') = 5 and v ->> 'r2Key' like '%/original' from t where k = 'ab'),
+  'abort_upload claims the upload and returns the keys to delete (original, variants, staging)');
+select pg_temp.ok(abort_upload('20000000-0000-0000-0000-000000000001', (select (v #>> '{results,6,uploadId}')::uuid from t where k = 'r1')) is null,
+  'a second abort (lost race) gets nothing to delete');
 select pg_temp.ok(not exists (select 1 from public.photos where id = (select (v #>> '{results,6,photoId}')::uuid from t where k = 'r1')), 'abort removes the uploading photo');
 select pg_temp.ok(pg_temp.all_ok(), 'no drift after abort');
 update public.uploads set expires_at = now() - interval '1 second' where owner_id = '20000000-0000-0000-0000-000000000002';
 select pg_temp.ok(record_part('20000000-0000-0000-0000-000000000002', (select id from public.uploads where owner_id = '20000000-0000-0000-0000-000000000002' limit 1), 1, 'e') is null,
   'expired upload: parts are refused');
-select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000002', (select id from public.uploads where owner_id = '20000000-0000-0000-0000-000000000002' limit 1), '{}') ->> 'status' = 'expired',
+select pg_temp.ok(complete_upload('20000000-0000-0000-0000-000000000002', (select id from public.uploads where owner_id = '20000000-0000-0000-0000-000000000002' limit 1), '{}', 0, 0) ->> 'status' = 'expired',
   'expired upload: complete → expired');
 insert into t select 'due', due_expired_uploads(100);
 select pg_temp.ok((select jsonb_array_length(v) = 2 and v #>> '{0,keys,0}' like 'u/20000000-0000-0000-0000-000000000002/p/%/original' from t where k = 'due'),
@@ -174,7 +187,7 @@ select pg_temp.ok((select count(distinct e ->> 'id') = 8 from t, jsonb_array_ele
 -- Order: no taken date sorts by upload time (now, now, now − 3 h), then June, then the January lakes.
 select pg_temp.ok((select v #>> '{items,0,id}' = (select v #>> '{photo,id}' from t where k = 'c1') from t where k = 'p2')
   and (select v #>> '{items,2,filename}' = 'Lake_3.jpg' from t where k = 'p1'), 'sort by taken, falling back to the upload time');
-select pg_temp.ok(list_photos('20000000-0000-0000-0000-000000000001', p_sort => 'added') #>> '{items,0,filename}' in ('filler.jpg', 'race.jpg'), 'sort by added');
+select pg_temp.ok(list_photos('20000000-0000-0000-0000-000000000001', p_sort => 'added') #>> '{items,0,filename}' in ('filler.jpg', 'race.jpg', 'IMG_1.jpg'), 'sort by added (ties on the upload time go by id)');
 select pg_temp.ok(jsonb_array_length(list_photos('20000000-0000-0000-0000-000000000001', p_view => 'raw') -> 'items') = 1, 'view raw');
 select pg_temp.ok(list_photos('20000000-0000-0000-0000-000000000001', p_q => 'leica') #>> '{items,0,filename}' = 'Lake_2.jpg', 'search by camera (trigram)');
 select pg_temp.ok(jsonb_array_length(list_photos('20000000-0000-0000-0000-000000000001', p_q => 'LAKE_') -> 'items') = 5, 'search by filename, case-insensitive, _ is literal');
@@ -238,7 +251,7 @@ select pg_temp.ok(create_uploads('20000000-0000-0000-0000-000000000001', jsonb_b
 select pg_temp.ok(bulk_photos('20000000-0000-0000-0000-000000000001', array[(select id from ids where filename = 'Lake_1.jpg')], 'restore') ->> 'affected' = '1', 'bulk restore');
 select pg_temp.ok(get_album('20000000-0000-0000-0000-000000000001', (select (v ->> 'id')::uuid from t where k = 'a1')) ->> 'photoCount' = '1', 'a restored photo is back in its album');
 insert into t select 'df', bulk_photos('20000000-0000-0000-0000-000000000001', array[(select id from ids where filename = 'Lake_2.jpg')], 'delete_forever');
-select pg_temp.ok((select v ->> 'affected' = '1' and jsonb_array_length(v #> '{purge,0,keys}') = 3 from t where k = 'df'), 'delete_forever from Trash returns the R2 keys');
+select pg_temp.ok((select v ->> 'affected' = '1' and jsonb_array_length(v #> '{purge,0,keys}') = 5 from t where k = 'df'), 'delete_forever from Trash returns the R2 keys');
 select pg_temp.ok(bulk_photos('20000000-0000-0000-0000-000000000001', array[(select id from ids where filename = 'Lake_2.jpg')], 'restore') ->> 'affected' = '0', 'a purging photo can''t be restored');
 select pg_temp.ok(get_photo('20000000-0000-0000-0000-000000000001', (select id from ids where filename = 'Lake_2.jpg')) is null, 'a purging photo is hidden');
 select pg_temp.ok(create_uploads('20000000-0000-0000-0000-000000000001', jsonb_build_array(pg_temp.file('lake2.jpg', 1002, 'jpeg', 'lake2'))) #>> '{results,0,status}' = 'ready',
@@ -283,6 +296,13 @@ update public.profiles set deletion_due = now() - interval '1 second', deletion_
 select pg_temp.ok((select jsonb_array_length(d) = 1 and d #>> '{0,ownerId}' = '20000000-0000-0000-0000-000000000003'
   and d #>> '{0,prefix}' = 'u/20000000-0000-0000-0000-000000000003/' from due_account_purges(10) d), 'due_account_purges: due members only (never staff)');
 select pg_temp.ok(restore_account('20000000-0000-0000-0000-000000000003') is null, 'too late to restore after the date');
+select pg_temp.ok(jsonb_array_length(due_account_purges(10)) = 0, 'an account attempted in the last hour is skipped (backoff)');
+select account_purge_progress('20000000-0000-0000-0000-000000000003');
+select pg_temp.ok(jsonb_array_length(due_account_purges(10)) = 1, 'after progress it is picked up again on the next run');
+update public.profiles set purge_attempts = 4, purge_attempted_at = now() - interval '2 hours' where id = '20000000-0000-0000-0000-000000000003';
+select pg_temp.ok(jsonb_array_length(due_account_purges(10)) = 1, 'retried after the hour');
+select pg_temp.ok(exists (select 1 from public.audit_log where action = 'jobs.account_purge_failing' and target = '20000000-0000-0000-0000-000000000003'),
+  'the fifth failed attempt raises an audit alert');
 -- The Worker deletes the Auth user; everything cascades.
 delete from auth.users where id = '20000000-0000-0000-0000-000000000001';
 select pg_temp.ok(not exists (select 1 from public.photos where owner_id = '20000000-0000-0000-0000-000000000001')
@@ -290,9 +310,9 @@ select pg_temp.ok(not exists (select 1 from public.photos where owner_id = '2000
   and not exists (select 1 from public.uploads where owner_id = '20000000-0000-0000-0000-000000000001'), 'deleting the Auth user cascades to the library');
 
 -- ---- Jobs bookkeeping ---------------------------------------------------------------------------------
-select record_cleanup('{"photosPurged": 3, "objectsDeleted": 9}');
+select record_cleanup('{"photosPurged": 3, "objectsDeleted": 9, "orphansDeleted": 1}');
 select pg_temp.ok(exists (select 1 from public.audit_log where action = 'jobs.cleanup' and actor is null and target is null
-  and details = '{"photosPurged": 3, "objectsDeleted": 9}'), 'record_cleanup writes counts only');
+  and details = '{"photosPurged": 3, "objectsDeleted": 9, "orphansDeleted": 1}'), 'record_cleanup writes counts only');
 do $$ begin
   begin
     perform public.record_cleanup('{"email": "x@example.com"}');
@@ -301,12 +321,28 @@ do $$ begin
   end;
 end $$;
 select pg_temp.ok(purge_rate_limits() >= 0, 'purge_rate_limits');
+insert into t select 'sw', create_uploads('20000000-0000-0000-0000-000000000002', jsonb_build_array(pg_temp.file('sw.jpg', 100, 'jpeg', 'sweep')));
+select pg_temp.ok((select jsonb_array_length(r) = 2
+    and (select bool_and((e ->> 'activeUpload')::boolean = ((e ->> 'status') = 'uploading')) from jsonb_array_elements(r) e)
+  from sweep_photo_rows(array[(select (v #>> '{results,0,photoId}')::uuid from t where k = 'sw'),
+                              (select (v #>> '{results,0,photoId}')::uuid from t where k = 'vs'), gen_random_uuid()]) r),
+  'sweep_photo_rows: known photos with their active-upload flag; unknown ids are absent');
+select set_job_state('orphan_sweep_cursor', 'abc');
+select set_job_state('orphan_sweep_cursor', 'def');
+select pg_temp.ok(get_job_state('orphan_sweep_cursor') = 'def', 'job state round-trips');
+do $$ begin
+  begin
+    perform public.set_job_state('anything', 'x');
+    raise exception 'FAILED: job_state took an unknown key';
+  exception when check_violation then raise notice 'ok - job_state only takes known keys';
+  end;
+end $$;
 
 -- ---- Privileges ----------------------------------------------------------------------------------------
 select pg_temp.ok(not exists (
   select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
     cross join unnest(array['anon', 'authenticated', 'service_role']) r(role)
-   where n.nspname = 'public' and c.relname in ('photos', 'uploads', 'albums', 'album_photos')
+   where n.nspname = 'public' and c.relname in ('photos', 'uploads', 'albums', 'album_photos', 'job_state')
      and (has_table_privilege(r.role, c.oid, 'select') or has_table_privilege(r.role, c.oid, 'insert')
           or has_table_privilege(r.role, c.oid, 'update') or has_table_privilege(r.role, c.oid, 'delete'))
      and r.role <> 'service_role'
@@ -334,7 +370,7 @@ do $$ begin
   end;
 end $$;
 reset role;
-select pg_temp.ok(has_function_privilege('service_role', 'public.complete_upload(uuid, uuid, jsonb)', 'execute')
+select pg_temp.ok(has_function_privilege('service_role', 'public.complete_upload(uuid, uuid, jsonb, integer, integer)', 'execute')
   and not has_function_privilege('service_role', 'public._clean_metadata(jsonb)', 'execute'), 'service_role calls entry points, not helpers');
 
 rollback;

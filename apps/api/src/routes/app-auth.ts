@@ -195,6 +195,8 @@ appAuthRoutes.get('/session', requireMember, async (c) => {
 appAuthRoutes.post('/sign-out', async (c) => {
   const s = await resolveSession(c, 'app');
   await endSession(c, 'app', s?.accessToken);
+  // Private images may sit in the browser cache (revalidated, but still stored): drop them.
+  c.header('Clear-Site-Data', '"cache"');
   return c.body(null, 204);
 });
 

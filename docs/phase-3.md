@@ -42,9 +42,13 @@ Every byte passes through the API Worker into R2 using R2 multipart upload. This
 4. `POST /api/v1/uploads/:uploadId/complete` sends `{ metadata }`:
    - Metadata the browser read from EXIF: width, height, taken-at, camera make and model, lens, focal length,
      aperture, shutter, ISO, orientation. Every field is length- and range-checked.
-   - The server finishes the multipart upload, checks that the stored size equals the declared size, switches the
-     reservation to real usage and marks the photo `ready`.
-5. `DELETE /api/v1/uploads/:uploadId` aborts the upload and releases the reservation. Uploads left unfinished for 24
+   - The server finishes the multipart upload and checks that the stored size equals the declared size.
+   - It reads the thumb and preview sizes from R2 (capped at their limits) instead of trusting earlier records, then
+     switches the reservation to real usage and marks the photo `ready`.
+   - A variant written after the upload has closed is deleted straight away and the request gets 410.
+5. `DELETE /api/v1/uploads/:uploadId` aborts the upload and releases the reservation. The abort is claimed in the
+   database first, under the owner's storage lock, and only the winner deletes R2 objects, so an abort can't race a
+   completion into a counted photo with no files. Uploads left unfinished for 24
    hours are aborted by the clean-up job.
 
 **Browser side.**
@@ -54,6 +58,8 @@ Every byte passes through the API Worker into R2 using R2 multipart upload. This
   the browser can encode it, JPEG otherwise.
 - For RAW files, the largest embedded JPEG preview is used, so no RAW decoder is needed until the editor (phase 4).
 - Uploads run three files at a time, with pause, cancel and retry. Retries resume from the last confirmed part.
+- The queue belongs to the user who started it. Sign-out, a 401 or a change of user aborts it, deletes its open
+  uploads, frees its object URLs and reloads the page.
 
 **GPS** stays inside the original file. Zephyr never parses, stores or shows location in this phase.
 
@@ -65,9 +71,11 @@ Every byte passes through the API Worker into R2 using R2 multipart upload. This
 - **Headers:**
   - A fixed `Content-Type`.
   - `X-Content-Type-Options: nosniff`.
-  - `Content-Security-Policy: default-src 'none'; sandbox`.
+  - `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'`.
   - `Cross-Origin-Resource-Policy: same-origin`.
-  - `Cache-Control: private, max-age=31536000, immutable` for variants (they never change), `no-store` for originals.
+  - `Cache-Control: private, no-cache` with an ETag for variants, so every view re-checks the session (a 304 is
+    cheap). Originals are `no-store`.
+  - Sign-out and account deletion send `Clear-Site-Data: "cache"` so nothing private stays in the browser cache.
 - Originals always download (`Content-Disposition: attachment`, RFC 5987 filename).
 
 ## Library API
@@ -107,7 +115,12 @@ to `audit_log` without personal data. It:
 3. Purges accounts whose `deletion_due` has passed:
    - Lists and deletes every R2 object under `u/<ownerId>/`.
    - Deletes the Auth user with the admin API, which cascades to the profile, photos and albums.
-4. Deletes rate-limit rows older than 2 days (pg_cron already does this; the job is idempotent).
+   - A failed account is retried no more than once an hour; after 5 failures an alert goes into `audit_log`.
+4. Sweeps a bounded page of `u/` keys (the cursor is kept in `job_state`) and deletes objects with no photo row,
+   skipping any photo with an upload still in progress.
+5. Deletes rate-limit rows older than 2 days (pg_cron already does this; the job is idempotent).
+
+An R2 lifecycle rule also aborts incomplete multipart uploads after one day (see setup.md).
 
 ## Security notes
 

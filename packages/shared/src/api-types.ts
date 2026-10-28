@@ -73,6 +73,7 @@ export type ApiErrorCode =
   | 'upload_expired'
   | 'too_large'
   | 'storage_full'
+  | 'session_changed' // uploads: X-Zephyr-Expected-User names a different user than the session (shared device)
   | 'server';
 
 export interface ApiError {

@@ -619,3 +619,12 @@ describe('Sign-ups & invites', () => {
     expect((await read(b)).items).toHaveLength(1);
   });
 });
+
+describe('admin sign-out', () => {
+  it('ends the session and clears the browser cache', async () => {
+    const { j, access } = await staffSession();
+    const res = await call('/admin/api/v1/auth/sign-out', { body: {}, jar: j, access });
+    expect(res.status).toBe(204);
+    expect(res.headers.get('Clear-Site-Data')).toBe('"cache"');
+  });
+});

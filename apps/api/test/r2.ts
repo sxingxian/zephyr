@@ -84,7 +84,13 @@ export class MockR2 {
       bytes = bytes.subarray(offset, offset + length);
       range = { offset, length };
     }
-    return { ...this.meta(key, s), range, body: new Response(bytes).body as ReadableStream<Uint8Array> };
+    const copy = new Uint8Array(bytes);
+    return {
+      ...this.meta(key, s),
+      range,
+      body: new Response(copy).body as ReadableStream<Uint8Array>,
+      arrayBuffer: async () => copy.buffer.slice(0),
+    };
   }
 
   async put(key: string, value: unknown, opts: { httpMetadata?: { contentType?: string } } = {}) {
@@ -108,16 +114,17 @@ export class MockR2 {
     }
   }
 
+  /** Cursors continue after the last key returned (like R2's), so deletes between pages don't skip keys. */
   async list(opts: { prefix?: string; limit?: number; cursor?: string } = {}) {
-    const keys = [...this.objects.keys()].filter((k) => k.startsWith(opts.prefix ?? '')).sort();
-    const start = opts.cursor ? Number(opts.cursor) : 0;
+    const after = opts.cursor ?? '';
+    const keys = [...this.objects.keys()].filter((k) => k.startsWith(opts.prefix ?? '') && k > after).sort();
     const limit = opts.limit ?? 1000;
-    const page = keys.slice(start, start + limit);
-    const truncated = start + limit < keys.length;
+    const page = keys.slice(0, limit);
+    const truncated = keys.length > limit;
     return {
       objects: page.map((k) => this.meta(k, this.objects.get(k) as Stored)),
       truncated,
-      cursor: truncated ? String(start + limit) : undefined,
+      cursor: truncated ? page.at(-1) : undefined,
       delimitedPrefixes: [],
     };
   }

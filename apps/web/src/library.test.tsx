@@ -6,6 +6,7 @@ import { routes } from './App';
 import { viewerKey } from './components/Viewer';
 import { dayLabel, daysLeft, exposure } from './lib/format';
 import { gridMove, rangeSelect } from './lib/selection';
+import { browser } from './lib/sessionGuard';
 import { resetUsage } from './lib/usage';
 
 const USER = {
@@ -85,11 +86,18 @@ function renderAt(path: string) {
   return router;
 }
 
+let assigned: string[] = [];
 beforeEach(() => {
   resetUsage();
+  assigned = [];
+  // Sign-out and account deletion end with a full page load; jsdom can't navigate, so record it.
+  vi.spyOn(browser, 'assign').mockImplementation((p) => {
+    assigned.push(p);
+  });
 });
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -224,6 +232,7 @@ describe('pending deletion', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Keep it deleted and sign out' }));
     await waitFor(() => expect(router.state.location.pathname).toBe('/sign-in'));
     expect(calls.some((c) => c.url.endsWith('/auth/sign-out') && c.method === 'POST')).toBe(true);
+    expect(assigned).toEqual(['/sign-in']);
   });
 
   it('re-checks the session when any call answers account_pending_deletion', async () => {
@@ -264,6 +273,7 @@ describe('delete account', () => {
     });
     await waitFor(() => expect(router.state.location.pathname).toBe('/account-deleted'));
     expect(calls.find((c) => c.url.endsWith('/me/delete'))?.body).toEqual({ confirm: 'DELETE' });
+    expect(assigned).toEqual(['/account-deleted']);
     expect(await screen.findByText('Your account is closed')).toBeTruthy();
   });
 

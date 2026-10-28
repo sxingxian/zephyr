@@ -65,6 +65,8 @@ export interface UploadRules {
 
 /** Everything the manager talks to, injectable for tests. */
 export interface UploadDeps {
+  /** The signed-in member's id. Every file is bound to the member who queued it. */
+  owner(): string | null;
   rules(): Promise<UploadRules | null>;
   hash(file: File): Promise<string>;
   prepare(file: File, raw: boolean): Promise<Prepared>;
@@ -87,10 +89,14 @@ export interface UploadDeps {
   onSettled?(): void;
   objectUrl?(blob: Blob): string;
   revokeUrl?(url: string): void;
+  /** Stop any fingerprinting in progress (the queue was reset). */
+  stopHashing?(): void;
 }
 
 interface Rec extends UploadItem {
   file: File;
+  /** The member who queued this file. Nothing is sent for it while anyone else is signed in. */
+  owner: string;
   sha256?: string;
   fileType?: FileTypeId;
   uploadId?: string;
@@ -151,9 +157,15 @@ function failMessage(e: unknown): string {
   return 'Didn’t upload · something went wrong';
 }
 const isAbort = (e: unknown) => e instanceof DOMException && e.name === 'AbortError';
+const aborted = () => new DOMException('Aborted', 'AbortError');
+
+/** The signed-in member changed while a file was queued. */
+class OwnerChanged extends Error {}
+export const OWNER_CHANGED_MESSAGE = 'Not uploaded · you signed out';
 
 /**
- * The upload queue. Lives at module level so uploads keep going while the member moves between pages.
+ * The upload queue. Lives at module level so uploads keep going while the member moves between pages, which
+ * is why each file is bound to the member who queued it and the queue is reset whenever the session ends.
  * Files are fingerprinted one at a time, accepted by the server in batches, then sent three at a time,
  * each file's parts in order. Paused or failed files resume from the parts the server confirmed.
  */
@@ -171,6 +183,8 @@ export class UploadManager {
   private wasBusy = false;
   private progressTimer: ReturnType<typeof setTimeout> | null = null;
   private rate = { t: 0, bytes: 0, bps: 0 };
+  /** Bumped by reset(); async work started in an earlier generation stops at its next step. */
+  private epoch = 0;
 
   constructor(
     private deps: UploadDeps,
@@ -258,12 +272,16 @@ export class UploadManager {
   // ------------------------------------------------------------ public actions
   /** Adds files to the queue. Files the plan can't take are marked straight away, without a request. */
   async add(files: File[]): Promise<void> {
-    if (!files.length) return;
+    const owner = this.deps.owner();
+    if (!files.length || !owner) return;
+    const epoch = this.epoch;
     try {
       this.rules = (await this.deps.rules()) ?? this.rules;
     } catch {
       // Let the server decide.
     }
+    // Signed out (or someone else signed in) while the plan was loading: queue nothing.
+    if (epoch !== this.epoch || this.deps.owner() !== owner) return;
     for (const file of files) {
       this.seq += 1;
       const rec: Rec = {
@@ -274,6 +292,7 @@ export class UploadManager {
         sent: 0,
         retryable: false,
         file,
+        owner,
         partSize: 0,
         partCount: 0,
         partsDone: new Set(),
@@ -324,7 +343,7 @@ export class UploadManager {
     const r = this.recs.find((x) => x.key === key);
     if (!r || r.state === 'done') return;
     r.ctrl?.abort();
-    if (r.uploadId) void this.deps.abort(r.uploadId).catch(() => {});
+    if (r.uploadId && r.owner === this.deps.owner()) void this.deps.abort(r.uploadId).catch(() => {});
     this.hashQueue = this.hashQueue.filter((x) => x !== r);
     this.createQueue = this.createQueue.filter((x) => x !== r);
     this.drop([r]);
@@ -336,6 +355,11 @@ export class UploadManager {
   retry(key: string): void {
     const r = this.recs.find((x) => x.key === key);
     if (r?.state !== 'failed' || !r.retryable) return;
+    if (r.owner !== this.deps.owner()) {
+      this.fail(r, OWNER_CHANGED_MESSAGE, false);
+      this.notify();
+      return;
+    }
     r.message = undefined;
     if (!r.sha256) {
       r.state = 'hashing';
@@ -361,6 +385,43 @@ export class UploadManager {
 
   retryAll(): void {
     for (const r of [...this.recs]) if (r.state === 'failed') this.retry(r.key);
+  }
+
+  /**
+   * Empties the queue: stops every request and fingerprint in flight, forgets every file and frees its
+   * thumbnail. Called whenever the session ends or changes, so one member's files can never be sent with
+   * another member's cookie. With `server`, the session is still valid: tell the server to drop the
+   * uploads it holds (best effort; anything left expires on its own).
+   */
+  reset(opts: { server?: boolean } = {}): Promise<void> {
+    this.epoch += 1;
+    const owner = this.deps.owner();
+    const open = opts.server
+      ? this.recs
+          .filter(
+            (r) =>
+              r.uploadId &&
+              r.owner === owner &&
+              r.state !== 'done' &&
+              r.state !== 'duplicate' &&
+              r.state !== 'rejected',
+          )
+          .map((r) => r.uploadId as string)
+      : [];
+    for (const r of this.recs) r.ctrl?.abort();
+    this.deps.stopHashing?.();
+    this.drop(this.recs);
+    this.hashQueue = [];
+    this.createQueue = [];
+    this.hashing = false;
+    this.creating = false;
+    this.paused = false;
+    this.rules = null;
+    this.rate = { t: 0, bytes: 0, bps: 0 };
+    // Nothing settled: don't refresh storage figures for a session that is ending.
+    this.wasBusy = false;
+    this.notify();
+    return Promise.allSettled(open.map((id) => this.deps.abort(id))).then(() => undefined);
   }
 
   /** Removes finished, skipped and rejected rows from the tray. */
@@ -390,6 +451,11 @@ export class UploadManager {
   private alive(r: Rec) {
     return this.recs.includes(r);
   }
+  /** Before every request: stop if the queue was reset, or if `r` belongs to someone else. */
+  private check(r: Rec, epoch: number) {
+    if (epoch !== this.epoch || !this.alive(r)) throw aborted();
+    if (r.owner !== this.deps.owner()) throw new OwnerChanged();
+  }
   private activeCount() {
     return this.recs.filter((r) => r.state === 'uploading').length;
   }
@@ -397,23 +463,26 @@ export class UploadManager {
   private async hashLoop() {
     if (this.hashing) return;
     this.hashing = true;
+    const epoch = this.epoch;
     try {
-      while (this.hashQueue.length) {
+      while (epoch === this.epoch && this.hashQueue.length) {
         const r = this.hashQueue.shift() as Rec;
         if (!this.alive(r)) continue;
         try {
-          r.sha256 = await this.deps.hash(r.file);
-          if (!this.alive(r)) continue;
+          const sha256 = await this.deps.hash(r.file);
+          if (epoch !== this.epoch || !this.alive(r)) continue;
+          r.sha256 = sha256;
           r.state = 'queued';
           this.createQueue.push(r);
         } catch {
+          if (epoch !== this.epoch || !this.alive(r)) continue;
           this.fail(r, 'Couldn’t read this file');
         }
         this.notify();
         void this.maybeFlush();
       }
     } finally {
-      this.hashing = false;
+      if (epoch === this.epoch) this.hashing = false;
     }
   }
 
@@ -431,7 +500,14 @@ export class UploadManager {
       this.recs.filter((r) => r.state === 'uploading' || r.state === 'waiting').length < this.concurrency;
     if (this.createQueue.length < this.batchSize() && this.hashQueue.length && !idle) return;
     this.creating = true;
-    const batch = this.createQueue.splice(0, this.batchSize()).filter((r) => this.alive(r));
+    const epoch = this.epoch;
+    const owner = this.deps.owner();
+    const batch: Rec[] = [];
+    for (const r of this.createQueue.splice(0, this.batchSize())) {
+      if (!this.alive(r)) continue;
+      if (r.owner === owner) batch.push(r);
+      else this.fail(r, OWNER_CHANGED_MESSAGE, false);
+    }
     try {
       if (batch.length) {
         const decisions = await this.deps.create(
@@ -442,15 +518,18 @@ export class UploadManager {
             lastModified: r.file.lastModified || undefined,
           })),
         );
+        // Reset meanwhile: the files are gone and the session may be someone else's, so send nothing more.
+        if (epoch !== this.epoch) return;
         for (const [i, r] of batch.entries()) this.apply(r, decisions[i]);
       }
     } catch (e) {
+      if (epoch !== this.epoch) return;
       for (const r of batch) {
         r.needsCreate = true;
         this.fail(r, failMessage(e), !(e instanceof ApiFailure && e.code === 'invalid'));
       }
     } finally {
-      this.creating = false;
+      if (epoch === this.epoch) this.creating = false;
     }
     this.notify();
     this.pump();
@@ -459,7 +538,8 @@ export class UploadManager {
 
   private apply(r: Rec, d: UploadDecision | undefined) {
     if (!this.alive(r)) {
-      if (d?.status === 'ready') void this.deps.abort(d.uploadId).catch(() => {});
+      if (d?.status === 'ready' && r.owner === this.deps.owner())
+        void this.deps.abort(d.uploadId).catch(() => {});
       return;
     }
     if (!d) return this.fail(r, 'Didn’t upload · something went wrong');
@@ -496,12 +576,15 @@ export class UploadManager {
 
   private async run(r: Rec): Promise<void> {
     const uploadId = r.uploadId as string;
+    const epoch = this.epoch;
+    const check = () => this.check(r, epoch);
     r.state = 'uploading';
     r.message = undefined;
     const ctrl = new AbortController();
     r.ctrl = ctrl;
     this.notify();
     try {
+      check();
       if (r.checkStatus) {
         const st = await this.deps.status(uploadId);
         r.partsDone = new Set(st.partsDone);
@@ -512,13 +595,16 @@ export class UploadManager {
       this.notify();
       if (!r.prepared) {
         const raw = Boolean(r.fileType && FILE_TYPES[r.fileType].raw);
-        r.prepared = await this.deps.prepare(r.file, raw);
-        if (r.prepared.thumb && this.deps.objectUrl) r.thumbUrl = this.deps.objectUrl(r.prepared.thumb);
+        const prepared = await this.deps.prepare(r.file, raw);
+        check();
+        r.prepared = prepared;
+        if (prepared.thumb && this.deps.objectUrl) r.thumbUrl = this.deps.objectUrl(prepared.thumb);
       }
       for (const kind of ['thumb', 'preview'] as const) {
         const blob = r.prepared[kind];
         if (!blob || r.variantsDone.has(kind)) continue;
         try {
+          check();
           await this.deps.putVariant(uploadId, kind, blob, ctrl.signal);
           r.variantsDone.add(kind);
         } catch (e) {
@@ -530,6 +616,7 @@ export class UploadManager {
       for (const n of partsToSend(r.partCount, r.partsDone)) {
         const { start, end } = partRange(r.size, r.partSize, n);
         const base = bytesDone(r.size, r.partSize, r.partsDone);
+        check();
         await this.deps.putPart(uploadId, n, r.file.slice(start, end), ctrl.signal, (s) => {
           r.sent = base + Math.min(s, end - start);
           this.notifySoon();
@@ -538,7 +625,9 @@ export class UploadManager {
         r.sent = bytesDone(r.size, r.partSize, r.partsDone);
         this.notifySoon();
       }
+      check();
       const { photo, duplicate } = await this.deps.complete(uploadId, r.prepared.metadata);
+      if (epoch !== this.epoch || !this.alive(r)) return;
       r.sent = r.size;
       r.photoId = photo.id;
       if (duplicate) {
@@ -549,8 +638,13 @@ export class UploadManager {
         this.deps.onPhoto?.(photo);
       }
     } catch (e) {
-      if (ctrl.signal.aborted || isAbort(e)) {
-        // Paused or cancelled: the caller already set the state.
+      if (epoch !== this.epoch || !this.alive(r)) {
+        // Reset or cancelled: the file is gone.
+      } else if (e instanceof OwnerChanged) {
+        ctrl.abort();
+        this.fail(r, OWNER_CHANGED_MESSAGE, false);
+      } else if (ctrl.signal.aborted || isAbort(e)) {
+        // Paused: the caller already set the state.
       } else if (e instanceof ApiFailure && (e.code === 'upload_expired' || e.code === 'not_found')) {
         r.needsCreate = true;
         this.fail(r, 'This upload expired · retry to start again');

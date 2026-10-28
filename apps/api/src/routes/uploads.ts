@@ -23,6 +23,7 @@ import {
   libraryGuard,
   memberHash,
   peek,
+  photoKey,
   photoKeys,
   readExact,
   UUID,
@@ -35,6 +36,18 @@ import { requireMember } from './session-helpers';
 export const uploadRoutes = new Hono<HonoEnv>();
 uploadRoutes.use('*', libraryGuard(LIBRARY_LIMITS.uploadCreateBodyBytes));
 uploadRoutes.use('*', requireMember);
+/**
+ * Shared devices: a page started by one member must not keep uploading into whoever signs in next. When
+ * the client says whose upload this is (X-Zephyr-Expected-User), a different session user gets 409
+ * session_changed. Without the header the request is allowed (older clients).
+ */
+uploadRoutes.use('*', async (c, next) => {
+  const expected = c.req.header('X-Zephyr-Expected-User');
+  if (expected !== undefined && expected.trim().toLowerCase() !== c.get('session').userId.toLowerCase()) {
+    return c.json(fail('session_changed'), 409);
+  }
+  await next();
+});
 
 interface UploadRow {
   uploadId: string;
@@ -67,17 +80,32 @@ async function loadUpload(c: Ctx, id: string): Promise<UploadRow | Response> {
 const ownerOf = (c: Ctx) => c.get('session').userId;
 const keysOf = (c: Ctx, up: UploadRow) => photoKeys(ownerOf(c), up.photoId);
 
-/** Aborts the R2 upload, deletes any objects, then removes the row and its reservation. */
-async function discardUpload(c: Ctx, up: UploadRow) {
-  if (up.r2UploadId) {
-    try {
-      await c.env.PHOTOS.resumeMultipartUpload(up.r2Key, up.r2UploadId).abort();
-    } catch {
-      /* already aborted or completed; the original key is deleted below either way */
+/**
+ * Discards an upload: claims it in the database first (rows and reservation go under the storage lock),
+ * then, only if this request won, aborts the R2 upload and deletes its objects. A concurrent complete
+ * that claimed first keeps its photo intact; anything left behind by a lost race or an R2 error is
+ * removed by the orphan sweep. False if there was nothing to claim.
+ */
+async function discardUpload(c: Ctx, uploadId: string): Promise<boolean> {
+  const claim = await rpc<{ r2Key: string; r2UploadId: string | null; keys: string[] } | null>(
+    c.env,
+    'abort_upload',
+    { p_owner: ownerOf(c), p_upload: uploadId },
+  );
+  if (!claim) return false;
+  try {
+    if (claim.r2UploadId) {
+      try {
+        await c.env.PHOTOS.resumeMultipartUpload(claim.r2Key, claim.r2UploadId).abort();
+      } catch {
+        /* already aborted or completed; the original key is deleted below either way */
+      }
     }
+    await deleteKeys(c.env.PHOTOS, claim.keys);
+  } catch (err) {
+    logError(c.get('requestId'), 'upload_discard_r2', err);
   }
-  await deleteKeys(c.env.PHOTOS, keysOf(c, up));
-  await rpc(c.env, 'abort_upload', { p_owner: ownerOf(c), p_upload: up.uploadId });
+  return true;
 }
 
 /** Per-member limit on part and variant PUTs (the UPLOAD_LIMITER binding). */
@@ -142,9 +170,7 @@ uploadRoutes.delete('/:id', async (c) => {
   try {
     const id = c.req.param('id');
     if (!UUID.test(id)) return c.json(fail('not_found'), 404);
-    const up = await rpc<UploadRow | null>(c.env, 'get_upload', { p_owner: ownerOf(c), p_upload: id });
-    if (!up) return c.json(fail('not_found'), 404);
-    await discardUpload(c, up);
+    if (!(await discardUpload(c, id))) return c.json(fail('not_found'), 404);
     return c.body(null, 204);
   } catch (err) {
     logError(c.get('requestId'), 'upload_abort', err);
@@ -174,7 +200,7 @@ uploadRoutes.put('/:id/parts/:n', async (c) => {
       const { head, rest } = await peek(body, SIGNATURE_BYTES);
       if (!signatureMatches(up.fileType, head)) {
         await rest.cancel().catch(() => undefined);
-        await discardUpload(c, up);
+        await discardUpload(c, up.uploadId);
         return c.json(fail('invalid'), 415);
       }
       body = rest;
@@ -240,8 +266,9 @@ uploadRoutes.put('/:id/variants/:kind', async (c) => {
     const info = imageInfo(bytes);
     if (!info) return c.json(fail('invalid'), 415);
     if (info.width > limits.maxEdge || info.height > limits.maxEdge) return c.json(fail('invalid'), 400);
-    const [, thumbKey, previewKey] = keysOf(c, up);
-    await c.env.PHOTOS.put(kind === 'thumb' ? (thumbKey as string) : (previewKey as string), bytes, {
+    // Staged, never the photo's own key: only a completion that wins the claim publishes it.
+    const staged = photoKey(ownerOf(c), up.photoId, `staging-${kind}`);
+    await c.env.PHOTOS.put(staged, bytes, {
       httpMetadata: { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' },
     });
     const recorded = await rpc<boolean | null>(c.env, 'record_variant', {
@@ -250,13 +277,40 @@ uploadRoutes.put('/:id/variants/:kind', async (c) => {
       p_kind: kind,
       p_bytes: bytes.byteLength,
     });
-    if (!recorded) return c.json(fail('upload_expired'), 410);
+    if (!recorded) {
+      // Completed, aborted or expired meanwhile: nothing will count or publish this copy.
+      await c.env.PHOTOS.delete(staged);
+      return c.json(fail('upload_expired'), 410);
+    }
     return c.json({ ok: true });
   } catch (err) {
     logError(c.get('requestId'), 'upload_variant', err);
     return c.json(fail('server'), 500);
   }
 });
+
+/** A staged variant, re-checked (size cap, JPEG/WEBP header, dimensions); null if absent or invalid. */
+async function readStaged(
+  c: Ctx,
+  key: string,
+  kind: VariantKind,
+): Promise<{ bytes: Uint8Array; type: 'image/jpeg' | 'image/webp' } | null> {
+  const obj = await c.env.PHOTOS.get(key);
+  if (!obj || !('body' in obj)) return null;
+  const limits = VARIANT_LIMITS[kind];
+  if (obj.size > limits.maxBytes) return null;
+  const bytes = new Uint8Array(await obj.arrayBuffer());
+  const info = imageInfo(bytes);
+  if (
+    !info ||
+    bytes.byteLength > limits.maxBytes ||
+    info.width > limits.maxEdge ||
+    info.height > limits.maxEdge
+  ) {
+    return null;
+  }
+  return { bytes, type: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' };
+}
 
 type CompleteResult =
   | { status: 'ready'; photo: PhotoItem }
@@ -288,17 +342,41 @@ uploadRoutes.post('/:id/complete', async (c) => {
       return completed ? c.json(fail('server'), 500) : c.json(fail('server'), 502);
     }
     if (head.size !== up.sizeBytes) {
-      await discardUpload(c, up);
+      await discardUpload(c, up.uploadId);
       return c.json(fail('invalid'), 400);
     }
+    // Measure the staged variants ourselves: their real sizes are what gets counted.
+    const owner = ownerOf(c);
+    const variants = {
+      thumb: await readStaged(c, photoKey(owner, up.photoId, 'staging-thumb'), 'thumb'),
+      preview: await readStaged(c, photoKey(owner, up.photoId, 'staging-preview'), 'preview'),
+    };
     const res = await rpc<CompleteResult | null>(c.env, 'complete_upload', {
-      p_owner: ownerOf(c),
+      p_owner: owner,
       p_upload: up.uploadId,
       p_metadata: body.metadata,
+      p_thumb_bytes: variants.thumb?.bytes.byteLength ?? 0,
+      p_preview_bytes: variants.preview?.bytes.byteLength ?? 0,
     });
     if (!res) return c.json(fail('not_found'), 404);
     switch (res.status) {
       case 'ready':
+        // This request won the claim: publish exactly the bytes that were counted.
+        try {
+          for (const kind of ['thumb', 'preview'] as const) {
+            const v = variants[kind];
+            if (v)
+              await c.env.PHOTOS.put(photoKey(owner, up.photoId, kind), v.bytes, {
+                httpMetadata: { contentType: v.type },
+              });
+          }
+          await deleteKeys(c.env.PHOTOS, [
+            photoKey(owner, up.photoId, 'staging-thumb'),
+            photoKey(owner, up.photoId, 'staging-preview'),
+          ]);
+        } catch (err) {
+          logError(c.get('requestId'), 'upload_publish_variants', err);
+        }
         return c.json({ ok: true, photo: res.photo } satisfies UploadCompleteResult);
       case 'duplicate': {
         // The same file finished first elsewhere: this copy's objects go; answer with the kept one.

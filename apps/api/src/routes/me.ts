@@ -157,6 +157,7 @@ meRoutes.post('/delete', requireRecentAuth, async (c) => {
       logError(c.get('requestId'), 'delete_logout', err);
     }
     appendCookies(c, clearCookies('app'));
+    c.header('Clear-Site-Data', '"cache"');
     await notifyAccountDeletion(c, s.email, purgeAt);
     return c.json({ ok: true, purgeAt } satisfies DeleteAccountResult);
   } catch (err) {

@@ -131,7 +131,7 @@ function mediaHeaders(contentType: string): Headers {
   return new Headers({
     'Content-Type': contentType,
     'X-Content-Type-Options': 'nosniff',
-    'Content-Security-Policy': "default-src 'none'; sandbox",
+    'Content-Security-Policy': "default-src 'none'; sandbox; frame-ancestors 'none'",
     'Cross-Origin-Resource-Policy': 'same-origin',
   });
 }
@@ -154,7 +154,9 @@ photoRoutes.get('/:id/:kind', async (c) => {
       if (!obj) return c.json(fail('not_found'), 404);
       // Variants are only ever stored as JPEG or WEBP by the upload route.
       const h = mediaHeaders(obj.httpMetadata?.contentType === 'image/jpeg' ? 'image/jpeg' : 'image/webp');
-      h.set('Cache-Control', 'private, max-age=31536000, immutable');
+      // Stored but revalidated every time: the 304 still passes the session and owner checks, and
+      // sign-out clears the cache (Clear-Site-Data), so nothing is readable once signed out.
+      h.set('Cache-Control', 'private, no-cache');
       h.set('ETag', obj.httpEtag);
       if (!('body' in obj)) return new Response(null, { status: 304, headers: h });
       h.set('Content-Length', String(obj.size));

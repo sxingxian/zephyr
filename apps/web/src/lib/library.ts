@@ -21,6 +21,7 @@ import {
   type VariantKind,
 } from '@zephyr/shared/client';
 import { ApiFailure, api, notifyFailure, toFailure } from './api';
+import { sessionUserId } from './sessionGuard';
 
 /** Builds the query string for GET /photos, leaving out empty values. */
 export function photoQuery(q: PhotoListQuery): string {
@@ -87,13 +88,24 @@ export const deleteAccount = () =>
 export const restoreAccount = () => api<SessionResponse>(LIBRARY_API.restoreAccount, { body: {} });
 
 // ---------------------------------------------------------------- uploads
+/**
+ * Upload calls name the member this tab believes is signed in. The cookie is shared by every tab, so if
+ * another tab has since signed in as someone else, the API answers 409 session_changed instead of acting
+ * for the wrong account.
+ */
+export const EXPECTED_USER_HEADER = 'x-zephyr-expected-user';
+export function expectedUser(): Record<string, string> {
+  const id = sessionUserId();
+  return id ? { [EXPECTED_USER_HEADER]: id } : {};
+}
 export const createUploads = (body: UploadCreateBody) =>
-  api<UploadCreateResult>(LIBRARY_API.uploads, { body });
-export const uploadStatus = (uploadId: string) => api<UploadStatus>(LIBRARY_API.upload(uploadId));
+  api<UploadCreateResult>(LIBRARY_API.uploads, { body, headers: expectedUser() });
+export const uploadStatus = (uploadId: string) =>
+  api<UploadStatus>(LIBRARY_API.upload(uploadId), { headers: expectedUser() });
 export const abortUpload = (uploadId: string) =>
-  api<void>(LIBRARY_API.upload(uploadId), { method: 'DELETE' });
+  api<void>(LIBRARY_API.upload(uploadId), { method: 'DELETE', headers: expectedUser() });
 export const completeUpload = (uploadId: string, body: UploadCompleteBody) =>
-  api<UploadCompleteResult>(LIBRARY_API.uploadComplete(uploadId), { body });
+  api<UploadCompleteResult>(LIBRARY_API.uploadComplete(uploadId), { body, headers: expectedUser() });
 
 /**
  * PUT raw bytes to our own API with upload progress. XHR rather than fetch because fetch can't report
@@ -113,6 +125,7 @@ export function putBytes(
     xhr.open('PUT', path);
     xhr.setRequestHeader('content-type', opts.contentType);
     xhr.setRequestHeader('accept', 'application/json');
+    for (const [k, v] of Object.entries(expectedUser())) xhr.setRequestHeader(k, v);
     xhr.upload.onprogress = (e) => opts.onProgress?.(e.loaded);
     xhr.onload = () => {
       done();

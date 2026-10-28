@@ -2,9 +2,10 @@ import type { PhotoMetadata } from '@zephyr/shared/client';
 import { useEffect, useSyncExternalStore } from 'react';
 import { emitLibrary } from '../bus';
 import { abortUpload, completeUpload, createUploads, putPart, putVariant, uploadStatus } from '../library';
+import { onSessionEnd, sessionUserId } from '../sessionGuard';
 import { getUsage, refreshUsage } from '../usage';
 import { readMetadata } from './exif';
-import { hashFile } from './hash';
+import { hashFile, stopHashing } from './hash';
 import { type Prepared, UploadManager, type UploadSnapshot } from './manager';
 import { rawPreview } from './raw';
 import { makeVariants } from './variants';
@@ -31,8 +32,12 @@ export async function prepareFile(file: File, raw: boolean): Promise<Prepared> {
   return { metadata, thumb: v.thumb, preview: v.preview };
 }
 
-/** The app's one upload queue. It outlives route changes; the tray reads it from anywhere. */
+/**
+ * The app's one upload queue. It outlives route changes; the tray reads it from anywhere. Each file is bound
+ * to the member who added it, and the whole queue is reset when the session ends or changes.
+ */
 export const uploads = new UploadManager({
+  owner: sessionUserId,
   rules: async () => {
     if (!getUsage()) await refreshUsage();
     const u = getUsage();
@@ -50,7 +55,12 @@ export const uploads = new UploadManager({
   onSettled: () => void refreshUsage(),
   objectUrl: (b) => URL.createObjectURL(b),
   revokeUrl: (u) => URL.revokeObjectURL(u),
+  stopHashing,
 });
+
+// Signing out (or any change of member) empties the queue. On a deliberate sign-out the session is still
+// valid, so the server is told to drop the uploads it holds; otherwise they expire on their own.
+onSessionEnd(({ server }) => uploads.reset({ server }));
 
 export function useUploads(): UploadSnapshot {
   return useSyncExternalStore(uploads.subscribe, uploads.getSnapshot, uploads.getSnapshot);

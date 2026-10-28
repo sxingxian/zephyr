@@ -10,9 +10,9 @@ AI photo editing and private passcode galleries, by Midnight Poetry Studio.
 | Admin                | zephyr.midnightpoetry.studio/admin | `apps/admin` (next phase)               |
 | Database and sign-in | Supabase                           | `supabase/`                             |
 
-Status: **phase 2**: accounts (email codes and passkeys), invites and invite codes, the app shell, and the admin
-Sign-ups & invites page, on top of phase 1's foundation and invite-only landing page. See
-[docs/roadmap.md](docs/roadmap.md) and [docs/phase-2.md](docs/phase-2.md).
+Status: **phase 3**: the photo library (uploads to private storage, library, viewer, albums, trash, account
+deletion) on top of accounts, invites and the invite-only landing page. See [docs/roadmap.md](docs/roadmap.md),
+[docs/phase-2.md](docs/phase-2.md) and [docs/phase-3.md](docs/phase-3.md).
 
 ## Layout
 

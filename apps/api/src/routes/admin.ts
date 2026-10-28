@@ -281,6 +281,7 @@ adminRoutes.get('/v1/auth/session', requireStaff({ allowEnrol: true }), (c) =>
 adminRoutes.post('/v1/auth/sign-out', async (c) => {
   const s = await resolveSession(c, 'admin');
   await endSession(c, 'admin', s?.accessToken);
+  c.header('Clear-Site-Data', '"cache"');
   return c.body(null, 204);
 });
 

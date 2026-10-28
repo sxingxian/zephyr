@@ -30,5 +30,24 @@
 10. **Secrets** live in Cloudflare (`wrangler secret put`) and GitHub environment secrets, never in the repo.
     `.dev.vars` and `.env*` files are git-ignored.
 
-Later phases add the rules for photos (private R2, signed URLs, re-encoding uploads, magic-byte checks), passcode
-galleries, ads isolation, CSAM scanning, face-data opt-in and retention jobs. See the design decisions doc.
+11. **Photos (phase 3):** a private R2 bucket with no public access and no r2.dev URL. Every byte goes through the
+    API Worker after the session and owner checks; there are no signed URLs to leak. Keys are
+    `u/<ownerId>/p/<photoId>/…` and never come from the client.
+    - **Uploads:** each file's type and size are checked against the plan, and the first part's magic bytes must
+      match the declared type. Every part needs a Content-Length, and storage is reserved under a per-owner lock
+      before any part is accepted. On completion the API reads the real sizes of the original and its variants from
+      R2 and counts those, not the client's claims. Variant writes are refused once the upload is closed, and any
+      object written after that is deleted.
+    - **Aborting:** an abort is claimed in the database first; R2 objects are deleted only by whichever side won.
+      Anything left over is removed by the clean-up job.
+    - **Serving:** responses carry `nosniff`, `Content-Security-Policy: default-src 'none'; sandbox;
+      frame-ancestors 'none'` and `Cross-Origin-Resource-Policy: same-origin`. Thumbnails and previews are
+      `private, no-cache` with an ETag, so the browser re-checks the session every time. Originals are `no-store`
+      downloads. Sign-out and account deletion send `Clear-Site-Data: "cache"`.
+    - **Shared devices:** the upload queue belongs to the user who started it. Sign-out, a 401 or a change of user
+      aborts it and deletes its open uploads, then reloads the page so no photo data stays in memory.
+    - **Retention:** a 15-minute Cron Trigger purges expired uploads, trash older than 30 days, accounts 30 days
+      after deletion (with backoff and an audit alert after repeated failures) and orphaned objects. An R2 lifecycle
+      rule aborts unfinished multipart uploads after one day.
+
+Later phases add passcode galleries, ads isolation, CSAM scanning and face-data opt-in. See the design decisions doc.

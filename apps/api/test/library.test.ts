@@ -280,7 +280,8 @@ describe('uploads', () => {
     expect(r2.objects.size).toBe(0);
     const ok = await put(thumb, webpVariant(512, 288), { jar: j, type: 'image/webp' });
     expect(ok.status).toBe(200);
-    expect(must(r2.objects.get(`${prefix(MEI.id, d.photoId)}thumb`)).contentType).toBe('image/webp');
+    expect(must(r2.objects.get(`${prefix(MEI.id, d.photoId)}staging-thumb`)).contentType).toBe('image/webp');
+    expect(r2.objects.has(`${prefix(MEI.id, d.photoId)}thumb`)).toBe(false);
     expect(must(db.uploads.get(d.uploadId)).variants.thumb).toBe(4000);
   });
 
@@ -501,16 +502,18 @@ describe('one member cannot reach another member’s library', () => {
 
 // ---- photos and media ----------------------------------------------------------------------------------
 describe('photos and media', () => {
-  it('serves variants with fixed type, sandbox CSP, private immutable caching and ETag/304', async () => {
+  it('serves variants with fixed type, sandbox CSP, revalidated private caching and ETag/304', async () => {
     const j = await signedIn(MEI);
     const { photo } = await storedPhoto(MEI.id);
     const res = await call(LIBRARY_API.photoFile(photo.id, 'thumb'), { jar: j });
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toBe('image/webp');
     expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
-    expect(res.headers.get('Content-Security-Policy')).toBe("default-src 'none'; sandbox");
+    expect(res.headers.get('Content-Security-Policy')).toBe(
+      "default-src 'none'; sandbox; frame-ancestors 'none'",
+    );
     expect(res.headers.get('Cross-Origin-Resource-Policy')).toBe('same-origin');
-    expect(res.headers.get('Cache-Control')).toBe('private, max-age=31536000, immutable');
+    expect(res.headers.get('Cache-Control')).toBe('private, no-cache');
     const etag = must(res.headers.get('ETag'));
     const again = await call(LIBRARY_API.photoFile(photo.id, 'thumb'), {
       jar: j,
@@ -529,7 +532,9 @@ describe('photos and media', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toBe('image/jpeg');
     expect(res.headers.get('Cache-Control')).toBe('no-store');
-    expect(res.headers.get('Content-Security-Policy')).toBe("default-src 'none'; sandbox");
+    expect(res.headers.get('Content-Security-Policy')).toBe(
+      "default-src 'none'; sandbox; frame-ancestors 'none'",
+    );
     expect(res.headers.get('Accept-Ranges')).toBe('bytes');
     expect(res.headers.get('Content-Disposition')).toBe(
       `attachment; filename="_t_ _ Paris.jpg"; filename*=UTF-8''%C3%89t%C3%A9%20%C3%A0%20Paris.jpg`,
@@ -635,7 +640,7 @@ describe('trash and clean-up', () => {
 
     must(db.photos.get(photo.id)).purgeAfter = new Date(Date.now() - 1000).toISOString();
     const counts = await runCleanup(env);
-    expect(counts).toMatchObject({ photosPurged: 1, objectsDeleted: 3 });
+    expect(counts).toMatchObject({ photosPurged: 1, objectsDeleted: 5 });
     expect(objectsUnder(MEI.id).sort()).toEqual(
       ['original', 'preview', 'thumb'].map((k) => `${prefix(MEI.id, keep.photo.id)}${k}`),
     );
@@ -651,7 +656,8 @@ describe('trash and clean-up', () => {
         uploadsAborted: 0,
         photosPurged: 1,
         accountsPurged: 0,
-        objectsDeleted: 3,
+        objectsDeleted: 5,
+        orphansDeleted: 0,
         rateLimitRows: 0,
       },
     });
@@ -844,5 +850,277 @@ describe('library constants match the migration', () => {
       .map((t) => `'${t}'`)
       .join(', ');
     expect(sql).toContain(`file_type in (${types})`);
+  });
+});
+
+// ---- security review fixes ----------------------------------------------------------------------------
+/** A PUT whose body sends 10 bytes, then waits for release() before the rest. */
+function slowPut(path: string, bytes: Uint8Array, j: Jar) {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const body = new ReadableStream<Uint8Array>({
+    async start(ctrl) {
+      ctrl.enqueue(bytes.subarray(0, 10));
+      await gate;
+      ctrl.enqueue(bytes.subarray(10));
+      ctrl.close();
+    },
+  });
+  const res = app.request(
+    `${APP}${path}`,
+    {
+      method: 'PUT',
+      duplex: 'half',
+      headers: {
+        'CF-Connecting-IP': '203.0.113.7',
+        'Content-Type': 'image/jpeg',
+        Origin: APP,
+        Cookie: [...j.cookies].map(([k, v]) => `${k}=${v}`).join('; '),
+        'Content-Length': String(bytes.byteLength),
+      },
+      body,
+    } as RequestInit,
+    env,
+  );
+  return { res, release };
+}
+const tick = () => new Promise((r) => setTimeout(r, 30));
+
+describe('variants can’t outlive or overwrite their upload (HIGH-1)', () => {
+  it('a variant PUT racing DELETE leaves no object behind', async () => {
+    const j = await signedIn(MEI);
+    const d = await createUpload(j, 'a.jpg', jpegFile(100));
+    const slow = slowPut(
+      LIBRARY_API.uploadVariant(d.uploadId, 'preview'),
+      jpegVariant(2048, 1536, 1_500_000),
+      j,
+    );
+    await tick();
+    expect((await call(LIBRARY_API.upload(d.uploadId), { jar: j, method: 'DELETE' })).status).toBe(204);
+    slow.release();
+    expect((await slow.res).status).toBe(410);
+    expect(objectsUnder(MEI.id)).toEqual([]);
+    expect(noDrift(MEI.id)).toBe(true);
+  });
+
+  it('a variant PUT racing complete can’t replace the finished photo’s variant', async () => {
+    const j = await signedIn(MEI);
+    const file = jpegFile(100);
+    const d = await createUpload(j, 'b.jpg', file);
+    expect((await put(LIBRARY_API.uploadPart(d.uploadId, 1), file, { jar: j })).status).toBe(200);
+    const small = jpegVariant(10, 10, 100);
+    expect((await put(LIBRARY_API.uploadVariant(d.uploadId, 'preview'), small, { jar: j })).status).toBe(200);
+    const slow = slowPut(
+      LIBRARY_API.uploadVariant(d.uploadId, 'preview'),
+      jpegVariant(2048, 1536, 1_500_000),
+      j,
+    );
+    await tick();
+    expect(
+      (await call(LIBRARY_API.uploadComplete(d.uploadId), { jar: j, body: { metadata: {} } })).status,
+    ).toBe(200);
+    slow.release();
+    expect((await slow.res).status).toBe(410);
+    expect(must(db.photos.get(d.photoId)).preview).toBe(100);
+    const served = await call(LIBRARY_API.photoFile(d.photoId, 'preview'), { jar: j });
+    expect((await served.arrayBuffer()).byteLength).toBe(100);
+    expect(objectsUnder(MEI.id).sort()).toEqual(
+      [`${prefix(MEI.id, d.photoId)}original`, `${prefix(MEI.id, d.photoId)}preview`].sort(),
+    );
+  });
+
+  it('counts the variant sizes measured in R2, not the recorded ones', async () => {
+    const j = await signedIn(MEI);
+    const file = jpegFile(100);
+    const d = await createUpload(j, 'c.jpg', file);
+    await put(LIBRARY_API.uploadPart(d.uploadId, 1), file, { jar: j });
+    await put(LIBRARY_API.uploadVariant(d.uploadId, 'thumb'), jpegVariant(100, 100, 5000), { jar: j });
+    must(db.uploads.get(d.uploadId)).variants = { thumb: 1, preview: 1 };
+    const res = await call(LIBRARY_API.uploadComplete(d.uploadId), { jar: j, body: { metadata: {} } });
+    expect((await read(res)).photo).toMatchObject({ hasThumb: true, hasPreview: false });
+    expect(must(db.photos.get(d.photoId))).toMatchObject({ thumb: 5000, preview: 0 });
+    expect(must(r2.objects.get(`${prefix(MEI.id, d.photoId)}thumb`)).bytes.byteLength).toBe(5000);
+    expect(r2.objects.has(`${prefix(MEI.id, d.photoId)}staging-thumb`)).toBe(false);
+  });
+
+  it('a variant PUT after completion is refused and touches nothing', async () => {
+    const j = await signedIn(MEI);
+    const file = jpegFile(100);
+    const d = await createUpload(j, 'd.jpg', file);
+    expect((await uploadWhole(j, d.uploadId, file, 1)).status).toBe(200);
+    const before = must(r2.objects.get(`${prefix(MEI.id, d.photoId)}thumb`)).etag;
+    const res = await put(LIBRARY_API.uploadVariant(d.uploadId, 'thumb'), jpegVariant(512, 512, 300_000), {
+      jar: j,
+    });
+    expect(res.status).toBe(404);
+    expect(must(r2.objects.get(`${prefix(MEI.id, d.photoId)}thumb`)).etag).toBe(before);
+  });
+
+  it('the orphan sweep deletes unaccounted objects a page at a time, sparing in-flight uploads', async () => {
+    const j = await signedIn(MEI);
+    const kept = await storedPhoto(MEI.id);
+    const ready = `${prefix(MEI.id, kept.photo.id)}staging-thumb`; // stale staging copy of a finished photo
+    await r2.put(ready, 'x');
+    const inflight = await createUpload(j, 'e.jpg', jpegFile(100));
+    await put(LIBRARY_API.uploadVariant(inflight.uploadId, 'thumb'), jpegVariant(10, 10), { jar: j });
+    const ghost = crypto.randomUUID();
+    for (let i = 0; i < 1200; i++) await r2.put(`${prefix(MEI.id, crypto.randomUUID())}original`, 'x');
+    await r2.put(`${prefix(MEI.id, ghost)}preview`, 'x');
+    await r2.put(`${prefix(WEI.id, kept.photo.id)}original`, 'x'); // a real photo id under the wrong owner
+    await r2.put('u/not-a-library-key', 'x');
+
+    const first = await runCleanup(env);
+    expect(first.orphansDeleted).toBeGreaterThan(0);
+    expect(db.jobState.get('orphan_sweep_cursor')).toBeTruthy();
+    const second = await runCleanup(env);
+    expect(first.orphansDeleted + second.orphansDeleted).toBe(1203);
+    expect(db.jobState.get('orphan_sweep_cursor')).toBeNull();
+    expect([...r2.objects.keys()].sort()).toEqual(
+      [
+        ...['original', 'thumb', 'preview'].map((k) => `${prefix(MEI.id, kept.photo.id)}${k}`),
+        `${prefix(MEI.id, inflight.photoId)}staging-thumb`,
+        'u/not-a-library-key',
+      ].sort(),
+    );
+    expect(world.calls.filter((c) => c.url.endsWith('/rpc/record_cleanup')).at(-1)?.body).toMatchObject({
+      p_details: { orphansDeleted: second.orphansDeleted },
+    });
+  });
+});
+
+describe('cached images and sign-out (MEDIUM-2)', () => {
+  it('sign-out and account deletion clear the browser cache', async () => {
+    const j = await signedIn(MEI);
+    const out = await call('/api/v1/auth/sign-out', { jar: j, body: {} });
+    expect(out.status).toBe(204);
+    expect(out.headers.get('Clear-Site-Data')).toBe('"cache"');
+    const k = await signedIn(MEI);
+    const del = await call(LIBRARY_API.deleteAccount, { jar: k, body: { confirm: 'DELETE' } });
+    expect(del.status).toBe(200);
+    expect(del.headers.get('Clear-Site-Data')).toBe('"cache"');
+  });
+
+  it('a revalidation after sign-out is refused, never answered from the session-less cache', async () => {
+    const j = await signedIn(MEI);
+    const { photo } = await storedPhoto(MEI.id);
+    const res = await call(LIBRARY_API.photoFile(photo.id, 'preview'), { jar: j });
+    const etag = must(res.headers.get('ETag'));
+    const anon = await call(LIBRARY_API.photoFile(photo.id, 'preview'), {
+      headers: { 'If-None-Match': etag },
+    });
+    expect(anon.status).toBe(401);
+  });
+});
+
+describe('abort can’t strand a completed photo (LOW-1)', () => {
+  it('DELETE racing complete: whoever claims first wins; no ready photo without files', async () => {
+    const j = await signedIn(MEI);
+    const file = jpegFile(100);
+    const d = await createUpload(j, 'f.jpg', file);
+    expect((await put(LIBRARY_API.uploadPart(d.uploadId, 1), file, { jar: j })).status).toBe(200);
+    const realHead = r2.head.bind(r2);
+    let releaseHead!: () => void;
+    const headGate = new Promise<void>((r) => {
+      releaseHead = r;
+    });
+    let inHead!: () => void;
+    const headReached = new Promise<void>((r) => {
+      inHead = r;
+    });
+    vi.spyOn(r2, 'head').mockImplementation(async (k: string) => {
+      const h = await realHead(k);
+      inHead();
+      await headGate;
+      return h;
+    });
+    const completing = call(LIBRARY_API.uploadComplete(d.uploadId), { jar: j, body: { metadata: {} } });
+    await headReached;
+    expect((await call(LIBRARY_API.upload(d.uploadId), { jar: j, method: 'DELETE' })).status).toBe(204);
+    releaseHead();
+    expect((await completing).status).toBe(404);
+    expect(db.photos.has(d.photoId)).toBe(false);
+    expect(objectsUnder(MEI.id)).toEqual([]);
+    expect(noDrift(MEI.id)).toBe(true);
+  });
+
+  it('a second DELETE (lost claim) deletes nothing', async () => {
+    const j = await signedIn(MEI);
+    const d = await createUpload(j, 'g.jpg', jpegFile(100));
+    expect((await call(LIBRARY_API.upload(d.uploadId), { jar: j, method: 'DELETE' })).status).toBe(204);
+    const deletes = r2.deleteBatches.length;
+    expect((await call(LIBRARY_API.upload(d.uploadId), { jar: j, method: 'DELETE' })).status).toBe(404);
+    expect(r2.deleteBatches.length).toBe(deletes);
+  });
+});
+
+describe('account purge backoff (LOW-3)', () => {
+  it('reports progress on a partial purge so it isn’t backed off', async () => {
+    for (let i = 0; i < 10_500; i++) {
+      r2.objects.set(`u/${MEI.id}/p/x-${i}/original`, { bytes: new Uint8Array(1), etag: 'e' });
+    }
+    profile(MEI.id).deletionDue = new Date(Date.now() - 1000).toISOString();
+    await runCleanup(env);
+    const progress = world.calls.filter((c) => c.url.endsWith('/rpc/account_purge_progress'));
+    expect(progress.map((c) => c.body)).toEqual([{ p_owner: MEI.id }]);
+  });
+});
+
+describe('uploads pinned to the expected user (shared devices)', () => {
+  it('409 session_changed when X-Zephyr-Expected-User names someone else; allowed when it matches or is absent', async () => {
+    const mei = await signedIn(MEI);
+    const bytes = jpegFile(100);
+    const d = await createUpload(mei, 'a.jpg', bytes);
+    const wei = await signedIn(WEI);
+    const as = (user: string) => ({ 'X-Zephyr-Expected-User': user });
+    const files = { files: [{ name: 'b.jpg', size: 10, sha256: 'b'.repeat(64) }] };
+
+    // Mei's tab, but Wei is now signed in on this device: every uploads route refuses.
+    const refused: [string, Promise<Response>][] = [
+      ['create', call(LIBRARY_API.uploads, { jar: wei, body: files, headers: as(MEI.id) })],
+      ['status', call(LIBRARY_API.upload(d.uploadId), { jar: wei, headers: as(MEI.id) })],
+      ['abort', call(LIBRARY_API.upload(d.uploadId), { jar: wei, method: 'DELETE', headers: as(MEI.id) })],
+      [
+        'complete',
+        call(LIBRARY_API.uploadComplete(d.uploadId), {
+          jar: wei,
+          body: { metadata: {} },
+          headers: as(MEI.id),
+        }),
+      ],
+      ['garbage', call(LIBRARY_API.uploads, { jar: mei, body: files, headers: as('not-a-uuid') })],
+    ];
+    for (const [what, p] of refused) {
+      const res = await p;
+      expect(res.status, what).toBe(409);
+      expect(await read(res), what).toEqual({ ok: false, error: 'session_changed' });
+    }
+    const part = await app.request(
+      `${APP}${LIBRARY_API.uploadPart(d.uploadId, 1)}`,
+      {
+        method: 'PUT',
+        headers: {
+          'CF-Connecting-IP': '203.0.113.7',
+          'Content-Type': 'application/octet-stream',
+          Origin: APP,
+          Cookie: [...wei.cookies].map(([k, v]) => `${k}=${v}`).join('; '),
+          'Content-Length': '100',
+          ...as(MEI.id),
+        },
+        body: bytes,
+      },
+      env,
+    );
+    expect(part.status).toBe(409);
+    expect(db.uploads.has(d.uploadId)).toBe(true);
+    expect(r2.multiparts.size).toBe(0);
+
+    // Matching (any case) or absent: allowed.
+    expect(
+      (await call(LIBRARY_API.uploads, { jar: wei, body: files, headers: as(WEI.id.toUpperCase()) })).status,
+    ).toBe(200);
+    expect((await call(LIBRARY_API.upload(d.uploadId), { jar: mei, headers: as(MEI.id) })).status).toBe(200);
+    expect((await call(LIBRARY_API.upload(d.uploadId), { jar: mei })).status).toBe(200);
   });
 });

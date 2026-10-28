@@ -35,6 +35,18 @@ function getWorker(): Worker | null {
   return worker;
 }
 
+/** Stops fingerprinting in progress: the worker is terminated (a new one starts on the next file). */
+export function stopHashing(): void {
+  if (worker) {
+    worker.terminate();
+    worker = undefined;
+  }
+  for (const [id, p] of pending) {
+    pending.delete(id);
+    p.reject(new DOMException('Aborted', 'AbortError'));
+  }
+}
+
 /** SHA-256 (hex) of a file, in a Web Worker when possible, falling back to the main thread. */
 export async function hashFile(file: Blob, onProgress?: (n: number) => void): Promise<string> {
   const w = getWorker();
@@ -45,7 +57,8 @@ export async function hashFile(file: Blob, onProgress?: (n: number) => void): Pr
         pending.set(seq, { resolve, reject, onProgress });
         w.postMessage({ id: seq, file });
       });
-    } catch {
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') throw e;
       // fall through to the main thread
     }
   }

@@ -4,6 +4,7 @@ import { type FormEvent, useEffect, useId, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
 import { ApiFailure, errorMessage } from '../lib/api';
 import { deleteAccount } from '../lib/library';
+import { browser, endSession } from '../lib/sessionGuard';
 import { useUsage } from '../lib/usage';
 
 const RETURN = '/settings/security?delete=1';
@@ -54,10 +55,14 @@ export function DeleteAccountCard() {
       } catch {
         // storage unavailable: the confirmation page falls back to "30 days"
       }
+      // The server has already signed out every session: stop this member's uploads (nothing is sent),
+      // then load the confirmation page afresh so no photo data stays in memory.
+      await endSession('deleted', false);
       setOpen(false);
       // The confirmation page forgets the session once it's showing, so the sign-in guard on this page
-      // doesn't redirect first. The server has already signed out every session.
+      // doesn't redirect first.
       nav('/account-deleted', { replace: true, state: { deleted: true } });
+      browser.assign('/account-deleted');
     } catch (err) {
       if (err instanceof ApiFailure && err.code === 'reauth_required') {
         toast.show('For your security, sign in again to delete your account.', 'bad');

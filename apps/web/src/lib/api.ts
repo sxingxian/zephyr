@@ -23,10 +23,16 @@ let onPendingDeletion: Listener | null = null;
 export function setPendingDeletionHandler(fn: Listener | null): void {
   onPendingDeletion = fn;
 }
-/** Shared by every request helper: global reactions to 401 and 403 account_pending_deletion. */
+let onSessionChanged: Listener | null = null;
+/** The session layer registers this to stop and reload when the cookie turns out to belong to someone else. */
+export function setSessionChangedHandler(fn: Listener | null): void {
+  onSessionChanged = fn;
+}
+/** Shared by every request helper: global reactions to 401, 403 account_pending_deletion and 409 session_changed. */
 export function notifyFailure(failure: ApiFailure, quiet401?: boolean): void {
   if (failure.code === 'unauthenticated' && !quiet401) onUnauthenticated?.();
   if (failure.code === 'account_pending_deletion') onPendingDeletion?.();
+  if (failure.code === 'session_changed') onSessionChanged?.();
 }
 
 export interface RequestOptions {
@@ -35,6 +41,8 @@ export interface RequestOptions {
   /** Don't trigger the global sign-in redirect on 401 (used by the session probe itself). */
   quiet401?: boolean;
   signal?: AbortSignal;
+  /** Extra request headers (e.g. the expected member on upload calls). */
+  headers?: Record<string, string>;
 }
 
 const KNOWN: ApiErrorCode[] = [
@@ -58,6 +66,7 @@ const KNOWN: ApiErrorCode[] = [
   'upload_expired',
   'too_large',
   'storage_full',
+  'session_changed',
   'server',
 ];
 
@@ -89,10 +98,11 @@ export async function api<T>(path: string, opts: RequestOptions = {}): Promise<T
     res = await fetch(path, {
       method,
       credentials: 'same-origin',
-      headers:
-        method === 'GET'
-          ? { accept: 'application/json' }
-          : { accept: 'application/json', 'content-type': 'application/json' },
+      headers: {
+        ...opts.headers,
+        accept: 'application/json',
+        ...(method === 'GET' ? {} : { 'content-type': 'application/json' }),
+      },
       body: method === 'GET' ? undefined : JSON.stringify(opts.body ?? {}),
       signal: opts.signal,
       cache: 'no-store',

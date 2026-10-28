@@ -2,7 +2,7 @@ import type { PhotoItem, UploadDecision, UploadFileSpec, UploadStatus } from '@z
 import { describe, expect, it, vi } from 'vitest';
 import { ApiFailure } from '../api';
 import { EXIF_OPTIONS, EXIF_PICK, exifDateToIso, toMetadata } from './exif';
-import { CONCURRENCY, fileTypeOf, type UploadDeps, UploadManager } from './manager';
+import { CONCURRENCY, fileTypeOf, OWNER_CHANGED_MESSAGE, type UploadDeps, UploadManager } from './manager';
 import { bytesDone, partCount, partRange, partsToSend } from './parts';
 import { jpegEnd, largestEmbeddedJpeg } from './raw';
 
@@ -176,6 +176,7 @@ function makeDeps(over: Partial<UploadDeps> = {}) {
     status: [] as string[],
   };
   const deps: UploadDeps = {
+    owner: () => 'u1',
     rules: async () => ({ fileTypes: ['jpeg', 'png', 'webp'], maxFileBytes: 50_000_000, batchSize: 2 }),
     hash: async (f) => `hash-${f.name}`,
     prepare: async () => ({
@@ -455,5 +456,223 @@ describe('upload manager', () => {
     expect(fileTypeOf('IMG_1.JPEG')).toBe('jpeg');
     expect(fileTypeOf('a.b.nef')).toBe('nef');
     expect(fileTypeOf('noext')).toBeNull();
+  });
+});
+
+/** A part upload that waits until released, and rejects like XHR when its request is aborted. */
+function heldPart(calls: { parts: { id: string; n: number; size: number }[] }) {
+  const gate = deferred();
+  const signals: AbortSignal[] = [];
+  const putPart: UploadDeps['putPart'] = async (id, n, blob, signal) => {
+    calls.parts.push({ id, n, size: blob.size });
+    signals.push(signal);
+    await new Promise<void>((res, rej) => {
+      signal.addEventListener('abort', () => rej(new DOMException('Aborted', 'AbortError')));
+      gate.promise.then(res);
+    });
+  };
+  return { gate, signals, putPart };
+}
+
+describe('upload queue and the session', () => {
+  it('queues nothing while signed out', async () => {
+    const { deps, calls } = makeDeps({ owner: () => null });
+    const m = new UploadManager(deps);
+    await m.add([file('a.jpg', 4)]);
+    await settle(20);
+    expect(m.getSnapshot().total).toBe(0);
+    expect(calls.create).toEqual([]);
+  });
+
+  it('sign-out mid-hash: stops fingerprinting and sends nothing, even when the hash comes back later', async () => {
+    let owner: string | null = 'u1';
+    const hashed = deferred<string>();
+    const stopHashing = vi.fn();
+    const { deps, calls } = makeDeps({ owner: () => owner, hash: () => hashed.promise, stopHashing });
+    const m = new UploadManager(deps);
+    await m.add([file('a.jpg', 8), file('b.jpg', 8)]);
+    await settle(5);
+    expect(m.getSnapshot().items.map((i) => i.state)).toEqual(['hashing', 'hashing']);
+
+    const done = m.reset({ server: true });
+    owner = null;
+    await done;
+    expect(stopHashing).toHaveBeenCalledTimes(1);
+    expect(m.getSnapshot()).toMatchObject({ total: 0, busy: false });
+
+    // The next member signs in; the old fingerprint arrives late.
+    owner = 'u2';
+    hashed.resolve('hash-a');
+    await settle(30);
+    expect(calls.create).toEqual([]);
+    expect(calls.parts).toEqual([]);
+    expect(calls.abort).toEqual([]);
+  });
+
+  it('sign-out mid-upload: aborts requests, drops the upload on the server with the old session, frees thumbnails', async () => {
+    let owner: string | null = 'u1';
+    const { deps, calls } = makeDeps({ owner: () => owner });
+    const held = heldPart(calls);
+    const revokeUrl = vi.fn();
+    const onSettled = vi.fn();
+    const abortedAs: (string | null)[] = [];
+    const m = new UploadManager({
+      ...deps,
+      putPart: held.putPart,
+      objectUrl: () => 'blob:thumb-1',
+      revokeUrl,
+      onSettled,
+      abort: async (id) => {
+        calls.abort.push(id);
+        abortedAs.push(owner);
+      },
+    });
+    await m.add([file('a.jpg', 12)]);
+    await settle(30);
+    expect(calls.parts).toHaveLength(1);
+    expect(m.getSnapshot().items[0]?.state).toBe('uploading');
+
+    // signOut() resets before the sign-out request, while the session is still the member's own.
+    const done = m.reset({ server: true });
+    expect(held.signals[0]?.aborted).toBe(true);
+    await done;
+    owner = null;
+    expect(calls.abort).toEqual(['up-a.jpg']);
+    expect(abortedAs).toEqual(['u1']);
+    expect(revokeUrl).toHaveBeenCalledWith('blob:thumb-1');
+    expect(m.getSnapshot()).toMatchObject({ total: 0, busy: false });
+    expect(onSettled).not.toHaveBeenCalled();
+
+    held.gate.resolve();
+    await settle(30);
+    expect(calls.parts).toHaveLength(1);
+    expect(calls.complete).toEqual([]);
+  });
+
+  it('401 mid-upload: stops without sending anything else (the session is already gone)', async () => {
+    let owner: string | null = 'u1';
+    const { deps, calls } = makeDeps({ owner: () => owner });
+    const m: UploadManager = new UploadManager({
+      ...deps,
+      putPart: async (id, n, blob) => {
+        calls.parts.push({ id, n, size: blob.size });
+        // What the app's 401 handler does: the session layer forgets the member and resets the queue.
+        owner = null;
+        void m.reset();
+        throw new ApiFailure('unauthenticated', 401);
+      },
+    });
+    await m.add([file('a.jpg', 12), file('b.jpg', 12)]);
+    await settle(40);
+    expect(calls.parts.length).toBeGreaterThanOrEqual(1);
+    const partsSoFar = calls.parts.length;
+    expect(m.getSnapshot().total).toBe(0);
+    await settle(40);
+    expect(calls.parts).toHaveLength(partsSoFar);
+    expect(calls.complete).toEqual([]);
+    expect(calls.abort).toEqual([]);
+  });
+
+  it("user switch: nothing queued by one member is sent with the next member's session", async () => {
+    let owner: string | null = 'u1';
+    const sentAs: string[] = [];
+    const { deps, calls } = makeDeps({ owner: () => owner });
+    const held = heldPart(calls);
+    const m = new UploadManager({
+      ...deps,
+      rules: async () => ({ fileTypes: ['jpeg'], maxFileBytes: 1e9, batchSize: 1 }),
+      create: async (files) => {
+        sentAs.push(`create:${owner}`);
+        return deps.create(files);
+      },
+      putPart: async (...a) => {
+        sentAs.push(`part:${owner}`);
+        return held.putPart(...a);
+      },
+      complete: async (id, md) => {
+        sentAs.push(`complete:${owner}`);
+        return deps.complete(id, md);
+      },
+      abort: async (id) => {
+        sentAs.push(`abort:${owner}`);
+        calls.abort.push(id);
+      },
+    });
+    await m.add(Array.from({ length: 5 }, (_, i) => file(`f${i}.jpg`, 8)));
+    await settle(40);
+    expect(sentAs.every((s) => s.endsWith(':u1'))).toBe(true);
+
+    // Defence in depth: another member is now signed in and nobody reset the queue.
+    owner = 'u2';
+    held.gate.resolve();
+    await settle(60);
+    expect(sentAs.filter((s) => s.endsWith(':u2'))).toEqual([]);
+    const s = m.getSnapshot();
+    expect(s.busy).toBe(false);
+    expect(s.items.every((i) => i.state === 'failed' && !i.retryable)).toBe(true);
+    expect(s.items[0]?.message).toBe(OWNER_CHANGED_MESSAGE);
+  });
+
+  it('Retry after a user switch does not re-create the upload under the new member', async () => {
+    let owner: string | null = 'u1';
+    const { deps, calls } = makeDeps({
+      owner: () => owner,
+      create: async () => {
+        throw new ApiFailure('network', 0);
+      },
+    });
+    const m = new UploadManager(deps);
+    await m.add([file('a.jpg', 8)]);
+    await settle(30);
+    const failed = m.getSnapshot().items[0];
+    expect(failed).toMatchObject({ state: 'failed', retryable: true });
+
+    owner = 'u2';
+    m.retry(failed?.key ?? '');
+    m.retryAll();
+    await settle(30);
+    expect(calls.create).toEqual([]);
+    expect(calls.status).toEqual([]);
+    expect(calls.parts).toEqual([]);
+    expect(m.getSnapshot().items[0]).toMatchObject({
+      state: 'failed',
+      retryable: false,
+      message: OWNER_CHANGED_MESSAGE,
+    });
+  });
+
+  it('ignores answers that arrive after a reset: no abort with the new session, no photo in the new grid', async () => {
+    let owner: string | null = 'u1';
+    const created = deferred<UploadDecision[]>();
+    const completed = deferred<{ photo: PhotoItem }>();
+    const onPhoto = vi.fn();
+    const { deps, calls } = makeDeps({ owner: () => owner });
+    const m = new UploadManager({
+      ...deps,
+      onPhoto,
+      rules: async () => ({ fileTypes: ['jpeg'], maxFileBytes: 1e9, batchSize: 1 }),
+      create: async (files) => (files[0]?.name === 'slow.jpg' ? created.promise : deps.create(files)),
+      complete: async (id) => {
+        calls.complete.push(id);
+        return completed.promise;
+      },
+    });
+    await m.add([file('fast.jpg', 4)]);
+    await settle(30);
+    expect(calls.complete).toEqual(['up-fast.jpg']);
+    await m.add([file('slow.jpg', 4)]);
+    await settle(30);
+
+    void m.reset();
+    owner = 'u2';
+    created.resolve([
+      { status: 'ready', uploadId: 'up-slow', photoId: 'ph-s', partSize: 4, partCount: 1, fileType: 'jpeg' },
+    ]);
+    completed.resolve({ photo: photo('ph-fast') });
+    await settle(30);
+    expect(calls.abort).toEqual([]);
+    expect(calls.parts.filter((p) => p.id === 'up-slow')).toEqual([]);
+    expect(onPhoto).not.toHaveBeenCalled();
+    expect(m.getSnapshot().total).toBe(0);
   });
 });

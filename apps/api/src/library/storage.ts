@@ -22,14 +22,31 @@ export const LIBRARY_LIMITS = {
   deleteBatch: 1000,
 } as const;
 
-/** `u/<owner>/p/<photo>/<kind>`: grouped by owner so an account purge can delete by prefix. */
-export const photoKey = (owner: string, photo: string, kind: 'original' | 'thumb' | 'preview') =>
-  `u/${owner}/p/${photo}/${kind}`;
-export const photoKeys = (owner: string, photo: string) => [
-  photoKey(owner, photo, 'original'),
-  photoKey(owner, photo, 'thumb'),
-  photoKey(owner, photo, 'preview'),
+export type ObjectKind = 'original' | 'thumb' | 'preview' | 'staging-thumb' | 'staging-preview';
+export const OBJECT_KINDS: readonly ObjectKind[] = [
+  'original',
+  'thumb',
+  'preview',
+  'staging-thumb',
+  'staging-preview',
 ];
+
+/**
+ * `u/<owner>/p/<photo>/<kind>`: grouped by owner so an account purge can delete by prefix. Variant PUTs
+ * write `staging-<kind>`; only a completion that won the database claim copies them to `<kind>`, so a
+ * late or racing PUT can never overwrite a finished photo's files.
+ */
+export const photoKey = (owner: string, photo: string, kind: ObjectKind) => `u/${owner}/p/${photo}/${kind}`;
+/** Every key a photo may have (as public._photo_keys). */
+export const photoKeys = (owner: string, photo: string) => OBJECT_KINDS.map((k) => photoKey(owner, photo, k));
+
+const ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/(${OBJECT_KINDS.join('|')})$`);
+/** Parses a library object key, or null for anything else. */
+export function parseKey(key: string): { owner: string; photo: string; kind: ObjectKind } | null {
+  const m = KEY_RE.exec(key);
+  return m ? { owner: m[1] as string, photo: m[2] as string, kind: m[3] as ObjectKind } : null;
+}
 
 /** A member's key for durable rate limits: an HMAC of the user id, never the id itself. */
 export const memberHash = async (env: Env, userId: string) =>

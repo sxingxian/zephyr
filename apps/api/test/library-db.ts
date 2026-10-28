@@ -69,6 +69,7 @@ export const db = {
   uploads: new Map<string, Upload>(),
   albums: new Map<string, Album>(),
   profiles: new Map<string, Profile>(),
+  jobState: new Map<string, string | null>(),
   /** Every library RPC's p_owner, to prove the Worker only ever passes the session's user. */
   owners: [] as string[],
 };
@@ -78,6 +79,7 @@ export function resetDb() {
   db.uploads.clear();
   db.albums.clear();
   db.profiles.clear();
+  db.jobState.clear();
   db.owners.length = 0;
 }
 
@@ -91,7 +93,7 @@ export const profile = (id: string): Profile => {
 };
 export const prefix = (owner: string, photo: string) => `u/${owner}/p/${photo}/`;
 const keys = (owner: string, photo: string) =>
-  ['original', 'thumb', 'preview'].map((k) => prefix(owner, photo) + k);
+  ['original', 'thumb', 'preview', 'staging-thumb', 'staging-preview'].map((k) => prefix(owner, photo) + k);
 
 export function photoJson(p: Photo) {
   return {
@@ -319,8 +321,9 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
       Object.assign(p, {
         status: 'ready',
         metadata: a.p_metadata ?? {},
-        thumb: u.variants.thumb ?? 0,
-        preview: u.variants.preview ?? 0,
+        // The Worker's measured sizes, never what the browser reported (uploads.variants).
+        thumb: Math.min(Number(a.p_thumb_bytes ?? 0), 307200),
+        preview: Math.min(Number(a.p_preview_bytes ?? 0), 1572864),
       });
       prof.storage += p.size + p.thumb + p.preview;
       return { status: 'ready', photo: photoJson(p) };
@@ -332,7 +335,7 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
       db.uploads.delete(u.id);
       db.photos.delete(u.photoId);
       profile(owner).reserved -= u.reserved;
-      return true;
+      return { r2Key: u.r2Key, r2UploadId: u.r2UploadId, keys: keys(owner, u.photoId) };
     },
     list_photos: (a) => {
       const owner = own(a);
@@ -536,6 +539,19 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
             .filter((u) => u.owner === id && u.r2UploadId)
             .map((u) => ({ r2Key: u.r2Key, r2UploadId: u.r2UploadId })),
         })),
+    account_purge_progress: () => null,
+    sweep_photo_rows: (a) =>
+      (a.p_ids as string[]).flatMap((id) => {
+        const p = db.photos.get(id);
+        if (!p) return [];
+        const activeUpload = [...db.uploads.values()].some((u) => u.photoId === id);
+        return [{ id, ownerId: p.owner, status: p.status, activeUpload }];
+      }),
+    get_job_state: (a) => db.jobState.get(String(a.p_key)) ?? null,
+    set_job_state: (a) => {
+      db.jobState.set(String(a.p_key), (a.p_value as string | null) ?? null);
+      return null;
+    },
     purge_rate_limits: () => 0,
     record_cleanup: () => null,
   };
