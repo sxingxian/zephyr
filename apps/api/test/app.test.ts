@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { app } from '../src/app';
 import type { Env } from '../src/env';
+import { env as baseEnv } from './helpers';
 
 const ORIGIN = 'https://zephyr.midnightpoetry.studio';
 const EMAIL = 'aisha.r@example.com';
@@ -8,13 +9,7 @@ const EMAIL = 'aisha.r@example.com';
 let limiterOk = true;
 const limiterKeys: string[] = [];
 const env: Env = {
-  ENVIRONMENT: 'test',
-  SUPABASE_URL: 'https://db.test',
-  ALLOWED_ORIGINS: ORIGIN,
-  TURNSTILE_EXPECTED_HOSTNAMES: 'zephyr.midnightpoetry.studio',
-  SUPABASE_SERVICE_ROLE_KEY: 'service-role-secret',
-  TURNSTILE_SECRET_KEY: 'turnstile-secret',
-  IP_HASH_SECRET: 'ip-hash-secret',
+  ...baseEnv,
   BURST_LIMITER: {
     limit: async ({ key }: { key: string }) => {
       limiterKeys.push(key);
@@ -86,7 +81,9 @@ describe('POST /api/v1/invite-requests', () => {
     expect(call.args.p_use_case).toBe('portraits');
     expect(call.args.p_ip_hash).toMatch(/^\\x[0-9a-f]{64}$/);
     expect(JSON.stringify(call.args)).not.toContain('203.0.113.7');
-    expect(call.headers.get('Authorization')).toBe('Bearer service-role-secret');
+    expect(call.headers.get('apikey')).toBe('sb_secret_test');
+    // New-style secret keys aren't JWTs, so they never go in Authorization.
+    expect(call.headers.get('Authorization')).toBeNull();
     expect(res.headers.get('Cache-Control')).toBe('no-store');
     expect(res.headers.get('Content-Security-Policy')).toContain("default-src 'none'");
     expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
@@ -201,7 +198,7 @@ describe('POST /api/v1/invite-requests', () => {
     const logged = spy.mock.calls.flat().join(' ');
     expect(logged).not.toContain(EMAIL);
     expect(logged).not.toContain('203.0.113.7');
-    expect(logged).not.toContain('service-role-secret');
+    expect(logged).not.toContain('sb_secret_test');
     expect(logged).toContain('rpc:submit_invite_request 500');
   });
 });
@@ -242,9 +239,9 @@ describe('everything else', () => {
     expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
   });
   it('rejects other methods with 405', async () => {
-    const res = await app.request('/api/v1/invite-requests', { method: 'DELETE' }, env);
+    const res = await app.request('/api/v1/invite-requests', { method: 'PUT' }, env);
     expect(res.status).toBe(405);
-    expect(res.headers.get('Allow')).toBe('GET, HEAD, POST');
+    expect(res.headers.get('Allow')).toBe('GET, HEAD, POST, PATCH, DELETE');
     expect(res.headers.get('Content-Security-Policy')).toBeTruthy();
   });
 });

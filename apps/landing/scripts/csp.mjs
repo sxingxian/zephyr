@@ -9,7 +9,18 @@ import { fileURLToPath } from 'node:url';
 const dist = fileURLToPath(new URL('../dist', import.meta.url));
 const walk = (d) =>
   readdirSync(d).flatMap((f) => (statSync(join(d, f)).isDirectory() ? walk(join(d, f)) : [join(d, f)]));
-const pages = walk(dist).filter((f) => f.endsWith('.html'));
+const adminDir = join(dist, 'admin');
+const all = walk(dist).filter((f) => f.endsWith('.html'));
+// The console under /admin gets its own policy from the Worker (worker/index.ts, ADMIN_CSP), which allows
+// no inline scripts at all, so check that here and keep its pages out of the landing policy.
+const pages = all.filter((f) => !f.startsWith(adminDir));
+for (const file of all.filter((f) => f.startsWith(adminDir))) {
+  const html = readFileSync(file, 'utf8');
+  if (/<script(?![^>]*\bsrc=)[^>]*>[\s\S]*?<\/script>/.test(html))
+    throw new Error(`Inline script in ${file}: the admin CSP forbids it`);
+  if (/\son[a-z]+=["']/i.test(html)) throw new Error(`Inline event handler in ${file}`);
+  if (/(src|href)="https?:\/\//.test(html)) throw new Error(`Third-party resource in ${file}`);
+}
 
 const hashes = new Set();
 for (const file of pages) {

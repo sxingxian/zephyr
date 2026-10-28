@@ -1,0 +1,69 @@
+import type { Passkey, SessionUser } from '@zephyr/shared';
+import type { Context, MiddlewareHandler } from 'hono';
+import { type GoTruePasskey, gotrue } from '../auth/gotrue';
+import { type ActiveSession, endSession, resolveSession } from '../auth/session';
+import type { Env } from '../env';
+import { fail, logError } from '../http';
+import { rpc } from '../supabase';
+import type { HonoEnv, SessionProfile } from '../types';
+
+export const toPasskey = (p: GoTruePasskey): Passkey => ({
+  id: p.id,
+  friendlyName: p.friendly_name ?? null,
+  createdAt: p.created_at,
+  lastUsedAt: p.last_used_at ?? null,
+});
+
+export async function passkeyCount(env: Env, jwt: string, requestId: string): Promise<number> {
+  try {
+    return (await gotrue.listPasskeys(env, jwt)).length;
+  } catch (err) {
+    logError(requestId, 'passkey_count', err);
+    return 0;
+  }
+}
+
+export const getProfile = (env: Env, userId: string) =>
+  rpc<SessionProfile | null>(env, 'get_session_profile', { p_user_id: userId });
+
+export async function sessionUser(
+  c: Context<HonoEnv>,
+  s: ActiveSession,
+  p: SessionProfile,
+): Promise<SessionUser> {
+  return {
+    id: s.userId,
+    email: s.email,
+    displayName: p.displayName ?? null,
+    plan: p.plan ?? 'free',
+    passkeyCount: await passkeyCount(c.env, s.accessToken, c.get('requestId')),
+    createdAt: p.createdAt,
+  };
+}
+
+/**
+ * App routes that need a member. Staff accounts are separate and can't use the app: their session is
+ * ended here. Deleted accounts are signed out too.
+ */
+export const requireMember: MiddlewareHandler<HonoEnv> = async (c, next) => {
+  const s = await resolveSession(c, 'app');
+  if (!s) return c.json(fail('unauthenticated'), 401);
+  let profile: SessionProfile | null;
+  try {
+    profile = await getProfile(c.env, s.userId);
+  } catch (err) {
+    logError(c.get('requestId'), 'session_profile', err);
+    return c.json(fail('server'), 500);
+  }
+  if (!profile || profile.deleted) {
+    await endSession(c, 'app', s.accessToken);
+    return c.json(fail('unauthenticated'), 401);
+  }
+  if (profile.isStaff) {
+    await endSession(c, 'app', s.accessToken);
+    return c.json(fail('forbidden'), 403);
+  }
+  c.set('session', s);
+  c.set('profile', profile);
+  await next();
+};

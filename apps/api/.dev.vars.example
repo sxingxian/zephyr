@@ -1,11 +1,25 @@
 # Copy to .dev.vars for `wrangler dev`. Never commit .dev.vars.
 ENVIRONMENT=development
 SUPABASE_URL=http://127.0.0.1:54321
+# From `supabase status` (local) or Project Settings › API keys. The publishable key isn't secret;
+# the secret key is server-side only.
+SUPABASE_PUBLISHABLE_KEY=
+SUPABASE_SECRET_KEY=
 ALLOWED_ORIGINS=http://localhost:4321
+APP_ORIGINS=http://localhost:5173
+ADMIN_ORIGINS=http://localhost:4321
+APP_URL=http://localhost:5173
 TURNSTILE_EXPECTED_HOSTNAMES=localhost
-# From `supabase status` (local) or Project Settings › API keys (production). Server-side only.
-SUPABASE_SERVICE_ROLE_KEY=
 # Turnstile test secret that always passes: 1x0000000000000000000000000000000AA
 TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
-# 32+ random bytes, e.g. `openssl rand -base64 48`
+# 32+ random bytes each, e.g. `openssl rand -base64 48`
 IP_HASH_SECRET=
+SESSION_HMAC_SECRET=
+# Local admin without Cloudflare Access: honoured only when ENVIRONMENT=development and the request
+# is to localhost. Use a staff member's email.
+CF_ACCESS_TEAM_DOMAIN=
+CF_ACCESS_AUD=
+CF_ACCESS_DEV_EMAIL=
+# Resend API key (https://resend.com/api-keys). Use a test key locally; emails go to real inboxes.
+RESEND_API_KEY=
+EMAIL_FROM=Zephyr <onboarding@resend.dev>

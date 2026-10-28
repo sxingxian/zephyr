@@ -31,6 +31,36 @@ enable_signup = false
 [auth.email]
 enable_signup = false
 enable_confirmations = true
+# Sign-in is by 6-digit code only (no clickable magic links), valid for 10 minutes.
+otp_length = 6
+otp_expiry = 600
+max_frequency = "60s"
+
+# The code email. Shows the code only; there is deliberately no sign-in button to click.
+[auth.email.template.magic_link]
+subject = "Your Zephyr sign-in code"
+content_path = "./supabase/templates/sign-in-code.html"
+
+# Supabase's built-in sender is for testing only. Production sends through Resend's SMTP relay.
+# Set RESEND_API_KEY in the environment (or the same values in Authentication › Emails › SMTP).
+[auth.email.smtp]
+enabled = true
+host = "smtp.resend.com"
+port = 465
+user = "resend"
+pass = "env(RESEND_API_KEY)"
+admin_email = "hello@zephyr.midnightpoetry.studio"
+sender_name = "Zephyr"
+
+# Passkeys (Supabase beta). One relying party for both Zephyr hosts; only these two origins may
+# use it, so other *.midnightpoetry.studio apps can't. Changing rp_id invalidates every passkey.
+[auth.passkey]
+enabled = true
+
+[auth.webauthn]
+rp_display_name = "Zephyr"
+rp_id = "midnightpoetry.studio"
+rp_origins = ["https://zephyrapp.midnightpoetry.studio", "https://zephyr.midnightpoetry.studio"]
 
 # Defence in depth: even admin-created accounts must match an open invite while Invite only is on.
 # Enforces Open / Invite only / paused on the server before any account is created.

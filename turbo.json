@@ -2,9 +2,20 @@
   "$schema": "https://turbo.build/schema.json",
   "ui": "stream",
   "tasks": {
-    "build": { "dependsOn": ["^build"], "outputs": ["dist/**", ".astro/**"] },
-    "typecheck": { "dependsOn": ["^build"] },
-    "test": { "dependsOn": ["^build"] },
-    "dev": { "cache": false, "persistent": true }
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".astro/**"],
+      "env": ["VITE_TURNSTILE_SITE_KEY", "VITE_ALLOW_TEST_TURNSTILE", "PUBLIC_TURNSTILE_SITE_KEY"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"]
+    },
+    "test": {
+      "dependsOn": ["^build"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    }
   }
 }

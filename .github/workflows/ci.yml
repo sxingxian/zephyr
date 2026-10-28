@@ -32,6 +32,9 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+        env:
+          # CI builds use Cloudflare's always-pass Turnstile test key; deploys pass the real one.
+          VITE_ALLOW_TEST_TURNSTILE: "1"
       - name: Audit production dependencies
         run: pnpm audit --prod --audit-level high
 

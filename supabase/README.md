@@ -2,13 +2,15 @@
 
 Postgres schema, access rules and the sign-up hook for Zephyr.
 
-| Path                                       | What it is                                                                    |
-| ------------------------------------------ | ----------------------------------------------------------------------------- |
-| `migrations/20261028000000_foundation.sql` | Tables, Row Level Security, functions, the auth hook and the new-user trigger |
-| `migrations/20261028000100_plans.sql`      | Free / Pro / Studio and the first active plan-limits version                  |
-| `migrations/20261028000200_cron.sql`       | Daily purge of unapproved invite requests older than 90 days (pg_cron)        |
-| `seed.sql`                                 | Local-only: an invite for `dev@zephyr.local`                                  |
-| `tests/`                                   | SQL assertions and a runner that uses a throwaway local Postgres              |
+| Path                                       | What it is                                                                           |
+| ------------------------------------------ | ------------------------------------------------------------------------------------ |
+| `migrations/20261028000000_foundation.sql` | Tables, Row Level Security, functions, the auth hook and the new-user trigger        |
+| `migrations/20261028000100_plans.sql`      | Free / Pro / Studio and the first active plan-limits version                         |
+| `migrations/20261028000200_cron.sql`       | Daily purge of unapproved invite requests older than 90 days (pg_cron)               |
+| `migrations/20261028100000_accounts.sql`   | Phase 2: invites, codes, member quota, admin Sign-ups functions, sign-in rate limits |
+| `templates/sign-in-code.html`              | The sign-in code email (code only, no link)                                          |
+| `seed.sql`                                 | Local-only: an invite for `dev@zephyr.local`                                         |
+| `tests/`                                   | SQL assertions and a runner that uses a throwaway local Postgres                     |
 
 ## Security model
 
@@ -99,3 +101,52 @@ supabase db push
 ```
 
 Then enable the auth hook and the pg_cron extension in the dashboard.
+
+
+## Accounts (phase 2)
+
+`20261028100000_accounts.sql` adds the functions the API calls. All are `SECURITY DEFINER`, `search_path = ''` and executable only by `service_role`. Internal helpers (`_*`) aren't executable by any API role.
+
+- **Invites:** `create_invite`, `preview_invite`, `mark_invite_accepted`, `redeem_invite_code`, `list_member_invites`.
+  - Tokens arrive as SHA-256 hashes; the raw token only exists in the email.
+  - `preview_invite` returns null for unknown, expired, revoked and used tokens alike, and for any token while sign-ups are paused.
+  - Member invites are limited per calendar month. An attempt that doesn't create a live invite (already a member, already invited) still records a revoked row, so it counts towards the quota and members can't use invites to probe who has an account.
+  - Invite codes are used up atomically (row lock). A second redemption for the same email rotates that email's link instead of using another use.
+- **Admin:** `get_signup_overview`, `update_signup_settings`, `revoke_invite`, `resend_invite`, `create_invite_code`, `revoke_invite_code`, `decide_invite_requests`, `reopen_invite_request`, `list_invites`, `list_invite_requests` (keyset pagination).
+  - Each write takes the acting staff id, re-checks the role (Owner or Admin; only an Owner may change the sign-up mode) and writes `audit_log`.
+- **Accounts:** `account_kind`, `user_id_by_email`, `is_staff`, `staff_lookup`, `get_session_profile`, `update_display_name`.
+- **Rate limits:** `rate_limit_hit`, `rate_limit_count`, `rate_limit_record` on `rate_limit_attempts` (HMAC-hashed keys only). The daily purge clears attempts older than 2 days.
+
+### Auth settings to mirror in the dashboard
+
+`config.toml` configures the local CLI. In production set the same in the dashboard:
+
+- **Sign-up:** public sign-up off.
+- **Email:** OTP length 6, expiry 600 s, the "Magic link" template = `templates/sign-in-code.html` (subject "Your Zephyr sign-in code"), and SMTP via Resend (`smtp.resend.com:465`, user `resend`, password = Resend API key).
+- **Passkeys:** on, RP ID `midnightpoetry.studio`, RP display name `Zephyr`, origins `https://zephyrapp.midnightpoetry.studio` and `https://zephyr.midnightpoetry.studio`. Changing the RP ID later invalidates every passkey.
+- **JWT signing keys:** asymmetric (the API verifies tokens with the project's JWKS).
+- **Rate limits:** raise the Auth per-IP limits, since every request comes from the API Worker, and leave CAPTCHA off (Turnstile is verified by the API).
+
+## Bootstrapping the first Owner
+
+Sign-up is invite-only and public sign-up is off, so the first staff account is created by hand, once, in the
+SQL editor and the Auth dashboard:
+
+1. Allow the address through the sign-up hook with a throwaway invite (the token is random and never sent):
+
+   ```sql
+   insert into public.invites (email, token_hash, source, expires_at)
+   values ('you@midnightpoetry.studio', extensions.digest(gen_random_uuid()::text, 'sha256'), 'admin', now() + interval '1 hour');
+   ```
+2. Auth › Users › **Add user** › _Create new user_ with that email and **Auto confirm user** ticked (leave the
+   password blank or random; you'll never use it).
+3. Make the account an Owner:
+
+   ```sql
+   insert into public.staff (user_id, role)
+   select id, 'owner' from auth.users where email = 'you@midnightpoetry.studio';
+   ```
+4. Open `https://zephyr.midnightpoetry.studio/admin`, pass Cloudflare Access with the same email, choose
+   **Enrol a passkey**, enter the emailed code and save a passkey. From then on the passkey is the only way in.
+
+Staff accounts can't sign in to the app; use a separate email for your own member account.

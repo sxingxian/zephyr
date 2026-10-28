@@ -23,8 +23,21 @@
   "vars": {
     "ENVIRONMENT": "production",
     "SUPABASE_URL": "https://YOUR-PROJECT-REF.supabase.co",
+    // Publishable key (sb_publishable_…): not a secret, used as `apikey` on user-level Auth calls.
+    "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_REPLACE_ME",
+    // Landing-page forms (invite requests).
     "ALLOWED_ORIGINS": "https://zephyr.midnightpoetry.studio",
-    "TURNSTILE_EXPECTED_HOSTNAMES": "zephyr.midnightpoetry.studio"
+    // The app (sign-in, invites, account) and the admin console. Exact origins, no wildcards.
+    "APP_ORIGINS": "https://zephyrapp.midnightpoetry.studio",
+    "ADMIN_ORIGINS": "https://zephyr.midnightpoetry.studio",
+    "APP_URL": "https://zephyrapp.midnightpoetry.studio",
+    "TURNSTILE_EXPECTED_HOSTNAMES": "zephyr.midnightpoetry.studio,zephyrapp.midnightpoetry.studio",
+    // Cloudflare Access application protecting zephyr.midnightpoetry.studio/admin*.
+    "CF_ACCESS_TEAM_DOMAIN": "YOUR-TEAM.cloudflareaccess.com",
+    "CF_ACCESS_AUD": "REPLACE_WITH_ACCESS_APPLICATION_AUD",
+    "EMAIL_FROM": "Zephyr <hello@zephyr.midnightpoetry.studio>"
   }
-  // Secrets (wrangler secret put …): SUPABASE_SERVICE_ROLE_KEY, TURNSTILE_SECRET_KEY, IP_HASH_SECRET
+  // Secrets (wrangler secret put …): SUPABASE_SECRET_KEY, TURNSTILE_SECRET_KEY, IP_HASH_SECRET,
+  // SESSION_HMAC_SECRET, RESEND_API_KEY. (SUPABASE_SERVICE_ROLE_KEY is still read if the new name
+  // isn't set.)
 }

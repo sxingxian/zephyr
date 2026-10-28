@@ -218,7 +218,7 @@ export interface AdminInviteResult {
   ok: true;
   sent: number;
   /** Addresses skipped because they already have an account or a pending invite (shown to staff only). */
-  skipped: { email: string; reason: 'already_member' | 'already_invited' | 'invalid' }[];
+  skipped: { email: string; reason: 'already_member' | 'already_invited' | 'invalid' | 'send_failed' }[];
 }
 export interface InviteCodeCreateBody {
   code: string;

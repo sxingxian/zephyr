@@ -137,6 +137,9 @@ importers:
       '@types/three':
         specifier: ^0.186.0
         version: 0.186.0
+      '@zephyr/admin':
+        specifier: workspace:*
+        version: link:../admin
       typescript:
         specifier: 6.0.3
         version: 6.0.3
