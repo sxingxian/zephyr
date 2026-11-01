@@ -8,6 +8,7 @@ export * from './invites';
 export * from './library-schemas';
 export * from './library-types';
 export * from './plans';
+export * from './scene-map';
 export * from './settings';
 export * from './share-schemas';
 export * from './share-types';
