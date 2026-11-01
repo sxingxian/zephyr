@@ -1577,7 +1577,8 @@ begin
 end;
 $$;
 
--- Records scene tags ([{scene, score}]) or a failure (p_scenes null), settling the reservation of p_reserved.
+-- Records scene tags ([{scene, score}]), a failure (p_scenes null) or 'retry' (tag it again later), settling the
+-- reservation of p_reserved.
 create function public.ai_scene_done(p_owner uuid, p_photo uuid, p_scenes jsonb, p_reserved bigint, p_cost bigint,
   p_calls jsonb) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
@@ -1589,6 +1590,11 @@ begin
   perform public._ai_spend_settle('scene_tags', p_owner, public._ai_today(), p_reserved, coalesce(p_cost, 0));
   perform public._ai_log_calls('scene_tags', p_calls);
   if not coalesce(ready, false) then return jsonb_build_object('status', 'skip'); end if;
+  if p_scenes = '"retry"'::jsonb then
+    -- The thumbnail wasn't there yet: the backfill tries again later.
+    update public.photos set scene_state = null, scene_queued_at = null where id = p_photo;
+    return jsonb_build_object('status', 'retry');
+  end if;
   delete from public.photo_scenes where photo_id = p_photo;
   if p_scenes is null or jsonb_typeof(p_scenes) <> 'array' then
     update public.photos set scene_state = 'failed' where id = p_photo;

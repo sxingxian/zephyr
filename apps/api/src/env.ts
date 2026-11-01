@@ -63,7 +63,29 @@ export interface Env {
   GUEST_LIMITER: RateLimit;
   /** Guest media requests per network. */
   MEDIA_LIMITER: RateLimit;
+
+  // ---- Phase 6: Zephyr AI ----
+  /** Workers AI (scene tags), always called through AI Gateway in production. */
+  AI: WorkersAi;
+  /** The zephyr-ai queue: background-removal items and scene tags (ids only, never image bytes). */
+  AI_QUEUE: Queue<AiMessage>;
+  /** Per-member AI writes (job creation, settings, signals, faces, people). */
+  AI_LIMITER: RateLimit;
+  /** Cloudflare account id and gateway id of the AI Gateway every cloud AI call goes through. */
+  AI_GATEWAY_ACCOUNT_ID?: string;
+  AI_GATEWAY_ID?: string;
+  /** Authenticated gateway token (cf-aig-authorization). */
+  AI_GATEWAY_TOKEN?: string;
+  RUNWARE_API_KEY?: string;
+  FAL_KEY?: string;
 }
+
+/** The slice of the Workers AI binding the API uses. */
+export interface WorkersAi {
+  run(model: string, inputs: Record<string, unknown>, options?: { gateway?: { id: string; skipCache?: boolean } }): Promise<unknown>;
+}
+/** Messages on the zephyr-ai queue. */
+export type AiMessage = { t: 'bg'; item: string } | { t: 'scene'; photo: string; owner: string };
 
 export const list = (v: string | undefined): string[] =>
   (v ?? '')
