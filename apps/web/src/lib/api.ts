@@ -76,6 +76,8 @@ const KNOWN: ApiErrorCode[] = [
   'limit_reached',
   'asset_in_use',
   'pending',
+  'insufficient_credits',
+  'feature_off',
   'server',
 ];
 
@@ -187,6 +189,14 @@ export function errorMessage(err: unknown): string {
       return 'That passcode isn’t right.';
     case 'gallery_paused':
       return 'This gallery is paused after too many wrong passcodes. Try again later.';
+    case 'insufficient_credits': {
+      const b = err.body as { needed?: number; balance?: number } | undefined;
+      return typeof b?.needed === 'number' && typeof b.balance === 'number'
+        ? `That needs ${b.needed} cloud credits and you have ${b.balance}.`
+        : 'You don’t have enough cloud credits for that.';
+    }
+    case 'feature_off':
+      return 'That Zephyr AI feature is switched off right now.';
     default:
       return 'Something went wrong on our side. Try again in a minute.';
   }

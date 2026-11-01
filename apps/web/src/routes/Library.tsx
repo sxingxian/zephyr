@@ -3,6 +3,7 @@ import { Button, Mascot, Note, useToast } from '@zephyr/ui';
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { AlbumPicker } from '../components/AlbumPicker';
+import { useAiBatch } from '../components/ai/BatchDialog';
 import { useEditActions } from '../components/editor/LibraryEdit';
 import {
   type BarAction,
@@ -35,7 +36,7 @@ const SORTS: { value: Sort; label: string }[] = [
 ];
 export const SOON = 'Coming soon';
 
-/** Edit, Share, Favourite, Add to album, Move to Trash, plus the not-yet-available Zephyr AI. */
+/** Edit, Zephyr AI, Share, Favourite, Add to album, Move to Trash. */
 export function useLibraryActions(list: PhotoList, sel: Selection, extra: BarAction[] = []) {
   const toast = useToast();
   const [picker, setPicker] = useState(false);
@@ -75,9 +76,10 @@ export function useLibraryActions(list: PhotoList, sel: Selection, extra: BarAct
 
   const editing = useEditActions(list, sel);
   const sharing = useShareGallery();
+  const ai = useAiBatch();
   const actions: BarAction[] = [
     ...editing.actions,
-    { icon: 'breeze', label: 'Zephyr AI', soon: SOON },
+    ...(ai.available ? [{ icon: 'breeze' as const, label: 'Zephyr AI', onClick: () => ai.open(ids) }] : []),
     { icon: 'folder', label: 'Add to album', onClick: () => setPicker(true) },
     { icon: 'heart', label: allFav ? 'Unfavourite' : 'Favourite', onClick: favourite, busy: busy === 'fav' },
     { icon: 'share', label: 'Share', onClick: () => sharing.open(ids) },
@@ -89,6 +91,7 @@ export function useLibraryActions(list: PhotoList, sel: Selection, extra: BarAct
       <AlbumPicker open={picker} photoIds={ids} onClose={() => setPicker(false)} onDone={() => sel.clear()} />
       {editing.dialogs}
       {sharing.dialogs}
+      {ai.dialog}
     </>
   );
   return { actions, pickerEl };

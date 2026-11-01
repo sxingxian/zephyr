@@ -24,6 +24,7 @@ import {
   useSyncExternalStore,
 } from 'react';
 import { useLocation, useNavigate } from 'react-router';
+import { editorAi, useAiStatus } from '../../lib/aiClient';
 import { errorMessage } from '../../lib/api';
 import { emitLibrary } from '../../lib/bus';
 import { copyEdits, useCopied } from '../../lib/editor/clipboard';
@@ -47,6 +48,7 @@ import {
 import { getPhoto } from '../../lib/library';
 import { sessionUserId } from '../../lib/sessionGuard';
 import { uploads } from '../../lib/uploads';
+import { type AiToast, EditorAiPanel } from '../ai/EditorAi';
 import { useViewerHost } from '../LibraryBits';
 import { CropOverlay } from './CropOverlay';
 import { ConflictDialog, ExportDialog, PasteDialog, SaveRecipeDialog } from './Dialogs';
@@ -139,6 +141,18 @@ export function Editor({ photoId }: { photoId: string }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [session, setSession] = useState<EditSession | null>(null);
   const [tool, setTool] = useState<Tool>('adjust');
+  const aiStatus = useAiStatus();
+  const showAi = editorAi(aiStatus);
+  const [aiToast, setAiToast] = useState<AiToast | null>(null);
+  // The AI tab disappears if Zephyr AI is switched off while it's open.
+  useEffect(() => {
+    if (tool === 'ai' && !showAi) setTool('adjust');
+  }, [tool, showAi]);
+  useEffect(() => {
+    if (!aiToast) return;
+    const t = setTimeout(() => setAiToast(null), 8000);
+    return () => clearTimeout(t);
+  }, [aiToast]);
   const [compare, setCompare] = useState<Compare>('after');
   const [held, setHeld] = useState(false);
   const [splitX, setSplitX] = useState(0.5);
@@ -896,6 +910,24 @@ export function Editor({ photoId }: { photoId: string }) {
                 </span>
               </div>
             )}
+            {aiToast && (
+              <div className="ai-toast" role="status" aria-live="polite">
+                <Icon name="breeze" size={16} className="ai-toast__icon" />
+                <span>{aiToast.text}</span>
+                {aiToast.undo && (
+                  <Button
+                    kind="ghost"
+                    size="sm"
+                    onClick={() => {
+                      aiToast.undo?.();
+                      setAiToast(null);
+                    }}
+                  >
+                    Undo
+                  </Button>
+                )}
+              </div>
+            )}
             {srcState.note && (
               <div className="edev edev--note" role="status">
                 <Icon name="info" size={16} />
@@ -959,7 +991,12 @@ export function Editor({ photoId }: { photoId: string }) {
             {session && tool === 'adjust' && <PhoneAdjust edit={edit} />}
             {session && tool === 'crop' && <PhoneCrop edit={edit} actions={cropActions} />}
             {session && tool === 'recipes' && <PhoneRecipes edit={edit} actions={recipeActions} />}
-            <ToolTabs tool={tool} onChange={setTool} />
+            {session && photo && tool === 'ai' && (
+              <div className="ephone__ai">
+                <EditorAiPanel photo={photo} session={session} edit={edit} phone onToast={setAiToast} />
+              </div>
+            )}
+            <ToolTabs tool={tool} onChange={setTool} ai={showAi} />
             {session && (
               <span className="ephone__saved">
                 <SaveState status={snap.status} error={snap.error} onRetry={() => session.retry()} />
@@ -972,13 +1009,15 @@ export function Editor({ photoId }: { photoId: string }) {
               {tool === 'adjust' && (
                 <Histogram data={hist} caption={histCaption.map((c) => <span key={c}>{c}</span>)} />
               )}
-              <ToolTabs tool={tool} onChange={setTool} />
+              <ToolTabs tool={tool} onChange={setTool} ai={showAi} />
               {!session ? (
                 <Spinner size={18} label="Loading edit" />
               ) : tool === 'adjust' ? (
                 <AdjustPanel edit={edit} />
               ) : tool === 'crop' ? (
                 <CropPanel edit={edit} actions={cropActions} />
+              ) : tool === 'ai' && photo ? (
+                <EditorAiPanel photo={photo} session={session} edit={edit} onToast={setAiToast} />
               ) : (
                 <RecipesPanel edit={edit} actions={recipeActions} />
               )}

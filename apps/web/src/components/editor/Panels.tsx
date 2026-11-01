@@ -25,7 +25,7 @@ import {
 } from '../../lib/editor/controls';
 import { Slider } from './Slider';
 
-export type Tool = 'adjust' | 'crop' | 'recipes';
+export type Tool = 'adjust' | 'crop' | 'recipes' | 'ai';
 export interface Edit {
   recipe: EditRecipe;
   /** Live change while dragging. */
@@ -34,14 +34,16 @@ export interface Edit {
   commit: (r?: EditRecipe) => void;
 }
 
-export function ToolTabs({ tool, onChange }: { tool: Tool; onChange: (t: Tool) => void }) {
-  const tabs: [Tool, string, 'sliders' | 'crop' | 'layers'][] = [
+export function ToolTabs({ tool, onChange, ai }: { tool: Tool; onChange: (t: Tool) => void; ai?: boolean }) {
+  const tabs: [Tool, string, 'sliders' | 'crop' | 'layers' | 'breeze'][] = [
     ['adjust', 'Adjust', 'sliders'],
     ['crop', 'Crop', 'crop'],
     ['recipes', 'Recipes', 'layers'],
   ];
+  // Phase 6: the Zephyr AI tab, when any editor AI tool is available.
+  if (ai) tabs.push(['ai', 'AI', 'breeze']);
   return (
-    <div className="etabs" role="tablist" aria-label="Editing tools">
+    <div className={`etabs${ai ? ' etabs--4' : ''}`} role="tablist" aria-label="Editing tools">
       {tabs.map(([t, label, icon]) => (
         <button
           key={t}
@@ -49,6 +51,7 @@ export function ToolTabs({ tool, onChange }: { tool: Tool; onChange: (t: Tool) =
           role="tab"
           id={`etab-${t}`}
           aria-selected={tool === t}
+          aria-label={t === 'ai' ? 'Zephyr AI' : undefined}
           aria-controls="epanel"
           className="etabs__tab"
           onClick={() => onChange(t)}

@@ -1,6 +1,7 @@
-import { ToastProvider } from '@zephyr/ui';
-import { useCallback } from 'react';
+import { Spinner, ToastProvider } from '@zephyr/ui';
+import { lazy, Suspense, useCallback } from 'react';
 import { createBrowserRouter, Outlet, type RouteObject, useLocation, useNavigate } from 'react-router';
+import { AiHost } from './components/ai/AiHost';
 import { EditTray } from './components/editor/EditTray';
 import { PublicOnly, RequireAuth } from './components/Guards';
 import { LibraryHost } from './components/LibraryHost';
@@ -33,6 +34,7 @@ function Uploads({ children }: { children: React.ReactNode }) {
   return (
     <UploadProvider enabled={on}>
       {children}
+      {on && <AiHost />}
       {on && <EditTray />}
       {on && <ShareTray />}
     </UploadProvider>
@@ -58,6 +60,24 @@ function Root() {
   );
 }
 
+// Phase 6 pages are their own chunks.
+const AiQueuePage = lazy(() => import('./routes/AiQueue').then((m) => ({ default: m.AiQueuePage })));
+const AiSettingsPage = lazy(() => import('./routes/AiSettings').then((m) => ({ default: m.AiSettingsPage })));
+const CleanupPage = lazy(() => import('./routes/Cleanup').then((m) => ({ default: m.CleanupPage })));
+const PeoplePage = lazy(() => import('./routes/People').then((m) => ({ default: m.PeoplePage })));
+const ScenesPage = lazy(() => import('./routes/Scenes').then((m) => ({ default: m.ScenesPage })));
+const page = (el: React.ReactNode) => (
+  <Suspense
+    fallback={
+      <div className="page-loading">
+        <Spinner size={22} label="Loading" />
+      </div>
+    }
+  >
+    {el}
+  </Suspense>
+);
+
 const pub = (el: React.ReactNode) => <PublicOnly>{el}</PublicOnly>;
 const auth = (el: React.ReactNode) => <RequireAuth>{el}</RequireAuth>;
 
@@ -74,8 +94,16 @@ export const routes: RouteObject[] = [
           { path: '/albums/:albumId', element: null },
           { path: '/photo/:photoId', element: null },
           { path: '/edit/:photoId', element: null },
+          // Phase 6: one person's and one scene's photos open the viewer on top, like the library.
+          { path: '/people/:personId', element: null },
+          { path: '/scenes/:scene', element: null },
         ],
       },
+      { path: '/people', element: auth(page(<PeoplePage />)) },
+      { path: '/scenes', element: auth(page(<ScenesPage />)) },
+      { path: '/cleanup', element: auth(page(<CleanupPage />)) },
+      { path: '/ai/queue', element: auth(page(<AiQueuePage />)) },
+      { path: '/settings/ai', element: auth(page(<AiSettingsPage />)) },
       { path: '/albums', element: auth(<AlbumsPage />) },
       { path: '/trash', element: auth(<TrashPage />) },
       { path: '/shared', element: auth(<GalleriesPage />) },
