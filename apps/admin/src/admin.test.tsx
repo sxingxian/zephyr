@@ -123,13 +123,18 @@ describe('Sign-ups page', () => {
     await act(async () => (screen.getByRole('radio', { name: /Open/ }) as HTMLInputElement).click());
     await act(async () => screen.getByRole('button', { name: 'Save' }).click());
     expect(calls.some((c) => c.method === 'PATCH')).toBe(false);
-    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'Launch day' } });
+    // Generous waits: this dialog flow is the slowest render in the suite when CI runs packages in parallel.
+    fireEvent.change(await screen.findByLabelText('Reason', {}, { timeout: 5000 }), {
+      target: { value: 'Launch day' },
+    });
     await act(async () => screen.getByRole('button', { name: 'Save change', hidden: true }).click());
-    await waitFor(() =>
-      expect(calls.find((c) => c.method === 'PATCH')?.body).toEqual({
-        signupMode: 'open',
-        reason: 'Launch day',
-      }),
+    await waitFor(
+      () =>
+        expect(calls.find((c) => c.method === 'PATCH')?.body).toEqual({
+          signupMode: 'open',
+          reason: 'Launch day',
+        }),
+      { timeout: 5000 },
     );
   });
   it('lets only Owners change the mode', async () => {

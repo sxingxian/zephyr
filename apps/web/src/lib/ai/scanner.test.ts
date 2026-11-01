@@ -26,7 +26,7 @@ function makeDeps(pending: string[], over: Partial<ScanDeps> = {}) {
     owner: () => who,
     signalsPending: vi.fn(async () => ({
       ok: true as const,
-      photos: [...left].map((id) => ({ id })),
+      photos: [...left].map((id) => ({ id, takenAt: null })),
       nextCursor: null,
       remaining: left.size,
     })),
