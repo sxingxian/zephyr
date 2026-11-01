@@ -387,6 +387,18 @@ uploadRoutes.post('/:id/complete', async (c) => {
             logError(c.get('requestId'), 'upload_publish_variants', err);
           }
         }
+        // Phase 6: scene tags for the new photo (the consumer checks the member's and Admin's switches).
+        if (variants.thumb && c.env.AI_QUEUE) {
+          const photo = up.photoId;
+          await background(c, async () => {
+            try {
+              await c.env.AI_QUEUE.send({ t: 'scene', photo, owner });
+            } catch (err) {
+              // The 15-minute backfill tags it instead.
+              logError(c.get('requestId'), 'upload_scene_enqueue', err);
+            }
+          });
+        }
         return c.json({ ok: true, photo: res.photo } satisfies UploadCompleteResult);
       case 'duplicate': {
         // The same file finished first elsewhere: this copy's objects go; answer with the kept one.

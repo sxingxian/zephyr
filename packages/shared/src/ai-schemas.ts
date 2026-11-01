@@ -125,8 +125,8 @@ export const cleanupIgnoreSchema = z
   .object({ kind: z.enum(['duplicates', 'blurry']), photoIds: z.array(uuid).min(1).max(500) })
   .strict();
 
-/** 128 float32 little-endian = 512 bytes = 684 base64 characters. */
-const embedding = z.string().regex(/^[A-Za-z0-9+/]{682}==$/);
+/** 128 float32 little-endian = 512 bytes = 684 base64 characters (683 + one '='). */
+const embedding = z.string().regex(/^[A-Za-z0-9+/]{683}=$/);
 const unit = z.number().finite().min(0).max(1);
 export const facesSchema = z
   .object({
@@ -206,8 +206,14 @@ export const aiSettingsPatchSchema = z
     bgProvider: z.enum(BG_PROVIDERS),
     bgFallback: z.enum([...BG_PROVIDERS, 'none']),
     runwareModel: z.string().regex(/^runware:\d{1,6}@\d{1,4}$/),
-    falModel: z.string().regex(/^fal-ai\/[a-z0-9][a-z0-9/_.-]{1,100}$/),
-    sceneModel: z.string().regex(/^@cf\/[a-z0-9][a-z0-9/_.-]{1,100}$/i),
+    falModel: z
+      .string()
+      .regex(/^fal-ai\/[a-z0-9][a-z0-9/_.-]{1,100}$/)
+      .refine((m) => !m.includes('..') && !m.includes('//'), 'no path tricks'),
+    sceneModel: z
+      .string()
+      .regex(/^@cf\/[a-z0-9][a-z0-9/_.-]{1,100}$/i)
+      .refine((m) => !m.includes('..') && !m.includes('//'), 'no path tricks'),
     bgCreditsPerPhoto: z.number().int().min(1).max(20),
     costs: z.object({ runwareMicros: micros, falMicros: micros, sceneMicros: micros }).partial().strict(),
     caps: z.object({ total: usd, bgRemoval: usd, sceneTags: usd, perUser: usd }).partial().strict(),

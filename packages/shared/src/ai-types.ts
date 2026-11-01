@@ -352,7 +352,8 @@ export interface AiSignalsBody {
 }
 export interface SignalsPendingPage {
   ok: true;
-  photos: { id: string }[];
+  /** takenAt feeds the device's Night rule (dark and taken at night). */
+  photos: { id: string; takenAt: string | null }[];
   nextCursor: string | null;
   remaining: number;
 }
@@ -436,7 +437,7 @@ export interface FaceInput {
   box: [number, number, number, number];
   /** Detector confidence 0–1 (faces under FACE_LIMITS.minScore are dropped on the device). */
   score: number;
-  /** 128 float32 values, little-endian, base64 (684 characters). L2-normalised by the server. */
+  /** 128 float32 values, little-endian, base64 (684 characters: 683 + one '='). L2-normalised by the server. */
   embedding: string;
 }
 export interface FacesBody {

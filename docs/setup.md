@@ -86,9 +86,36 @@ Nothing here is committed; each value goes into Cloudflare, Supabase, Resend or 
       - a guest image has no EXIF data;
       - an original over 70 MB downloads at full size (if it can't be transformed, guests get an error for that photo);
       - the media host blocks direct requests.
-6. Create an API token with _Workers Scripts: Edit_, _Workers Routes: Edit_, _Workers R2 Storage: Edit_ and
-   _Zone: Read_ on midnightpoetry.studio.
-7. Deploy order: the API (`zephyr-api`, which also runs the 15-minute clean-up job), then the landing Worker (custom domain `zephyr.midnightpoetry.studio`,
+6. **Zephyr AI (phase 6):**
+   1. **AI Gateway:** under _AI › AI Gateway_, create a gateway named `zephyr-prod`. Turn on **Authenticated
+      Gateway** and create a token; turn on logs (they show the AI jobs page's numbers in the dashboard too).
+      Put the account id and gateway id in the API Worker vars `AI_GATEWAY_ACCOUNT_ID` and `AI_GATEWAY_ID`.
+      In production the API never calls a provider except through this gateway.
+   2. **Runware (background removal):** create an API key. In the gateway, add a **Custom Provider** with the
+      slug `runware` (calls go to `…/custom-runware/v1`) and the base URL `https://api.runware.ai`. Ask Runware
+      sales to turn on **Zero Data Retention** for the organisation before launch (results already come back
+      inline, so nothing is stored as a file).
+   3. **fal (fallback):** create an API key. fal is a native gateway provider (`…/fal/<model>`); every call sends
+      `X-Fal-Store-IO: 0` so fal doesn't keep the request.
+   4. **Workers AI (scene tags):** nothing to create; the `AI` binding in `wrangler.jsonc` calls it through the
+      gateway. Measure the cost per scene tag in week 1 and set it in Admin › Zephyr AI › cost estimates.
+   5. **Queue:** `pnpm exec wrangler queues create zephyr-ai` and `pnpm exec wrangler queues create zephyr-ai-dlq`.
+      The API Worker is both producer and consumer (`wrangler.jsonc`), with 3 retries before the dead-letter queue.
+   6. **Secrets:**
+
+      ```sh
+      pnpm exec wrangler secret put RUNWARE_API_KEY
+      pnpm exec wrangler secret put FAL_KEY
+      pnpm exec wrangler secret put AI_GATEWAY_TOKEN   # the authenticated gateway's token
+      ```
+   7. **Database:** the migration enables `pgvector` (Database › Extensions shows `vector` in schema `extensions`).
+   8. **Bake-off (launch gate):** run `node scripts/bakeoff.mjs <folder of ≤50 JPEGs> <output folder>` with
+      `RUNWARE_API_KEY` and `FAL_KEY` set, open `index.html` in the output, and set the winner in Admin › Zephyr AI.
+   9. **After the first deploy:** remove the background of one photo and check that the cut-out appears in the
+      editor, that Admin › AI jobs shows the call, and that today's spend moved.
+7. Create an API token with _Workers Scripts: Edit_, _Workers Routes: Edit_, _Workers R2 Storage: Edit_,
+   _Queues: Edit_, _AI Gateway: Read_ and _Zone: Read_ on midnightpoetry.studio.
+8. Deploy order: the API (`zephyr-api`, which also runs the 15-minute clean-up job and the zephyr-ai queue), then the landing Worker (custom domain `zephyr.midnightpoetry.studio`,
    includes /admin), then the app Worker (custom domain `zephyrapp.midnightpoetry.studio`).
 
 ## 4. GitHub (Settings › Environments › production)

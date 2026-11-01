@@ -65,6 +65,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Phase 6: face grouping stores embeddings with pgvector (Supabase ships it; the runner needs the package).
+      - name: Install pgvector for the runner's Postgres
+        run: |
+          v="$(ls /usr/lib/postgresql | sort -V | tail -1)"
+          sudo apt-get update -q
+          sudo apt-get install -y -q "postgresql-${v}-pgvector"
       - name: Apply migrations to a throwaway Postgres and run the SQL tests
         run: supabase/tests/run-local.sh
 

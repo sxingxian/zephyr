@@ -40,6 +40,14 @@ const fakeLimiter = (l: { ok: boolean; keys: string[] }) =>
       return { success: l.ok };
     },
   }) as unknown as RateLimit;
+/** Phase 6: the zephyr-ai queue (messages sent), Workers AI (scene labels) and the per-member AI limiter. */
+export const aiQueue = { sent: [] as unknown[], fail: false };
+export const workersAi = {
+  calls: [] as { model: string; options: unknown }[],
+  result: [] as unknown,
+  fail: false,
+};
+export const aiLimiter = { ok: true, keys: [] as string[] };
 export const MEDIA_HOST = 'media.test';
 export const MEDIA_SECRET = 'media-host-secret';
 
@@ -91,6 +99,29 @@ export const env: Env = {
   SHARE_LIMITER: fakeLimiter(shareLimiter),
   GUEST_LIMITER: fakeLimiter(guestLimiter),
   MEDIA_LIMITER: fakeLimiter(mediaLimiter),
+  AI: {
+    run: async (model: string, _inputs: Record<string, unknown>, options?: unknown) => {
+      workersAi.calls.push({ model, options });
+      if (workersAi.fail) throw new Error('workers ai down');
+      return workersAi.result;
+    },
+  },
+  AI_QUEUE: {
+    send: async (body: unknown) => {
+      if (aiQueue.fail) throw new Error('queue down');
+      aiQueue.sent.push(body);
+    },
+    sendBatch: async (msgs: Iterable<{ body: unknown }>) => {
+      if (aiQueue.fail) throw new Error('queue down');
+      for (const m of msgs) aiQueue.sent.push(m.body);
+    },
+  } as unknown as Queue<import('../src/env').AiMessage>,
+  AI_LIMITER: fakeLimiter(aiLimiter),
+  AI_GATEWAY_ACCOUNT_ID: 'acct123',
+  AI_GATEWAY_ID: 'zephyr-test',
+  AI_GATEWAY_TOKEN: 'gateway-token',
+  RUNWARE_API_KEY: 'runware-key',
+  FAL_KEY: 'fal-key',
 };
 
 // ---- keys --------------------------------------------------------------------------------------------
@@ -186,6 +217,8 @@ export interface World {
   globalLogouts: string[];
   /** The media host (zephyr-shared behind Cloudflare): keys it blocks with 451, whether it's down, what was fetched. */
   media: { blocked: Set<string>; down: boolean; fetched: string[] };
+  /** Phase 6: answers for other hosts (AI providers); undefined falls through to "unexpected fetch". */
+  external?: (call: Call, init?: RequestInit) => Response | Promise<Response> | undefined;
 }
 export const world: World = {} as World;
 
@@ -226,7 +259,15 @@ export function resetWorld() {
     onUserDeleted: undefined,
     globalLogouts: [],
     media: { blocked: new Set(), down: false, fetched: [] },
+    external: undefined,
   } satisfies World);
+  aiQueue.sent.length = 0;
+  aiQueue.fail = false;
+  workersAi.calls.length = 0;
+  workersAi.result = [];
+  workersAi.fail = false;
+  aiLimiter.ok = true;
+  aiLimiter.keys.length = 0;
   shared.reset();
   images.reset();
   for (const l of [shareLimiter, guestLimiter, mediaLimiter]) {
@@ -499,6 +540,10 @@ export function installFetch() {
           (body ?? {}) as Record<string, unknown>,
           headers,
         );
+      }
+      if (world.external) {
+        const r = await world.external({ url, method, body, headers }, init);
+        if (r) return r;
       }
       throw new Error(`unexpected fetch ${method} ${url}`);
     }),

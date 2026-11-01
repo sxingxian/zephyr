@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { rejectDuplicateCookies } from './auth/session';
 import { fail, logError } from './http';
 import { adminRoutes } from './routes/admin';
+import { aiRoutes } from './routes/ai';
 import { albumRoutes } from './routes/albums';
 import { appAuthRoutes } from './routes/app-auth';
 import { brandingRoutes } from './routes/branding';
@@ -64,6 +65,8 @@ app.route('/api/v1/photos', photoRoutes);
 app.route('/api/v1/albums', albumRoutes);
 app.route('/api/v1/trash', trashRoutes);
 app.route('/api/v1/recipes', recipeRoutes);
+// Zephyr AI (phase 6).
+app.route('/api/v1/ai', aiRoutes);
 // Sharing (phase 5): members' galleries, and guests (the link token is the capability).
 app.route('/api/v1/galleries', galleryRoutes);
 app.route('/api/v1/g', guestRoutes);

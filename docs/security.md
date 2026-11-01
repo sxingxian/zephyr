@@ -89,4 +89,31 @@
     - **Branding:** a member's branding can only use preset accent colours and re-encoded images, and guest-visible
       text is plain text.
 
-Later phases add ads isolation, the admin Safety queue and face-data opt-in. See the design decisions doc.
+14. **Zephyr AI (phase 6):**
+    - **Owner scoping:** every AI function takes the member id from the verified session and filters by it;
+      device-submitted signals, faces and job progress can only touch the member's own ready photos, with counts
+      and sizes capped by the schemas and again in SQL.
+    - **Providers:** called only through AI Gateway (authenticated) in production, at fixed hosts with model ids
+      checked against strict patterns; API keys live in Worker secrets. Providers get the photo's ≤ 2048 px preview
+      inline, never the original or a link to our storage; fal storage is off (`X-Fal-Store-IO: 0`); a provider
+      result that is a URL instead of inline data is refused.
+    - **Untrusted output:** masks go through a strict PNG reader (8-bit grey, grey+alpha or RGBA; no interlace,
+      palette or odd sizes; input capped; inflated into a buffer of exactly the expected size, so a decompression
+      bomb stops at once), must match the photo's aspect, and are stored re-encoded as greyscale. The provider's
+      RGB pixels are discarded.
+    - **Money:** credits are charged when a job is created and refunded once per failed or canceled item, under a
+      per-member advisory lock; a balance can't go negative. Every provider call first reserves its estimated cost
+      under the day's lock, so parallel consumers can't pass a daily cap; the reservation is settled to the real
+      cost afterwards.
+    - **Face data (biometric):** off by default, on only with recorded consent (version and time, audit log), Pro
+      and Studio only. Faces are found on the device; face codes are stored per member, never returned to any
+      client, never logged, never compared across accounts. Turning it off deletes every face, person and
+      rejection at once; a plan that loses people grouping stops scanning and the data is deleted 30 days later,
+      with emails.
+    - **Admin:** any change that could raise spend or turn something on needs a passkey sign-in in the last 10
+      minutes, is audited with a before/after diff and emails every Owner; switching things off or lowering a cap
+      saves at once, so a one-person team can always pull the kill switch.
+    - **Shared devices:** AI writes carry `X-Zephyr-Expected-User`; device-job leases belong to a sign-in session.
+      Masks are served to their owner only, privately cached under ids that are never reused.
+
+Later phases add ads isolation and the admin Safety queue. See the design decisions doc.
