@@ -272,6 +272,29 @@ select pg_temp.ok((select jsonb_array_length(x -> 'remaining') = 1 from (select 
   'another device continues where it stopped');
 select pg_temp.ok((public.ai_device_progress(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj'), 'session-b',
                    null, array[(select v from t where k = 'p3')]) #>> '{job,status}') = 'done', 'the job finishes');
+-- Runner tokens: two tabs of one sign-in never run the same job (client review #2).
+insert into r values ('dj2', public.ai_device_job_create(:mei, array[(select v from t where k = 'p2'), (select v from t where k = 'p3')],
+  '{"steps": ["hdr"]}', 'Tabs', 'Chrome on Mac', 'session-t'));
+select pg_temp.ok((public.ai_device_claim(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'Chrome on Mac', 'session-t',
+                   'AAAAAAAAAAAAAAAAAAAAAA') ->> 'error') is null, 'the creating tab claims with its runner token');
+select pg_temp.ok((public.ai_device_claim(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'Chrome on Mac', 'session-t',
+                   'BBBBBBBBBBBBBBBBBBBBBB') ->> 'error') = 'held', 'another tab of the same sign-in can''t claim a live lease');
+select pg_temp.ok((public.ai_device_claim(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'Chrome on Mac', 'session-t')
+                   ->> 'error') = 'held', 'a claim without a runner token can''t take a tab''s live lease');
+select pg_temp.ok((public.ai_device_progress(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'session-t',
+                   array[(select v from t where k = 'p2')], null, 'BBBBBBBBBBBBBBBBBBBBBB') ->> 'error') = 'lost',
+  'another tab can''t report progress');
+select pg_temp.ok((public.ai_device_progress(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'session-t',
+                   array[(select v from t where k = 'p2')], null, 'AAAAAAAAAAAAAAAAAAAAAA') #>> '{job,counts,completed}')::integer = 1,
+  'the holding tab reports progress');
+select pg_temp.ok((public.ai_device_claim(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'Chrome on Mac', 'session-t',
+                   'not-a-token') ->> 'error') = 'invalid', 'a malformed runner token is refused');
+update public.ai_jobs set lease_until = now() - interval '1 second' where id = (select (v #>> '{job,id}')::uuid from r where k = 'dj2');
+select pg_temp.ok((public.ai_device_claim(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'Chrome on Mac', 'session-t',
+                   'BBBBBBBBBBBBBBBBBBBBBB') ->> 'error') is null, 'once the lease lapses another tab can continue');
+select public.ai_device_pause(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'));
+select pg_temp.ok((select lease_runner is null from public.ai_jobs where id = (select (v #>> '{job,id}')::uuid from r where k = 'dj2')),
+  'pause releases the runner too');
 select pg_temp.ok((public.ai_device_job_create(:mei, array[(select v from t where k = 'p2')], '{"steps": ["color_match"], "reference": "a6000000-0000-0000-0000-00000000dead"}',
                    null, 'Mac', 's') ->> 'error') = 'invalid', 'a reference that isn''t the member''s is refused');
 select pg_temp.ok((public.ai_jobs_list(:mei, 'finished') #>> '{counts,finished}')::integer >= 1, 'the jobs list counts finished jobs');

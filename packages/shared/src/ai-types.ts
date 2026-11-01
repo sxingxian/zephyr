@@ -317,7 +317,14 @@ export interface AiJobRetryBody {
 }
 export interface DeviceClaimBody {
   device: string;
+  /**
+   * This tab's runner token (RUNNER_TOKEN_RE): with it, another tab of the same sign-in can't claim or report
+   * on a job this tab holds (409 conflict).
+   */
+  runner?: string;
 }
+/** A runner token: 16 random bytes, base64url (22 characters). */
+export const RUNNER_TOKEN_RE = /^[A-Za-z0-9_-]{22}$/;
 export interface DeviceClaimResult {
   ok: true;
   job: AiJobSummary;
@@ -327,6 +334,8 @@ export interface DeviceClaimResult {
 export interface DeviceProgressBody {
   done?: string[];
   failed?: string[];
+  /** The token the job was claimed with (DeviceClaimBody.runner). */
+  runner?: string;
 }
 /** A device lease lasts this long without progress; then the job shows "Waiting for this device". */
 export const DEVICE_LEASE_SECONDS = 120;

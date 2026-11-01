@@ -563,6 +563,23 @@ describe('member AI routes', () => {
     expect(String(tag)).toMatch(/^[0-9a-f]{32}$/);
   });
 
+  it('passes the tab runner token on claims and progress, and refuses a malformed one', async () => {
+    const j = await signedIn(MEI);
+    const runner = 'AbCdEfGhIjKlMnOpQrStUv';
+    world.rpc.ai_device_claim = () => ({ error: 'held', holder: 'Chrome on Mac' });
+    await call(AI_API.jobClaim(JOB), { jar: j, body: { device: 'Chrome on Mac', runner } });
+    expect(rpcArgs('ai_device_claim')[0]?.p_runner).toBe(runner);
+    world.rpc.ai_device_progress = () => ({ error: 'lost' });
+    const lost = await call(AI_API.jobProgress(JOB), { jar: j, body: { done: [], runner } });
+    expect(lost.status).toBe(409);
+    expect(rpcArgs('ai_device_progress')[0]?.p_runner).toBe(runner);
+    const bad = await call(AI_API.jobClaim(JOB), {
+      jar: j,
+      body: { device: 'Chrome on Mac', runner: 'short' },
+    });
+    expect(bad.status).toBe(400);
+  });
+
   it('normalises face codes and drops unusable ones', async () => {
     const j = await signedIn(MEI);
     world.rpc.ai_faces_add = () => ({ saved: 1 });

@@ -338,6 +338,7 @@ aiRoutes.post('/jobs/:id/claim', async (c) => {
       p_job: id,
       p_device: body.device,
       p_session: await sessionTag(c),
+      p_runner: body.runner ?? null,
     });
     if (!out) return c.json(fail('not_found'), 404);
     if (out.error === 'held') return c.json(fail('conflict', { holder: out.holder ?? '' }), 409);
@@ -360,6 +361,7 @@ aiRoutes.post('/jobs/:id/progress', async (c) => {
       p_session: await sessionTag(c),
       p_done: body.done ?? [],
       p_failed: body.failed ?? [],
+      p_runner: body.runner ?? null,
     });
     if (!out) return c.json(fail('not_found'), 404);
     if (out.error || !out.job) return blocked(c, out.error);

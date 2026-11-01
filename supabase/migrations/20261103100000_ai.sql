@@ -156,6 +156,8 @@ create table public.ai_jobs (
   credits_refunded integer not null default 0 check (credits_refunded >= 0),
   lease_device text check (lease_device is null or length(lease_device) between 1 and 40),
   lease_session text check (lease_session is null or length(lease_session) <= 64),
+  -- The tab (runner) holding the lease inside that session: two tabs of one sign-in never run the same job.
+  lease_runner text check (lease_runner is null or lease_runner ~ '^[A-Za-z0-9_-]{22}$'),
   lease_until timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -735,6 +737,9 @@ language sql volatile set search_path = '' as $$
          lease_session = case when exists (select 1 from public.ai_job_items i
                                             where i.job_id = j.id and i.status in ('pending', 'processing'))
                               then j.lease_session end,
+         lease_runner = case when exists (select 1 from public.ai_job_items i
+                                           where i.job_id = j.id and i.status in ('pending', 'processing'))
+                             then j.lease_runner end,
          lease_until = case when exists (select 1 from public.ai_job_items i
                                           where i.job_id = j.id and i.status in ('pending', 'processing'))
                             then j.lease_until end
@@ -1267,7 +1272,7 @@ begin
     update public.ai_job_items set status = 'canceled', finished_at = now(), reserved_micros = 0, wait_until = null where id = it.id;
     perform public._ai_refund_item(it.id);
   end loop;
-  update public.ai_jobs set state = 'canceled', lease_device = null, lease_session = null, lease_until = null, updated_at = now()
+  update public.ai_jobs set state = 'canceled', lease_device = null, lease_session = null, lease_runner = null, lease_until = null, updated_at = now()
    where id = p_job;
   perform public._ai_job_touch(p_job);
   select * into j from public.ai_jobs where id = p_job;
@@ -1316,23 +1321,29 @@ begin
 end;
 $$;
 
--- Device jobs: claim (any of the owner's sessions, unless another one holds a live lease).
+-- Device jobs: claim (any of the owner's sessions and tabs, unless another session or another tab of this one
+-- holds a live lease). p_runner is the claiming tab's random token (22 base64url characters).
 -- {job, remaining} | {error: 'held', holder} | {error: 'finished'} | null.
-create function public.ai_device_claim(p_owner uuid, p_job uuid, p_device text, p_session text) returns jsonb
+create function public.ai_device_claim(p_owner uuid, p_job uuid, p_device text, p_session text, p_runner text default null)
+returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   j public.ai_jobs;
   device text := left(nullif(btrim(regexp_replace(coalesce(p_device, ''), '[[:cntrl:]]', '', 'g')), ''), 40);
 begin
   if device is null or nullif(p_session, '') is null then return jsonb_build_object('error', 'invalid'); end if;
+  if p_runner is not null and p_runner !~ '^[A-Za-z0-9_-]{22}$' then return jsonb_build_object('error', 'invalid'); end if;
   select * into j from public.ai_jobs where id = p_job and owner_id = p_owner and kind = 'device' for update;
   if not found then return null; end if;
   if j.state = 'canceled' or j.finished_at is not null then return jsonb_build_object('error', 'finished'); end if;
-  if j.lease_until > now() and j.lease_session is distinct from left(p_session, 64) and j.state = 'active' then
+  if j.lease_until > now() and j.state = 'active'
+     and (j.lease_session is distinct from left(p_session, 64)
+          or (j.lease_runner is not null and j.lease_runner is distinct from p_runner)) then
     return jsonb_build_object('error', 'held', 'holder', j.lease_device);
   end if;
   update public.ai_jobs
-     set state = 'active', lease_device = device, lease_session = left(p_session, 64), lease_until = now() + interval '120 seconds',
+     set state = 'active', lease_device = device, lease_session = left(p_session, 64), lease_runner = p_runner,
+         lease_until = now() + interval '120 seconds',
          updated_at = now()
    where id = p_job returning * into j;
   return jsonb_build_object('job', public._ai_job_json(j, p_session),
@@ -1341,15 +1352,17 @@ begin
 end;
 $$;
 
--- Device progress: only the session holding the lease. Renews the lease. {job} | {error: 'lost'} | null.
-create function public.ai_device_progress(p_owner uuid, p_job uuid, p_session text, p_done uuid[], p_failed uuid[]) returns jsonb
+-- Device progress: only the session (and tab) holding the lease. Renews the lease. {job} | {error: 'lost'} | null.
+create function public.ai_device_progress(p_owner uuid, p_job uuid, p_session text, p_done uuid[], p_failed uuid[],
+                                          p_runner text default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   j public.ai_jobs;
 begin
   select * into j from public.ai_jobs where id = p_job and owner_id = p_owner and kind = 'device' for update;
   if not found then return null; end if;
-  if j.state <> 'active' or j.lease_session is distinct from left(p_session, 64) or j.lease_until is null then
+  if j.state <> 'active' or j.lease_session is distinct from left(p_session, 64) or j.lease_until is null
+     or (j.lease_runner is not null and j.lease_runner is distinct from p_runner) then
     return jsonb_build_object('error', 'lost');
   end if;
   update public.ai_job_items set status = 'completed', finished_at = now()
@@ -1372,7 +1385,7 @@ language plpgsql volatile security definer set search_path = '' as $$
 declare
   j public.ai_jobs;
 begin
-  update public.ai_jobs set state = 'paused', lease_device = null, lease_session = null, lease_until = null, updated_at = now()
+  update public.ai_jobs set state = 'paused', lease_device = null, lease_session = null, lease_runner = null, lease_until = null, updated_at = now()
    where id = p_job and owner_id = p_owner and kind = 'device' and state <> 'canceled'
   returning * into j;
   if not found then
@@ -2195,7 +2208,7 @@ begin
      where id = it.id;
     perform public._ai_refund_item(it.id);
   end loop;
-  update public.ai_jobs set state = 'canceled', lease_device = null, lease_session = null, lease_until = null, updated_at = now()
+  update public.ai_jobs set state = 'canceled', lease_device = null, lease_session = null, lease_runner = null, lease_until = null, updated_at = now()
    where owner_id = new.id and state <> 'canceled' and finished_at is null;
   perform public._ai_job_touch(j.id) from public.ai_jobs j where j.owner_id = new.id;
   update public.photos set scene_state = null, scene_queued_at = null where owner_id = new.id and scene_state = 'pending';
@@ -2553,8 +2566,8 @@ grant execute on function
   public.ai_job_get(uuid, uuid, integer, text),
   public.ai_job_cancel(uuid, uuid, text),
   public.ai_job_retry(uuid, uuid, uuid[], text),
-  public.ai_device_claim(uuid, uuid, text, text),
-  public.ai_device_progress(uuid, uuid, text, uuid[], uuid[]),
+  public.ai_device_claim(uuid, uuid, text, text, text),
+  public.ai_device_progress(uuid, uuid, text, uuid[], uuid[], text),
   public.ai_device_pause(uuid, uuid, text),
   public.ai_mask_key(uuid, uuid, uuid),
   public.ai_item_begin(uuid, bigint),

@@ -12,6 +12,7 @@ import {
   FACE_MODEL_VERSION,
   JOB_TITLE_MAX,
   PERSON_NAME_MAX,
+  RUNNER_TOKEN_RE,
   SCENES,
   SIGNALS_VERSION,
 } from './ai-types';
@@ -93,9 +94,16 @@ export const aiJobCreateSchema = z.discriminatedUnion('kind', [
     .strict(),
 ]);
 export const aiJobRetrySchema = z.object({ itemIds: z.array(uuid).min(1).max(2000).optional() }).strict();
-export const deviceClaimSchema = z.object({ device: text(DEVICE_LABEL_MAX) }).strict();
+const runner = z.string().regex(RUNNER_TOKEN_RE);
+export const deviceClaimSchema = z
+  .object({ device: text(DEVICE_LABEL_MAX), runner: runner.optional() })
+  .strict();
 export const deviceProgressSchema = z
-  .object({ done: z.array(uuid).max(200).optional(), failed: z.array(uuid).max(200).optional() })
+  .object({
+    done: z.array(uuid).max(200).optional(),
+    failed: z.array(uuid).max(200).optional(),
+    runner: runner.optional(),
+  })
   .strict();
 export const jobListQuerySchema = z.object({
   state: z.enum(['running', 'finished', 'failed']).default('running'),

@@ -487,6 +487,14 @@ describe('one member cannot reach another member’s library', () => {
       const res = await call(LIBRARY_API.photosBulk, { jar: wei, body: { ids: [photo.id], action } });
       expect(await read(res)).toEqual({ ok: true, affected: 0 });
     }
+    // A bulk action started for someone else (a shared device that switched accounts) is refused outright.
+    const switched = await call(LIBRARY_API.photosBulk, {
+      jar: wei,
+      body: { ids: [photo.id], action: 'trash' },
+      headers: { 'X-Zephyr-Expected-User': '20000000-0000-4000-8000-000000000099' },
+    });
+    expect(switched.status).toBe(409);
+    expect(await read(switched)).toMatchObject({ error: 'session_changed' });
     const list = await read(await call(LIBRARY_API.photos, { jar: wei }));
     expect(list.items).toEqual([]);
 

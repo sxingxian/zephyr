@@ -12,7 +12,15 @@ import {
 import { type Context, Hono } from 'hono';
 import { fail, logError, readBody } from '../http';
 import { contentDisposition, downloadName, parseRange } from '../library/files';
-import { LIBRARY_LIMITS, libraryGuard, type PurgeItem, photoKey, purgeNow, UUID } from '../library/storage';
+import {
+  expectedUser,
+  LIBRARY_LIMITS,
+  libraryGuard,
+  type PurgeItem,
+  photoKey,
+  purgeNow,
+  UUID,
+} from '../library/storage';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 import { editRoutes } from './edits';
@@ -52,7 +60,8 @@ photoRoutes.get('/', async (c) => {
   }
 });
 
-photoRoutes.post('/bulk', async (c) => {
+// Bulk actions name the member they were started for (multi-chunk trash/restore from Cleanup and Trash).
+photoRoutes.post('/bulk', expectedUser, async (c) => {
   const body = await readBody(c, bulkSchema);
   if (!body) return c.json(fail('invalid'), 400);
   try {
