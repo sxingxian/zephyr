@@ -110,9 +110,17 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
   if (begin.status !== 'go') return begin.status === 'failed' ? 'failed' : 'skipped';
   await sendSpendAlerts(env, begin.alerts, s.atCap);
   const { ownerId, photoId } = begin;
+  // This run's attempt number: a late report from a run taken over as stuck is ignored by the database.
+  const attempt = Number.isInteger(begin.attempts) ? begin.attempts : null;
   const calls: CallLog[] = [];
   const failed = async (error: AiItemError, cost = 0) => {
-    await rpc(env, 'ai_item_failed', { p_item: itemId, p_error: error, p_cost: cost, p_calls: calls });
+    await rpc(env, 'ai_item_failed', {
+      p_item: itemId,
+      p_error: error,
+      p_cost: cost,
+      p_calls: calls,
+      p_attempt: attempt,
+    });
     return 'failed' as const;
   };
 
@@ -173,6 +181,7 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
         p_cost: spent,
         p_latency_ms: Date.now() - t0,
         p_calls: calls,
+        p_attempt: attempt,
       });
       const drop = (done.deleteKeys ?? []).filter(
         (k) => typeof k === 'string' && k.startsWith(`u/${ownerId}/p/`),
@@ -197,7 +206,7 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
 }
 
 type SceneBegin =
-  | { status: 'go'; day?: string; alerts?: SpendAlert[] }
+  | { status: 'go'; day?: string; run?: string; alerts?: SpendAlert[] }
   | { status: 'wait'; alerts?: SpendAlert[] }
   | { status: 'skip' };
 
@@ -220,6 +229,8 @@ export async function processScene(
   if (begin.status !== 'go') return 'skipped';
   // Settled on the day the reservation was made (a run can cross midnight UTC).
   const day = typeof begin.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(begin.day) ? begin.day : null;
+  // The run token: the database settles this run once, so a repeated report (say, after a lost reply) is a no-op.
+  const run = typeof begin.run === 'string' && UUID.test(begin.run) ? begin.run : null;
   const done = (scenes: unknown, calls: CallLog[]) =>
     rpc(env, 'ai_scene_done', {
       p_owner: owner,
@@ -229,6 +240,7 @@ export async function processScene(
       p_cost: calls.length ? estimate : 0,
       p_calls: calls,
       p_day: day,
+      p_run: run,
     });
   let called = false;
   const t0 = Date.now();

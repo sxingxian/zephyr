@@ -90,6 +90,7 @@ export const aiJobCreateSchema = z.discriminatedUnion('kind', [
       params: deviceJobParamsSchema,
       title: text(JOB_TITLE_MAX).optional(),
       device: text(DEVICE_LABEL_MAX),
+      runner: z.string().regex(RUNNER_TOKEN_RE).optional(),
     })
     .strict(),
 ]);

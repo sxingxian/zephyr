@@ -306,6 +306,14 @@ describe('background-removal consumer', () => {
     world.rpc.ai_alert_recipients = () => ['owner@zephyr.test'];
   });
 
+  it('reports with the attempt number from begin (re-review #4)', async () => {
+    world.rpc.ai_item_begin = () => ({ ...go(), attempts: 2 });
+    await storePreview(40, 30);
+    world.external = runwareOk;
+    await processBgItem(env, ITEM);
+    expect(rpcArgs('ai_item_complete')[0]?.p_attempt).toBe(2);
+  });
+
   it('stores a greyscale mask at the preview size and attaches it', async () => {
     await storePreview(40, 30);
     await r2.put(`u/${MEI.id}/p/${PHOTO}/m/old.png`, new Uint8Array(3));
@@ -388,7 +396,11 @@ describe('background-removal consumer', () => {
     await storePreview();
     world.external = down;
     expect(await processBgItem(env, ITEM)).toBe('failed');
-    expect(rpcArgs('ai_item_failed')[0]).toMatchObject({ p_item: ITEM, p_error: 'provider_error' });
+    expect(rpcArgs('ai_item_failed')[0]).toMatchObject({
+      p_item: ITEM,
+      p_error: 'provider_error',
+      p_attempt: 1,
+    });
     expect(rpcCalls('ai_item_complete')).toHaveLength(0);
   });
 
@@ -463,6 +475,25 @@ describe('scene tags consumer', () => {
     workersAi.result = [{ label: 'SEASHORE', score: 0.6 }];
     await processScene(env, PHOTO, MEI.id);
     expect(rpcArgs('ai_scene_done')[0]?.p_day).toBe('2026-10-31');
+  });
+
+  it('reports with the run token from begin, so a repeated report is a no-op (re-review #3)', async () => {
+    const run = 'b1000000-0000-4000-8000-000000000001';
+    world.rpc.ai_scene_begin = () => ({ status: 'go', day: '2026-11-01', run, alerts: [] });
+    // The first report commits but its reply is lost; the catch path's report then finds the run settled.
+    let n = 0;
+    world.rpc.ai_scene_done = () => {
+      n += 1;
+      if (n === 1) throw new Error('reply lost');
+      return { status: 'stale' };
+    };
+    await r2.put(`u/${MEI.id}/p/${PHOTO}/thumb`, jpeg(16, 12));
+    workersAi.result = [{ label: 'SEASHORE', score: 0.6 }];
+    await expect(processScene(env, PHOTO, MEI.id)).rejects.toThrow('reply lost');
+    const reports = rpcArgs('ai_scene_done');
+    expect(reports).toHaveLength(2);
+    expect(reports.every((a) => a?.p_run === run)).toBe(true);
+    expect(reports[1]?.p_scenes).toBe('retry');
   });
 
   it('settles and retries later when the run breaks after the reservation', async () => {
@@ -576,6 +607,34 @@ describe('member AI routes', () => {
     const bad = await call(AI_API.jobClaim(JOB), {
       jar: j,
       body: { device: 'Chrome on Mac', runner: 'short' },
+    });
+    expect(bad.status).toBe(400);
+  });
+
+  it("leases a new device job to the creating tab's runner token (re-review #6)", async () => {
+    const j = await signedIn(MEI);
+    const runner = 'AbCdEfGhIjKlMnOpQrStUv';
+    world.rpc.ai_device_job_create = () => ({ error: 'feature_off' });
+    await call(AI_API.jobs, {
+      jar: j,
+      body: {
+        kind: 'device',
+        photoIds: [PHOTO],
+        params: { steps: ['hdr'] },
+        device: 'Chrome on Mac',
+        runner,
+      },
+    });
+    expect(rpcArgs('ai_device_job_create')[0]?.p_runner).toBe(runner);
+    const bad = await call(AI_API.jobs, {
+      jar: j,
+      body: {
+        kind: 'device',
+        photoIds: [PHOTO],
+        params: { steps: ['hdr'] },
+        device: 'Chrome on Mac',
+        runner: 'x',
+      },
     });
     expect(bad.status).toBe(400);
   });

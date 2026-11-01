@@ -244,6 +244,7 @@ aiRoutes.post('/jobs', async (c) => {
       p_title: body.title ?? null,
       p_device: body.device,
       p_session: await sessionTag(c),
+      p_runner: body.runner ?? null,
     });
     if (!out) return c.json(fail('not_found'), 404);
     if (out.error === 'no_photos') return c.json({ ...fail('invalid'), skipped: out.skipped ?? [] }, 400);

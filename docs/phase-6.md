@@ -92,7 +92,9 @@ Messages carry ids only, never image bytes or URLs. The consumer:
    - **Development only:** without `AI_GATEWAY_ID` the calls go straight to the providers. Production refuses to start cloud work without a gateway.
 3. **Timeouts and fallback:** 30 s per call, and the item is tried twice on the primary. After the second failure it goes to `bgFallback` once, if that's set. A provider whose output was rejected (`bad_output`) isn't asked again for that item. The provider used is recorded on the item.
    - **Reservation:** before the first call, `ai_item_begin` reserves the item's worst case (every primary attempt plus the fallback), so whatever the calls cost stays inside the caps; it's settled to the real cost afterwards.
-   - **Failure budget:** provider failures are refunded, so once a member has `AI_FAILURE_BUDGET` (50) refunded provider failures in a UTC day, their further items wait until tomorrow.
+   - **Failure budget:** provider failures are refunded, so once a member has `AI_FAILURE_BUDGET` (50) provider failures in a UTC day, their further items wait until tomorrow. Failures are counted as they happen (`ai_user_spend_daily.failures`, append-only), so retrying failed items doesn't reset the count, and creations and retries share `memberJobsPerMinute` (`ai_job_requests`).
+   - **Run tokens:** `ai_item_complete` and `ai_item_failed` carry the attempt number from `ai_item_begin`. A late report from an attempt that was taken over as stuck (whose whole reservation was counted as spent then) attaches nothing and counts nothing.
+   - **Account deletion:** a result that arrives after deletion was scheduled attaches nothing; the item is canceled and refunded, the call's cost is counted, and the stored mask (no row) is removed by the sweep or straight away by the consumer.
    - **Concurrency:** the queue consumer runs at most 4 batches (20 items) at once (`max_concurrency`).
 4. **Output check** (`apps/api/src/ai/png.ts`): the result is untrusted and goes through a strict PNG reader built on `fflate` inflate.
    - Signature and IHDR are checked.
@@ -115,7 +117,8 @@ Messages carry ids only, never image bytes or URLs. The consumer:
 - sets `photos.scene_state` (`done` / `failed` / `skipped`).
 
 Failures are not retried more than the queue's retries. Turning scene tags off deletes the member's scene rows, and a result that arrives after that (or after Admin turned scene tags off) is dropped.
-- `ai_scene_begin` returns the day it reserved on, and `ai_scene_done` settles on that day. If a run breaks after the reservation (R2 or the database), the consumer reports `retry`, which settles it.
+- `ai_scene_begin` returns the day it reserved on and a run token; `ai_scene_done` settles only the run in flight, once, on that day. A repeated report (a lost reply, then the consumer's catch path) or one from a run taken over by a later begin (which counted its reservation as spent) is `stale` and changes nothing. If a run breaks after the reservation (R2 or the database), the consumer reports `retry`, which settles it. `ai_scene_begin` waits while `scene_retry_at` is in the future.
+- A result and "scene tags off" both take the member's scenes lock first, so an opt-out never leaves tags behind and a re-tag can't deadlock with it.
 - Photos that have to wait get `photos.scene_retry_at` instead of going straight back into the backfill: cap reached → tomorrow, cloud paused → 15 minutes, thumbnail not there yet or a broken run → 1 hour.
 - The backfill skips members at their daily per-member cap and accounts scheduled for deletion, so one capped member can't fill every run.
 
@@ -232,7 +235,7 @@ A background scanner (`scanner.ts`) runs while the app is open and idle (request
 - **`ai_settings`:** one row, the `AiSettings` fields. The default has every feature on, Runware primary, fal fallback, caps of 10 / 8 / 2 / 0.50 USD, alerts at 50, 80 and 100, and pause at the cap.
 - **`ai_member_settings`:** `face_grouping`, `face_consent_at`, `face_consent_version`, `scene_tags`, `cleanup`, `face_plan_lapsed_at`.
 - **Credits:** `credit_balances` and `credit_ledger`.
-- **Jobs:** `ai_jobs` and `ai_job_items`. Each item has a status and an error, `attempts`, `provider`, `cost_micros`, `credits`, `mask_id`, `wait_until`, `started_at` and `finished_at`. Device jobs keep their photo list in items too, with `lease_device` and `lease_until` on the job.
+- **Jobs:** `ai_jobs` and `ai_job_items`. Each item has a status and an error, `attempts`, `provider`, `cost_micros`, `credits`, `mask_id`, `wait_until`, `started_at` and `finished_at`. Device jobs keep their photo list in items too, with `lease_device`, `lease_session`, `lease_runner` (the creating or claiming tab's token) and `lease_until` on the job.
 - **Spend:** `ai_spend_daily`, `ai_user_spend_daily` and `ai_spend_alerts`.
 - **Masks:** `photo_masks`. Photo purge and account purge delete the mask keys: `_photo_keys` includes them, and the orphan sweep treats `m/` keys with a `photo_masks` row as known.
 - **Signals:** `photo_signals`, holding `phash` as a bigint, `sharpness`, `brightness`, `night`, `version`, `dup_ignored` and `blur_ignored`.

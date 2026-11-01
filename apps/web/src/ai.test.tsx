@@ -286,7 +286,11 @@ describe('Zephyr AI for a selection', () => {
       params: { steps: ['auto_enhance'], strength: 70, skin: true },
     });
     expect(typeof posts[1]?.device).toBe('string');
+    // The new job is leased to this tab's runner token, and the claim carries the same token (re-review #6).
+    expect(String(posts[1]?.runner)).toMatch(/^[A-Za-z0-9_-]{22}$/);
     await waitFor(() => expect(calls.some((c) => c.url === '/api/v1/ai/jobs/dj/claim')).toBe(true));
+    const claim = calls.find((c) => c.url === '/api/v1/ai/jobs/dj/claim')?.body as { runner?: string };
+    expect(claim?.runner).toBe(posts[1]?.runner);
   });
   it('caps the selection at the plan batch size and blocks a run the credits can’t cover', () => {
     setAiStatus(status({ batchSize: 25, credits: { ...status().credits, balance: 3 } }));

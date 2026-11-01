@@ -106,10 +106,14 @@
     - **Money:** credits are charged when a job is created and refunded once per failed or canceled item, under a
       per-member advisory lock; a balance can't go negative. Before an item's first provider call, its worst case
       (every primary attempt plus the fallback) is reserved under the day's lock, so parallel consumers can't pass
-      a daily cap; it's settled to the real cost on the day it was reserved, and a late report still records what
-      its calls cost. A provider whose output was rejected isn't asked again for that item; at most 20 items are in
-      flight; and a member with 50 refunded provider failures in a day waits until tomorrow. Items stuck in
-      processing are picked up again even when their job was canceled, and refunded and settled.
+      a daily cap; it's settled to the real cost on the day it was reserved. Every run carries a token (the item's
+      attempt number, a scene run's id), so only the run in flight reports, once: a late or repeated report (a run
+      taken over as stuck, whose whole reservation was counted then, or a lost reply) changes and counts nothing.
+      A provider whose output was rejected isn't asked again for that item; at most 20 items are in flight; and a
+      member with 50 provider failures in a day waits until tomorrow. Failures are counted as they happen in an
+      append-only daily counter, so retrying failed items doesn't reset it, and retries count toward the per-minute
+      job limit like new jobs. Items stuck in processing are picked up again even when their job was canceled, and
+      refunded and settled.
     - **Face data (biometric):** off by default, on only with recorded consent to the current wording (version and
       time, audit log), Pro and Studio only. Faces are found on the device; face codes are stored per member, never
       returned to any client, never logged, never compared across accounts. Every face write re-checks the opt-out
@@ -123,7 +127,8 @@
       minutes, is audited with a before/after diff and emails every Owner; switching things off or lowering a cap
       saves at once, so a one-person team can always pull the kill switch.
     - **Shared devices:** AI writes (and bulk photo actions) carry `X-Zephyr-Expected-User`, captured when the work
-      began. Device-job leases belong to a sign-in session and to one tab's random runner token; a Web Lock keeps a
+      began. Device-job leases belong to a sign-in session and to one tab's random runner token (set when the tab
+      creates the job; a claim or report with no token, or another tab's, can't use a live lease); a Web Lock keeps a
       second tab of the browser off the same job, and a photo edited after its job started is left alone, so
       steps never stack. Masks are served to their owner only, privately cached but revalidated on every use
       (`no-cache` + ETag), so a browser never shows a mask its member can no longer read. Sign-out, an account
@@ -134,7 +139,10 @@
       down. A model that fails to download or verify is remembered with a growing back-off, so it's never
       re-downloaded per photo. 429s are waited out with their Retry-After. Spending actions show their credit
       cost and ask first ("Retry all failed").
+    - **Scene tags:** a result and a "scene tags off" take the member's scenes lock first, so whichever comes
+      second sees the other: no tags survive an opt-out, and a re-tag can't deadlock with it.
     - **Account deletion:** scheduling it deletes face data, cancels and refunds pending cloud work, and the scene
-      backfill and the queue consumer skip the account.
+      backfill and the queue consumer skip the account. A background removal already running when deletion is
+      scheduled attaches nothing and is refunded; its stored mask has no row, so the sweep removes it.
 
 Later phases add ads isolation and the admin Safety queue. See the design decisions doc.

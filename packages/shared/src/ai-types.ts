@@ -297,6 +297,8 @@ export type AiJobCreateBody =
       title?: string;
       /** This device's label; it claims the job straight away. */
       device: string;
+      /** This tab's runner token (RUNNER_TOKEN_RE): the job's first lease is this tab's, so it claims at once. */
+      runner?: string;
     };
 export type AiSkipReason = 'already_cut_out' | 'not_found' | 'no_preview';
 export interface AiJobCreateResult {

@@ -142,11 +142,15 @@ export function BatchDialog({
       }
       if (deviceSteps.length) {
         const device = deviceLabel();
+        // The job's first lease is this tab's (its runner token), so this tab claims it straight away and no
+        // other tab of the same sign-in can.
+        const { deviceRunner, tabRunnerToken } = await import('../../lib/deviceRunner');
         const r = await createJob({
           kind: 'device',
           photoIds,
           title: jobTitle,
           device,
+          runner: tabRunnerToken(),
           params: {
             steps: deviceSteps,
             ...(steps.auto_enhance ? { strength: 70, skin: true } : {}),
@@ -154,7 +158,6 @@ export function BatchDialog({
             ...(steps.color_match && reference ? { reference: reference.id, matchStrength: 80 } : {}),
           },
         });
-        const { deviceRunner } = await import('../../lib/deviceRunner');
         void deviceRunner.start(r.job);
         started.push('on-device steps');
       }
