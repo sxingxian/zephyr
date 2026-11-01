@@ -2,6 +2,8 @@ import { Spinner, ToastProvider } from '@zephyr/ui';
 import { type ReactNode, useCallback } from 'react';
 import { createBrowserRouter, Navigate, Outlet, type RouteObject, useNavigate } from 'react-router';
 import { AdminSessionProvider, useAdminSession } from './lib/session';
+import { AiControls } from './routes/AiControls';
+import { AiJobs } from './routes/AiJobs';
 import { Enrol } from './routes/Enrol';
 import { SignIn } from './routes/SignIn';
 import { Signups } from './routes/Signups';
@@ -68,6 +70,22 @@ export const routes: RouteObject[] = [
         element: (
           <RequireStaff>
             <Signups />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/ai',
+        element: (
+          <RequireStaff>
+            <AiControls />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/ai/jobs',
+        element: (
+          <RequireStaff>
+            <AiJobs />
           </RequireStaff>
         ),
       },

@@ -4,13 +4,13 @@ import { NavLink, useNavigate } from 'react-router';
 import { ROLE_LABEL, useAdminSession } from '../lib/session';
 import { Avatar } from './Avatar';
 
-const NAV: { label: string; icon: IconName; to?: string; phase?: number }[] = [
+const NAV: { label: string; icon: IconName; to?: string; end?: boolean; phase?: number }[] = [
   { label: 'Overview', icon: 'home', phase: 8 },
   { label: 'Users', icon: 'people', phase: 8 },
   { label: 'Sign-ups & invites', icon: 'mail', to: '/signups' },
   { label: 'Safety & reports', icon: 'shield', phase: 5 },
-  { label: 'AI jobs', icon: 'cpu', phase: 6 },
-  { label: 'Zephyr AI', icon: 'breeze', phase: 6 },
+  { label: 'AI jobs', icon: 'cpu', to: '/ai/jobs' },
+  { label: 'Zephyr AI', icon: 'breeze', to: '/ai', end: true },
   { label: 'Plans & billing', icon: 'card', phase: 7 },
   { label: 'Plan limits', icon: 'sliders', phase: 7 },
   { label: 'Ads', icon: 'megaphone', phase: 8 },
@@ -62,7 +62,7 @@ export function AdminShell({
         <div className="anav__items">
           {NAV.map((n) =>
             n.to ? (
-              <NavLink key={n.label} to={n.to} className="anav__item">
+              <NavLink key={n.label} to={n.to} end={n.end} className="anav__item">
                 <Icon name={n.icon} size={18} />
                 <span>{n.label}</span>
               </NavLink>
