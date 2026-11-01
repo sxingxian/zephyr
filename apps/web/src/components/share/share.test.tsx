@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiFailure } from '../../lib/api';
 import { csvCell, toCsv } from '../../lib/csv';
 import { setSessionUserId } from '../../lib/sessionGuard';
-import { assetInUseMessage, isoDay, watermarkReady } from '../../lib/share';
+import { assetInUseMessage, isoDay, watermarkKindInUseMessage, watermarkReady } from '../../lib/share';
 import { ShareRenderQueue } from '../../lib/shareRenders';
 import { refreshUsage, resetUsage } from '../../lib/usage';
 import { drawTextWatermark, WATERMARK_FONT_PX } from '../../lib/watermark';
@@ -600,5 +600,18 @@ describe('watermark readiness and gallery notices', () => {
     );
     expect(assetInUseMessage(new ApiFailure('session_changed', 409), 'logo')).toBeNull();
     expect(assetInUseMessage(new ApiFailure('server', 500), 'logo')).toBeNull();
+  });
+  it('explains a 409 when switching the watermark to a logo that isn’t uploaded while galleries use it', () => {
+    expect(
+      watermarkKindInUseMessage(
+        new ApiFailure('asset_in_use', 409, undefined, { error: 'asset_in_use', galleries: 2 }),
+      ),
+    ).toMatch(/^2 live galleries use your watermark\. Upload a logo first/);
+    expect(
+      watermarkKindInUseMessage(new ApiFailure('asset_in_use', 409, undefined, { galleries: 1 })),
+    ).toMatch(/^1 live gallery uses/);
+    expect(watermarkKindInUseMessage(new ApiFailure('conflict', 409))).toMatch(/^Live galleries use/);
+    expect(watermarkKindInUseMessage(new ApiFailure('session_changed', 409))).toBeNull();
+    expect(watermarkKindInUseMessage(new ApiFailure('server', 500))).toBeNull();
   });
 });

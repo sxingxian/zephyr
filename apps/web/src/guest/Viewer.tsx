@@ -1,8 +1,18 @@
 import type { GalleryDownloads, GuestPhoto } from '@zephyr/shared/client';
 import { Icon } from '@zephyr/ui';
-import { type PointerEvent, useEffect, useId, useRef, useState } from 'react';
+import { type MouseEvent, type PointerEvent, useEffect, useId, useRef, useState } from 'react';
 import { GuestImage } from './GuestImage';
+import { fetchDownload, firstPendingDelay } from './media';
 import { useReport } from './Report';
+import { saveBlob } from './zip';
+
+type DlState = 'busy' | 'pending' | 'expired' | 'error';
+const DL_NOTE: Record<DlState, string> = {
+  busy: 'Downloading…',
+  pending: 'Preparing · try again in a minute',
+  expired: 'Link refreshed · try again',
+  error: 'Couldn’t download · try again',
+};
 
 export interface ViewerProps {
   photos: GuestPhoto[];
@@ -32,6 +42,15 @@ export function Viewer(p: ViewerProps) {
   const menuId = useId();
   const moreId = useId();
   const report = useReport();
+  // Per photo and size: a download in flight, or why the last one didn't save.
+  const [dl, setDl] = useState<Record<string, DlState>>({});
+  const timers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  useEffect(() => {
+    const t = timers.current;
+    return () => {
+      for (const id of t) clearTimeout(id);
+    };
+  }, []);
   const photo = p.photos[p.index];
   const count = p.photos.length;
   const total = Math.max(p.total, count);
@@ -78,7 +97,47 @@ export function Viewer(p: ViewerProps) {
     if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
   };
   if (!photo) return null;
-  const dl = p.downloads !== 'none' ? photo.download : undefined;
+  const links = p.downloads !== 'none' ? photo.download : undefined;
+  const dlKey = (size: 'web' | 'full') => `${photo.id}:${size}`;
+  const setDlState = (key: string, state: DlState | null) =>
+    setDl((m) => {
+      const next = { ...m };
+      if (state) next[key] = state;
+      else delete next[key];
+      return next;
+    });
+  /**
+   * Fetch, then save: a size the server is still preparing answers 503 "pending", and a plain link would
+   * save that error as the photo. While pending the item stays disabled for the server's Retry-After.
+   */
+  const download = async (e: MouseEvent, size: 'web' | 'full', url: string) => {
+    e.preventDefault();
+    const key = dlKey(size);
+    if (dl[key] === 'busy' || dl[key] === 'pending') return;
+    setDlState(key, 'busy');
+    const r = await fetchDownload(url);
+    if (r.kind === 'file') {
+      saveBlob(r.blob, r.name);
+      setDlState(key, null);
+      setMenu(false);
+      return;
+    }
+    setDlState(key, r.kind);
+    if (r.kind === 'expired') p.onImageError();
+    if (r.kind === 'pending') {
+      const id = setTimeout(() => {
+        timers.current.delete(id);
+        setDl((m) => {
+          if (m[key] !== 'pending') return m;
+          const next = { ...m };
+          delete next[key];
+          return next;
+        });
+      }, firstPendingDelay(r.retryAfterMs) ?? 30_000);
+      timers.current.add(id);
+    }
+  };
+  const blocked = (size: 'web' | 'full') => dl[dlKey(size)] === 'busy' || dl[dlKey(size)] === 'pending';
 
   return (
     <dialog
@@ -118,7 +177,7 @@ export function Viewer(p: ViewerProps) {
             <span>Favourite</span>
           </button>
         )}
-        {dl && (
+        {links && (
           <div className="g-menu-wrap">
             <button
               type="button"
@@ -138,18 +197,23 @@ export function Viewer(p: ViewerProps) {
             {menu && (
               <div className="g-menu" role="menu" id={menuId}>
                 {p.downloads === 'full' &&
-                  (dl.full ? (
+                  (links.full ? (
                     <a
                       role="menuitem"
-                      className="g-menu__item"
-                      href={dl.full}
+                      className={`g-menu__item${blocked('full') ? ' g-menu__item--off' : ''}`}
+                      href={links.full}
                       download
                       referrerPolicy="no-referrer"
-                      onClick={() => setMenu(false)}
+                      aria-disabled={blocked('full') || undefined}
+                      onClick={(e) => void download(e, 'full', links.full as string)}
                     >
                       <span>Full size</span>
-                      <span className="g-muted">
-                        {photo.width && photo.height ? `${photo.width} × ${photo.height} · JPEG` : 'JPEG'}
+                      <span className="g-muted" aria-live="polite">
+                        {dl[dlKey('full')]
+                          ? DL_NOTE[dl[dlKey('full')] as DlState]
+                          : photo.width && photo.height
+                            ? `${photo.width} × ${photo.height} · JPEG`
+                            : 'JPEG'}
                       </span>
                     </a>
                   ) : (
@@ -165,14 +229,17 @@ export function Viewer(p: ViewerProps) {
                   ))}
                 <a
                   role="menuitem"
-                  className="g-menu__item"
-                  href={dl.web}
+                  className={`g-menu__item${blocked('web') ? ' g-menu__item--off' : ''}`}
+                  href={links.web}
                   download
                   referrerPolicy="no-referrer"
-                  onClick={() => setMenu(false)}
+                  aria-disabled={blocked('web') || undefined}
+                  onClick={(e) => void download(e, 'web', links.web)}
                 >
                   <span>Web size</span>
-                  <span className="g-muted">Up to 2048 px · JPEG</span>
+                  <span className="g-muted" aria-live="polite">
+                    {dl[dlKey('web')] ? DL_NOTE[dl[dlKey('web')] as DlState] : 'Up to 2048 px · JPEG'}
+                  </span>
                 </a>
               </div>
             )}

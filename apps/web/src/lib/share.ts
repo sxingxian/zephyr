@@ -141,6 +141,20 @@ export function assetInUseMessage(e: unknown, kind: BrandingAssetKind): string |
   return `Your ${what} is used by live galleries. Turn the watermark off in those galleries first, or replace the ${what} instead.`;
 }
 
+/**
+ * Switching the watermark to a logo with no logo uploaded, while live galleries draw the watermark: the
+ * server refuses (409 asset_in_use) rather than leave those galleries' previews stuck on "Preparing".
+ */
+export function watermarkKindInUseMessage(e: unknown): string | null {
+  if (!(e instanceof ApiFailure) || e.status !== 409 || e.code === 'session_changed') return null;
+  const n = Number((e.body as { galleries?: unknown } | undefined)?.galleries);
+  const who =
+    Number.isInteger(n) && n > 0
+      ? `${n} live ${n === 1 ? 'gallery uses' : 'galleries use'}`
+      : 'Live galleries use';
+  return `${who} your watermark. Upload a logo first, or turn the watermark off in those galleries, before switching to a logo watermark.`;
+}
+
 /** The owner's preview of a gallery as guests see it (no passcode; served by the guest page). */
 export const galleryPreviewPath = (id: string) => `/g/preview/${encodeURIComponent(id)}`;
 

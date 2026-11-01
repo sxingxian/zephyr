@@ -30,6 +30,7 @@ import {
   background,
   clientIp,
   clientNetwork,
+  customerNetworkHash,
   fail,
   guardWrite,
   logError,
@@ -404,7 +405,8 @@ async function setFavourite(c: Ctx, on: boolean) {
       p_guest: await guestIdHash(c.env, r.state.id, gid),
       p_photo: photoId,
       p_on: on,
-      p_network: await networkHash(c),
+      // The new-guest cap is per customer network (IPv6 /48): see customerNetworkHash.
+      p_network: await customerNetworkHash(c),
     });
     if (res === null) return notFound(c);
     if (res === 'off') return c.json(fail('forbidden'), 403);
@@ -502,11 +504,12 @@ guestRoutes.post('/:token/report', async (c) => {
       p_photo: body.photoId ?? null,
       p_reason: body.reason,
       p_details: body.details ?? null,
-      p_network: await networkHash(c),
+      p_network: await customerNetworkHash(c),
     });
     if (!res) return notFound(c);
     if (res.status === 'limited') return rateLimited(c, 3600);
-    // Every report is recorded; Safety is emailed at most once an hour per gallery, with the count since.
+    // Every report is recorded; Safety is emailed at most once an hour per gallery, with the count since. Once
+    // the email is sent the reports it covers are marked; the cron sweeps up any it didn't (due_safety_alerts).
     if (body.reason === 'csam' && res.alert && c.env.SAFETY_ALERT_EMAIL) {
       const env = c.env;
       const galleryId = r.state.id;
@@ -522,7 +525,7 @@ guestRoutes.post('/:token/report', async (c) => {
             at: new Date(),
           }),
           idempotencyKey: `report-${res.reportId}`,
-        }),
+        }).then(() => rpc(env, 'confirm_safety_alert', { p_report: res.reportId })),
       );
     }
     return c.json({ ok: true }, 202);

@@ -5,8 +5,13 @@
  * - IPv6: the /64 prefix, e.g. `2001:db8:1:2::/64`. One subscriber usually gets a whole /64 (or more),
  *   so limiting single IPv6 addresses would let one person rotate through billions of them.
  * Returns null for anything that isn't a valid IP.
+ *
+ * `v6Prefix: 48` widens IPv6 to the /48 for limits that exist to stop one customer rather than one device:
+ * many ISPs and hosts hand a customer a /48 (65,536 /64s), so a /64 key lets them rotate past such a cap.
+ * The cost is that unrelated people in one /48 (some mobile carriers pool many devices per /48) share
+ * the bucket, so it is used only where a collision is unlikely and cheap; see `customerNetworkHash`.
  */
-export function networkKey(raw: string | null | undefined): string | null {
+export function networkKey(raw: string | null | undefined, v6Prefix: 48 | 64 = 64): string | null {
   if (!raw) return null;
   let ip = raw.trim().toLowerCase();
   if (ip.startsWith('[') && ip.endsWith(']')) ip = ip.slice(1, -1);
@@ -23,6 +28,7 @@ export function networkKey(raw: string | null | undefined): string | null {
   if (a === 0 && b === 0 && c === 0 && d === 0 && e === 0 && f === 0xffff) {
     return [g >> 8, g & 0xff, k >> 8, k & 0xff].join('.');
   }
+  if (v6Prefix === 48) return `${[a, b, c].map((x) => x.toString(16)).join(':')}::/48`;
   return `${[a, b, c, d].map((x) => x.toString(16)).join(':')}::/64`;
 }
 

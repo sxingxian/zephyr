@@ -127,7 +127,8 @@ export function safetyMatchEmail(e: { photoId: string; galleryId: string; ownerI
 /** To SAFETY_ALERT_EMAIL for a guest's CSAM report. Ids only; the guest's details stay in the database. */
 export function safetyReportEmail(e: {
   reportId: string;
-  galleryId: string;
+  /** null once the owner has deleted the gallery (the reports are kept). */
+  galleryId: string | null;
   ownerId: string;
   photoId: string | null;
   /** CSAM reports on this gallery since the last alert email (this one included; at most one email an hour). */
@@ -137,7 +138,7 @@ export function safetyReportEmail(e: {
   const n = Math.max(1, Math.floor(e.count ?? 1));
   return layout('[Zephyr safety] CSAM report from a guest', 'CSAM report from a guest', [
     'A guest reported a shared gallery for child sexual abuse material. Review it now.',
-    `Report ${e.reportId} · gallery ${e.galleryId} · account ${e.ownerId}${e.photoId ? ` · photo ${e.photoId}` : ''} · ${e.at.toISOString()}`,
+    `Report ${e.reportId} · gallery ${e.galleryId ?? '(deleted)'} · account ${e.ownerId}${e.photoId ? ` · photo ${e.photoId}` : ''} · ${e.at.toISOString()}`,
     ...(n > 1
       ? [
           `${n} CSAM reports on this gallery since the last alert (alerts are sent at most once an hour per gallery).`,

@@ -1,5 +1,12 @@
 import { type ImgHTMLAttributes, useEffect, useRef, useState } from 'react';
-import { classifyImageFailure, type ImageProblem, nextPendingDelay, withProbeSlot } from './media';
+import {
+  firstPendingDelay,
+  type ImageFailure,
+  type ImageProblem,
+  nextPendingDelay,
+  probeImageFailure,
+  withProbeSlot,
+} from './media';
 
 type State = { kind: 'ok' } | { kind: 'pending'; since: number } | { kind: 'gave_up' };
 
@@ -10,7 +17,7 @@ export interface GuestImageProps extends Omit<ImgHTMLAttributes<HTMLImageElement
   /** "Preparing" in a grid tile (compact) or in the viewer (sentence). */
   variant: 'tile' | 'viewer';
   /** Test seams. */
-  classify?: (url: string) => Promise<ImageProblem>;
+  classify?: (url: string) => Promise<ImageProblem | ImageFailure>;
   now?: () => number;
 }
 
@@ -46,9 +53,11 @@ export function GuestImage({ src, onExpired, variant, classify, now = Date.now, 
     setAttempt(0);
   }, [src]);
 
-  const pending = () => {
+  const pending = (retryAfterMs: number | null = null) => {
     if (since.current === null) since.current = now();
-    const delay = nextPendingDelay(tries.current, now() - since.current);
+    // The first wait follows the server's Retry-After (5 s to 2 min); later ones back off as usual.
+    const first = tries.current === 0 ? firstPendingDelay(retryAfterMs) : null;
+    const delay = first ?? nextPendingDelay(tries.current, now() - since.current);
     if (delay === null) {
       setState({ kind: 'gave_up' });
       return;
@@ -63,15 +72,23 @@ export function GuestImage({ src, onExpired, variant, classify, now = Date.now, 
 
   const onError = () => {
     const url = srcRef.current;
-    void withProbeSlot(() => (classify ?? classifyImageFailure)(url)).then((problem) => {
+    void withProbeSlot(() => (classify ?? probeImageFailure)(url)).then(async (r) => {
+      const { problem, retryAfterMs } = typeof r === 'string' ? { problem: r, retryAfterMs: null } : r;
       if (!alive.current || srcRef.current !== url) return;
       // A URL that keeps failing as "expired" after a refresh is treated as pending, so it can't loop.
       if (problem === 'expired' && expiredFor.current !== url) {
         expiredFor.current = url;
-        void onExpired();
+        try {
+          await onExpired();
+        } catch {
+          // Refreshing failed: fall through to the slow retries.
+        }
+        // A refresh that handed back the same URL (signed URLs are stable within a window) would leave a
+        // broken image for good: retry it on the pending backoff instead.
+        if (alive.current && srcRef.current === url) pending();
         return;
       }
-      pending();
+      pending(retryAfterMs);
     });
   };
 

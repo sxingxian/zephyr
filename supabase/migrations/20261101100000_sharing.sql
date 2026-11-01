@@ -205,9 +205,15 @@ create table public.gallery_reports (
   details text check (details is null or length(details) <= 1000),
   network_hash bytea not null check (octet_length(network_hash) = 32),
   created_at timestamptz not null default now(),
-  reviewed_at timestamptz
+  reviewed_at timestamptz,
+  -- CSAM reports: set once an alert email covering this report has been sent (confirm_safety_alert). Reports
+  -- that arrive inside a gallery's one-alert-an-hour window, or whose email failed, are swept by the cron
+  -- (due_safety_alerts) so none is left unalerted.
+  alerted_at timestamptz
 );
 alter table public.gallery_reports enable row level security;
+create index gallery_reports_unalerted on public.gallery_reports (created_at)
+  where reason = 'csam' and alerted_at is null;
 create index gallery_reports_open on public.gallery_reports (created_at) where reviewed_at is null;
 create index gallery_reports_network on public.gallery_reports (network_hash, created_at);
 
@@ -372,6 +378,47 @@ language sql stable set search_path = '' as $$
   select e.version from public.photo_edits e where e.photo_id = p_photo and not public._recipe_empty(e.recipe);
 $$;
 
+-- The pixel size a gallery reports for a photo (grid layout, the viewer's "Full size W × H"). Unedited: the
+-- original's. Edited: the edited output's, never the uncropped original's: the stored edited preview's
+-- aspect (crop and quarter turns included) scaled to the full-size output's long edge (the original, turned,
+-- times the crop rectangle). Until a preview of the current version is stored: the recipe's output size.
+-- {width, height}; 0 when unknown.
+create function public._shared_size(p public.photos) returns integer[]
+language plpgsql stable set search_path = '' as $$
+declare
+  e public.photo_edits;
+  c jsonb;
+  q integer := 0;
+  rw numeric := 1;
+  rh numeric := 1;
+  w integer;
+  h integer;
+  long integer;
+begin
+  select * into e from public.photo_edits pe where pe.photo_id = p.id and not public._recipe_empty(pe.recipe);
+  if not found then return array[coalesce(p.width, 0), coalesce(p.height, 0)]; end if;
+  c := case when jsonb_typeof(e.recipe -> 'crop') = 'object' then e.recipe -> 'crop' else '{}'::jsonb end;
+  if jsonb_typeof(c -> 'quarterTurns') = 'number' then q := floor((c ->> 'quarterTurns')::numeric)::integer; end if;
+  if jsonb_typeof(c -> 'rect' -> 'w') = 'number' then rw := least(greatest((c -> 'rect' ->> 'w')::numeric, 0.0001), 1); end if;
+  if jsonb_typeof(c -> 'rect' -> 'h') = 'number' then rh := least(greatest((c -> 'rect' ->> 'h')::numeric, 0.0001), 1); end if;
+  if coalesce(p.width, 0) > 0 and coalesce(p.height, 0) > 0 then
+    if mod(abs(q), 2) = 1 then
+      w := greatest(1, round(p.height * rw)); h := greatest(1, round(p.width * rh));
+    else
+      w := greatest(1, round(p.width * rw)); h := greatest(1, round(p.height * rh));
+    end if;
+  end if;
+  if e.preview_version = e.version and e.preview_width is not null then
+    long := coalesce(greatest(w, h), greatest(e.preview_width, e.preview_height));
+    if e.preview_width >= e.preview_height then
+      return array[long, greatest(1, round(long::numeric * e.preview_height / e.preview_width))::integer];
+    end if;
+    return array[greatest(1, round(long::numeric * e.preview_width / e.preview_height))::integer, long];
+  end if;
+  return array[coalesce(w, 0), coalesce(h, 0)];
+end;
+$$;
+
 -- Ready, not held: what a gallery may show.
 create function public._photo_shareable(p public.photos) returns boolean
 language sql immutable set search_path = '' as $$
@@ -408,12 +455,15 @@ language sql immutable set search_path = '' as $$
 $$;
 
 -- "Storage full — some gallery previews can't be prepared": a preview was refused past the overflow
--- allowance and the account is still past it (clears by itself once there's room).
+-- allowance, either within the last hour (the refused preview may have been what would have tipped the
+-- account over, so usage alone can still read just under the line) or while the account is still past it.
+-- Clears when a preview is stored again, or an hour after the last refusal once there's room.
 create function public._previews_blocked(pr public.profiles) returns boolean
 language sql stable set search_path = '' as $$
   select pr.share_previews_blocked_at is not null
-     and pr.storage_bytes + pr.reserved_bytes
-         >= r.storage_bytes + public._share_overflow(r.storage_bytes)
+     and (pr.share_previews_blocked_at > now() - interval '1 hour'
+          or pr.storage_bytes + pr.reserved_bytes
+             >= r.storage_bytes + public._share_overflow(r.storage_bytes))
     from public._share_rules(pr.plan_id) r;
 $$;
 
@@ -915,13 +965,16 @@ language sql stable security definer set search_path = '' as $$
 $$;
 
 -- p_patch: BrandingBody (validated by the Worker). Name and accent need the plan's branding; watermark
--- settings need its watermark. {branding} | {error: 'plan' | 'invalid'}.
+-- settings need its watermark. {branding} | {error: 'plan' | 'invalid'} | {error: 'in_use', galleries} when
+-- switching the watermark kind to one with no image yet while live galleries show the watermark (same rule
+-- as deleting the image: those galleries would stop showing photos).
 create function public.update_branding(p_owner uuid, p_patch jsonb) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   r record;
   w jsonb := coalesce(p_patch -> 'watermark', '{}'::jsonb);
   b public.branding;
+  n integer;
 begin
   select rr.* into r from public.profiles pr cross join lateral public._share_rules(pr.plan_id) rr where pr.id = p_owner;
   if not found then return jsonb_build_object('error', 'invalid'); end if;
@@ -929,7 +982,16 @@ begin
      or (w <> '{}'::jsonb and not r.watermark) then
     return jsonb_build_object('error', 'plan');
   end if;
+  -- Same lock order as delete_branding_asset (storage, then the branding row).
+  perform public._lock_storage(p_owner);
   insert into public.branding (owner_id) values (p_owner) on conflict (owner_id) do nothing;
+  select * into b from public.branding where owner_id = p_owner for update;
+  if w ? 'kind' and w ->> 'kind' is distinct from coalesce(b.wm_kind, 'text')
+     and not (case w ->> 'kind' when 'logo' then b.logo_key is not null else b.wm_key is not null end) then
+    select count(*) into n from public.galleries g cross join lateral public._gallery_effective(g) e
+     where g.owner_id = p_owner and e.watermark and public._gallery_serving(g);
+    if n > 0 then return jsonb_build_object('error', 'in_use', 'galleries', n); end if;
+  end if;
   update public.branding set
     studio_name = case when p_patch ? 'studioName' then nullif(p_patch ->> 'studioName', '') else studio_name end,
     accent = case when p_patch ? 'accent' then p_patch ->> 'accent' else accent end,
@@ -1170,13 +1232,13 @@ begin
     select * into guest from public.gallery_guests where gallery_id = g.id and cookie_hash = p_guest;
   end if;
   with page as (
-    select p.id, p.width, p.height, p.file_type, gp.position from public.gallery_photos gp
+    select p.id, public._shared_size(p) as dims, p.file_type, gp.position from public.gallery_photos gp
       join public.photos p on p.id = gp.photo_id
      where gp.gallery_id = g.id and public._photo_shareable(p) and gp.position >= coalesce(p_cursor, 0)
      order by gp.position, p.id limit lim + 1
   )
   select coalesce(jsonb_agg(jsonb_build_object(
-           'id', x.id, 'width', coalesce(x.width, 0), 'height', coalesce(x.height, 0),
+           'id', x.id, 'width', x.dims[1], 'height', x.dims[2],
            'full', case when eff.downloads <> 'full' then 'n/a'
                         when public._photo_edit_version(x.id) is null and x.file_type in ('jpeg', 'png', 'webp') then 'ready'
                         when exists (select 1 from public.gallery_renders r where r.gallery_id = g.id and r.photo_id = x.id
@@ -1277,7 +1339,7 @@ begin
     end if;
   end if;
   return jsonb_build_object('ownerId', g.owner_id, 'galleryName', g.name, 'position', pos,
-    'width', p.width, 'height', p.height,
+    'width', nullif((public._shared_size(p))[1], 0), 'height', nullif((public._shared_size(p))[2], 0),
     'rendition', case when rk is not null then jsonb_build_object('key', rk) end,
     'source', jsonb_build_object('key', src, 'editVersion', ev),
     'watermark', wm, 'wmVersion', wv);
@@ -1322,6 +1384,12 @@ begin
   end if;
   perform public._lock_storage(g.owner_id);
   m := public.guest_media(p_gallery, p_photo, p_size, p_size = 'full');
+  -- Storage turned full between the Worker's check and this record: say so (and flag the account for
+  -- Settings) rather than reporting the photo as gone.
+  if m is not null and coalesce((m ->> 'storageFull')::boolean, false) then
+    if p_size <> 'full' then perform public._note_previews_blocked(g.owner_id); end if;
+    return jsonb_build_object('status', 'storage_full');
+  end if;
   if m is null or m ? 'unavailable' or (m -> 'source' ->> 'editVersion')::integer <> p_edit_version
      or (m ->> 'wmVersion')::integer <> p_wm_version then
     return jsonb_build_object('status', 'gone');
@@ -1471,12 +1539,70 @@ begin
                         jsonb_build_object('galleryId', g.id, 'ownerId', g.owner_id, 'photoId', ph, 'reason', p_reason));
   if p_reason = 'csam' and (g.csam_alerted_at is null or g.csam_alerted_at <= now() - interval '1 hour') then
     select count(*) into pending from public.gallery_reports r
-     where r.gallery_id = g.id and r.reason = 'csam' and r.created_at > coalesce(g.csam_alerted_at, '-infinity');
+     where r.gallery_id = g.id and r.reason = 'csam' and r.alerted_at is null;
     update public.galleries set csam_alerted_at = now() where id = g.id;
     alert := true;
   end if;
   return jsonb_build_object('status', 'ok', 'reportId', rid, 'ownerId', g.owner_id, 'photoId', ph,
                             'alert', alert, 'pendingCount', pending);
+end;
+$$;
+
+-- An alert email covering p_report was sent: marks it and every earlier unalerted CSAM report on the same
+-- gallery (or, once the gallery is deleted, the same owner's deleted galleries) as alerted. Number marked.
+create function public.confirm_safety_alert(p_report uuid) returns integer
+language plpgsql volatile security definer set search_path = '' as $$
+declare
+  r public.gallery_reports;
+  n integer;
+begin
+  select * into r from public.gallery_reports where id = p_report;
+  if not found or r.reason <> 'csam' then return 0; end if;
+  update public.gallery_reports x set alerted_at = now()
+   where x.reason = 'csam' and x.alerted_at is null and x.created_at <= r.created_at
+     and (case when r.gallery_id is null then x.gallery_id is null and x.owner_id is not distinct from r.owner_id
+               else x.gallery_id = r.gallery_id end);
+  get diagnostics n = row_count;
+  return n;
+end;
+$$;
+
+-- Cron: CSAM reports no alert has covered yet (they arrived inside the gallery's hour, or the email failed).
+-- One row per gallery (per owner once the gallery is gone), only when the gallery's one-alert-an-hour window
+-- allows; claiming sets galleries.csam_alerted_at like guest_report does. Reports under 5 minutes old are
+-- left to the request that is still sending their email. Unreviewed reports only. One sweep at a time.
+-- [{galleryId|null, ownerId, reportId (the latest), photoId, count}]; the caller emails, then confirms.
+create function public.due_safety_alerts(p_limit integer) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare
+  lim integer := least(greatest(coalesce(p_limit, 20), 1), 100);
+  out jsonb := '[]'::jsonb;
+  x record;
+begin
+  if not pg_try_advisory_xact_lock(hashtextextended('zephyr:safety_alert_sweep', 0)) then return out; end if;
+  for x in
+    select r.gallery_id, r.owner_id, count(*)::integer as n,
+           (array_agg(r.id order by r.created_at desc, r.id desc))[1] as report_id,
+           (array_agg(r.photo_id order by r.created_at desc, r.id desc))[1] as photo_id
+      from public.gallery_reports r
+      left join public.galleries g on g.id = r.gallery_id
+     where r.reason = 'csam' and r.alerted_at is null and r.reviewed_at is null
+       and r.created_at <= now() - interval '5 minutes'
+       and (g.id is null or g.csam_alerted_at is null or g.csam_alerted_at <= now() - interval '1 hour')
+     group by r.gallery_id, r.owner_id
+     order by min(r.created_at)
+     limit lim
+  loop
+    if x.gallery_id is not null then
+      -- Same window test under the row lock: a report racing in may have just claimed this hour's alert.
+      update public.galleries set csam_alerted_at = now()
+       where id = x.gallery_id and (csam_alerted_at is null or csam_alerted_at <= now() - interval '1 hour');
+      if not found then continue; end if;
+    end if;
+    out := out || jsonb_build_array(jsonb_build_object('galleryId', x.gallery_id, 'ownerId', x.owner_id,
+      'reportId', x.report_id, 'photoId', x.photo_id, 'count', x.n));
+  end loop;
+  return out;
 end;
 $$;
 
@@ -1585,7 +1711,7 @@ language sql stable security definer set search_path = '' as $$
       'accessLog', s.access_log,
       'suspended', pr.sharing_suspended_at is not null,
       -- "Storage full — some gallery previews can't be prepared": a preview was refused past the overflow
-      -- allowance and the account is still past it.
+      -- allowance within the last hour, or was refused before and the account is still past it.
       'previewsBlocked', coalesce(public._previews_blocked(pr), false)))
   from public.profiles pr
   cross join lateral public._plan_rules(pr.plan_id) r
@@ -1695,6 +1821,7 @@ revoke execute on function
   public._gallery_serving(public.galleries),
   public._gallery_effective(public.galleries),
   public._photo_edit_version(uuid),
+  public._shared_size(public.photos),
   public._photo_shareable(public.photos),
   public._share_key_ok(uuid, uuid, uuid, text, integer, text),
   public._gallery_summary(public.galleries),
@@ -1737,6 +1864,8 @@ grant execute on function
   public.gallery_preview_info(uuid, uuid),
   public.guest_logo(uuid),
   public.guest_report(uuid, uuid, text, text, bytea),
+  public.confirm_safety_alert(uuid),
+  public.due_safety_alerts(integer),
   public.gallery_unlock_reserve(uuid, bytea, boolean),
   public.gallery_unlock_succeeded(bigint),
   public.guest_photos(uuid, integer, integer, bytea),

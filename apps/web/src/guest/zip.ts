@@ -64,28 +64,42 @@ export interface ZipOptions {
   fresh?: (id: string) => Promise<GuestPhoto | null>;
 }
 
-async function fetchBytes(url: string, signal?: AbortSignal): Promise<Uint8Array | null> {
+type Fetched = Uint8Array | 'pending' | null;
+
+async function fetchBytes(url: string, signal?: AbortSignal): Promise<Fetched> {
   const res = await fetch(url, { credentials: 'same-origin', referrerPolicy: 'no-referrer', signal });
-  if (!res.ok) return null;
-  return new Uint8Array(await res.arrayBuffer());
+  if (res.ok) return new Uint8Array(await res.arrayBuffer());
+  // 503 {error:'pending'} (or 425 from older builds): this size is still being made. Skip it, don't fail.
+  const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
+  if (res.status === 425 || (res.status === 503 && body?.error === 'pending')) return 'pending';
+  return null;
+}
+
+/** What went into the zip: the blob (null when streamed to disk) and photos left out as still preparing. */
+export interface ZipResult {
+  blob: Blob | null;
+  skipped: number;
 }
 
 /**
  * The gallery as one .zip, built in this browser (stored, not recompressed: JPEGs don't shrink). With a
- * sink the zip streams to disk one photo at a time and the result is null; without one it is held in memory
- * and returned, which `checkZipSize` caps up front.
+ * sink the zip streams to disk one photo at a time and the blob is null; without one it is held in memory
+ * and returned, which `checkZipSize` caps up front. Photos the server is still preparing are left out and
+ * counted rather than failing the whole download.
  */
 export async function buildZip(
   photos: GuestPhoto[],
   o: ZipOptions,
   sink?: ZipSink | null,
-): Promise<Blob | null> {
+): Promise<ZipResult> {
   checkZipSize(photos, o.size, Boolean(sink));
   const { Zip, ZipPassThrough } = await import('fflate');
   const names = zipEntryNames(o.galleryName, photos.length);
   const parts: Uint8Array[] = [];
   let writing: Promise<void> = Promise.resolve();
   let failed: unknown = null;
+  let added = 0;
+  let skipped = 0;
   const zip = new Zip((err, chunk) => {
     if (err) {
       failed = err;
@@ -100,37 +114,49 @@ export async function buildZip(
       let p = photos[i] as GuestPhoto;
       const pick = (q: GuestPhoto) => (o.size === 'full' ? q.download?.full : q.download?.web) ?? null;
       let url = pick(p);
-      let bytes = url ? await fetchBytes(url, o.signal) : null;
-      if (!bytes && o.fresh) {
+      let got: Fetched = url ? await fetchBytes(url, o.signal) : null;
+      if (got === null && o.fresh) {
         // Signed URLs last an hour; a long download can outlive them.
         const again = await o.fresh(p.id);
         if (again) {
           p = again;
           url = pick(p);
-          bytes = url ? await fetchBytes(url, o.signal) : null;
+          got = url ? await fetchBytes(url, o.signal) : null;
         }
       }
-      if (!bytes)
-        throw new ZipProblem('A photo couldn’t be downloaded. Check your connection and try again.');
-      const entry = new ZipPassThrough(names[i] as string);
+      if (got === 'pending') {
+        skipped++;
+        o.onProgress?.(i + 1, photos.length);
+        continue;
+      }
+      if (!got) throw new ZipProblem('A photo couldn’t be downloaded. Check your connection and try again.');
+      // Running numbers stay consecutive when a photo is left out.
+      const entry = new ZipPassThrough(names[added] as string);
+      added++;
       zip.add(entry);
-      entry.push(bytes, true);
+      entry.push(got, true);
       if (failed) throw failed;
       await writing;
       o.onProgress?.(i + 1, photos.length);
     }
+    if (!added) throw new ZipProblem('These photos are still being prepared. Try again in a few minutes.');
     zip.end();
     await writing;
     if (failed) throw failed;
     if (sink) {
       await sink.close();
-      return null;
+      return { blob: null, skipped };
     }
-    return new Blob(parts as BlobPart[], { type: 'application/zip' });
+    return { blob: new Blob(parts as BlobPart[], { type: 'application/zip' }), skipped };
   } catch (e) {
     if (sink) await sink.abort().catch(() => undefined);
     throw e;
   }
+}
+
+/** "N photos were still being prepared and weren't included." */
+export function preparingNote(n: number): string {
+  return `${n} ${n === 1 ? 'photo was' : 'photos were'} still being prepared and ${n === 1 ? 'wasn’t' : 'weren’t'} included.`;
 }
 
 /** Saves a blob through a temporary same-origin object URL. */

@@ -269,6 +269,29 @@ select pg_temp.ok(record_gallery_render(pg_temp.i('mei'), pg_temp.i('g1'), pg_te
   and record_rendition(pg_temp.i('g1'), pg_temp.i('p1'), 'full', pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'full', 'a'), 9000, 1, 0) ->> 'status' = 'storage_full'
   and record_rendition(pg_temp.i('g1'), pg_temp.i('p4'), 'grid', pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p4'), 'grid', 'a'), 300, 0, 0) ->> 'status' = 'ok',
   'storage full: renders and full renditions refused, grid and view still recorded');
+-- Past the overflow allowance too: previews are refused as storage_full (never 'gone') and the member is told.
+select public._share_overflow(:big) as over \gset
+update public.profiles set storage_bytes = storage_bytes + :over where id = pg_temp.i('mei');
+select pg_temp.ok(get_usage(pg_temp.i('mei')) #>> '{sharing,previewsBlocked}' = 'false'
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p2'), 'grid', false) ->> 'storageFull' = 'true',
+  'past the overflow allowance: previews are refused, but no notice until one actually was');
+-- (Separate statements: a statement's stable reads don't see what its own volatile calls wrote.)
+select record_rendition(pg_temp.i('g1'), pg_temp.i('p2'), 'grid', pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p2'), 'grid', 'full'), 300, 0, 0) ->> 'status' as st \gset
+select pg_temp.ok(:'st' = 'storage_full'
+  and (select share_previews_blocked_at = now() from public.profiles where id = pg_temp.i('mei'))
+  and get_usage(pg_temp.i('mei')) #>> '{sharing,previewsBlocked}' = 'true'
+  and not exists (select 1 from public.gallery_renditions where key = pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p2'), 'grid', 'full')),
+  'past the overflow allowance: record_rendition → storage_full (not gone), flags the account, records nothing');
+update public.profiles set storage_bytes = storage_bytes - :over where id = pg_temp.i('mei');
+select pg_temp.ok(get_usage(pg_temp.i('mei')) #>> '{sharing,previewsBlocked}' = 'true',
+  'previews refused within the last hour: the notice stays even after usage drops back under the margin');
+update public.profiles set share_previews_blocked_at = now() - interval '2 hours' where id = pg_temp.i('mei');
+select pg_temp.ok(get_usage(pg_temp.i('mei')) #>> '{sharing,previewsBlocked}' = 'false',
+  'an old flag with usage back under the margin: no notice');
+update public.profiles set storage_bytes = storage_bytes + :over where id = pg_temp.i('mei');
+select pg_temp.ok(get_usage(pg_temp.i('mei')) #>> '{sharing,previewsBlocked}' = 'true',
+  'an old flag with usage still past the margin: the notice shows');
+update public.profiles set storage_bytes = storage_bytes - :over, share_previews_blocked_at = null where id = pg_temp.i('mei');
 update public.profiles set storage_bytes = storage_bytes - :big where id = pg_temp.i('mei');
 select pg_temp.ok(pg_temp.all_ok(), 'usage invariant holds');
 
@@ -289,6 +312,11 @@ select pg_temp.ok((select v ->> 'error' = 'in_use' and v ->> 'galleries' = '1'
   and branding_asset_key(pg_temp.i('mei'), 'watermark') is not null
   and delete_branding_asset(pg_temp.i('mei'), 'logo') ? 'branding',
   'the watermark image can''t be deleted while a live gallery draws it (the unused logo can)');
+select pg_temp.ok((select v ->> 'error' = 'in_use' and v ->> 'galleries' = '1'
+  from (select update_branding(pg_temp.i('mei'), '{"watermark":{"kind":"logo"}}') v) x)
+  and (select wm_kind from public.branding where owner_id = pg_temp.i('mei')) is distinct from 'logo'
+  and update_branding(pg_temp.i('mei'), '{"watermark":{"kind":"text"}}') ? 'branding',
+  'switching the watermark to a kind with nothing to draw is refused while a live gallery uses it (same kind is fine)');
 select pg_temp.ok(branding_asset_key(pg_temp.i('mei'), 'watermark') like 'o/' || pg_temp.i('mei') || '/b/watermark-%'
   and branding_asset_key(pg_temp.i('wei'), 'watermark') is null, 'the owner reads back their own asset key');
 select pg_temp.ok((select v -> 'watermark' ->> 'key' like '%/b/watermark-%' and v -> 'rendition' = 'null'::jsonb and (v ->> 'wmVersion')::int > 1
@@ -363,6 +391,9 @@ select pg_temp.ok((select v ->> 'status' = 'ok' and v ->> 'ownerId' = pg_temp.i(
                      and v ->> 'alert' = 'true' and v ->> 'pendingCount' = '1'
   from (select guest_report(pg_temp.i('g1'), pg_temp.i('w1'), 'csam', 'Details', pg_temp.h('rep')) v) x),
   'a guest report is stored; a photo outside the gallery comes back null; the first CSAM report alerts');
+-- The Worker confirms once the alert email is sent.
+select pg_temp.ok((select confirm_safety_alert(id) from public.gallery_reports where network_hash = pg_temp.h('rep') and reason = 'csam') = 1,
+  'confirming an alert marks the reports it covered');
 select (select v ->> 'alert' = 'false' and v ->> 'photoId' = pg_temp.i('p1')::text
   from (select guest_report(pg_temp.i('g1'), pg_temp.i('p1'), 'csam', null, pg_temp.h('rep3')) v) x) as st \gset
 select pg_temp.ok(:'st'::boolean
@@ -374,9 +405,33 @@ update public.galleries set csam_alerted_at = now() - interval '2 hours' where i
 select guest_report(pg_temp.i('g1'), null, 'csam', null, pg_temp.h('rep4')) -> 'alert' as st \gset
 select pg_temp.ok(:'st'::boolean, 'an hour after the last alert, the next CSAM report alerts again');
 update public.galleries set csam_alerted_at = now() - interval '2 hours' where id = pg_temp.i('g1');
-select pg_temp.ok((select v ->> 'alert' = 'true' and v ->> 'pendingCount' = '2'
+select pg_temp.ok((select v ->> 'alert' = 'true' and v ->> 'pendingCount' = '3'
   from (select guest_report(pg_temp.i('g1'), null, 'csam', null, pg_temp.h('rep3')) v) x),
-  'the alert carries the count of CSAM reports since the last one');
+  'the alert counts every CSAM report no sent alert has covered (the last one''s email wasn''t confirmed)');
+-- Cron sweep: reports no alert covered.
+select pg_temp.ok(due_safety_alerts(10) = '[]'::jsonb, 'sweep: nothing while the gallery''s alert hour is taken');
+update public.galleries set csam_alerted_at = now() - interval '2 hours' where id = pg_temp.i('g1');
+select due_safety_alerts(10) as v \gset
+select pg_temp.ok((select jsonb_array_length(v) = 1 and v #>> '{0,galleryId}' = pg_temp.i('g1')::text
+                     and v #>> '{0,ownerId}' = pg_temp.i('mei')::text and v #>> '{0,count}' = '1'
+                     and v #>> '{0,photoId}' = pg_temp.i('p1')::text
+  from (select :'v'::jsonb v) x)
+  and (select csam_alerted_at = now() from public.galleries where id = pg_temp.i('g1'))
+  and due_safety_alerts(10) = '[]'::jsonb,
+  'sweep: one row per gallery for unalerted reports over 5 minutes old; it claims the gallery''s hour');
+select confirm_safety_alert((:'v'::jsonb #>> '{0,reportId}')::uuid) as st \gset
+select pg_temp.ok(:'st' = '1'
+  and (select count(*) from public.gallery_reports where gallery_id = pg_temp.i('g1') and reason = 'csam' and alerted_at is null) = 2,
+  'confirming the sweep''s alert marks what it covered; fresher reports wait for the next hour');
+insert into public.gallery_reports (gallery_id, owner_id, reason, network_hash, created_at, reviewed_at) values
+  (null, pg_temp.i('mei'), 'csam', pg_temp.h('orph'), now() - interval '1 hour', null),
+  (null, pg_temp.i('mei'), 'csam', pg_temp.h('orph'), now() - interval '1 hour', now());
+select due_safety_alerts(10) as v \gset
+select confirm_safety_alert((:'v'::jsonb #>> '{0,reportId}')::uuid) as st \gset
+select pg_temp.ok((select jsonb_array_length(v) = 1 and v -> 0 -> 'galleryId' = 'null'::jsonb and v #>> '{0,count}' = '1'
+  from (select :'v'::jsonb v) x)
+  and :'st'::int >= 1 and due_safety_alerts(10) = '[]'::jsonb,
+  'sweep: reports on a deleted gallery still alert (reviewed ones don''t), once');
 select pg_temp.ok((select photo_id is null and reason = 'csam' from public.gallery_reports where network_hash = pg_temp.h('rep') and reason = 'csam')
   and exists (select 1 from public.audit_log where action = 'safety.report'), 'a photo outside the gallery isn''t attached; the report is audited');
 select guest_report(pg_temp.i('g1'), null, 'other', null, pg_temp.h('rep')) from generate_series(1, 9);
@@ -458,6 +513,31 @@ select pg_temp.ok((select v #>> '{sharing,galleries}' = '3' and v #>> '{sharing,
   from (select get_usage(pg_temp.i('wei')) v) x)
   and get_usage(pg_temp.i('mei')) #>> '{sharing,accessLog}' = 'true', 'usage carries the plan''s sharing limits');
 
+-- ---- Edited photo sizes -----------------------------------------------------------------------------------
+insert into ids select 'pz', pg_temp.photo(pg_temp.i('mei'), 'z.jpg');
+insert into ids values ('gz', '5a000000-0000-0000-0000-00000000000f');
+select pg_temp.mk(pg_temp.i('mei'), pg_temp.i('gz'), 'z-tok-1', false, array[pg_temp.i('pz')], 3, 'web');
+create function pg_temp.dims() returns text language sql as $$
+  select (x ->> 'width') || 'x' || (x ->> 'height') from jsonb_array_elements(guest_photos(pg_temp.i('gz'), null, 10, null) -> 'items') x
+$$;
+create function pg_temp.mdims() returns text language sql as $$
+  select (v ->> 'width') || 'x' || (v ->> 'height') from (select guest_media(pg_temp.i('gz'), pg_temp.i('pz'), 'view', false) v) x
+$$;
+select pg_temp.ok(pg_temp.dims() = '4000x3000', 'unedited: the original''s size');
+select save_edit(pg_temp.i('mei'), pg_temp.i('pz'), '{"v":1,"crop":{"quarterTurns":1,"rect":{"x":0,"y":0,"w":1,"h":0.5}}}', null);
+select pg_temp.ok(pg_temp.dims() = '3000x2000', 'edited, no preview yet: the recipe''s output size (turned and cropped), never 4000x3000');
+select pg_temp.ok(record_edit_variant(pg_temp.i('mei'), pg_temp.i('pz'), 1, 'preview',
+    'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('pz') || '/edit-1-preview-' || md5('z1'), 700, 2048, null) ->> 'status' = 'invalid'
+  and record_edit_variant(pg_temp.i('mei'), pg_temp.i('pz'), 1, 'preview',
+    'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('pz') || '/edit-1-preview-' || md5('z1'), 700, 9000, 6000) ->> 'status' = 'invalid',
+  'record_edit_variant: width and height together, within bounds');
+select record_edit_variant(pg_temp.i('mei'), pg_temp.i('pz'), 1, 'preview',
+  'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('pz') || '/edit-1-preview-' || md5('z1'), 700, 2048, 1366);
+select pg_temp.ok(pg_temp.dims() = '3000x2001' and pg_temp.mdims() = '3000x2001',
+  'edited: the stored preview''s aspect at the output''s long edge, in the photo list and the media plan alike');
+select save_edit(pg_temp.i('mei'), pg_temp.i('pz'), '{"v":1,"crop":{"rect":{"x":0,"y":0,"w":0.5,"h":1}}}', 1);
+select pg_temp.ok(pg_temp.dims() = '2000x3000', 'a preview of an older version doesn''t set the size');
+
 -- ---- Clean-up ---------------------------------------------------------------------------------------------
 update public.galleries set expires_at = now() - interval '2 days' where id = pg_temp.i('g1');
 insert into public.gallery_attempts (gallery_id, network_hash, created_at) values (pg_temp.i('g1'), pg_temp.h('old'), now() - interval '3 days');
@@ -524,7 +604,7 @@ select pg_temp.ok((select bool_and(p.prosecdef and p.proconfig @> array['search_
     'gallery_activity', 'gallery_render_queue', 'gallery_render_check', 'record_gallery_render', 'get_branding', 'update_branding',
     'record_branding_asset', 'delete_branding_asset', 'guest_gallery_state', 'guest_gallery_info', 'gallery_unlock_reserve',
     'gallery_unlock_succeeded', 'guest_photos', 'guest_media', 'record_rendition', 'gallery_event', 'guest_set_favourite',
-    'guest_send_favourites', 'apply_safety_hold', 'gallery_link', 'branding_asset_key', 'gallery_preview_info', 'guest_logo', 'guest_report', 'due_share_cleanup', 'due_share_deletions', 'confirm_share_deletions')),
+    'guest_send_favourites', 'apply_safety_hold', 'gallery_link', 'branding_asset_key', 'gallery_preview_info', 'guest_logo', 'guest_report', 'confirm_safety_alert', 'due_safety_alerts', 'due_share_cleanup', 'due_share_deletions', 'confirm_share_deletions')),
   'entry points: security definer, empty search_path, service_role only');
 
 rollback;

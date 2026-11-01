@@ -79,7 +79,7 @@ export type ApiErrorCode =
   | 'sharing_suspended' // the account's sharing is suspended pending a safety review
   | 'plan_required' // the member's plan doesn't include this (e.g. full-size downloads, Studio extras)
   | 'limit_reached' // a plan count is used up (e.g. live galleries)
-  | 'pending' // guest media (425): that image is still being prepared (edit not rendered, watermark not ready, storage full); retry later
+  | 'pending' // guest media (503 with Retry-After): that image is still being prepared (edit not rendered, watermark not ready, storage full); retry later
   | 'asset_in_use' // branding (409): the image is drawn by the watermark of a live gallery
   | 'server';
 

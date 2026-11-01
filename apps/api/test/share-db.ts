@@ -110,6 +110,8 @@ export const sdb = {
     details: string | null;
     net: string;
     at?: number;
+    owner?: string;
+    alertedAt?: number | null;
   }[],
   queue: [] as { id: number; bucket: 'shared' | 'photos'; key: string; prefix: boolean }[],
   held: new Set<string>(),
@@ -165,6 +167,25 @@ const effective = (g: Gallery) => {
 const editVersion = (photo: string) => {
   const e = db.edits.get(photo);
   return e && Object.keys(e.recipe).length > 1 ? e.version : null;
+};
+/** Mirrors _shared_size: the edited output's size for edited photos (the fake's originals are 4000 × 3000). */
+export const sharedSize = (photo: string): { width: number; height: number } => {
+  const W = 4000;
+  const H = 3000;
+  const e = db.edits.get(photo);
+  if (!e || editVersion(photo) === null) return { width: W, height: H };
+  const crop = (e.recipe.crop ?? {}) as { quarterTurns?: number; rect?: { w?: number; h?: number } };
+  const clamp = (n: unknown) => (typeof n === 'number' ? Math.min(Math.max(n, 0.0001), 1) : 1);
+  const turned = Math.abs(Math.floor(crop.quarterTurns ?? 0)) % 2 === 1;
+  const w = Math.max(1, Math.round((turned ? H : W) * clamp(crop.rect?.w)));
+  const h = Math.max(1, Math.round((turned ? W : H) * clamp(crop.rect?.h)));
+  if (e.previewVersion === e.version && e.previewWidth && e.previewHeight) {
+    const long = Math.max(w, h);
+    return e.previewWidth >= e.previewHeight
+      ? { width: long, height: Math.max(1, Math.round((long * e.previewHeight) / e.previewWidth)) }
+      : { width: Math.max(1, Math.round((long * e.previewWidth) / e.previewHeight)), height: long };
+  }
+  return { width: w, height: h };
 };
 const isRaw = (photo: string) => ['cr2', 'nef', 'arw'].includes(db.photos.get(photo)?.fileType ?? '');
 const fullState = (g: Gallery, photo: string): 'n/a' | 'pending' | 'ready' => {
@@ -395,8 +416,7 @@ function media(g: Gallery | undefined, photo: string, size: string, download: bo
     ownerId: g.owner,
     galleryName: g.name,
     position: g.photos.indexOf(photo),
-    width: 4000,
-    height: 3000,
+    ...sharedSize(photo),
     rendition: r ? { key: r.key } : null,
     source: { key: src, editVersion: ev },
     watermark: wm,
@@ -632,6 +652,14 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
       if (!rules(owner).studio && ('studioName' in p || 'accent' in p || Object.keys(w).length))
         return { error: 'plan' };
       const b = brand(owner);
+      // Switching to a watermark kind with no image while live galleries show the watermark: refused.
+      const curKind = b.wmKind ?? 'text';
+      if (w.kind && w.kind !== curKind && !(w.kind === 'logo' ? b.logoKey : b.wmKey)) {
+        const n = [...sdb.galleries.values()].filter(
+          (g) => g.owner === owner && serving(g) && effective(g).watermark,
+        ).length;
+        if (n > 0) return { error: 'in_use', galleries: n };
+      }
       if ('studioName' in p) b.studioName = (p.studioName as string | null) || null;
       if ('accent' in p) b.accent = (p.accent as string | null) ?? null;
       if (Object.keys(w).length) {
@@ -762,8 +790,7 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
       return {
         items: page.map((r) => ({
           id: r.id,
-          width: 4000,
-          height: 3000,
+          ...sharedSize(r.id),
           full: fullState(g, r.id),
           favourite: !!guest?.favs.has(r.id),
         })),
@@ -912,19 +939,54 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
         details: (a.p_details as string | null) ?? null,
         net: String(a.p_network),
         at: Date.now(),
+        owner: g.owner,
+        alertedAt: null,
       });
       sdb.audit.push({ action: 'safety.report', target: id });
       let alert = false;
       let pendingCount = 0;
       if (a.p_reason === 'csam' && (!g.csamAlertedAt || g.csamAlertedAt <= Date.now() - 3600000)) {
-        const since = g.csamAlertedAt ?? 0;
         pendingCount = sdb.reports.filter(
-          (r) => r.gallery === g.id && r.reason === 'csam' && (r.at ?? Date.now()) > since,
+          (r) => r.gallery === g.id && r.reason === 'csam' && !r.alertedAt,
         ).length;
         g.csamAlertedAt = Date.now();
         alert = true;
       }
       return { status: 'ok', reportId: id, ownerId: g.owner, photoId: photo, alert, pendingCount };
+    },
+    confirm_safety_alert: (a) => {
+      const r = sdb.reports.find((x) => x.id === a.p_report);
+      if (r?.reason !== 'csam') return 0;
+      let n = 0;
+      for (const x of sdb.reports)
+        if (x.reason === 'csam' && !x.alertedAt && x.gallery === r.gallery && (x.at ?? 0) <= (r.at ?? 0)) {
+          x.alertedAt = Date.now();
+          n++;
+        }
+      return n;
+    },
+    due_safety_alerts: () => {
+      const now = Date.now();
+      const groups = new Map<string, typeof sdb.reports>();
+      for (const r of sdb.reports) {
+        if (r.reason !== 'csam' || r.alertedAt || (r.at ?? now) > now - 300_000) continue;
+        groups.set(r.gallery, [...(groups.get(r.gallery) ?? []), r]);
+      }
+      const out = [];
+      for (const [gid, rs] of groups) {
+        const g = sdb.galleries.get(gid);
+        if (g?.csamAlertedAt && g.csamAlertedAt > now - 3600000) continue;
+        if (g) g.csamAlertedAt = now;
+        const last = rs.reduce((m, r) => ((r.at ?? 0) >= (m.at ?? 0) ? r : m));
+        out.push({
+          galleryId: g ? gid : null,
+          ownerId: last.owner ?? null,
+          reportId: last.id,
+          photoId: last.photo,
+          count: rs.length,
+        });
+      }
+      return out;
     },
     guest_logo: (a) => {
       const g = sdb.galleries.get(String(a.p_gallery));

@@ -173,6 +173,8 @@ editRoutes.put('/:id/edit/variants/:kind', async (c) => {
         p_kind: kind,
         p_key: key,
         p_bytes: head.size,
+        // The preview's pixel size: galleries lay edited photos out with its aspect (crop included).
+        ...(kind === 'preview' ? { p_width: info.width, p_height: info.height } : {}),
       });
       outcomeUnknown = false;
       if (res.status === 'ok') {

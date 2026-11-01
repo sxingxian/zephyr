@@ -35,9 +35,15 @@ create table public.photo_edits (
   preview_version integer check (preview_version >= 1),
   preview_key text,
   preview_bytes integer not null default 0 check (preview_bytes between 0 and 1572864),
+  -- The stored edited preview's pixel size (read from its header by the Worker): its aspect is the edited
+  -- photo's, crop and quarter turns included, so galleries never lay it out with the original's.
+  preview_width integer check (preview_width between 1 and 8192),
+  preview_height integer check (preview_height between 1 and 8192),
   updated_at timestamptz not null default now(),
   constraint photo_edits_thumb_pair check ((thumb_version is null) = (thumb_bytes = 0) and (thumb_version is null) = (thumb_key is null)),
-  constraint photo_edits_preview_pair check ((preview_version is null) = (preview_bytes = 0) and (preview_version is null) = (preview_key is null))
+  constraint photo_edits_preview_pair check ((preview_version is null) = (preview_bytes = 0) and (preview_version is null) = (preview_key is null)),
+  constraint photo_edits_preview_size check ((preview_width is null) = (preview_height is null)
+                                              and (preview_version is not null or preview_width is null))
 );
 alter table public.photo_edits enable row level security;
 create index photo_edits_owner on public.photo_edits (owner_id);
@@ -382,7 +388,8 @@ $$;
 -- {status: 'exists'} (the same version of this kind was recorded meanwhile: the Worker deletes its own
 -- object and succeeds) | {status: 'gone'} (the edit changed, was reverted, or the photo isn't ready: the
 -- Worker deletes its own object) | {status: 'storage_full'} | {status: 'invalid'}.
-create function public.record_edit_variant(p_owner uuid, p_photo uuid, p_version integer, p_kind text, p_key text, p_bytes integer)
+create function public.record_edit_variant(p_owner uuid, p_photo uuid, p_version integer, p_kind text, p_key text, p_bytes integer,
+  p_width integer default null, p_height integer default null)
 returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
@@ -396,6 +403,7 @@ declare
 begin
   if p_kind not in ('thumb', 'preview') or p_bytes is null or p_version is null
      or p_bytes not between 1 and (case p_kind when 'thumb' then 307200 else 1572864 end)
+     or (p_width is null) <> (p_height is null) or p_width not between 1 and 8192 or p_height not between 1 and 8192
      or not public._edit_key_ok(p_owner, p_photo, p_version, p_kind, p_key) then
     return jsonb_build_object('status', 'invalid');
   end if;
@@ -420,7 +428,9 @@ begin
   if p_kind = 'thumb' then
     update public.photo_edits set thumb_version = p_version, thumb_key = p_key, thumb_bytes = p_bytes where photo_id = p_photo;
   else
-    update public.photo_edits set preview_version = p_version, preview_key = p_key, preview_bytes = p_bytes where photo_id = p_photo;
+    update public.photo_edits set preview_version = p_version, preview_key = p_key, preview_bytes = p_bytes,
+           preview_width = p_width, preview_height = p_height
+     where photo_id = p_photo;
   end if;
   update public.profiles set storage_bytes = storage_bytes + delta where id = p_owner;
   return jsonb_build_object('status', 'ok', 'previousKey', old_key);
@@ -606,7 +616,7 @@ grant execute on function
   public.save_edit(uuid, uuid, jsonb, integer),
   public.delete_edit(uuid, uuid),
   public.edit_variant_check(uuid, uuid, integer, text),
-  public.record_edit_variant(uuid, uuid, integer, text, text, integer),
+  public.record_edit_variant(uuid, uuid, integer, text, text, integer, integer, integer),
   public.bulk_edit_state(uuid, uuid[]),
   public.apply_bulk_edits(uuid, jsonb),
   public.list_recipes(uuid),

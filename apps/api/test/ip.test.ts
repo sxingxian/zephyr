@@ -18,6 +18,15 @@ describe('networkKey', () => {
     expect(networkKey('2001:db8:1:3::1')).not.toBe(want);
   });
 
+  it('widens IPv6 to its /48 on request, leaving IPv4 as it is', () => {
+    expect(networkKey('2001:db8:1:2::1', 48)).toBe('2001:db8:1::/48');
+    expect(networkKey('2001:db8:1:ffff:1:2:3:4', 48)).toBe('2001:db8:1::/48');
+    expect(networkKey('2001:db8:2:2::1', 48)).not.toBe('2001:db8:1::/48');
+    expect(networkKey('203.0.113.7', 48)).toBe('203.0.113.7');
+    expect(networkKey('::ffff:203.0.113.7', 48)).toBe('203.0.113.7');
+    expect(networkKey('nope', 48)).toBeNull();
+  });
+
   it('handles :: at the start, middle and end', () => {
     expect(networkKey('::1')).toBe('0:0:0:0::/64');
     expect(networkKey('::')).toBe('0:0:0:0::/64');

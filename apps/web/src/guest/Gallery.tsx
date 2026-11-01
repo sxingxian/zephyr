@@ -8,7 +8,7 @@ import { GuestImage } from './GuestImage';
 import { useGuestPhotos } from './photos';
 import { SendDialog } from './SendDialog';
 import { Viewer } from './Viewer';
-import { buildZip, saveBlob, ZipProblem, type ZipSize, zipPlan } from './zip';
+import { buildZip, preparingNote, saveBlob, ZipProblem, type ZipSize, zipPlan } from './zip';
 
 export interface GalleryProps {
   info: GuestGalleryInfo;
@@ -102,7 +102,7 @@ export function Gallery({ info, token, fetchPage, onLocked, preview }: GalleryPr
     const ctrl = new AbortController();
     setZip({ done: 0, total: plan.included.length, ctrl });
     try {
-      const blob = await buildZip(
+      const { blob, skipped } = await buildZip(
         plan.included,
         {
           size,
@@ -117,11 +117,8 @@ export function Gallery({ info, token, fetchPage, onLocked, preview }: GalleryPr
         sink,
       );
       if (blob) saveBlob(blob, name);
-      setLive(
-        plan.preparing
-          ? `Downloaded. ${plan.preparing} full-size ${plan.preparing === 1 ? 'photo is' : 'photos are'} still being prepared and weren’t included.`
-          : 'Download ready.',
-      );
+      const left = plan.preparing + skipped;
+      setLive(left ? `Downloaded. ${preparingNote(left)}` : 'Download ready.');
     } catch (e) {
       if ((e as Error).name === 'AbortError') setLive('Download cancelled.');
       else setLive(e instanceof ZipProblem ? e.message : 'The download didn’t finish. Try again.');

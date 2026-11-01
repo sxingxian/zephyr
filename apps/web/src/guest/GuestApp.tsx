@@ -43,9 +43,7 @@ export function GuestApp({ pathname, now = Date.now }: { pathname: string; now?:
   }, [load]);
 
   useEffect(() => {
-    if (view.kind === 'info' || view.kind === 'paused') {
-      document.title = `${view.info.name} · ${view.info.brand.studioName}`;
-    } else if (view.kind === 'bad') document.title = 'Link not working';
+    document.title = guestTitle(view);
   }, [view]);
 
   const fetchPage = useCallback(
@@ -96,4 +94,19 @@ export function GuestApp({ pathname, now = Date.now }: { pathname: string; now?:
       {content}
     </ReportProvider>
   );
+}
+
+/** The tab title: never built from blank fields (ended links carry no name or studio). */
+export function guestTitle(view: {
+  kind: string;
+  info?: { state: string; name: string; brand: { studioName: string } };
+}): string {
+  if (view.kind === 'bad') return 'Link not working';
+  if (view.kind === 'failed') return 'Gallery';
+  if ((view.kind === 'info' || view.kind === 'paused') && view.info) {
+    if (view.info.state === 'ended') return 'Gallery ended';
+    const parts = [view.info.name.trim(), view.info.brand.studioName.trim()].filter(Boolean);
+    return parts.length ? parts.join(' · ') : 'Gallery';
+  }
+  return 'Gallery';
 }

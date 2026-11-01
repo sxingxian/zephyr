@@ -8,26 +8,50 @@
  * - `error`: anything else (offline, 5xx): treated like pending, with the same slow retries.
  */
 export type ImageProblem = 'pending' | 'expired' | 'error';
+/** A probe result: the problem, and how long the server asked us to wait (Retry-After), if it said. */
+export interface ImageFailure {
+  problem: ImageProblem;
+  retryAfterMs: number | null;
+}
 
 export async function classifyImageFailure(url: string, f: typeof fetch = fetch): Promise<ImageProblem> {
+  return (await probeImageFailure(url, f)).problem;
+}
+
+export async function probeImageFailure(url: string, f: typeof fetch = fetch): Promise<ImageFailure> {
   let res: Response;
   try {
     res = await f(url, { credentials: 'same-origin', cache: 'no-store', referrerPolicy: 'no-referrer' });
   } catch {
-    return 'error';
+    return { problem: 'error', retryAfterMs: null };
   }
   if (res.ok) {
     // It loads now (a rendition finished between the two requests).
     await res.body?.cancel().catch(() => undefined);
-    return 'pending';
+    return { problem: 'pending', retryAfterMs: null };
   }
+  const retryAfterMs = retryAfter(res.headers.get('Retry-After'));
   const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-  if (isPendingBody(res.status, body)) return 'pending';
-  if (res.status === 401 || res.status === 403 || res.status === 404 || res.status === 410) return 'expired';
-  return 'error';
+  if (isPendingBody(res.status, body)) return { problem: 'pending', retryAfterMs };
+  if (res.status === 401 || res.status === 403 || res.status === 404 || res.status === 410)
+    return { problem: 'expired', retryAfterMs: null };
+  return { problem: 'error', retryAfterMs };
+}
+
+/** Retry-After in seconds (the only form the API sends), as milliseconds; null when absent or unusable. */
+function retryAfter(header: string | null): number | null {
+  if (!header || !/^\d{1,6}$/.test(header.trim())) return null;
+  return Number(header.trim()) * 1000;
+}
+
+/** The first wait honours the server's Retry-After, kept between 5 seconds and 2 minutes. */
+export function firstPendingDelay(retryAfterMs: number | null): number | null {
+  if (retryAfterMs === null) return null;
+  return Math.min(120_000, Math.max(5_000, retryAfterMs));
 }
 
 function isPendingBody(status: number, body: Record<string, unknown> | null): boolean {
+  // The API answers 503 {error:'pending'} with Retry-After (older builds used 425).
   if (status === 425) return true;
   const error = typeof body?.error === 'string' ? body.error : null;
   if (body?.unavailable === 'pending' || error === 'pending' || body?.pending === true) return true;
@@ -65,4 +89,59 @@ export async function withProbeSlot<T>(fn: () => Promise<T>): Promise<T> {
     running--;
     waiting.shift()?.();
   }
+}
+
+/** A single download, fetched rather than navigated to so a not-ready size never saves an error page. */
+export type DownloadResult =
+  | { kind: 'file'; blob: Blob; name: string }
+  | { kind: 'pending'; retryAfterMs: number | null }
+  | { kind: 'expired' }
+  | { kind: 'error' };
+
+/**
+ * Fetches a signed download URL with the same flags the link would use (same-origin credentials, no
+ * referrer). One GET is both the probe and the download: a HEAD first would make the server render and
+ * count the photo twice. The file name comes from the server's Content-Disposition, never from the page.
+ */
+export async function fetchDownload(url: string, f: typeof fetch = fetch): Promise<DownloadResult> {
+  let res: Response;
+  try {
+    res = await f(url, { credentials: 'same-origin', cache: 'no-store', referrerPolicy: 'no-referrer' });
+  } catch {
+    return { kind: 'error' };
+  }
+  if (res.ok) {
+    try {
+      const blob = await res.blob();
+      return { kind: 'file', blob, name: filenameFromDisposition(res.headers.get('Content-Disposition')) };
+    } catch {
+      return { kind: 'error' };
+    }
+  }
+  const retryAfterMs = retryAfter(res.headers.get('Retry-After'));
+  const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  if (isPendingBody(res.status, body)) return { kind: 'pending', retryAfterMs };
+  if (res.status === 401 || res.status === 403 || res.status === 404 || res.status === 410)
+    return { kind: 'expired' };
+  return { kind: 'error' };
+}
+
+/** The server's file name (RFC 6266 filename*, then filename), reduced to a safe base name. */
+export function filenameFromDisposition(header: string | null): string {
+  let name = '';
+  const star = header?.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+  if (star) {
+    try {
+      name = decodeURIComponent(star.trim());
+    } catch {
+      name = '';
+    }
+  }
+  if (!name) name = header?.match(/filename\s*=\s*"([^"]*)"/i)?.[1] ?? '';
+  // No paths, no control characters: the browser sanitises too, but don't rely on it.
+  name = name
+    .replace(/[/\\]/g, '_')
+    .replace(/\p{Cc}/gu, '')
+    .trim();
+  return name && name !== '.' && name !== '..' ? name.slice(0, 200) : 'photo.jpg';
 }

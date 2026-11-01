@@ -15,6 +15,7 @@ import {
   putBrandingAsset,
   saveBranding,
   sharingLimits,
+  watermarkKindInUseMessage,
 } from '../lib/share';
 import { useUsage } from '../lib/usage';
 import { drawTextWatermark } from '../lib/watermark';
@@ -144,16 +145,23 @@ export function SharingSettings() {
           const png = await drawTextWatermark(wmText);
           await putBrandingAsset('watermark', png);
         }
-        apply(
-          await saveBranding({
-            watermark: {
-              kind: wmKind,
-              text: wmKind === 'text' ? wmText.trim() : null,
-              position: wmPos,
-              opacity: wmOpacity,
-            },
-          }),
-        );
+        try {
+          apply(
+            await saveBranding({
+              watermark: {
+                kind: wmKind,
+                text: wmKind === 'text' ? wmText.trim() : null,
+                position: wmPos,
+                opacity: wmOpacity,
+              },
+            }),
+          );
+        } catch (e) {
+          // 409 while live galleries draw the watermark and the new kind has nothing to draw yet.
+          const inUse = watermarkKindInUseMessage(e);
+          if (inUse) throw new ShownError(inUse);
+          throw e;
+        }
       },
       'Watermark saved. New guest images use it; existing ones update as guests view them.',
     );

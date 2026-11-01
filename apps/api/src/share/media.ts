@@ -85,13 +85,13 @@ interface MediaPlan {
 }
 
 /**
- * Media responses: private browser cache, sandboxed, never sniffed. `revalidate`: the owner's preview, which
- * must not outlive the session in the browser cache (no-cache plus an ETag, checked after the session).
+ * Media responses: private browser cache, sandboxed, never sniffed. `noStore`: the owner's preview, which
+ * must not outlive the session anywhere in the browser, not even on disk.
  */
-export function mediaHeaders(h: Headers, contentType: string, length: string | null, revalidate = false) {
+export function mediaHeaders(h: Headers, contentType: string, length: string | null, noStore = false) {
   h.set('Content-Type', contentType);
   if (length) h.set('Content-Length', length);
-  h.set('Cache-Control', revalidate ? 'private, no-cache' : 'private, max-age=3600');
+  h.set('Cache-Control', noStore ? 'no-store' : 'private, max-age=3600');
   h.set('Content-Security-Policy', "default-src 'none'; sandbox; frame-ancestors 'none'");
   h.set('X-Content-Type-Options', 'nosniff');
   h.set('Cross-Origin-Resource-Policy', 'same-origin');
@@ -108,9 +108,12 @@ class Unavailable extends Error {
 
 /** Seconds a guest waits before asking again for an image still being prepared. */
 const PENDING_RETRY = 30;
-/** "Not yet" (425 Too Early): the guest page shows a Preparing tile and retries. Never cached. */
+/**
+ * "Not yet": 503 with Retry-After (425 Too Early is meant for TLS early data and can trigger an automatic
+ * replay behind Cloudflare's 0-RTT). The guest page shows a Preparing tile and retries. Never cached.
+ */
 function pendingResponse(c: Ctx): Response {
-  return c.json(fail('pending', { retryAfter: PENDING_RETRY }), 425, {
+  return c.json(fail('pending', { retryAfter: PENDING_RETRY }), 503, {
     'Retry-After': String(PENDING_RETRY),
     'Cache-Control': 'no-store',
   });
@@ -264,8 +267,8 @@ async function safetyHold(c: Ctx, galleryId: string, photoId: string, tokenHashP
 export interface ServeOptions {
   /** web and full downloads: served as an attachment, only if the gallery's downloads allow it now. */
   download?: boolean;
-  /** The owner's preview: `private, no-cache` with an ETag (304 when unchanged), after the session check. */
-  revalidate?: boolean;
+  /** The owner's preview: `no-store`, so it never outlives the session in the browser (no ETag/304). */
+  noStore?: boolean;
   /** For the state cache to forget a held gallery. */
   tokenHashPg?: string | null;
   /** Called once the bytes are on their way (download events). */
@@ -293,13 +296,6 @@ export async function serveRendition(
       return pendingResponse(c);
     }
     const key = m.rendition?.key ?? (await makeRendition(c, galleryId, photoId, size, m));
-    const etag = o.revalidate ? await keyTag(key) : null;
-    if (etag && ifNoneMatch(c.req.header('If-None-Match'), etag)) {
-      const h = new Headers({ ETag: etag });
-      mediaHeaders(h, 'image/jpeg', null, true);
-      h.delete('Content-Type');
-      return new Response(null, { status: 304, headers: h });
-    }
     const res = await fetchCached(c.env, key);
     if (res.status === 451) {
       await res.body?.cancel().catch(() => undefined);
@@ -312,8 +308,7 @@ export async function serveRendition(
       return c.json(fail('server'), 502);
     }
     const out = new Response(res.body, { status: 200 });
-    mediaHeaders(out.headers, 'image/jpeg', res.headers.get('Content-Length'), o.revalidate === true);
-    if (etag) out.headers.set('ETag', etag);
+    mediaHeaders(out.headers, 'image/jpeg', res.headers.get('Content-Length'), o.noStore === true);
     if (o.download) {
       out.headers.set(
         'Content-Disposition',
@@ -329,16 +324,6 @@ export async function serveRendition(
     logError(c.get('requestId'), 'media', err);
     return c.json(fail('server'), 500);
   }
-}
-
-/** A strong ETag for a stored object: its key is unique per content (a new nonce for every rendition). */
-async function keyTag(key: string): Promise<string> {
-  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key)));
-  return `"${[...d.slice(0, 12)].map((b) => b.toString(16).padStart(2, '0')).join('')}"`;
-}
-function ifNoneMatch(header: string | undefined, etag: string): boolean {
-  if (!header) return false;
-  return header.split(',').some((t) => t.trim().replace(/^W\//, '') === etag);
 }
 
 /** Flags the account for Settings ("Storage full — some gallery previews can't be prepared"). */

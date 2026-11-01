@@ -51,4 +51,12 @@ echo "ok - reopen and create racing at the cap: exactly one succeeds"
 r="$(run_pair "public.race_reopen('62000000-0000-0000-0000-000000000004')" "public.race_reopen('62000000-0000-0000-0000-000000000004')")"
 [ "$(P -c 'select public.race_live()')" = 3 ] || fail "two reopens: more than 3 live galleries"
 echo "ok - reopens racing at the cap stay within it"
+
+# Two different expired galleries reopening at the cap: one slot, so exactly one wins.
+P -c "update public.galleries set expires_at = now() - interval '1 hour' where id in ('62000000-0000-0000-0000-000000000003', '62000000-0000-0000-0000-000000000004');"
+[ "$(P -c 'select public.race_live()')" = 2 ] || fail "setup: want 2 live galleries"
+r="$(run_pair "public.race_reopen('62000000-0000-0000-0000-000000000003')" "public.race_reopen('62000000-0000-0000-0000-000000000004')")"
+[ "$r" = "ok limit" ] || fail "two different reopens at the cap: got '$r', want 'ok limit'"
+[ "$(P -c 'select public.race_live()')" = 3 ] || fail "two different reopens: more than 3 live galleries"
+echo "ok - two different galleries reopening at the cap: exactly one succeeds"
 echo "All sharing race tests passed."

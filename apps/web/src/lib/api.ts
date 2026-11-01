@@ -74,6 +74,8 @@ const KNOWN: ApiErrorCode[] = [
   'sharing_suspended',
   'plan_required',
   'limit_reached',
+  'asset_in_use',
+  'pending',
   'server',
 ];
 

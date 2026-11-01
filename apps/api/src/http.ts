@@ -70,6 +70,19 @@ export async function burstOk(c: Context<HonoEnv>, scope: string): Promise<boole
 
 export const networkHash = async (c: Context<HonoEnv>) =>
   toPgBytea(await hashIp(clientNetwork(c), c.env.IP_HASH_SECRET));
+/**
+ * The hash of the client's customer network: the same as `networkHash` for IPv4, the /48 for IPv6.
+ * Used where a limit aims to stop one person minting identities or flooding a queue:
+ * - the new-guest cap per gallery (20 guest identities a day): a collision needs two guests of the same
+ *   gallery inside one /48, and the cap is generous;
+ * - the guest report limit (10 a day): one person mustn't flood Safety and owners from a /48 of /64s; a
+ *   collision only defers a report with a "try later".
+ * Passcode attempts stay per /64 (`networkHash`): the gallery-wide cap (25 per 15 minutes, then a pause)
+ * already bounds guessing however many networks are used, and a /48 key would push a whole carrier pool
+ * to the Turnstile check after one guest's typos.
+ */
+export const customerNetworkHash = async (c: Context<HonoEnv>) =>
+  toPgBytea(await hashIp(networkKey(clientIp(c), 48) ?? 'unknown', c.env.IP_HASH_SECRET));
 export const emailHash = async (env: Env, email: string) =>
   toPgBytea(await hmac(`email:${email.trim().toLowerCase()}`, env.IP_HASH_SECRET));
 

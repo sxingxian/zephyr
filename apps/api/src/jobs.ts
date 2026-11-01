@@ -5,7 +5,7 @@
  */
 import { gotrue } from './auth/gotrue';
 import { sendEmail } from './email/resend';
-import { galleryExpiringEmail } from './email/share-templates';
+import { galleryExpiringEmail, safetyReportEmail } from './email/share-templates';
 import type { Env } from './env';
 import { logError } from './http';
 import { deleteAll, deleteUnder, stores } from './library/objects';
@@ -33,6 +33,8 @@ export const JOB_LIMITS = {
   /** Galleries per sharing clean-up step, and queued object deletions per run. */
   shareCleanup: 100,
   shareDeletions: 500,
+  /** Galleries with unalerted CSAM reports emailed per run. */
+  safetyAlerts: 20,
 } as const;
 
 export interface CleanupCounts {
@@ -48,6 +50,7 @@ export interface CleanupCounts {
   galleriesDeleted: number;
   shareObjectsDeleted: number;
   expiryReminders: number;
+  safetyAlerts: number;
 }
 
 interface ExpiredUpload {
@@ -87,6 +90,7 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
     galleriesDeleted: 0,
     shareObjectsDeleted: 0,
     expiryReminders: 0,
+    safetyAlerts: 0,
   };
 
   // 1. Uploads left unfinished for 24 hours. The database claims them first (rows and reservation go
@@ -190,7 +194,14 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
     logError(requestId, 'job_share_deletions', err);
   }
 
-  // 8. Old rate-limit rows (pg_cron does this daily too).
+  // 8. CSAM reports no alert email has covered (inside a gallery's hour, or the email failed).
+  try {
+    counts.safetyAlerts = await sweepSafetyAlerts(env, requestId);
+  } catch (err) {
+    logError(requestId, 'job_safety_alerts', err);
+  }
+
+  // 9. Old rate-limit rows (pg_cron does this daily too).
   try {
     counts.rateLimitRows = await rpc<number>(env, 'purge_rate_limits');
   } catch (err) {
@@ -348,6 +359,48 @@ export async function shareCleanup(env: Env, requestId = 'cron') {
     }
   }
   return { purged: r.purged, deleted: r.deleted, reminders: sent };
+}
+
+interface DueSafetyAlert {
+  galleryId: string | null;
+  ownerId: string | null;
+  reportId: string;
+  photoId: string | null;
+  count: number;
+}
+
+/**
+ * Emails Safety about CSAM reports no alert has covered yet, at most once an hour per gallery (the database
+ * claims the gallery's hour before returning it). A report is marked alerted only after its email is sent,
+ * so a failed send is retried by a later run once the hour allows. Without SAFETY_ALERT_EMAIL nothing is
+ * claimed.
+ */
+export async function sweepSafetyAlerts(env: Env, requestId = 'cron'): Promise<number> {
+  if (!env.SAFETY_ALERT_EMAIL) return 0;
+  const due = await rpc<DueSafetyAlert[]>(env, 'due_safety_alerts', { p_limit: JOB_LIMITS.safetyAlerts });
+  let sent = 0;
+  for (const a of due) {
+    try {
+      await sendEmail(env, {
+        to: env.SAFETY_ALERT_EMAIL,
+        ...safetyReportEmail({
+          reportId: a.reportId,
+          galleryId: a.galleryId,
+          ownerId: a.ownerId ?? 'unknown',
+          photoId: a.photoId,
+          count: a.count,
+          at: new Date(),
+        }),
+        // The same key as the request's own alert: a send that worked but wasn't confirmed isn't repeated.
+        idempotencyKey: `report-${a.reportId}`,
+      });
+      await rpc(env, 'confirm_safety_alert', { p_report: a.reportId });
+      sent += 1;
+    } catch (err) {
+      logError(requestId, 'safety_alert_email', err);
+    }
+  }
+  return sent;
 }
 
 interface QueuedDeletion {

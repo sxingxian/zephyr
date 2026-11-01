@@ -59,12 +59,18 @@ brandingRoutes.put('/', async (c) => {
   const body = await readBody(c, brandingSchema);
   if (!body) return c.json(fail('invalid'), 400);
   try {
-    const res = await rpc<{ branding: unknown } | { error: 'plan' | 'invalid' }>(c.env, 'update_branding', {
+    const res = await rpc<
+      { branding: unknown } | { error: 'plan' | 'invalid' } | { error: 'in_use'; galleries: number }
+    >(c.env, 'update_branding', {
       p_owner: ownerOf(c),
       p_patch: body,
     });
-    if ('error' in res)
-      return res.error === 'plan' ? c.json(fail('plan_required'), 403) : c.json(fail('invalid'), 400);
+    if ('error' in res) {
+      if (res.error === 'plan') return c.json(fail('plan_required'), 403);
+      // Switching to a watermark kind with no image while live galleries show the watermark.
+      if (res.error === 'in_use') return c.json(fail('asset_in_use', { galleries: res.galleries }), 409);
+      return c.json(fail('invalid'), 400);
+    }
     return c.json({ ok: true, branding: res.branding });
   } catch (err) {
     logError(c.get('requestId'), 'branding_put', err);

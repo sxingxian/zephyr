@@ -49,6 +49,8 @@ export interface Edit {
   previewVersion: number | null;
   previewKey: string | null;
   previewBytes: number;
+  previewWidth?: number | null;
+  previewHeight?: number | null;
   updatedAt: string;
 }
 export interface Recipe {
@@ -750,7 +752,14 @@ function editorRpc(): Record<string, (a: Args) => unknown> {
         return { status: 'storage_full' };
       const key = String(a.p_key);
       if (kind === 'thumb') Object.assign(e, { thumbVersion: v, thumbKey: key, thumbBytes: bytes });
-      else Object.assign(e, { previewVersion: v, previewKey: key, previewBytes: bytes });
+      else
+        Object.assign(e, {
+          previewVersion: v,
+          previewKey: key,
+          previewBytes: bytes,
+          previewWidth: (a.p_width as number | undefined) ?? null,
+          previewHeight: (a.p_height as number | undefined) ?? null,
+        });
       prof.storage += delta;
       return { status: 'ok', previousKey: oldKey };
     },

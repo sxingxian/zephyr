@@ -665,6 +665,7 @@ describe('trash and clean-up', () => {
         galleriesDeleted: 0,
         shareObjectsDeleted: 0,
         expiryReminders: 0,
+        safetyAlerts: 0,
       },
     });
   });

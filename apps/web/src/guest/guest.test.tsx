@@ -3,13 +3,20 @@ import type { GuestGalleryInfo, GuestPhoto, GuestPhotoPage } from '@zephyr/share
 import { resetTurnstileLoader } from '@zephyr/ui';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { brandingOn, monogram, safeAccent, sameOriginUrl } from './brand';
-import { GuestApp } from './GuestApp';
+import { GuestApp, guestTitle } from './GuestApp';
 import { GuestImage } from './GuestImage';
-import { classifyImageFailure, nextPendingDelay, PENDING_DELAYS_MS, PENDING_GIVE_UP_MS } from './media';
+import {
+  classifyImageFailure,
+  firstPendingDelay,
+  nextPendingDelay,
+  PENDING_DELAYS_MS,
+  PENDING_GIVE_UP_MS,
+  probeImageFailure,
+} from './media';
 import { Passcode } from './Passcode';
 import { REFRESH_COOLDOWN_MS, useGuestPhotos } from './photos';
 import { parseGuestPath } from './route';
-import { buildZip, checkZipSize, ZipProblem, zipEntryNames, zipPlan } from './zip';
+import { buildZip, checkZipSize, preparingNote, ZipProblem, zipEntryNames, zipPlan } from './zip';
 
 // A made-up 43-character link token, built at runtime so secret scanners don't mistake it for a key.
 const TOKEN = `${'Tk'.repeat(20)}a-_`;
@@ -269,6 +276,25 @@ describe('guest page states', () => {
       screen.getByText(/stopped working on 1 Jan 2026.*ask Mei Lin Photography for a new link/),
     ).toBeTruthy();
   });
+  it('the tab title says what happened and is never built from blank fields', async () => {
+    mockApi(() => json(404, { ok: false, error: 'not_found' }));
+    render(<GuestApp pathname={`/g/${TOKEN}`} />);
+    await screen.findByRole('heading', { name: 'This link doesn’t work' });
+    expect(document.title).toBe('Link not working');
+    cleanup();
+    mockApi(galleryApi({ info: { state: 'ended', name: '', brand: { ...INFO.brand, studioName: '' } } }));
+    render(<GuestApp pathname={`/g/${TOKEN}`} />);
+    await screen.findByRole('heading', { name: 'This gallery has ended' });
+    expect(document.title).toBe('Gallery ended');
+    const info = (state: string, name: string, studioName: string) => ({
+      kind: 'info',
+      info: { state, name, brand: { studioName } },
+    });
+    expect(guestTitle(info('active', 'Wedding', 'Mei Lin'))).toBe('Wedding · Mei Lin');
+    expect(guestTitle(info('active', 'Wedding', ' '))).toBe('Wedding');
+    expect(guestTitle(info('active', '', ''))).toBe('Gallery');
+    expect(guestTitle({ kind: 'failed' })).toBe('Gallery');
+  });
   it('locked → unlock → the gallery, with the message kept as written', async () => {
     let unlocked = false;
     const api = galleryApi();
@@ -368,6 +394,59 @@ describe('gallery', () => {
     expect(screen.getByText('2 of 3')).toBeTruthy();
     fireEvent.click(dialog().getByRole('button', { name: /^Download/ }));
     expect(dialog().getAllByRole('menuitem')[0]?.getAttribute('href')).toContain('/m/p2/full');
+  });
+
+  it('single downloads fetch first: a size still being prepared shows "Preparing" instead of saving an error', async () => {
+    const base = galleryApi({
+      pages: [
+        { ok: true, items: [photo(1, { download: { web: '/api/w1', full: null } })], nextCursor: null },
+      ],
+    });
+    mockApi((url, init) => {
+      if (url === '/api/w1')
+        return json(503, { ok: false, error: 'pending', retryAfter: 30 }, { 'retry-after': '30' });
+      return base(url, init);
+    });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click');
+    render(<GuestApp pathname={`/g/${TOKEN}`} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Open photo 1' }));
+    const dialog = () => within(screen.getByRole('dialog'));
+    fireEvent.click(dialog().getByRole('button', { name: /^Download/ }));
+    const web = () => dialog().getByRole('menuitem', { name: /Web size/ });
+    fireEvent.click(web());
+    await waitFor(() => expect(web().textContent).toMatch(/Preparing/));
+    expect(web().getAttribute('aria-disabled')).toBe('true');
+    expect(click).not.toHaveBeenCalled();
+    // Clicking again while pending doesn't ask the server again.
+    const before = calls.length;
+    fireEvent.click(web());
+    expect(calls.length).toBe(before);
+    click.mockRestore();
+  });
+  it('a ready single download saves the server’s file name', async () => {
+    const { fetchDownload, filenameFromDisposition } = await import('./media');
+    const ok = await fetchDownload(
+      '/x',
+      async () =>
+        new Response(new Uint8Array([1]), {
+          headers: {
+            'content-disposition': `attachment; filename="a.jpg"; filename*=UTF-8''Tan%20%26%20Wei%20001.jpg`,
+          },
+        }),
+    );
+    expect(ok.kind === 'file' && ok.name).toBe('Tan & Wei 001.jpg');
+    const pending = await fetchDownload('/x', async () =>
+      json(503, { ok: false, error: 'pending' }, { 'retry-after': '30' }),
+    );
+    expect(pending).toEqual({ kind: 'pending', retryAfterMs: 30_000 });
+    expect((await fetchDownload('/x', async () => json(403, { ok: false, error: 'forbidden' }))).kind).toBe(
+      'expired',
+    );
+    expect((await fetchDownload('/x', async () => json(503, { ok: false, error: 'server' }))).kind).toBe(
+      'error',
+    );
+    expect(filenameFromDisposition(`attachment; filename*=UTF-8''..%2F..%2Fevil.jpg`)).toBe('.._.._evil.jpg');
+    expect(filenameFromDisposition(null)).toBe('photo.jpg');
   });
 
   it('view-only galleries offer no downloads; web-only galleries offer web size only', async () => {
@@ -501,16 +580,50 @@ describe('download all (.zip)', () => {
       }),
     );
     const fresh = vi.fn(async () => photo(2, { download: { web: '/new-web-2', full: '/new-full-2' } }));
-    const blob = await buildZip([photo(1), photo(2, { download: { web: '/old', full: '/old' } })], {
-      size: 'web',
-      galleryName: 'G',
-      fresh,
-    });
+    const { blob, skipped } = await buildZip(
+      [photo(1), photo(2, { download: { web: '/old', full: '/old' } })],
+      { size: 'web', galleryName: 'G', fresh },
+    );
+    expect(skipped).toBe(0);
     expect(blob?.type).toBe('application/zip');
     expect(fresh).toHaveBeenCalledWith('p2');
     expect(seen).toEqual([photo(1).download?.web, '/old', '/new-web-2']);
     const bytes = new Uint8Array(await (blob as Blob).arrayBuffer());
     expect(new TextDecoder().decode(bytes)).toContain('G 001.jpg');
+  });
+  it('skips photos still being prepared and counts them, instead of aborting', async () => {
+    const pending = () =>
+      new Response(JSON.stringify({ ok: false, error: 'pending', retryAfter: 30 }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '30' },
+      });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) =>
+        url.includes('p2') ? pending() : new Response(new Uint8Array([1, 2, 3])),
+      ),
+    );
+    const fresh = vi.fn(async () => null);
+    const { blob, skipped } = await buildZip([photo(1), photo(2), photo(3)], {
+      size: 'web',
+      galleryName: 'G',
+      fresh,
+    });
+    expect(skipped).toBe(1);
+    expect(fresh).not.toHaveBeenCalled();
+    const text = new TextDecoder().decode(new Uint8Array(await (blob as Blob).arrayBuffer()));
+    expect(text).toContain('G 001.jpg');
+    expect(text).toContain('G 002.jpg');
+    expect(text).not.toContain('G 003.jpg');
+    expect(preparingNote(1)).toBe('1 photo was still being prepared and wasn’t included.');
+    expect(preparingNote(3)).toBe('3 photos were still being prepared and weren’t included.');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => pending()),
+    );
+    await expect(buildZip([photo(1)], { size: 'web', galleryName: 'G' })).rejects.toThrow(
+      /still being prepared/,
+    );
   });
   it('streams into a picked file and abandons it on failure', async () => {
     vi.stubGlobal(
@@ -657,6 +770,46 @@ describe('images the server is still preparing', () => {
     }) as unknown as typeof fetch;
     expect(await classifyImageFailure('/u', offline)).toBe('error');
   });
+  it('the API’s 503 pending with Retry-After sets the first wait (between 5 s and 2 min)', async () => {
+    const r = (after: string) =>
+      new Response(JSON.stringify({ ok: false, error: 'pending', retryAfter: 30 }), {
+        status: 503,
+        headers: { 'content-type': 'application/json', 'retry-after': after },
+      });
+    const f = (x: Response) => vi.fn(async () => x) as unknown as typeof fetch;
+    expect(await probeImageFailure('/u', f(r('30')))).toEqual({ problem: 'pending', retryAfterMs: 30_000 });
+    // A plain 503 without the pending marker is an error (still retried slowly).
+    expect((await probeImageFailure('/u', f(res(503, { ok: false, error: 'server' })))).problem).toBe(
+      'error',
+    );
+    expect(firstPendingDelay(30_000)).toBe(30_000);
+    expect(firstPendingDelay(1_000)).toBe(5_000);
+    expect(firstPendingDelay(600_000)).toBe(120_000);
+    expect(firstPendingDelay(null)).toBeNull();
+  });
+  it('honours Retry-After for the first retry of a tile', async () => {
+    vi.useFakeTimers();
+    let t = 0;
+    const classify = vi.fn(async () => ({ problem: 'pending' as const, retryAfterMs: 30_000 }));
+    const { container } = render(
+      <GuestImage variant="tile" src="/api/r" alt="" onExpired={vi.fn()} classify={classify} now={() => t} />,
+    );
+    const img = () => container.querySelector('img') as HTMLImageElement;
+    await act(async () => {
+      fireEvent.error(img());
+    });
+    const first = img();
+    t = 10_000;
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(img()).toBe(first); // not yet: the server asked for 30 s
+    t = 31_000;
+    await act(async () => {
+      vi.advanceTimersByTime(21_000);
+    });
+    expect(img()).not.toBe(first);
+  });
   it('backs off slowly and stops after about five minutes', () => {
     const half = () => 0.5;
     expect(PENDING_DELAYS_MS.map((_, i) => nextPendingDelay(i, 0, half))).toEqual(PENDING_DELAYS_MS);
@@ -739,6 +892,8 @@ describe('images the server is still preparing', () => {
       fireEvent.error(img());
     });
     expect(onExpired).toHaveBeenCalledTimes(1);
+    // The refresh handed back the same URL: not a broken image for good, but the slow retries.
+    expect(screen.getByRole('status').textContent).toBe('Preparing');
     await act(async () => {
       fireEvent.error(img());
     });

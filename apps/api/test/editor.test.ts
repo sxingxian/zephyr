@@ -240,6 +240,18 @@ describe('edited variants', () => {
     const v = await renderedEdit(j, p.id);
     expect(hasKey(editKeyOf(MEI.id, p.id, v, 'thumb'))).toBe(true);
     expect(must(db.edits.get(p.id))).toMatchObject({ thumbBytes: 3000, previewBytes: 9000 });
+    // The preview's header size is recorded (galleries use its aspect); the thumb's isn't sent.
+    expect(must(db.edits.get(p.id))).toMatchObject({ previewWidth: 2048, previewHeight: 1536 });
+    const recorded = world.calls.filter((c) => c.url.endsWith('/rpc/record_edit_variant'));
+    expect(
+      recorded.map((c) => [
+        (c.body as Record<string, unknown>).p_kind,
+        (c.body as Record<string, unknown>).p_width,
+      ]),
+    ).toEqual([
+      ['thumb', undefined],
+      ['preview', 2048],
+    ]);
     expect(noDrift(MEI.id)).toBe(true);
     expect((await read(await call(EDIT_API.photoEdit(p.id), { jar: j }))).edit.rendered).toBe(true);
 
