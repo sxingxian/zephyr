@@ -3,15 +3,20 @@ import { Mascot } from '@zephyr/ui';
 import { brandingOn } from './brand';
 import { accentStyle, CardScreen, formatDate, StudioBadge } from './Chrome';
 
-/** An expired or revoked gallery. */
+/** An expired or revoked gallery. The server may send no name or studio for an ended link, so neither is assumed. */
 export function Ended({ info }: { info: GuestGalleryInfo }) {
-  const branded = brandingOn(info.brand);
-  const when = formatDate(info.expiresAt);
-  const past = Date.parse(info.expiresAt) <= Date.now();
+  const brand = info.brand ?? { studioName: '', accent: null, logoUrl: null };
+  const branded = brandingOn(brand);
+  const name = info.name?.trim();
+  const studio = brand.studioName?.trim();
+  const when = info.expiresAt ? formatDate(info.expiresAt) : null;
+  const past = info.expiresAt ? Date.parse(info.expiresAt) <= Date.now() : false;
+  const what = name ? `The link to “${name}”` : 'This link';
+  const ending = past && when ? `${what} stopped working on ${when}.` : `${what} has been turned off.`;
   return (
-    <CardScreen style={accentStyle(info.brand)}>
+    <CardScreen style={accentStyle(brand)}>
       {branded ? (
-        <StudioBadge brand={info.brand} size={88} />
+        <StudioBadge brand={brand} size={88} />
       ) : (
         <Mascot
           pose="nap"
@@ -21,10 +26,7 @@ export function Ended({ info }: { info: GuestGalleryInfo }) {
       )}
       <h1 className="g-card__title">This gallery has ended</h1>
       <p className="g-lede">
-        {past && when
-          ? `The link to “${info.name}” stopped working on ${when}.`
-          : `The link to “${info.name}” has been turned off.`}{' '}
-        If you still need the photos, ask {info.brand.studioName} for a new link.
+        {ending} If you still need the photos, ask {studio || 'the person who shared it'} for a new link.
       </p>
     </CardScreen>
   );

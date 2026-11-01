@@ -95,6 +95,11 @@ export interface SharingLimits {
   accessLog: boolean;
   /** Sharing suspended pending a safety review: new galleries are refused and existing ones show as ended. */
   suspended?: boolean;
+  /**
+   * Storage is past the plan plus the preview allowance (10% of the plan's storage, at most 5 GB) and a guest
+   * preview was refused: "Storage full — some gallery previews can't be prepared". Clears once there's room.
+   */
+  previewsBlocked?: boolean;
 }
 
 // ---------------------------------------------------------------- member side
@@ -139,6 +144,16 @@ export interface GalleryDetail extends GallerySummary {
   linkHint: string;
   /** Full-size renders still to make on the member's device. */
   pendingRenders: number;
+  /**
+   * The owner's watermark has an image to draw (a text watermark's rendered image, or the logo for a logo
+   * watermark). While the watermark is on and this is false, guests see "Preparing" instead of photos.
+   */
+  watermarkReady?: boolean;
+  /**
+   * The owner's storage is past the plan plus the preview allowance and guest previews are being refused:
+   * "Storage full — some gallery previews can't be prepared".
+   */
+  storageFull?: boolean;
   revokedAt: string | null;
 }
 export interface GalleryPatchBody {
@@ -218,6 +233,8 @@ export interface Branding {
     opacity: number; // 10–90
     hasImage: boolean;
   };
+  /** The watermark can be drawn (text: its image is uploaded; logo: a logo is uploaded). */
+  watermarkReady?: boolean;
   updatedAt: string | null;
 }
 export interface BrandingBody {
@@ -228,6 +245,7 @@ export interface BrandingBody {
 
 // ---------------------------------------------------------------- guest side
 export interface GuestBrand {
+  /** Empty on an ended gallery (an old link names neither the gallery nor its owner). */
   studioName: string;
   accent: string | null;
   /** Same-origin, signed. */

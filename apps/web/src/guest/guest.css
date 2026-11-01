@@ -335,6 +335,57 @@ body,
   height: 100%;
   object-fit: cover;
 }
+.g-pending {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px;
+  text-align: center;
+  color: var(--muted);
+  pointer-events: none;
+}
+.g-pending--tile {
+  font-size: 12.5px;
+  font-weight: 550;
+  background: var(--bg2);
+}
+.g-pending--viewer {
+  font-size: 15px;
+  color: #b8bec9;
+  max-width: 420px;
+  margin: auto;
+}
+.g-pending__retry {
+  pointer-events: auto;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line2);
+  background: var(--surf);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.g-pending--viewer .g-pending__retry {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: transparent;
+  color: #fff;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .g-pending--tile {
+    animation: g-breathe 2.4s ease-in-out infinite;
+  }
+}
+@keyframes g-breathe {
+  50% {
+    opacity: 0.7;
+  }
+}
 .g-heart {
   position: absolute;
   top: 8px;

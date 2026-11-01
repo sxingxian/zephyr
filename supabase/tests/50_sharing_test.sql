@@ -157,6 +157,7 @@ select pg_temp.ok((select count(*) from public.gallery_attempts where gallery_id
 insert into public.gallery_attempts (gallery_id, network_hash) select pg_temp.i('g1'), pg_temp.h('net' || n) from generate_series(10, 28) n;
 select pg_temp.ok((select v ->> 'status' = 'ok' and v ->> 'pausedNow' = 'true' and v ->> 'ownerEmail' = 'mei5@example.com'
   from (select gallery_unlock_reserve(pg_temp.i('g1'), pg_temp.h('net3'), false) v) x), 'the 25th failure from anywhere pauses the gallery');
+select pg_temp.ok((select paused_notified_at is not null from public.galleries where id = pg_temp.i('g1')), 'the pause email is recorded');
 select pg_temp.ok(gallery_unlock_reserve(pg_temp.i('g1'), pg_temp.h('net4'), false) ->> 'status' = 'paused'
   and get_gallery(pg_temp.i('mei'), pg_temp.i('g1')) ->> 'status' = 'paused'
   and guest_gallery_info(pg_temp.h('m-tok-1'), pg_temp.h('net4')) ->> 'state' = 'paused'
@@ -166,6 +167,11 @@ select pg_temp.ok(gallery_unlock_reserve(pg_temp.i('g1'), pg_temp.h('net4'), fal
 select patch_gallery(pg_temp.i('mei'), pg_temp.i('g1'), '{"unpause":true}') #>> '{gallery,status}' as st \gset
 select pg_temp.ok(:'st' = 'live'
   and not exists (select 1 from public.gallery_attempts where gallery_id = pg_temp.i('g1')), 'reopen clears the pause and the attempts');
+insert into public.gallery_attempts (gallery_id, network_hash) select pg_temp.i('g1'), pg_temp.h('again' || n) from generate_series(1, 24) n;
+select pg_temp.ok((select v ->> 'pausedNow' = 'true' and v ->> 'ownerEmail' is null and v ->> 'name' is null
+  from (select gallery_unlock_reserve(pg_temp.i('g1'), pg_temp.h('again0'), false) v) x),
+  'paused again within a day: no second email to the owner');
+select patch_gallery(pg_temp.i('mei'), pg_temp.i('g1'), '{"unpause":true}');
 select pg_temp.ok(gallery_passcode_state(pg_temp.i('mei'), pg_temp.i('g1')) ->> 'generation' = '1'
   and gallery_passcode_state(pg_temp.i('wei'), pg_temp.i('g1')) is null, 'passcode state is the owner''s');
 select set_gallery_passcode(pg_temp.i('mei'), pg_temp.i('g1'), 3, pg_temp.h('new')) as a,
@@ -186,13 +192,27 @@ select pg_temp.ok((select jsonb_agg(x ->> 'full' order by n) = '["ready","ready"
 select pg_temp.ok(guest_photos(pg_temp.i('g2'), null, 10, null) -> 'selection' = 'null'::jsonb, 'no favourites → no selection');
 
 -- ---- Renditions and storage -------------------------------------------------------------------------------
+select pg_temp.ok(guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', false) ->> 'unavailable' = 'pending'
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'view', false) ->> 'unavailable' = 'pending'
+  and get_gallery(pg_temp.i('mei'), pg_temp.i('g1')) ->> 'watermarkReady' = 'false'
+  and get_branding(pg_temp.i('mei')) ->> 'watermarkReady' = 'false',
+  'watermark on without an image to draw → pending, never unwatermarked (watermarkReady false)');
+select patch_gallery(pg_temp.i('mei'), pg_temp.i('g1'), '{"extras":{"watermark":false}}');
 select pg_temp.ok((select v #>> '{source,key}' = 'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/preview'
                      and v -> 'rendition' = 'null'::jsonb and v -> 'watermark' = 'null'::jsonb and v ->> 'wmVersion' = '0'
-  from (select guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid') v) x), 'grid comes from the preview (no watermark image yet)');
-select pg_temp.ok(guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full') #>> '{source,key}' = 'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/original'
-  and guest_media(pg_temp.i('g1'), pg_temp.i('p3'), 'full') ->> 'unavailable' = 'pending'
-  and guest_media(pg_temp.i('g2'), pg_temp.i('p1'), 'full') ->> 'unavailable' = 'not_allowed'
-  and guest_media(pg_temp.i('g1'), pg_temp.i('w1'), 'grid') is null and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'huge') is null,
+                     and v ->> 'galleryName' = 'Wedding' and v ->> 'position' = '0' and not (v ? 'filename')
+  from (select guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', false) v) x),
+  'grid comes from the preview; the plan names the gallery and position, never the member''s file name');
+select pg_temp.ok(guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full', false) ->> 'unavailable' = 'not_allowed'
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', true) ->> 'unavailable' = 'not_allowed'
+  and guest_media(pg_temp.i('gw2'), pg_temp.i('w1'), 'view', true) ->> 'unavailable' = 'not_allowed'
+  and guest_media(pg_temp.i('gw2'), pg_temp.i('w1'), 'view', false) ->> 'unavailable' is null
+  and guest_media(pg_temp.i('gw1'), pg_temp.i('w1'), 'view', true) ->> 'unavailable' is null,
+  'downloads are checked when served: none → refused, web allowed; full only as a download; grid never');
+select pg_temp.ok(guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full', true) #>> '{source,key}' = 'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/original'
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p3'), 'full', true) ->> 'unavailable' = 'pending'
+  and guest_media(pg_temp.i('g2'), pg_temp.i('p1'), 'full', true) ->> 'unavailable' = 'not_allowed'
+  and guest_media(pg_temp.i('g1'), pg_temp.i('w1'), 'grid', false) is null and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'huge', false) is null,
   'full size: the original for unedited JPEGs, pending for RAW, refused without full downloads; other photos → null');
 select pg_temp.ok(record_rendition(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', pg_temp.rk(pg_temp.i('wei'), pg_temp.i('g1'), pg_temp.i('p1'), 'grid', 'a'), 500, 0, 0) ->> 'status' = 'invalid'
   and record_rendition(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'view', 'a'), 500, 0, 0) ->> 'status' = 'invalid'
@@ -202,7 +222,7 @@ select pg_temp.ok(record_rendition(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', pg_
   'record_rendition: made from another edit version → gone');
 select record_rendition(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'grid', 'a'), 500, 0, 0) ->> 'status' as st \gset
 select pg_temp.ok(:'st' = 'ok'
-  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid') #>> '{rendition,key}' = pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'grid', 'a')
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', false) #>> '{rendition,key}' = pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'grid', 'a')
   and pg_temp.all_ok(), 'a recorded rendition is served next time and counts toward storage');
 select pg_temp.ok((select v ->> 'status' = 'exists' and v ->> 'key' = pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'grid', 'a')
   from (select record_rendition(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'grid', 'b'), 600, 0, 0) v) x),
@@ -210,16 +230,20 @@ select pg_temp.ok((select v ->> 'status' = 'exists' and v ->> 'key' = pg_temp.rk
 select record_rendition(pg_temp.i('g1'), pg_temp.i('p2'), 'view', pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p2'), 'view', 'a'), 900, 0, 0);
 -- An edit with a stored preview: grid and view now come from it, and the old rendition is replaced.
 select save_edit(pg_temp.i('mei'), pg_temp.i('p1'), '{"v":1,"light":{"exposure":0.5}}', null);
+select pg_temp.ok(guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', false) ->> 'unavailable' = 'pending'
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'view', true) ->> 'unavailable' = 'pending'
+  and record_rendition(pg_temp.i('g1'), pg_temp.i('p1'), 'view', pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'view', 'pre'), 500, 0, 0) ->> 'status' = 'gone',
+  'edited but its preview not rendered yet → pending (never the unedited original, nor the rendition made from it)');
 select record_edit_variant(pg_temp.i('mei'), pg_temp.i('p1'), 1, 'preview',
   'u/' || pg_temp.i('mei') || '/p/' || pg_temp.i('p1') || '/edit-1-preview-' || md5('e1'), 700);
 select pg_temp.ok((select v #>> '{source,editVersion}' = '1' and v -> 'rendition' = 'null'::jsonb
                      and v #>> '{source,key}' like '%/edit-1-preview-%'
-  from (select guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid') v) x), 'an edit makes a new rendition from the edited preview');
+  from (select guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', false) v) x), 'an edit makes a new rendition from the edited preview');
 select record_rendition(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'grid', 'c'), 450, 1, 0) ->> 'status' as st \gset
 select pg_temp.ok(:'st' = 'ok'
   and exists (select 1 from public.share_object_deletions where key = pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 'grid', 'a'))
   and pg_temp.all_ok(), 'the replaced rendition''s object is queued for deletion and its bytes released');
-select pg_temp.ok(guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full') ->> 'unavailable' = 'pending'
+select pg_temp.ok(guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full', true) ->> 'unavailable' = 'pending'
   and (get_gallery(pg_temp.i('mei'), pg_temp.i('g1')) ->> 'pendingRenders')::int = 2, 'an edited photo''s full size waits for a device render');
 
 -- ---- Full-size renders ------------------------------------------------------------------------------------
@@ -237,7 +261,7 @@ select pg_temp.ok(record_gallery_render(pg_temp.i('mei'), pg_temp.i('g1'), pg_te
 select record_gallery_render(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 1, pg_temp.fk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 1, 'r'), 5000) ->> 'status' as a \gset
 select record_gallery_render(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 1, pg_temp.fk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 1, 's'), 5000) ->> 'status' as b \gset
 select pg_temp.ok(:'a' = 'ok' and :'b' = 'exists'
-  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full') #>> '{source,key}' = pg_temp.fk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 1, 'r')
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full', true) #>> '{source,key}' = pg_temp.fk(pg_temp.i('mei'), pg_temp.i('g1'), pg_temp.i('p1'), 1, 'r')
   and pg_temp.all_ok(), 'a render is recorded once (a racing one → exists), becomes the full-size source and counts');
 select pl.storage_gb::bigint * 1073741824 as big from public.plan_limits pl join public.plan_limit_versions v on v.id = pl.version_id and v.status = 'active' where pl.plan_id = 'studio' \gset
 update public.profiles set storage_bytes = storage_bytes + :big where id = pg_temp.i('mei');
@@ -249,6 +273,7 @@ update public.profiles set storage_bytes = storage_bytes - :big where id = pg_te
 select pg_temp.ok(pg_temp.all_ok(), 'usage invariant holds');
 
 -- ---- Watermark and downgrades -----------------------------------------------------------------------------
+select patch_gallery(pg_temp.i('mei'), pg_temp.i('g1'), '{"extras":{"watermark":true}}');
 select pg_temp.ok(update_branding(pg_temp.i('wei'), '{"studioName":"W"}') ->> 'error' = 'plan'
   and update_branding(pg_temp.i('ana'), '{"watermark":{"opacity":50}}') ->> 'error' = 'plan', 'branding and watermark need their plan limits');
 select pg_temp.ok(record_branding_asset(pg_temp.i('mei'), 'watermark', 'o/' || pg_temp.i('wei') || '/b/watermark-' || md5('w'), 800) ->> 'status' = 'invalid'
@@ -257,29 +282,36 @@ select pg_temp.ok(record_branding_asset(pg_temp.i('mei'), 'watermark', 'o/' || p
 select pg_temp.ok((select v ->> 'status' = 'ok' and v #>> '{branding,watermark,hasImage}' = 'true'
   from (select record_branding_asset(pg_temp.i('mei'), 'watermark', 'o/' || pg_temp.i('mei') || '/b/watermark-' || md5('w'), 800) v) x)
   and pg_temp.all_ok(), 'a watermark image is recorded and counts');
+select pg_temp.ok(get_gallery(pg_temp.i('mei'), pg_temp.i('g1')) ->> 'watermarkReady' = 'true'
+  and get_branding(pg_temp.i('mei')) ->> 'watermarkReady' = 'true', 'watermarkReady once the text watermark has its image');
+select pg_temp.ok((select v ->> 'error' = 'in_use' and v ->> 'galleries' = '1'
+  from (select delete_branding_asset(pg_temp.i('mei'), 'watermark') v) x)
+  and branding_asset_key(pg_temp.i('mei'), 'watermark') is not null
+  and delete_branding_asset(pg_temp.i('mei'), 'logo') ? 'branding',
+  'the watermark image can''t be deleted while a live gallery draws it (the unused logo can)');
 select pg_temp.ok(branding_asset_key(pg_temp.i('mei'), 'watermark') like 'o/' || pg_temp.i('mei') || '/b/watermark-%'
   and branding_asset_key(pg_temp.i('wei'), 'watermark') is null, 'the owner reads back their own asset key');
 select pg_temp.ok((select v -> 'watermark' ->> 'key' like '%/b/watermark-%' and v -> 'rendition' = 'null'::jsonb and (v ->> 'wmVersion')::int > 1
-  from (select guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid') v) x), 'a watermark change makes new renditions');
+  from (select guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', false) v) x), 'a watermark change makes new renditions');
 select pg_temp.ok(update_branding(pg_temp.i('mei'), '{"studioName":"Mei Studio","accent":"#2D5FD3","watermark":{"position":"tiled","opacity":40}}') #>> '{branding,watermark,position}' = 'tiled'
   and update_branding(pg_temp.i('mei'), '{"accent":"#123456"}') ->> 'error' = 'invalid', 'branding settings (accents from the fixed list only)');
 select pg_temp.ok(guest_gallery_info(pg_temp.h('m-tok-1'), pg_temp.h('n')) #>> '{brand,studioName}' = 'Mei Studio', 'guests see the studio''s brand');
 update public.profiles set plan_id = 'free' where id = pg_temp.i('mei');
 select pg_temp.ok((select v ->> 'downloads' = 'web' and v ->> 'favourites' = 'false' and v #>> '{brand,studioName}' = 'Zephyr' and v ->> 'state' = 'locked'
   from (select guest_gallery_info(pg_temp.h('m-tok-1'), pg_temp.h('n')) v) x)
-  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid') -> 'watermark' = 'null'::jsonb
-  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full') ->> 'unavailable' = 'not_allowed'
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', false) -> 'watermark' = 'null'::jsonb
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full', true) ->> 'unavailable' = 'not_allowed'
   and get_gallery(pg_temp.i('mei'), pg_temp.i('g1')) #>> '{extras,watermark}' = 'true',
   'after a downgrade the extras stop working but the gallery stays live, unchanged');
 update public.profiles set plan_id = 'studio' where id = pg_temp.i('mei');
 
 -- ---- Favourites -------------------------------------------------------------------------------------------
-select pg_temp.ok(guest_set_favourite(pg_temp.i('g2'), pg_temp.h('v1'), pg_temp.i('p1'), true) = 'off', 'favourites off for this gallery → off');
-select pg_temp.ok(guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('w1'), true) is null, 'a photo not in the gallery → null');
-select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('p1'), true) as a \gset
-select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('p2'), true) as b \gset
-select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('p2'), false) as c \gset
-select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v2'), pg_temp.i('p2'), false) as d \gset
+select pg_temp.ok(guest_set_favourite(pg_temp.i('g2'), pg_temp.h('v1'), pg_temp.i('p1'), true, pg_temp.h('fnet')) = 'off', 'favourites off for this gallery → off');
+select pg_temp.ok(guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('w1'), true, pg_temp.h('fnet')) is null, 'a photo not in the gallery → null');
+select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('p1'), true, pg_temp.h('fnet')) as a \gset
+select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('p2'), true, pg_temp.h('fnet')) as b \gset
+select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('p2'), false, pg_temp.h('fnet')) as c \gset
+select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v2'), pg_temp.i('p2'), false, pg_temp.h('fnet')) as d \gset
 select pg_temp.ok(:'a' = 'ok' and :'b' = 'ok' and :'c' = 'ok' and :'d' = 'ok'
   and (guest_photos(pg_temp.i('g1'), null, 10, pg_temp.h('v1')) #>> '{selection,count}')::int = 1
   and guest_photos(pg_temp.i('g1'), null, 10, pg_temp.h('v1')) #>> '{items,0,favourite}' = 'true'
@@ -288,15 +320,33 @@ select pg_temp.ok(:'a' = 'ok' and :'b' = 'ok' and :'c' = 'ok' and :'d' = 'ok'
 select pg_temp.ok(guest_send_favourites(pg_temp.i('g1'), pg_temp.h('v2'), 'Ann', null) ->> 'status' = 'empty', 'send with nothing favourited → empty');
 select pg_temp.ok((select v ->> 'status' = 'ok' and v ->> 'notify' = 'true' and v ->> 'ownerEmail' = 'mei5@example.com'
   from (select guest_send_favourites(pg_temp.i('g1'), pg_temp.h('v1'), 'Lin', 'These please') v) x), 'send favourites: stored, owner emailed');
-select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v2'), pg_temp.i('p4'), true);
+select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v2'), pg_temp.i('p4'), true, pg_temp.h('fnet'));
 select pg_temp.ok(guest_send_favourites(pg_temp.i('g1'), pg_temp.h('v2'), 'Ann', null) ->> 'notify' = 'false', 'at most one favourites email per gallery an hour');
 select pg_temp.ok((select jsonb_array_length(v) = 2 and v #>> '{1,name}' is not null
   from (select gallery_favourites(pg_temp.i('mei'), pg_temp.i('g1')) v) x)
   and gallery_favourites(pg_temp.i('wei'), pg_temp.i('g1')) is null, 'the owner sees each guest''s selection');
-insert into public.gallery_guests (gallery_id, cookie_hash) select pg_temp.i('g1'), pg_temp.h('many' || n) from generate_series(1, 498) n;
-select pg_temp.ok(guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v3'), pg_temp.i('p1'), true) = 'limit'
-  and guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('p4'), true) = 'ok', 'at most 500 guests per gallery (existing ones still work)');
-delete from public.gallery_guests where cookie_hash in (select pg_temp.h('many' || n) from generate_series(1, 498) n);
+-- Guests without favourites don't count toward the cap.
+insert into public.gallery_guests (gallery_id, cookie_hash) select pg_temp.i('g1'), pg_temp.h('idle' || n) from generate_series(1, 600) n;
+select pg_temp.ok(guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v4'), pg_temp.i('p1'), true, pg_temp.h('fnet')) = 'ok',
+  'guests with no favourites don''t count toward the 500');
+delete from public.gallery_guests where cookie_hash in (select pg_temp.h('idle' || n) from generate_series(1, 600) n)
+   or cookie_hash = pg_temp.h('v4');
+with g as (insert into public.gallery_guests (gallery_id, cookie_hash)
+           select pg_temp.i('g1'), pg_temp.h('many' || n) from generate_series(1, 498) n returning id)
+insert into public.gallery_favourites (guest_id, gallery_id, photo_id) select g.id, pg_temp.i('g1'), pg_temp.i('p1') from g;
+insert into public.gallery_guests (gallery_id, cookie_hash) values (pg_temp.i('g1'), pg_temp.h('empty'));
+select pg_temp.ok(guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v3'), pg_temp.i('p1'), true, pg_temp.h('fnet')) = 'limit'
+  and guest_set_favourite(pg_temp.i('g1'), pg_temp.h('empty'), pg_temp.i('p1'), true, pg_temp.h('fnet')) = 'limit'
+  and guest_set_favourite(pg_temp.i('g1'), pg_temp.h('v1'), pg_temp.i('p4'), true, pg_temp.h('fnet')) = 'ok',
+  'at most 500 guests with favourites per gallery (existing ones still work)');
+delete from public.gallery_guests where cookie_hash in (select pg_temp.h('many' || n) from generate_series(1, 498) n)
+   or cookie_hash = pg_temp.h('empty');
+select guest_set_favourite(pg_temp.i('g1'), pg_temp.h('n' || n), pg_temp.i('p1'), true, pg_temp.h('busy')) from generate_series(1, 20) n;
+select pg_temp.ok(guest_set_favourite(pg_temp.i('g1'), pg_temp.h('n21'), pg_temp.i('p1'), true, pg_temp.h('busy')) = 'limit'
+  and guest_set_favourite(pg_temp.i('g1'), pg_temp.h('n1'), pg_temp.i('p2'), true, pg_temp.h('busy')) = 'ok'
+  and guest_set_favourite(pg_temp.i('g1'), pg_temp.h('n21'), pg_temp.i('p1'), true, pg_temp.h('calm')) = 'ok',
+  'one network makes at most 20 new guests per gallery a day');
+delete from public.gallery_guests where network_hash in (pg_temp.h('busy'), pg_temp.h('calm'));
 select update_gallery_photos(pg_temp.i('mei'), pg_temp.i('g1'), null, array[pg_temp.i('p4')]) ->> 'count' as st \gset
 select pg_temp.ok(:'st' = '3'
   and not exists (select 1 from public.gallery_favourites where photo_id = pg_temp.i('p4'))
@@ -309,9 +359,25 @@ select pg_temp.ok(gallery_preview_info(pg_temp.i('mei'), pg_temp.i('g1')) ->> 'n
 select pg_temp.ok(guest_logo(pg_temp.i('g1')) is null and guest_logo(pg_temp.i('g2')) is null, 'no logo recorded → none shown');
 
 -- ---- Reports ----------------------------------------------------------------------------------------------
-select pg_temp.ok((select v ->> 'status' = 'ok' and v ->> 'ownerId' = pg_temp.i('mei')::text
-  from (select guest_report(pg_temp.i('g1'), pg_temp.i('w1'), 'csam', 'Details', pg_temp.h('rep')) v) x), 'a guest report is stored');
-select pg_temp.ok((select photo_id is null and reason = 'csam' from public.gallery_reports where network_hash = pg_temp.h('rep'))
+select pg_temp.ok((select v ->> 'status' = 'ok' and v ->> 'ownerId' = pg_temp.i('mei')::text and v -> 'photoId' = 'null'::jsonb
+                     and v ->> 'alert' = 'true' and v ->> 'pendingCount' = '1'
+  from (select guest_report(pg_temp.i('g1'), pg_temp.i('w1'), 'csam', 'Details', pg_temp.h('rep')) v) x),
+  'a guest report is stored; a photo outside the gallery comes back null; the first CSAM report alerts');
+select (select v ->> 'alert' = 'false' and v ->> 'photoId' = pg_temp.i('p1')::text
+  from (select guest_report(pg_temp.i('g1'), pg_temp.i('p1'), 'csam', null, pg_temp.h('rep3')) v) x) as st \gset
+select pg_temp.ok(:'st'::boolean
+  and (select count(*) from public.gallery_reports where gallery_id = pg_temp.i('g1') and reason = 'csam') = 2,
+  'CSAM alerts at most once an hour per gallery (every report still recorded; the validated photo id returned)');
+-- (now() is the transaction's start: move the earlier reports and the alert back in time.)
+update public.gallery_reports set created_at = now() - interval '3 hours' where gallery_id = pg_temp.i('g1');
+update public.galleries set csam_alerted_at = now() - interval '2 hours' where id = pg_temp.i('g1');
+select guest_report(pg_temp.i('g1'), null, 'csam', null, pg_temp.h('rep4')) -> 'alert' as st \gset
+select pg_temp.ok(:'st'::boolean, 'an hour after the last alert, the next CSAM report alerts again');
+update public.galleries set csam_alerted_at = now() - interval '2 hours' where id = pg_temp.i('g1');
+select pg_temp.ok((select v ->> 'alert' = 'true' and v ->> 'pendingCount' = '2'
+  from (select guest_report(pg_temp.i('g1'), null, 'csam', null, pg_temp.h('rep3')) v) x),
+  'the alert carries the count of CSAM reports since the last one');
+select pg_temp.ok((select photo_id is null and reason = 'csam' from public.gallery_reports where network_hash = pg_temp.h('rep') and reason = 'csam')
   and exists (select 1 from public.audit_log where action = 'safety.report'), 'a photo outside the gallery isn''t attached; the report is audited');
 select guest_report(pg_temp.i('g1'), null, 'other', null, pg_temp.h('rep')) from generate_series(1, 9);
 select pg_temp.ok(guest_report(pg_temp.i('g1'), null, 'other', null, pg_temp.h('rep')) ->> 'status' = 'limited'
@@ -339,8 +405,11 @@ select pg_temp.ok(:'st'::boolean
   and not exists (select 1 from public.gallery_renditions where gallery_id = pg_temp.i('g2'))
   and exists (select 1 from public.share_object_deletions where key = pg_temp.rk(pg_temp.i('mei'), pg_temp.i('g2'), pg_temp.i('p1'), 'view', 'a'))
   and guest_gallery_info(pg_temp.h('m-tok-2'), pg_temp.h('n')) ->> 'state' = 'ended'
+  and guest_gallery_info(pg_temp.h('m-tok-2'), pg_temp.h('n')) ->> 'name' = ''
+  and guest_gallery_info(pg_temp.h('m-tok-2'), pg_temp.h('n')) #>> '{brand,studioName}' = ''
+  and guest_gallery_info(pg_temp.h('m-tok-2'), pg_temp.h('n')) ->> 'message' is null
   and guest_gallery_state(pg_temp.h('m-tok-2')) ->> 'serving' = 'false'
-  and guest_photos(pg_temp.i('g2'), null, 10, null) is null and guest_media(pg_temp.i('g2'), pg_temp.i('p1'), 'grid') is null
+  and guest_photos(pg_temp.i('g2'), null, 10, null) is null and guest_media(pg_temp.i('g2'), pg_temp.i('p1'), 'grid', false) is null
   and pg_temp.all_ok(), 'revoke: renditions go at once, guests see ended, nothing is served');
 select pg_temp.ok(patch_gallery(pg_temp.i('mei'), pg_temp.i('g2'), '{"expiresOn":"2099-01-01"}') ->> 'error' = 'ended'
   and set_gallery_passcode(pg_temp.i('mei'), pg_temp.i('g2'), 2, null) = 'ended'

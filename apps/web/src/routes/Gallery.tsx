@@ -28,6 +28,7 @@ import { createAlbum, getPhoto, thumbUrl } from '../lib/library';
 import { usePhotoList } from '../lib/photos';
 import {
   changeGalleryPhotos,
+  type GalleryState,
   galleryPreviewPath,
   getActivity,
   getFavourites,
@@ -213,6 +214,7 @@ export function GalleryPage() {
             </button>
           </Note>
         )}
+        {!ended && galleryNotices(g as GalleryState)}
         <div role="tablist" aria-label="Gallery" className="sh-tabs">
           {TABS.map((t) => (
             <NavLink
@@ -980,5 +982,26 @@ function SettingRow({
       </span>
       <span className="row__actions">{children}</span>
     </div>
+  );
+}
+
+/** Problems the member should know about before guests notice: a missing watermark, full storage. */
+export function galleryNotices(g: GalleryState) {
+  return (
+    <>
+      {g.extras.watermark && g.watermarkReady === false && (
+        <Note tone="warn" icon="alert">
+          Your watermark isn’t set up, so guests see “Preparing” instead of these photos.{' '}
+          <Link to="/settings/sharing">Set it up in Sharing &amp; branding</Link>, or turn the watermark off
+          in Settings.
+        </Note>
+      )}
+      {g.storageFull && (
+        <Note tone="warn" icon="alert">
+          Storage full — some gallery previews can’t be prepared. Guests see “Preparing” for those photos
+          until you free up space or upgrade.
+        </Note>
+      )}
+    </>
   );
 }

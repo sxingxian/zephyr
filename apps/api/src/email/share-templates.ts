@@ -130,10 +130,18 @@ export function safetyReportEmail(e: {
   galleryId: string;
   ownerId: string;
   photoId: string | null;
+  /** CSAM reports on this gallery since the last alert email (this one included; at most one email an hour). */
+  count?: number;
   at: Date;
 }): Mail {
+  const n = Math.max(1, Math.floor(e.count ?? 1));
   return layout('[Zephyr safety] CSAM report from a guest', 'CSAM report from a guest', [
     'A guest reported a shared gallery for child sexual abuse material. Review it now.',
     `Report ${e.reportId} · gallery ${e.galleryId} · account ${e.ownerId}${e.photoId ? ` · photo ${e.photoId}` : ''} · ${e.at.toISOString()}`,
+    ...(n > 1
+      ? [
+          `${n} CSAM reports on this gallery since the last alert (alerts are sent at most once an hour per gallery).`,
+        ]
+      : []),
   ]);
 }

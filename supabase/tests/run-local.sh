@@ -30,4 +30,9 @@ for t in "$here"/[1-9]*_test.sql; do
   if ! out="$("${psql[@]}" -f "$t" 2>&1 >/dev/null)"; then echo "$out"; echo "FAILED: $(basename "$t")" >&2; exit 1; fi
   echo "$out" | sed -n 's/.*NOTICE:  //p; /passed/p'
 done
+for t in "$here"/[1-9]*_race.sh; do
+  [ -e "$t" ] || continue
+  echo "test $(basename "$t")"
+  PSQL_ARGS="${psql[*]}" bash "$t"
+done
 echo "All SQL tests passed."

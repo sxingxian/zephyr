@@ -12,6 +12,7 @@ import {
   type Jar,
   jar,
   mediaLimiter,
+  must,
   r2,
   read,
   resetWorld,
@@ -22,7 +23,7 @@ import {
   world,
 } from './helpers';
 import { images } from './images';
-import { db, deleteUserCascade, libraryRpc, profile, resetDb, seedPhoto } from './library-db';
+import { db, deleteUserCascade, libraryRpc, PLANS, profile, resetDb, seedPhoto } from './library-db';
 import { type Gallery, resetShareDb, sdb, shareBytes, shareRpc } from './share-db';
 
 const MEI: User = {
@@ -375,6 +376,22 @@ describe('guest info and unlock', () => {
     // Reopening clears it.
     await call(SHARE_API.gallery(g.id), { jar: j, method: 'PATCH', body: { unpause: true } });
     expect((await unlock(token, passcode, jar(), '192.0.2.202')).res.status).toBe(200);
+    // Paused again the same day: no second email (at most one a day per gallery).
+    for (let i = 0; sdb.attempts.length < 24; i++) await unlock(token, wrong, jar(), `198.51.101.${i + 1}`);
+    expect((await unlock(token, wrong, jar(), '192.0.2.210')).res.status).toBe(423);
+    expect(world.emails.filter((e) => e.to === MEI.email && /paused/.test(e.subject))).toHaveLength(1);
+  });
+
+  it('an ended link names neither the gallery nor its owner', async () => {
+    const j = await signedIn(MEI);
+    const p = await photo(MEI.id);
+    const { token, g } = await created(j, [p.id], { passcode: false });
+    expect((await read(await get(SHARE_API.guest(token)))).brand.studioName).toBe('Mei Lin');
+    await call(SHARE_API.gallery(g.id), { jar: j, method: 'DELETE' });
+    const info = await read(await get(SHARE_API.guest(token)));
+    expect(info).toMatchObject({ state: 'ended', name: '', message: null });
+    expect(info.brand).toEqual({ studioName: '', accent: null, logoUrl: null });
+    expect(JSON.stringify(info)).not.toMatch(/Mei|Wedding/);
   });
 
   it('the unlock cookie: HttpOnly __Host- cookie, forged, expired and moved cookies fail', async () => {
@@ -505,10 +522,12 @@ describe('guest photos and media', () => {
   it('downloads: web and full as attachments, logged; full needs the plan', async () => {
     const { item, g } = await setup({ downloads: 'full', extras: { accessLog: true } });
     const web = await get(item.download.web);
-    expect(web.headers.get('Content-Disposition')).toMatch(/^attachment; filename="IMG_0001-web\.jpg"/);
+    // Never the member's file name: the gallery name and the position.
+    expect(web.headers.get('Content-Disposition')).toMatch(/^attachment; filename="Wedding 001-web\.jpg"/);
     const full = await get(item.download.full);
     expect(full.status).toBe(200);
-    expect(full.headers.get('Content-Disposition')).toMatch(/filename="IMG_0001\.jpg"/);
+    expect(full.headers.get('Content-Disposition')).toMatch(/filename="Wedding 001-full\.jpg"/);
+    expect(full.headers.get('Content-Disposition')).not.toContain('IMG_0001');
     // Full size comes from the original, re-encoded without resizing.
     expect(images.pipelines.at(-1)?.ops).toEqual([]);
     expect(images.pipelines.at(-1)?.inputBytes).toBe(900);
@@ -516,6 +535,84 @@ describe('guest photos and media', () => {
     expect(sdb.events.filter((e) => e.kind === 'downloaded')).toHaveLength(2);
     sdb.plans.set(MEI.id, 'free');
     expect((await get(item.download.full)).status).toBe(404);
+  });
+
+  it('downloads are checked when served: turning downloads off stops URLs already handed out', async () => {
+    const { item, g, j } = await setup({ downloads: 'web' });
+    expect((await get(item.download.web)).status).toBe(200);
+    await call(SHARE_API.gallery(g.id), { jar: j, method: 'PATCH', body: { downloads: 'none' } });
+    const res = await get(item.download.web);
+    expect(res.status).toBe(404);
+    expect((await get(item.view)).status).toBe(200);
+  });
+
+  it('an edited photo whose edited preview is not ready is pending, never the unedited original', async () => {
+    const { item, p } = await setup();
+    // A rendition made from the original before the edit.
+    expect((await get(item.view)).status).toBe(200);
+    db.edits.set(p.id, {
+      photoId: p.id,
+      owner: MEI.id,
+      recipe: { v: 1, crop: { x: 0.5 } },
+      version: 2,
+      thumbVersion: null,
+      thumbKey: null,
+      thumbBytes: 0,
+      previewVersion: null,
+      previewKey: null,
+      previewBytes: 0,
+      updatedAt: new Date().toISOString(),
+    });
+    images.reset();
+    for (const url of [item.grid, item.view]) {
+      const res = await get(url);
+      expect(res.status).toBe(425);
+      expect(res.headers.get('Cache-Control')).toBe('no-store');
+      expect(res.headers.get('Retry-After')).toBe('30');
+      expect(await read(res)).toMatchObject({ ok: false, error: 'pending' });
+    }
+    expect(images.pipelines).toHaveLength(0);
+    expect(world.media.fetched.filter((k) => k.includes('/view-'))).toHaveLength(1);
+    // Once the edited preview lands, a new rendition is made from it.
+    const key = `u/${MEI.id}/p/${p.id}/edit-2-preview-${'a'.repeat(32)}`;
+    await r2.put(key, JPEG(), { httpMetadata: { contentType: 'image/jpeg' } });
+    Object.assign(must(db.edits.get(p.id)), { previewVersion: 2, previewKey: key, previewBytes: 300 });
+    expect((await get(item.view)).status).toBe(200);
+    expect(images.pipelines).toHaveLength(1);
+  });
+
+  it('watermark on but nothing to draw: pending, never unwatermarked', async () => {
+    const { item, j, g } = await setup({ extras: { watermark: true } });
+    images.reset();
+    const res = await get(item.view);
+    expect(res.status).toBe(425);
+    expect(images.pipelines).toHaveLength(0);
+    const before = await read(await call(SHARE_API.gallery(g.id), { jar: j }));
+    expect(before.gallery.watermarkReady).toBe(false);
+    expect((await put(SHARE_API.brandingAsset('watermark'), PNG(), j, 'image/png')).status).toBe(200);
+    // The stored watermark image vanished from the bucket: still never unwatermarked.
+    const wmKey = must(sdb.branding.get(MEI.id)?.wmKey);
+    shared.objects.delete(wmKey);
+    expect((await get(item.view)).status).toBe(425);
+    expect(sharedKeys(`o/${MEI.id}/g/`)).toHaveLength(0);
+  });
+
+  it('past the storage allowance, previews are pending and the member is told', async () => {
+    const { item, g, j } = await setup();
+    const lim = PLANS.pro.storage;
+    const allowance = Math.min(Math.floor(lim / 10), 5 * 1073741824);
+    // Over the plan but within the allowance: previews are still made.
+    profile(MEI.id).storage += lim;
+    expect((await get(item.grid)).status).toBe(200);
+    // Past the allowance: pending, and flagged for Settings and the gallery.
+    profile(MEI.id).storage += allowance;
+    images.reset();
+    expect((await get(item.view)).status).toBe(425);
+    expect(images.pipelines).toHaveLength(0);
+    const detail = await read(await call(SHARE_API.gallery(g.id), { jar: j }));
+    expect(detail.gallery.storageFull).toBe(true);
+    profile(MEI.id).storage -= lim + allowance;
+    expect((await get(item.view)).status).toBe(200);
   });
 
   it('watermarks while the plan has it; a downgrade turns it off', async () => {
@@ -534,8 +631,10 @@ describe('guest photos and media', () => {
   it('a 451 from the media host holds the photo, suspends sharing and alerts the safety team', async () => {
     const { item, p, token, j } = await setup();
     world.media.blocked = { has: () => true } as unknown as Set<string>;
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const res = await get(item.grid);
     expect(res.status).toBe(404);
+    expect(logged.mock.calls.flat().join(' ')).toContain('safety_451');
     expect(sdb.held.has(p.id)).toBe(true);
     expect(sdb.suspended.has(MEI.id)).toBe(true);
     expect(sdb.audit).toContainEqual({ action: 'safety.csam_match', target: p.id });
@@ -693,6 +792,70 @@ describe('favourites', () => {
     expect(act.events.map((e: { kind: string }) => e.kind)).toContain('favourites_sent');
   });
 
+  it('the favourites id is hashed per gallery; one network makes at most 20 new guests a day', async () => {
+    const j = await signedIn(MEI);
+    const p = await photo(MEI.id);
+    const a = await created(j, [p.id], { passcode: false, extras: { favourites: true } });
+    const b = await created(j, [p.id], { passcode: false, extras: { favourites: true } });
+    const guest = jar();
+    await call(SHARE_API.guestFavourite(a.token, p.id), { jar: guest, method: 'PUT', body: {} });
+    await call(SHARE_API.guestFavourite(b.token, p.id), { jar: guest, method: 'PUT', body: {} });
+    const [ha, hb] = [sdb.guests[0]?.hash, sdb.guests[1]?.hash];
+    expect(ha).toBeTruthy();
+    expect(ha).not.toBe(hb);
+    for (let n = 1; n < 20; n++) {
+      const res = await call(SHARE_API.guestFavourite(a.token, p.id), {
+        jar: jar(),
+        method: 'PUT',
+        body: {},
+      });
+      expect(res.status).toBe(204);
+    }
+    const over = await call(SHARE_API.guestFavourite(a.token, p.id), { jar: jar(), method: 'PUT', body: {} });
+    expect(over.status).toBe(409);
+    expect(await read(over)).toMatchObject({ error: 'limit_reached' });
+    // Another network still can; an existing guest still can.
+    expect(
+      (
+        await call(SHARE_API.guestFavourite(a.token, p.id), {
+          jar: jar(),
+          method: 'PUT',
+          body: {},
+          ip: '198.51.100.9',
+        })
+      ).status,
+    ).toBe(204);
+    expect(
+      (await call(SHARE_API.guestFavourite(a.token, p.id), { jar: guest, method: 'PUT', body: {} })).status,
+    ).toBe(204);
+  });
+
+  it('only guests with favourites count toward the 500 cap', async () => {
+    const j = await signedIn(MEI);
+    const p = await photo(MEI.id);
+    const { g, token } = await created(j, [p.id], { passcode: false, extras: { favourites: true } });
+    const add = (n: number, favs: boolean) => {
+      for (let i = 0; i < n; i++)
+        sdb.guests.push({
+          id: crypto.randomUUID(),
+          gallery: g.id,
+          hash: `\\x${i}${favs}`,
+          name: null,
+          note: null,
+          sentAt: null,
+          favs: new Set(favs ? [p.id] : []),
+        });
+    };
+    add(600, false);
+    add(499, true);
+    expect(
+      (await call(SHARE_API.guestFavourite(token, p.id), { jar: jar(), method: 'PUT', body: {} })).status,
+    ).toBe(204);
+    expect(
+      (await call(SHARE_API.guestFavourite(token, p.id), { jar: jar(), method: 'PUT', body: {} })).status,
+    ).toBe(409);
+  });
+
   it('off without the plan or the extra', async () => {
     const j = await signedIn(MEI);
     const p = await photo(MEI.id);
@@ -750,9 +913,33 @@ describe('reports', () => {
     ).toBe(202);
     const alert = world.emails.find((e) => e.to === 'safety@zephyr.test');
     expect(alert?.text).toContain(g.id);
+    expect(alert?.text).toContain(p.id);
     expect(alert?.text).not.toContain(token);
     expect(sdb.reports).toHaveLength(2);
     expect(sdb.audit.filter((a) => a.action === 'safety.report')).toHaveLength(2);
+    // Every report is recorded, but Safety is emailed at most once an hour per gallery; the email names only
+    // the photo the database validated (in this gallery), never the guest's.
+    const other = crypto.randomUUID();
+    for (let i = 0; i < 3; i++)
+      await call(SHARE_API.guestReport(token), {
+        body: { reason: 'csam', photoId: other, turnstileToken: 't' },
+      });
+    expect(sdb.reports).toHaveLength(5);
+    expect(world.emails.filter((e) => e.to === 'safety@zephyr.test')).toHaveLength(1);
+    vi.useFakeTimers({ now: Date.now() + 3601_000, toFake: ['Date'] });
+    expect(
+      (
+        await call(SHARE_API.guestReport(token), {
+          body: { reason: 'csam', photoId: other, turnstileToken: 't' },
+        })
+      ).status,
+    ).toBe(202);
+    vi.useRealTimers();
+    const alerts = world.emails.filter((e) => e.to === 'safety@zephyr.test');
+    expect(alerts).toHaveLength(2);
+    expect(alerts[1]?.text).not.toContain(other);
+    expect(alerts[1]?.text).toContain('4 CSAM reports');
+    sdb.reports.splice(2);
     world.turnstile.action = 'gallery_unlock';
     expect(
       (await call(SHARE_API.guestReport(token), { body: { reason: 'other', turnstileToken: 't' } })).status,
@@ -776,7 +963,16 @@ describe('owner preview', () => {
     expect(item.download).toBeUndefined();
     expect(item.favourite).toBeUndefined();
     expect(item.grid).toMatch(new RegExp(`^/api/v1/galleries/${g.id}/preview/m/`));
-    expect((await call(item.grid, { jar: j })).status).toBe(200);
+    const first = await call(item.grid, { jar: j });
+    expect(first.status).toBe(200);
+    expect(first.headers.get('Cache-Control')).toBe('private, no-cache');
+    const etag = must(first.headers.get('ETag'));
+    expect(etag).toMatch(/^"[0-9a-f]{24}"$/);
+    const again = await call(item.grid, { jar: j, headers: { 'If-None-Match': etag } });
+    expect(again.status).toBe(304);
+    expect(again.headers.get('Cache-Control')).toBe('private, no-cache');
+    // The session is checked before the ETag.
+    expect((await call(item.grid, { headers: { 'If-None-Match': etag } })).status).toBe(401);
     expect((await call(item.grid, { jar: await signedIn(WEI) })).status).toBe(404);
     expect((await call(item.grid)).status).toBe(401);
     expect(g.views).toBe(0);
@@ -804,6 +1000,25 @@ describe('branding', () => {
     );
     expect(ok.branding).toMatchObject({ studioName: 'Mei Studio', accent: '#2D5FD3', hasLogo: false });
     expect((await read(await call(SHARE_API.branding, { jar: j }))).branding.studioName).toBe('Mei Studio');
+  });
+
+  it("a watermark image a live gallery draws can't be deleted (409 asset_in_use); watermarkReady says so", async () => {
+    const j = await signedIn(MEI);
+    const p = await photo(MEI.id);
+    expect((await put(SHARE_API.brandingAsset('watermark'), PNG(), j, 'image/png')).status).toBe(200);
+    expect((await read(await call(SHARE_API.branding, { jar: j }))).branding.watermarkReady).toBe(true);
+    const { g } = await created(j, [p.id], { passcode: false, extras: { watermark: true } });
+    expect((await read(await call(SHARE_API.gallery(g.id), { jar: j }))).gallery.watermarkReady).toBe(true);
+    const res = await call(SHARE_API.brandingAsset('watermark'), { jar: j, method: 'DELETE' });
+    expect(res.status).toBe(409);
+    expect(await read(res)).toEqual({ ok: false, error: 'asset_in_use', galleries: 1 });
+    expect(sdb.branding.get(MEI.id)?.wmKey).toBeTruthy();
+    // The logo isn't drawn by a text watermark: it can go.
+    expect((await call(SHARE_API.brandingAsset('logo'), { jar: j, method: 'DELETE' })).status).toBe(200);
+    // Once no live gallery uses it, the watermark image can go too.
+    await call(SHARE_API.gallery(g.id), { jar: j, method: 'PATCH', body: { extras: { watermark: false } } });
+    expect((await call(SHARE_API.brandingAsset('watermark'), { jar: j, method: 'DELETE' })).status).toBe(200);
+    expect((await read(await call(SHARE_API.branding, { jar: j }))).branding.watermarkReady).toBe(false);
   });
 
   it('logo uploads are re-encoded to a small PNG, counted, served to the owner and to guests (branding on)', async () => {

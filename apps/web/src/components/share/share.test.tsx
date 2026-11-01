@@ -1,17 +1,17 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import type { GalleryCreated, SharingLimits } from '@zephyr/shared/client';
+import type { Branding, GalleryCreated, SharingLimits } from '@zephyr/shared/client';
 import { ToastProvider } from '@zephyr/ui';
 import { createMemoryRouter, RouterProvider } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiFailure } from '../../lib/api';
 import { csvCell, toCsv } from '../../lib/csv';
 import { setSessionUserId } from '../../lib/sessionGuard';
-import { isoDay } from '../../lib/share';
+import { assetInUseMessage, isoDay, watermarkReady } from '../../lib/share';
 import { ShareRenderQueue } from '../../lib/shareRenders';
 import { refreshUsage, resetUsage } from '../../lib/usage';
 import { drawTextWatermark, WATERMARK_FONT_PX } from '../../lib/watermark';
-import { favouritesCsv } from '../../routes/Gallery';
-import { CreateGalleryDialog, GalleryLiveDialog, useShareGallery } from './ShareDialogs';
+import { favouritesCsv, galleryNotices } from '../../routes/Gallery';
+import { CreateGalleryDialog, ExtrasSwitches, GalleryLiveDialog, useShareGallery } from './ShareDialogs';
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -528,5 +528,77 @@ describe('gallery page: copy link', () => {
     const { linkCalls } = await openGallery('revoked');
     expect(screen.queryByRole('button', { name: /Copy link/ })).toBeNull();
     expect(linkCalls).toHaveLength(0);
+  });
+});
+
+// ------------------------------------------------------------ review follow-ups
+describe('watermark readiness and gallery notices', () => {
+  const withRouter = (el: React.ReactElement) => {
+    const router = createMemoryRouter([{ path: '/', element: el }]);
+    return render(<RouterProvider router={router} />);
+  };
+  const extras = { favourites: false, watermark: false, branding: false, accessLog: false };
+  const b = (o: Partial<typeof BRANDING> & { watermarkReady?: boolean } = {}) =>
+    ({ ...BRANDING, ...o }) as unknown as Branding;
+  it('a logo watermark needs a logo, a text watermark its image; the server’s flag wins', () => {
+    expect(watermarkReady(null)).toBe(false);
+    expect(watermarkReady(b({ watermark: { ...BRANDING.watermark, kind: 'logo', hasImage: true } }))).toBe(
+      false,
+    );
+    expect(watermarkReady(b({ hasLogo: true, watermark: { ...BRANDING.watermark, kind: 'logo' } }))).toBe(
+      true,
+    );
+    expect(watermarkReady(b({ watermark: { ...BRANDING.watermark, hasImage: true } }))).toBe(true);
+    expect(
+      watermarkReady(b({ watermark: { ...BRANDING.watermark, hasImage: true }, watermarkReady: false })),
+    ).toBe(false);
+  });
+  it('can’t turn the watermark on until it’s ready, but can always turn it off', () => {
+    const onChange = vi.fn();
+    const notReady = b({ watermark: { ...BRANDING.watermark, kind: 'logo', hasImage: true } });
+    const { unmount } = withRouter(
+      <ExtrasSwitches value={extras} onChange={onChange} limits={STUDIO} branding={notReady} />,
+    );
+    expect((screen.getByRole('switch', { name: /Watermark photos/ }) as HTMLInputElement).disabled).toBe(
+      true,
+    );
+    expect(screen.getByRole('link', { name: /Sharing & branding/ }).getAttribute('href')).toBe(
+      '/settings/sharing',
+    );
+    unmount();
+    withRouter(
+      <ExtrasSwitches
+        value={{ ...extras, watermark: true }}
+        onChange={onChange}
+        limits={STUDIO}
+        branding={notReady}
+      />,
+    );
+    const sw = screen.getByRole('switch', { name: /Watermark photos/ }) as HTMLInputElement;
+    expect(sw.disabled).toBe(false);
+    expect(screen.getByText(/guests see “Preparing” until it is/)).toBeTruthy();
+    fireEvent.click(sw);
+    expect(onChange).toHaveBeenCalledWith({ ...extras, watermark: false });
+  });
+  it('the gallery page warns about a missing watermark and full storage', () => {
+    const g = {
+      ...CREATED.gallery,
+      extras: { ...extras, watermark: true },
+      watermarkReady: false,
+      storageFull: true,
+    };
+    withRouter(galleryNotices(g));
+    expect(screen.getByText(/Your watermark isn’t set up/)).toBeTruthy();
+    expect(screen.getByText(/Storage full — some gallery previews can’t be prepared/)).toBeTruthy();
+    cleanup();
+    withRouter(galleryNotices(CREATED.gallery));
+    expect(screen.queryByText(/watermark isn’t set up|Storage full/)).toBeNull();
+  });
+  it('explains a 409 when removing a logo that live galleries use', () => {
+    expect(assetInUseMessage(new ApiFailure('conflict', 409), 'logo')).toMatch(
+      /logo is used by live galleries/,
+    );
+    expect(assetInUseMessage(new ApiFailure('session_changed', 409), 'logo')).toBeNull();
+    expect(assetInUseMessage(new ApiFailure('server', 500), 'logo')).toBeNull();
   });
 });

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { pickZipSink } from '../lib/editor/zipSink';
 import { GuestApiError, sendFavourites, setFavourite } from './api';
 import { accentStyle, formatDate, GuestFooter, StudioBadge } from './Chrome';
+import { GuestImage } from './GuestImage';
 import { useGuestPhotos } from './photos';
 import { SendDialog } from './SendDialog';
 import { Viewer } from './Viewer';
@@ -248,13 +249,13 @@ export function Gallery({ info, token, fetchPage, onLocked, preview }: GalleryPr
                   onClick={() => setViewing(i)}
                   aria-label={`Open photo ${i + 1}`}
                 >
-                  <img
+                  <GuestImage
+                    variant="tile"
                     src={p.grid}
                     alt=""
                     loading="lazy"
                     decoding="async"
-                    referrerPolicy="no-referrer"
-                    onError={() => void ph.refreshUrls()}
+                    onExpired={() => ph.refreshUrls()}
                   />
                 </button>
                 {favs && (

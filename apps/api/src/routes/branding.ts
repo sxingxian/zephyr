@@ -176,10 +176,13 @@ brandingRoutes.delete('/:kind', async (c) => {
   const kind = kindOf(c);
   if (!kind) return c.json(fail('not_found'), 404);
   try {
-    const res = await rpc<{ branding: unknown }>(c.env, 'delete_branding_asset', {
-      p_owner: ownerOf(c),
-      p_kind: kind,
-    });
+    const res = await rpc<{ branding: unknown } | { error: 'in_use'; galleries: number }>(
+      c.env,
+      'delete_branding_asset',
+      { p_owner: ownerOf(c), p_kind: kind },
+    );
+    // A live gallery's watermark draws this image: removing it would leave those galleries unwatermarked.
+    if ('error' in res) return c.json(fail('asset_in_use', { galleries: res.galleries }), 409);
     return c.json({ ok: true, branding: res.branding });
   } catch (err) {
     logError(c.get('requestId'), 'branding_asset_delete', err);

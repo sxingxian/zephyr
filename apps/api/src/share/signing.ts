@@ -167,9 +167,12 @@ export function newGuestId(): { value: string; cookie: string } {
   };
 }
 export const validGuestId = (v: string | undefined): v is string => !!v && /^[A-Za-z0-9_-]{43}$/.test(v);
-/** What the database stores for a favourites id: an HMAC, never the cookie. */
-export const guestIdHash = async (env: Env, value: string) =>
-  toPgBytea(await hmac(`guest:${value}`, env.IP_HASH_SECRET));
+/**
+ * What the database stores for a favourites id: an HMAC over the gallery and the cookie, never the cookie.
+ * Scoped per gallery, so the same browser can't be linked across galleries from the database.
+ */
+export const guestIdHash = async (env: Env, galleryId: string, value: string) =>
+  toPgBytea(await hmac(`guest:${galleryId}|${value}`, env.IP_HASH_SECRET));
 
 // ---- media URLs -------------------------------------------------------------------------------------------
 /** Guest media sizes: renditions (grid, view, full) and the download forms (web = view, as a file). */

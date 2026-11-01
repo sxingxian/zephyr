@@ -167,8 +167,12 @@ export async function infoBody(
   return {
     ok: true,
     state,
+    // An ended link names neither the gallery nor its owner (the database blanks them too).
     name: state === 'ended' ? '' : row.name,
-    brand: { studioName: row.brand.studioName, accent: row.brand.accent, logoUrl },
+    brand:
+      state === 'ended'
+        ? { studioName: '', accent: null, logoUrl: null }
+        : { studioName: row.brand.studioName, accent: row.brand.accent, logoUrl },
     photoCount: visible ? row.photoCount : 0,
     expiresAt: row.expiresAt,
     downloads: row.downloads,
@@ -364,7 +368,7 @@ guestRoutes.get('/:token/photos', async (c) => {
       p_gallery: r.state.id,
       p_cursor: cursor,
       p_limit: GUEST_PAGE,
-      p_guest: info.favourites && validGuestId(gid) ? await guestIdHash(c.env, gid) : null,
+      p_guest: info.favourites && validGuestId(gid) ? await guestIdHash(c.env, r.state.id, gid) : null,
     });
     if (!rows) return notFound(c);
     return c.json(
@@ -397,9 +401,10 @@ async function setFavourite(c: Ctx, on: boolean) {
     }
     const res = await rpc<'ok' | 'off' | 'limit' | null>(c.env, 'guest_set_favourite', {
       p_gallery: r.state.id,
-      p_guest: await guestIdHash(c.env, gid),
+      p_guest: await guestIdHash(c.env, r.state.id, gid),
       p_photo: photoId,
       p_on: on,
+      p_network: await networkHash(c),
     });
     if (res === null) return notFound(c);
     if (res === 'off') return c.json(fail('forbidden'), 403);
@@ -436,7 +441,7 @@ guestRoutes.post('/:token/favourites/send', async (c) => {
       | null
     >(c.env, 'guest_send_favourites', {
       p_gallery: r.state.id,
-      p_guest: await guestIdHash(c.env, gid),
+      p_guest: await guestIdHash(c.env, r.state.id, gid),
       p_name: body.name,
       p_note: body.note ?? null,
     });
@@ -478,20 +483,31 @@ guestRoutes.post('/:token/report', async (c) => {
     if (!(await verifyTurnstile(c.env, body.turnstileToken, clientIp(c), TURNSTILE_ACTIONS.galleryReport))) {
       return c.json(fail('verification_failed'), 400);
     }
-    const res = await rpc<{ status: 'ok'; reportId: string; ownerId: string } | { status: 'limited' } | null>(
-      c.env,
-      'guest_report',
-      {
-        p_gallery: r.state.id,
-        p_photo: body.photoId ?? null,
-        p_reason: body.reason,
-        p_details: body.details ?? null,
-        p_network: await networkHash(c),
-      },
-    );
+    const res = await rpc<
+      | {
+          status: 'ok';
+          reportId: string;
+          ownerId: string;
+          /** Validated by the database: in this gallery, else null. */
+          photoId: string | null;
+          /** Email Safety now (at most once an hour per gallery). */
+          alert: boolean;
+          /** CSAM reports on this gallery since the last alert (this one included). */
+          pendingCount: number;
+        }
+      | { status: 'limited' }
+      | null
+    >(c.env, 'guest_report', {
+      p_gallery: r.state.id,
+      p_photo: body.photoId ?? null,
+      p_reason: body.reason,
+      p_details: body.details ?? null,
+      p_network: await networkHash(c),
+    });
     if (!res) return notFound(c);
     if (res.status === 'limited') return rateLimited(c, 3600);
-    if (body.reason === 'csam' && c.env.SAFETY_ALERT_EMAIL) {
+    // Every report is recorded; Safety is emailed at most once an hour per gallery, with the count since.
+    if (body.reason === 'csam' && res.alert && c.env.SAFETY_ALERT_EMAIL) {
       const env = c.env;
       const galleryId = r.state.id;
       await emailLater(c, 'safety_report_email', () =>
@@ -501,7 +517,8 @@ guestRoutes.post('/:token/report', async (c) => {
             reportId: res.reportId,
             galleryId,
             ownerId: res.ownerId,
-            photoId: body.photoId ?? null,
+            photoId: res.photoId,
+            count: res.pendingCount,
             at: new Date(),
           }),
           idempotencyKey: `report-${res.reportId}`,

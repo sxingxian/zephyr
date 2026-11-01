@@ -38,6 +38,8 @@ export interface Gallery {
   views: number;
   downloadCount: number;
   favouritesNotifiedAt: number | null;
+  pausedNotifiedAt?: number | null;
+  csamAlertedAt?: number | null;
   createdAt: number;
   photos: string[];
 }
@@ -85,6 +87,8 @@ export const sdb = {
     name: string | null;
     note: string | null;
     sentAt: string | null;
+    net?: string;
+    createdAt?: number;
     favs: Set<string>;
   }[],
   attempts: [] as { id: number; gallery: string; net: string; at: number }[],
@@ -105,6 +109,7 @@ export const sdb = {
     reason: string;
     details: string | null;
     net: string;
+    at?: number;
   }[],
   queue: [] as { id: number; bucket: 'shared' | 'photos'; key: string; prefix: boolean }[],
   held: new Set<string>(),
@@ -125,6 +130,7 @@ export function resetShareDb() {
   sdb.queue = [];
   sdb.held.clear();
   sdb.suspended.clear();
+  blocked.clear();
   sdb.audit = [];
   sdb.seq = 0;
 }
@@ -219,8 +225,22 @@ const detail = (g: Gallery) => ({
   extras: { ...g.x },
   linkHint: g.linkHint,
   pendingRenders: pending(g).length,
+  watermarkReady: wmReady(sdb.branding.get(g.owner)),
+  storageFull: previewsBlocked(g.owner),
   revokedAt: iso(g.revokedAt),
 });
+/** Mirrors _watermark_ready: text needs its image, logo needs the logo. */
+function wmReady(b: Branding | undefined): boolean {
+  return !!b && (b.wmKind === 'logo' ? !!b.logoKey : !!b.wmKey);
+}
+/** Mirrors _share_overflow: 10% of the plan's storage, at most 5 GB. */
+const overflow = (lim: number) => Math.min(Math.floor(lim / 10), 5 * 1073741824);
+export const blocked = new Set<string>();
+function previewsBlocked(owner: string): boolean {
+  const prof = profile(owner);
+  const lim = rules(owner).storage;
+  return blocked.has(owner) && prof.storage + prof.reserved >= lim + overflow(lim);
+}
 const brandingJson = (b: Branding | undefined) => ({
   studioName: b?.studioName ?? null,
   accent: b?.accent ?? null,
@@ -232,6 +252,7 @@ const brandingJson = (b: Branding | undefined) => ({
     opacity: b?.wmOpacity ?? 70,
     hasImage: Boolean(b?.wmKey),
   },
+  watermarkReady: wmReady(b),
   updatedAt: b ? new Date().toISOString() : null,
 });
 const brand = (owner: string): Branding => {
@@ -305,14 +326,15 @@ function guestInfo(g: Gallery, net: unknown) {
         : g.pausedUntil && g.pausedUntil > Date.now()
           ? 'paused'
           : 'locked',
-    name: g.name,
-    message: g.message,
+    name: serving(g) ? g.name : '',
+    message: serving(g) ? g.message : null,
     photoCount: visiblePhotos(g).length,
     expiresAt: iso(g.expiresAt),
     downloads: e.downloads,
     favourites: e.favourites,
-    brand:
-      e.branding && b
+    brand: !serving(g)
+      ? { studioName: '', accent: null, hasLogo: false }
+      : e.branding && b
         ? { studioName: b.studioName ?? display ?? 'Zephyr', accent: b.accent, hasLogo: Boolean(b.logoKey) }
         : { studioName: display ?? 'Zephyr', accent: null, hasLogo: false },
     turnstile:
@@ -323,11 +345,13 @@ function guestInfo(g: Gallery, net: unknown) {
   };
 }
 
-function media(g: Gallery | undefined, photo: string, size: string) {
+function media(g: Gallery | undefined, photo: string, size: string, download: boolean) {
   if (!g || !serving(g) || !g.photos.includes(photo) || !shareable(photo)) return null;
   const p = db.photos.get(photo);
   if (!p) return null;
   const e = effective(g);
+  if ((download && (size === 'grid' || e.downloads === 'none')) || (size === 'full' && !download))
+    return { unavailable: 'not_allowed' };
   const edit = db.edits.get(photo);
   const ev0 = editVersion(photo);
   let ev = 0;
@@ -341,7 +365,9 @@ function media(g: Gallery | undefined, photo: string, size: string) {
       src = sdb.renders.find((r) => r.gallery === g.id && r.photo === photo && r.ev === ev)?.key ?? null;
       if (!src) return { unavailable: 'pending' };
     }
-  } else if (ev0 !== null && edit?.previewVersion === edit?.version && edit?.previewKey) {
+  } else if (ev0 !== null) {
+    // Edited: only the current edited preview, never the original (privacy first).
+    if (edit?.previewVersion !== edit?.version || !edit?.previewKey) return { unavailable: 'pending' };
     ev = ev0;
     src = edit.previewKey;
   } else if (p.preview > 0) src = `${pfx}preview`;
@@ -351,16 +377,24 @@ function media(g: Gallery | undefined, photo: string, size: string) {
   let wv = 0;
   const b = sdb.branding.get(g.owner);
   const wmKey = b ? (b.wmKind === 'logo' ? b.logoKey : b.wmKey) : null;
-  if (e.watermark && b && wmKey) {
+  if (e.watermark) {
+    if (!b || !wmKey) return { unavailable: 'pending' };
     wv = b.wmVersion;
     wm = { key: wmKey, version: b.wmVersion, position: b.wmPosition, opacity: b.wmOpacity };
   }
   const r = sdb.renditions.find(
     (x) => x.gallery === g.id && x.photo === photo && x.size === size && x.ev === ev && x.wv === wv,
   );
+  if (!r && size !== 'full') {
+    const prof = profile(g.owner);
+    const lim = rules(g.owner).storage;
+    if (prof.storage + prof.reserved >= lim + overflow(lim))
+      return { unavailable: 'pending', storageFull: true, ownerId: g.owner };
+  }
   return {
     ownerId: g.owner,
-    filename: p.filename,
+    galleryName: g.name,
+    position: g.photos.indexOf(photo),
     width: 4000,
     height: 3000,
     rendition: r ? { key: r.key } : null,
@@ -632,8 +666,14 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
     delete_branding_asset: (a) => {
       const owner = String(a.p_owner);
       const b = sdb.branding.get(owner);
+      const kind = String(a.p_kind);
+      if (b && ((kind === 'logo' && b.wmKind === 'logo') || (kind === 'watermark' && b.wmKind === 'text'))) {
+        const n = [...sdb.galleries.values()].filter(
+          (g) => g.owner === owner && serving(g) && effective(g).watermark,
+        ).length;
+        if (n > 0) return { error: 'in_use', galleries: n };
+      }
       if (b) {
-        const kind = String(a.p_kind);
         const key = kind === 'logo' ? b.logoKey : b.wmKey;
         if (key) {
           sdb.queue.push({ id: next(), bucket: 'shared', key, prefix: false });
@@ -692,6 +732,8 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
         pausedNow = true;
         log(g, 'paused');
       }
+      const notify = pausedNow && (!g.pausedNotifiedAt || g.pausedNotifiedAt <= Date.now() - 86400000);
+      if (notify) g.pausedNotifiedAt = Date.now();
       return {
         status: 'ok',
         attemptId: id,
@@ -699,8 +741,8 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
         generation: g.generation,
         pausedNow,
         networkAttempts: mine.length + 1,
-        ownerEmail: pausedNow ? world.users.find((u) => u.id === g.owner)?.email : null,
-        name: pausedNow ? g.name : null,
+        ownerEmail: notify ? world.users.find((u) => u.id === g.owner)?.email : null,
+        name: notify ? g.name : null,
       };
     },
     gallery_unlock_succeeded: (a) => {
@@ -731,7 +773,14 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
           : null,
       };
     },
-    guest_media: (a) => media(sdb.galleries.get(String(a.p_gallery)), String(a.p_photo), String(a.p_size)),
+    guest_media: (a) => {
+      if (typeof a.p_download !== 'boolean') throw new Error('guest_media: p_download is required');
+      return media(sdb.galleries.get(String(a.p_gallery)), String(a.p_photo), String(a.p_size), a.p_download);
+    },
+    note_previews_blocked: (a) => {
+      blocked.add(String(a.p_owner));
+      return null;
+    },
     record_rendition: (a) => {
       const g = sdb.galleries.get(String(a.p_gallery));
       const photo = String(a.p_photo);
@@ -739,7 +788,7 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
       const bytes = Number(a.p_bytes);
       if (!g || !keyOk(a.p_key, `o/${g.owner}/g/${g.id}/${photo}/${size}-`) || bytes < 1)
         return { status: 'invalid' };
-      const m = media(g, photo, size) as {
+      const m = media(g, photo, size, size === 'full') as {
         unavailable?: string;
         source: { editVersion: number };
         wmVersion: number;
@@ -755,13 +804,15 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
       if (cur && cur.ev === Number(a.p_edit_version) && cur.wv === Number(a.p_wm_version))
         return { status: 'exists', key: cur.key };
       const prof = profile(g.owner);
+      const lim = rules(g.owner).storage;
       if (
-        size === 'full' &&
         bytes > (cur?.bytes ?? 0) &&
-        prof.storage + prof.reserved + bytes - (cur?.bytes ?? 0) > rules(g.owner).storage
+        prof.storage + prof.reserved + bytes - (cur?.bytes ?? 0) > lim + (size === 'full' ? 0 : overflow(lim))
       ) {
+        if (size !== 'full') blocked.add(g.owner);
         return { status: 'storage_full' };
       }
+      if (size !== 'full') blocked.delete(g.owner);
       dropRenditions((r) => r === cur);
       sdb.renditions.push({
         gallery: g.id,
@@ -794,11 +845,25 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
       const photo = String(a.p_photo);
       if (!g || !serving(g) || !g.photos.includes(photo) || !shareable(photo)) return null;
       if (!effective(g).favourites) return 'off';
+      if (typeof a.p_network !== 'string') throw new Error('guest_set_favourite: p_network is required');
       let guest = sdb.guests.find((x) => x.gallery === g.id && x.hash === a.p_guest);
+      if (!guest && !a.p_on) return 'ok';
+      if (
+        a.p_on &&
+        !guest?.favs.size &&
+        sdb.guests.filter((x) => x.gallery === g.id && x.favs.size > 0).length >= 500
+      )
+        return 'limit';
       if (!guest) {
-        if (!a.p_on) return 'ok';
-        if (sdb.guests.filter((x) => x.gallery === g.id).length >= 500) return 'limit';
+        const day = Date.now() - 86400000;
+        if (
+          sdb.guests.filter((x) => x.gallery === g.id && x.net === a.p_network && (x.createdAt ?? 0) > day)
+            .length >= 20
+        )
+          return 'limit';
         guest = {
+          net: String(a.p_network),
+          createdAt: Date.now(),
           id: crypto.randomUUID(),
           gallery: g.id,
           hash: String(a.p_guest),
@@ -846,9 +911,20 @@ export function shareRpc(): Record<string, (a: Args) => unknown> {
         reason: String(a.p_reason),
         details: (a.p_details as string | null) ?? null,
         net: String(a.p_network),
+        at: Date.now(),
       });
       sdb.audit.push({ action: 'safety.report', target: id });
-      return { status: 'ok', reportId: id, ownerId: g.owner };
+      let alert = false;
+      let pendingCount = 0;
+      if (a.p_reason === 'csam' && (!g.csamAlertedAt || g.csamAlertedAt <= Date.now() - 3600000)) {
+        const since = g.csamAlertedAt ?? 0;
+        pendingCount = sdb.reports.filter(
+          (r) => r.gallery === g.id && r.reason === 'csam' && (r.at ?? Date.now()) > since,
+        ).length;
+        g.csamAlertedAt = Date.now();
+        alert = true;
+      }
+      return { status: 'ok', reportId: id, ownerId: g.owner, photoId: photo, alert, pendingCount };
     },
     guest_logo: (a) => {
       const g = sdb.galleries.get(String(a.p_gallery));

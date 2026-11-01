@@ -508,7 +508,8 @@ galleryRoutes.get('/:id/preview/m/:photoId/:size', async (c) => {
     ) {
       return notFound(c);
     }
-    return serveRendition(c, id, photoId, size);
+    // The owner's preview: revalidated on every use (no-cache + ETag), so it never outlives the session.
+    return serveRendition(c, id, photoId, size, { revalidate: true });
   } catch (err) {
     logError(c.get('requestId'), 'gallery_preview_media', err);
     return c.json(fail('server'), 500);

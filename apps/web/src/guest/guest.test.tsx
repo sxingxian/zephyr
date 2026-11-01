@@ -4,6 +4,8 @@ import { resetTurnstileLoader } from '@zephyr/ui';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { brandingOn, monogram, safeAccent, sameOriginUrl } from './brand';
 import { GuestApp } from './GuestApp';
+import { GuestImage } from './GuestImage';
+import { classifyImageFailure, nextPendingDelay, PENDING_DELAYS_MS, PENDING_GIVE_UP_MS } from './media';
 import { Passcode } from './Passcode';
 import { REFRESH_COOLDOWN_MS, useGuestPhotos } from './photos';
 import { parseGuestPath } from './route';
@@ -625,5 +627,154 @@ describe('report this gallery', () => {
     mockApi(() => json(200, { ...INFO, state: 'locked', turnstile: true }));
     render(<GuestApp pathname={`/g/${TOKEN}`} />);
     await waitFor(() => expect(tsActions).toContain('gallery_unlock'));
+  });
+});
+
+// ------------------------------------------------------------ review follow-ups
+describe('images the server is still preparing', () => {
+  const res = (status: number, body?: unknown) =>
+    new Response(body === undefined ? 'x' : JSON.stringify(body), {
+      status,
+      headers: { 'content-type': body === undefined ? 'image/jpeg' : 'application/json' },
+    });
+  it('tells "preparing" apart from an expired link', async () => {
+    const f = (r: Response) => vi.fn(async () => r) as unknown as typeof fetch;
+    expect(await classifyImageFailure('/u', f(res(404, { ok: false, error: 'pending' })))).toBe('pending');
+    expect(await classifyImageFailure('/u', f(res(409, { unavailable: 'pending' })))).toBe('pending');
+    expect(await classifyImageFailure('/u', f(res(425, { ok: false })))).toBe('pending');
+    expect(await classifyImageFailure('/u', f(res(503, { ok: false, error: 'storage_full' })))).toBe(
+      'pending',
+    );
+    expect(await classifyImageFailure('/u', f(res(409, { ok: false, error: 'conflict' })))).toBe('pending');
+    expect(await classifyImageFailure('/u', f(res(200)))).toBe('pending');
+    expect(await classifyImageFailure('/u', f(res(401, { ok: false, error: 'unauthenticated' })))).toBe(
+      'expired',
+    );
+    expect(await classifyImageFailure('/u', f(res(404, { ok: false, error: 'not_found' })))).toBe('expired');
+    expect(await classifyImageFailure('/u', f(res(502, { ok: false, error: 'server' })))).toBe('error');
+    const offline = vi.fn(async () => {
+      throw new TypeError('offline');
+    }) as unknown as typeof fetch;
+    expect(await classifyImageFailure('/u', offline)).toBe('error');
+  });
+  it('backs off slowly and stops after about five minutes', () => {
+    const half = () => 0.5;
+    expect(PENDING_DELAYS_MS.map((_, i) => nextPendingDelay(i, 0, half))).toEqual(PENDING_DELAYS_MS);
+    expect(nextPendingDelay(20, 0, half)).toBe(120_000);
+    expect(nextPendingDelay(3, PENDING_GIVE_UP_MS - 1000, half)).toBe(1000);
+    expect(nextPendingDelay(3, PENDING_GIVE_UP_MS, half)).toBeNull();
+    // Jitter stays within ±20%.
+    expect(nextPendingDelay(0, 0, () => 0)).toBe(4000);
+    expect(nextPendingDelay(0, 0, () => 0.999)).toBeLessThanOrEqual(6000);
+  });
+  it('a tile shows "Preparing", retries on the backoff, and shows the photo once it’s ready', async () => {
+    vi.useFakeTimers();
+    let t = 0;
+    const classify = vi.fn(async () => 'pending' as const);
+    const onExpired = vi.fn();
+    const { container } = render(
+      <GuestImage
+        variant="tile"
+        src="/api/x?e=1&s=a"
+        alt=""
+        onExpired={onExpired}
+        classify={classify}
+        now={() => t}
+      />,
+    );
+    const img = () => container.querySelector('img') as HTMLImageElement;
+    await act(async () => {
+      fireEvent.error(img());
+    });
+    expect(screen.getByRole('status').textContent).toBe('Preparing');
+    expect(img().style.opacity).toBe('0');
+    const first = img();
+    t = 6000;
+    await act(async () => {
+      vi.advanceTimersByTime(6000);
+    });
+    expect(img()).not.toBe(first); // remounted to try again
+    await act(async () => {
+      fireEvent.load(img());
+    });
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(onExpired).not.toHaveBeenCalled();
+  });
+  it('gives up after the backoff with a manual "Try again"', async () => {
+    vi.useFakeTimers();
+    let t = 0;
+    const classify = vi.fn(async () => 'pending' as const);
+    const { container } = render(
+      <GuestImage
+        variant="viewer"
+        src="/api/x"
+        alt="Shot 1"
+        onExpired={vi.fn()}
+        classify={classify}
+        now={() => t}
+      />,
+    );
+    const img = () => container.querySelector('img') as HTMLImageElement;
+    for (let i = 0; i < 12 && !screen.queryByRole('button', { name: 'Try again' }); i++) {
+      await act(async () => {
+        fireEvent.error(img());
+      });
+      t += 130_000;
+      await act(async () => {
+        vi.advanceTimersByTime(130_000);
+      });
+    }
+    expect(screen.getByText('This photo isn’t ready yet.')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(screen.getByRole('status').textContent).toMatch(/still being prepared/);
+  });
+  it('an expired URL asks for fresh ones once, and doesn’t loop on the same URL', async () => {
+    const classify = vi.fn(async () => 'expired' as const);
+    const onExpired = vi.fn();
+    const { container } = render(
+      <GuestImage variant="tile" src="/api/y" alt="" onExpired={onExpired} classify={classify} />,
+    );
+    const img = () => container.querySelector('img') as HTMLImageElement;
+    await act(async () => {
+      fireEvent.error(img());
+    });
+    expect(onExpired).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      fireEvent.error(img());
+    });
+    expect(onExpired).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('status').textContent).toBe('Preparing');
+  });
+});
+
+describe('ended links and downloads after the review', () => {
+  it('an ended link without a name or studio uses general wording', async () => {
+    mockApi(
+      galleryApi({
+        info: {
+          state: 'ended',
+          name: '',
+          expiresAt: '2026-01-01T23:59:59Z',
+          brand: { studioName: '', accent: null, logoUrl: null },
+        },
+      }),
+    );
+    render(<GuestApp pathname={`/g/${TOKEN}`} />);
+    expect(await screen.findByRole('heading', { name: 'This gallery has ended' })).toBeTruthy();
+    expect(
+      screen.getByText(
+        /^This link stopped working on 1 Jan 2026\. .*ask the person who shared it for a new link\.$/,
+      ),
+    ).toBeTruthy();
+  });
+  it('single downloads leave the file name to the server (no member file name in the page)', async () => {
+    mockApi(galleryApi({}));
+    render(<GuestApp pathname={`/g/${TOKEN}`} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Open photo 1' }));
+    const dialog = within(screen.getByRole('dialog'));
+    fireEvent.click(dialog.getByRole('button', { name: /^Download/ }));
+    for (const a of dialog.getAllByRole('menuitem')) {
+      if (a.tagName === 'A') expect(a.getAttribute('download')).toBe('');
+    }
   });
 });

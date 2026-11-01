@@ -9,6 +9,7 @@ import { errorMessage } from '../lib/api';
 import { listPhotos, previewUrl } from '../lib/library';
 import { useSession } from '../lib/session';
 import {
+  assetInUseMessage,
   deleteBrandingAsset,
   getBranding,
   putBrandingAsset,
@@ -28,6 +29,9 @@ const ACCENT_NAMES: Record<(typeof BRAND_ACCENTS)[number], string> = {
   '#0E6B78': 'Teal',
   '#8A5A00': 'Bronze',
 };
+/** An error whose message is written for the member and shown as it is. */
+class ShownError extends Error {}
+
 const POSITIONS: { value: Branding['watermark']['position']; label: string }[] = [
   { value: 'bottom-right', label: 'Bottom right' },
   { value: 'bottom-left', label: 'Bottom left' },
@@ -101,7 +105,7 @@ export function SharingSettings() {
       await fn();
       if (ok) toast.show(ok, 'good');
     } catch (e) {
-      toast.show(errorMessage(e), 'bad');
+      toast.show(e instanceof ShownError ? e.message : errorMessage(e), 'bad');
     } finally {
       setBusy(null);
     }
@@ -215,7 +219,14 @@ export function SharingSettings() {
                           kind="ghost"
                           onClick={() =>
                             run('logo', async () => {
-                              apply(await deleteBrandingAsset('logo'));
+                              try {
+                                apply(await deleteBrandingAsset('logo'));
+                              } catch (e) {
+                                // 409 while live galleries draw this logo as their watermark.
+                                const inUse = assetInUseMessage(e, 'logo');
+                                if (inUse) throw new ShownError(inUse);
+                                throw e;
+                              }
                               setLogoUrl(null);
                             })
                           }

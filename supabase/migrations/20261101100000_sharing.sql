@@ -37,6 +37,9 @@ update public.plan_limits set guest_favourites = true, watermark = true, access_
 -- staff review it. The account's sharing is suspended at the same time.
 alter table public.photos add column safety_hold_at timestamptz;
 alter table public.profiles add column sharing_suspended_at timestamptz;
+-- Set while a grid/view rendition was refused because the account is past its storage overflow allowance
+-- (Settings shows "Storage full — some gallery previews can't be prepared"); cleared by the next one stored.
+alter table public.profiles add column share_previews_blocked_at timestamptz;
 
 -- ---------------------------------------------------------------------------------------------
 -- Tables
@@ -69,6 +72,10 @@ create table public.galleries (
   download_count integer not null default 0 check (download_count >= 0),
   reminder_sent_at timestamptz,
   favourites_notified_at timestamptz,
+  -- The last "gallery paused" email to the owner (at most one a day per gallery).
+  paused_notified_at timestamptz,
+  -- The last CSAM report alert emailed to Safety for this gallery (at most one an hour per gallery).
+  csam_alerted_at timestamptz,
   -- Set once the job removed an ended gallery's renditions (a day after it ended).
   renditions_purged_at timestamptz,
   created_at timestamptz not null default now(),
@@ -125,10 +132,13 @@ create table public.gallery_guests (
   name text check (name is null or length(name) between 1 and 60),
   note text check (note is null or length(note) <= 1000),
   sent_at timestamptz,
+  -- The network (HMAC, never an IP) that created this guest: caps new guest identities per network.
+  network_hash bytea check (network_hash is null or octet_length(network_hash) = 32),
   created_at timestamptz not null default now(),
   unique (gallery_id, cookie_hash)
 );
 alter table public.gallery_guests enable row level security;
+create index gallery_guests_network on public.gallery_guests (gallery_id, network_hash, created_at);
 
 create table public.gallery_favourites (
   guest_id uuid not null references public.gallery_guests (id) on delete cascade,
@@ -382,6 +392,31 @@ language sql immutable set search_path = '' as $$
     end || '[0-9a-f]{32}$');
 $$;
 
+-- True when the owner's watermark has an image to draw: a text watermark needs its rendered image, a logo
+-- watermark needs the logo. Without one, watermarked galleries serve nothing (never unwatermarked).
+create function public._watermark_ready(b public.branding) returns boolean
+language sql immutable set search_path = '' as $$
+  select b.owner_id is not null
+     and case coalesce(b.wm_kind, 'text') when 'logo' then b.logo_key is not null else b.wm_key is not null end;
+$$;
+
+-- Grid/view renditions may take an account past its plan storage by this much (10% of the plan's storage,
+-- at most 5 GB), so a full account doesn't break its galleries at once; past it, previews wait.
+create function public._share_overflow(p_storage bigint) returns bigint
+language sql immutable set search_path = '' as $$
+  select least(p_storage / 10, 5::bigint * 1073741824);
+$$;
+
+-- "Storage full — some gallery previews can't be prepared": a preview was refused past the overflow
+-- allowance and the account is still past it (clears by itself once there's room).
+create function public._previews_blocked(pr public.profiles) returns boolean
+language sql stable set search_path = '' as $$
+  select pr.share_previews_blocked_at is not null
+     and pr.storage_bytes + pr.reserved_bytes
+         >= r.storage_bytes + public._share_overflow(r.storage_bytes)
+    from public._share_rules(pr.plan_id) r;
+$$;
+
 create function public._gallery_summary(g public.galleries) returns jsonb
 language sql stable set search_path = '' as $$
   select jsonb_build_object(
@@ -423,6 +458,8 @@ language sql stable set search_path = '' as $$
                                  'branding', g.x_branding, 'accessLog', g.x_access_log),
     'linkHint', g.link_hint,
     'pendingRenders', (select count(*) from public._pending_renders(g)),
+    'watermarkReady', coalesce((select public._watermark_ready(b) from public.branding b where b.owner_id = g.owner_id), false),
+    'storageFull', coalesce((select public._previews_blocked(pr) from public.profiles pr where pr.id = g.owner_id), false),
     'revokedAt', g.revoked_at);
 $$;
 
@@ -435,6 +472,7 @@ language sql stable set search_path = '' as $$
     'watermark', jsonb_build_object('kind', coalesce(b.wm_kind, 'text'), 'text', b.wm_text,
                                     'position', coalesce(b.wm_position, 'bottom-right'),
                                     'opacity', coalesce(b.wm_opacity, 70), 'hasImage', b.wm_key is not null),
+    'watermarkReady', coalesce(public._watermark_ready(b), false),
     'updatedAt', b.updated_at);
 $$;
 
@@ -468,6 +506,14 @@ begin
 end;
 $$;
 
+-- Every change to an owner's live-gallery count (create, reopen) runs under these two locks, always taken
+-- in this order (storage first, as everywhere else), and counts while holding them.
+create function public._lock_galleries(p_owner uuid) returns void
+language sql volatile set search_path = '' as $$
+  select public._lock_storage(p_owner);
+  select pg_advisory_xact_lock(hashtextextended('zephyr:galleries:' || p_owner::text, 0));
+$$;
+
 create function public._owner_email(p_owner uuid) returns text
 language sql stable set search_path = '' as $$
   select u.email::text from auth.users u where u.id = p_owner;
@@ -497,8 +543,8 @@ begin
      or p_token_hash is null or octet_length(p_token_hash) <> 32 then
     return jsonb_build_object('error', 'invalid');
   end if;
-  -- One owner's gallery count changes one at a time.
-  perform pg_advisory_xact_lock(hashtextextended('zephyr:galleries:' || p_owner::text, 0));
+  -- One owner's live-gallery count changes one at a time (same locks, same order as patch_gallery).
+  perform public._lock_galleries(p_owner);
   select pr.plan_id, pr.sharing_suspended_at, pr.deletion_due, pr.deleted_at into prof
     from public.profiles pr where pr.id = p_owner;
   if not found or prof.deleted_at is not null or prof.deletion_due is not null then
@@ -564,7 +610,8 @@ declare
   exp timestamptz;
   x jsonb := coalesce(p_patch -> 'extras', '{}'::jsonb);
 begin
-  perform public._lock_storage(p_owner);
+  -- Reopening changes the live-gallery count: the same locks, in the same order, as create_gallery.
+  perform public._lock_galleries(p_owner);
   select * into g from public.galleries where id = p_id and owner_id = p_owner for update;
   if not found then return null; end if;
   if g.revoked_at is not null then return jsonb_build_object('error', 'ended'); end if;
@@ -864,7 +911,7 @@ language sql stable security definer set search_path = '' as $$
                   jsonb_build_object('studioName', null, 'accent', null, 'hasLogo', false,
                     'watermark', jsonb_build_object('kind', 'text', 'text', null, 'position', 'bottom-right',
                                                     'opacity', 70, 'hasImage', false),
-                    'updatedAt', null));
+                    'watermarkReady', false, 'updatedAt', null));
 $$;
 
 -- p_patch: BrandingBody (validated by the Worker). Name and accent need the plan's branding; watermark
@@ -944,11 +991,21 @@ language sql stable security definer set search_path = '' as $$
     from public.branding b where b.owner_id = p_owner;
 $$;
 
+-- {branding} | {error: 'in_use', galleries} while a live gallery shows the watermark this image draws
+-- (a logo watermark needs the logo, a text watermark its image): removing it would stop those galleries.
 create function public.delete_branding_asset(p_owner uuid, p_kind text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
-declare b public.branding;
+declare
+  b public.branding;
+  n integer;
 begin
   perform public._lock_storage(p_owner);
+  select * into b from public.branding where owner_id = p_owner for update;
+  if found and ((p_kind = 'logo' and b.wm_kind = 'logo') or (p_kind = 'watermark' and b.wm_kind = 'text')) then
+    select count(*) into n from public.galleries g cross join lateral public._gallery_effective(g) e
+     where g.owner_id = p_owner and e.watermark and public._gallery_serving(g);
+    if n > 0 then return jsonb_build_object('error', 'in_use', 'galleries', n); end if;
+  end if;
   if p_kind = 'logo' then
     update public.branding set logo_key = null, logo_bytes = 0, wm_version = wm_version + 1, updated_at = now()
      where owner_id = p_owner;
@@ -990,14 +1047,17 @@ language sql stable set search_path = '' as $$
                   when g.passcode_hmac is null then 'open'
                   when g.paused_until > now() then 'paused'
                   else 'locked' end,
-    'name', g.name,
-    'message', g.message,
+    -- An ended link names neither the gallery nor its owner (anyone holding an old link could look).
+    'name', case when public._gallery_serving(g) then g.name else '' end,
+    'message', case when public._gallery_serving(g) then g.message end,
     'photoCount', (select count(*) from public.gallery_photos gp join public.photos p on p.id = gp.photo_id
                     where gp.gallery_id = g.id and public._photo_shareable(p)),
     'expiresAt', g.expires_at,
     'downloads', e.downloads,
     'favourites', e.favourites,
-    'brand', case when e.branding and b.owner_id is not null
+    'brand', case when not public._gallery_serving(g)
+                  then jsonb_build_object('studioName', '', 'accent', null, 'hasLogo', false)
+                  when e.branding and b.owner_id is not null
                   then jsonb_build_object('studioName', coalesce(b.studio_name, pr.display_name, 'Zephyr'),
                                           'accent', b.accent, 'hasLogo', b.logo_key is not null)
                   else jsonb_build_object('studioName', coalesce(pr.display_name, 'Zephyr'), 'accent', null, 'hasLogo', false) end,
@@ -1035,7 +1095,8 @@ $$;
 -- gallery's row lock so parallel guesses can't slip past. Limits (PASSCODE_LIMITS): 5 per network per
 -- 15 minutes; from the 3rd attempt in the window a Turnstile token is required (p_has_turnstile, checked
 -- by the Worker); 25 from anywhere pause unlocking for 15 minutes. Returns
--- {status: 'ok', attemptId, hmac (hex), generation, pausedNow, ownerEmail?, name?} |
+-- {status: 'ok', attemptId, hmac (hex), generation, pausedNow, ownerEmail?, name?} (ownerEmail only when
+-- the owner should be emailed: at most once a day per gallery) |
 -- {status: 'turnstile'} | {status: 'limited', retryAfter} | {status: 'paused', pausedUntil} |
 -- {status: 'open'} (no passcode) | {status: 'ended'}, or null.
 create function public.gallery_unlock_reserve(p_gallery uuid, p_network bytea, p_has_turnstile boolean) returns jsonb
@@ -1047,6 +1108,7 @@ declare
   oldest timestamptz;
   att bigint;
   paused_now boolean := false;
+  notify boolean := false;
 begin
   if p_network is null or octet_length(p_network) <> 32 then return null; end if;
   select * into g from public.galleries where id = p_gallery for update;
@@ -1068,11 +1130,16 @@ begin
     update public.galleries set paused_until = now() + interval '15 minutes' where id = g.id;
     paused_now := true;
     perform public._gallery_log(g.id, 'paused', null, null, 1);
+    -- The owner hears about it at most once a day per gallery (repeated pauses mustn't flood their inbox).
+    if g.paused_notified_at is null or g.paused_notified_at <= now() - interval '24 hours' then
+      update public.galleries set paused_notified_at = now() where id = g.id;
+      notify := true;
+    end if;
   end if;
   return jsonb_build_object('status', 'ok', 'attemptId', att, 'hmac', encode(g.passcode_hmac, 'hex'),
     'generation', g.passcode_generation, 'pausedNow', paused_now, 'networkAttempts', n_net + 1,
-    'ownerEmail', case when paused_now then public._owner_email(g.owner_id) end,
-    'name', case when paused_now then g.name end);
+    'ownerEmail', case when notify then public._owner_email(g.owner_id) end,
+    'name', case when notify then g.name end);
 end;
 $$;
 
@@ -1133,13 +1200,20 @@ $$;
 
 -- What the media route needs to serve one rendition of one photo: the stored rendition if it was made from
 -- the current source and watermark, else the source to make it from. Null if the photo isn't shown in a
--- serving gallery. {ownerId, filename, rendition: {key} | null, unavailable?: 'pending' | 'not_allowed',
--- source: {key, editVersion}, watermark: {key, version, position, opacity} | null, wmVersion}.
-create function public.guest_media(p_gallery uuid, p_photo uuid, p_size text) returns jsonb
+-- serving gallery. p_download: the guest is downloading (web = 'view', or 'full'), which the gallery's
+-- downloads in force must allow. {ownerId, galleryName, position, rendition: {key} | null,
+-- unavailable?: 'pending' | 'not_allowed', storageFull?, source: {key, editVersion},
+-- watermark: {key, version, position, opacity} | null, wmVersion}.
+-- Never serves what the owner didn't mean guests to see: an edited photo waits ('pending') until its
+-- edited preview is current (never the unedited original), and a watermarked gallery waits until the
+-- watermark has an image (never unwatermarked). Renditions carry the edit and watermark versions they
+-- were made from, so ones made before an edit (or a watermark change) are never served after it.
+create function public.guest_media(p_gallery uuid, p_photo uuid, p_size text, p_download boolean) returns jsonb
 language plpgsql stable security definer set search_path = '' as $$
 declare
   g public.galleries;
   p public.photos;
+  pos integer;
   e public.photo_edits;
   eff record;
   b public.branding;
@@ -1148,14 +1222,19 @@ declare
   wm jsonb;
   wv integer := 0;
   rk text;
+  prof record;
 begin
-  if p_size not in ('grid', 'view', 'full') then return null; end if;
+  if p_size not in ('grid', 'view', 'full') or p_download is null then return null; end if;
   select * into g from public.galleries where id = p_gallery;
   if not found or not public._gallery_serving(g) then return null; end if;
-  select ph.* into p from public.photos ph join public.gallery_photos gp on gp.photo_id = ph.id and gp.gallery_id = g.id
-   where ph.id = p_photo;
+  select gp.position into pos from public.gallery_photos gp where gp.gallery_id = g.id and gp.photo_id = p_photo;
+  if not found then return null; end if;
+  select * into p from public.photos ph where ph.id = p_photo;
   if not found or not public._photo_shareable(p) then return null; end if;
   select * into eff from public._gallery_effective(g);
+  if (p_download and (p_size = 'grid' or eff.downloads = 'none')) or (p_size = 'full' and not p_download) then
+    return jsonb_build_object('unavailable', 'not_allowed');
+  end if;
   select * into e from public.photo_edits pe where pe.photo_id = p.id and not public._recipe_empty(pe.recipe);
   if p_size = 'full' then
     if eff.downloads <> 'full' then return jsonb_build_object('unavailable', 'not_allowed'); end if;
@@ -1166,7 +1245,11 @@ begin
       select r.key into src from public.gallery_renders r where r.gallery_id = g.id and r.photo_id = p.id and r.edit_version = ev;
       if src is null then return jsonb_build_object('unavailable', 'pending'); end if;
     end if;
-  elsif e.photo_id is not null and e.preview_version = e.version and e.preview_key is not null then
+  elsif e.photo_id is not null then
+    -- Edited: only the edited preview of the current version. Privacy first: no older or unedited image.
+    if e.preview_version is distinct from e.version or e.preview_key is null then
+      return jsonb_build_object('unavailable', 'pending');
+    end if;
     ev := e.version; src := e.preview_key;
   elsif p.has_preview then
     ev := 0; src := public._r2_prefix(p.owner_id, p.id) || 'preview';
@@ -1178,26 +1261,50 @@ begin
   if eff.watermark then
     select * into b from public.branding where owner_id = g.owner_id;
     -- A 'logo' watermark draws the logo; a 'text' one draws the PNG the member's device rendered.
-    if found and (case b.wm_kind when 'logo' then b.logo_key else b.wm_key end) is not null then
-      wv := b.wm_version;
-      wm := jsonb_build_object('key', case b.wm_kind when 'logo' then b.logo_key else b.wm_key end,
-                               'version', b.wm_version, 'position', b.wm_position, 'opacity', b.wm_opacity);
-    end if;
+    if not found or not public._watermark_ready(b) then return jsonb_build_object('unavailable', 'pending'); end if;
+    wv := b.wm_version;
+    wm := jsonb_build_object('key', case b.wm_kind when 'logo' then b.logo_key else b.wm_key end,
+                             'version', b.wm_version, 'position', b.wm_position, 'opacity', b.wm_opacity);
   end if;
   select r.key into rk from public.gallery_renditions r
    where r.gallery_id = g.id and r.photo_id = p.id and r.size = p_size and r.edit_version = ev and r.wm_version = wv;
-  return jsonb_build_object('ownerId', g.owner_id, 'filename', p.filename, 'width', p.width, 'height', p.height,
+  if rk is null and p_size <> 'full' then
+    -- No room left even with the overflow allowance: don't make a rendition only to refuse it.
+    select pr.storage_bytes, pr.reserved_bytes, r.storage_bytes as lim into prof
+      from public.profiles pr cross join lateral public._share_rules(pr.plan_id) r where pr.id = g.owner_id;
+    if prof.storage_bytes + prof.reserved_bytes >= prof.lim + public._share_overflow(prof.lim) then
+      return jsonb_build_object('unavailable', 'pending', 'storageFull', true, 'ownerId', g.owner_id);
+    end if;
+  end if;
+  return jsonb_build_object('ownerId', g.owner_id, 'galleryName', g.name, 'position', pos,
+    'width', p.width, 'height', p.height,
     'rendition', case when rk is not null then jsonb_build_object('key', rk) end,
     'source', jsonb_build_object('key', src, 'editVersion', ev),
     'watermark', wm, 'wmVersion', wv);
 end;
 $$;
 
+-- Flags the account for Settings ("Storage full — some gallery previews can't be prepared"). Written at
+-- most once an hour; cleared when a preview is stored again (record_rendition).
+create function public._note_previews_blocked(p_owner uuid) returns void
+language sql volatile set search_path = '' as $$
+  update public.profiles set share_previews_blocked_at = now()
+   where id = p_owner and (share_previews_blocked_at is null or share_previews_blocked_at < now() - interval '1 hour');
+$$;
+
+-- The media route saw guest_media refuse a preview for storage (storageFull): flag the account.
+create function public.note_previews_blocked(p_owner uuid) returns void
+language sql volatile security definer set search_path = '' as $$
+  select public._note_previews_blocked(p_owner);
+$$;
+
 -- Records a rendition the Worker made and stored at p_key, if it still matches the photo's current source
 -- (p_edit_version) and watermark (p_wm_version). Under the owner's storage lock. Grid and view renditions
--- always count but are never refused (a full account mustn't break its galleries); full ones are refused
--- when storage is full. {status: 'ok'} | {status: 'exists', key} (another request recorded the same one:
--- the Worker deletes its own object and serves that) | {status: 'gone' | 'storage_full' | 'invalid'}.
+-- may go past the plan's storage by the overflow allowance (_share_overflow), so a full account doesn't
+-- break its galleries at once; past that they are refused too (and the account is flagged for Settings).
+-- Full ones are refused when storage is full. {status: 'ok'} | {status: 'exists', key} (another request
+-- recorded the same one: the Worker deletes its own object and serves that) |
+-- {status: 'gone' | 'storage_full' | 'invalid'}.
 create function public.record_rendition(p_gallery uuid, p_photo uuid, p_size text, p_key text, p_bytes bigint,
   p_edit_version integer, p_wm_version integer) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
@@ -1206,6 +1313,7 @@ declare
   m jsonb;
   cur public.gallery_renditions;
   prof record;
+  allowance bigint;
 begin
   select * into g from public.galleries where id = p_gallery;
   if not found or p_bytes is null or p_bytes not between 1 and 104857600
@@ -1213,7 +1321,7 @@ begin
     return jsonb_build_object('status', 'invalid');
   end if;
   perform public._lock_storage(g.owner_id);
-  m := public.guest_media(p_gallery, p_photo, p_size);
+  m := public.guest_media(p_gallery, p_photo, p_size, p_size = 'full');
   if m is null or m ? 'unavailable' or (m -> 'source' ->> 'editVersion')::integer <> p_edit_version
      or (m ->> 'wmVersion')::integer <> p_wm_version then
     return jsonb_build_object('status', 'gone');
@@ -1222,12 +1330,16 @@ begin
   if found and cur.edit_version = p_edit_version and cur.wm_version = p_wm_version then
     return jsonb_build_object('status', 'exists', 'key', cur.key);
   end if;
-  if p_size = 'full' then
-    select pr.plan_id, pr.storage_bytes, pr.reserved_bytes into prof from public.profiles pr where pr.id = g.owner_id for update;
-    if p_bytes > coalesce(cur.bytes, 0)
-       and prof.storage_bytes + prof.reserved_bytes + p_bytes - coalesce(cur.bytes, 0) > (select r.storage_bytes from public._share_rules(prof.plan_id) r) then
-      return jsonb_build_object('status', 'storage_full');
-    end if;
+  select pr.plan_id, pr.storage_bytes, pr.reserved_bytes, pr.share_previews_blocked_at, r.storage_bytes as lim into prof
+    from public.profiles pr cross join lateral public._share_rules(pr.plan_id) r where pr.id = g.owner_id for update of pr;
+  allowance := prof.lim + (case when p_size = 'full' then 0 else public._share_overflow(prof.lim) end);
+  if p_bytes > coalesce(cur.bytes, 0)
+     and prof.storage_bytes + prof.reserved_bytes + p_bytes - coalesce(cur.bytes, 0) > allowance then
+    if p_size <> 'full' then perform public._note_previews_blocked(g.owner_id); end if;
+    return jsonb_build_object('status', 'storage_full');
+  end if;
+  if p_size <> 'full' and prof.share_previews_blocked_at is not null then
+    update public.profiles set share_previews_blocked_at = null where id = g.owner_id;
   end if;
   insert into public.gallery_renditions (gallery_id, photo_id, size, owner_id, key, bytes, edit_version, wm_version)
   values (p_gallery, p_photo, p_size, g.owner_id, p_key, p_bytes, p_edit_version, p_wm_version)
@@ -1248,14 +1360,18 @@ end;
 $$;
 
 -- Favourites a photo for this browser (or removes it). 'ok' | 'off' (favourites not in force) | 'limit'
--- (500 guests per gallery), or null (not a shareable photo of a serving gallery).
-create function public.guest_set_favourite(p_gallery uuid, p_guest bytea, p_photo uuid, p_on boolean) returns text
+-- (500 guests with favourites per gallery, or this network already made 20 new guests here today), or
+-- null (not a shareable photo of a serving gallery).
+create function public.guest_set_favourite(p_gallery uuid, p_guest bytea, p_photo uuid, p_on boolean, p_network bytea)
+returns text
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   g public.galleries;
   gid uuid;
 begin
-  if p_guest is null or octet_length(p_guest) <> 32 then return null; end if;
+  if p_guest is null or octet_length(p_guest) <> 32 or p_network is null or octet_length(p_network) <> 32 then
+    return null;
+  end if;
   select * into g from public.galleries where id = p_gallery for update;
   if not found or not public._gallery_serving(g) then return null; end if;
   if not exists (select 1 from public.gallery_photos gp join public.photos p on p.id = gp.photo_id
@@ -1264,10 +1380,20 @@ begin
   end if;
   if not (select e.favourites from public._gallery_effective(g) e) then return 'off'; end if;
   select id into gid from public.gallery_guests where gallery_id = g.id and cookie_hash = p_guest;
+  if gid is null and not p_on then return 'ok'; end if;
+  -- Only guests who have favourites count toward the cap (one who cleared theirs frees a place).
+  if p_on and (gid is null or not exists (select 1 from public.gallery_favourites f where f.guest_id = gid))
+     and (select count(distinct f.guest_id) from public.gallery_favourites f where f.gallery_id = g.id) >= 500 then
+    return 'limit';
+  end if;
   if gid is null then
-    if not p_on then return 'ok'; end if;
-    if (select count(*) from public.gallery_guests where gallery_id = g.id) >= 500 then return 'limit'; end if;
-    insert into public.gallery_guests (gallery_id, cookie_hash) values (g.id, p_guest) returning id into gid;
+    -- One network can't mint guests to fill the cap: 20 new guest identities per gallery a day.
+    if (select count(*) from public.gallery_guests gg where gg.gallery_id = g.id and gg.network_hash = p_network
+          and gg.created_at > now() - interval '1 day') >= 20 then
+      return 'limit';
+    end if;
+    insert into public.gallery_guests (gallery_id, cookie_hash, network_hash) values (g.id, p_guest, p_network)
+    returning id into gid;
   end if;
   if p_on then
     insert into public.gallery_favourites (guest_id, gallery_id, photo_id) values (gid, g.id, p_photo) on conflict do nothing;
@@ -1312,7 +1438,10 @@ end;
 $$;
 
 -- A guest reports a gallery (and optionally one photo in it). Needs only the link: it works on locked and
--- ended galleries too. At most 10 reports per network a day. {status: 'ok', reportId, ownerId} |
+-- ended galleries too. At most 10 reports per network a day (counted under a per-network lock). Every
+-- report is recorded; a CSAM report alerts Safety by email at most once an hour per gallery (alert true),
+-- the email carrying how many CSAM reports came in since the last one (pendingCount).
+-- {status: 'ok', reportId, ownerId, photoId (validated: in this gallery, else null), alert, pendingCount} |
 -- {status: 'limited'}, or null for an unknown gallery. Reports outlive the gallery (gallery_id set null).
 create function public.guest_report(p_gallery uuid, p_photo uuid, p_reason text, p_details text, p_network bytea)
 returns jsonb
@@ -1321,12 +1450,15 @@ declare
   g public.galleries;
   rid uuid;
   ph uuid;
+  alert boolean := false;
+  pending integer := 0;
 begin
   if p_network is null or octet_length(p_network) <> 32 or p_reason not in ('csam', 'violence', 'copyright', 'privacy', 'other')
      or coalesce(length(p_details), 0) > 1000 then
     return null;
   end if;
-  select * into g from public.galleries where id = p_gallery;
+  perform pg_advisory_xact_lock(hashtextextended('zephyr:report:' || encode(p_network, 'hex'), 0));
+  select * into g from public.galleries where id = p_gallery for update;
   if not found then return null; end if;
   if (select count(*) from public.gallery_reports r where r.network_hash = p_network
         and r.created_at > now() - interval '1 day') >= 10 then
@@ -1337,7 +1469,14 @@ begin
   values (g.id, g.owner_id, ph, p_reason, nullif(p_details, ''), p_network) returning id into rid;
   perform public._audit(null, 'safety.report', rid::text,
                         jsonb_build_object('galleryId', g.id, 'ownerId', g.owner_id, 'photoId', ph, 'reason', p_reason));
-  return jsonb_build_object('status', 'ok', 'reportId', rid, 'ownerId', g.owner_id);
+  if p_reason = 'csam' and (g.csam_alerted_at is null or g.csam_alerted_at <= now() - interval '1 hour') then
+    select count(*) into pending from public.gallery_reports r
+     where r.gallery_id = g.id and r.reason = 'csam' and r.created_at > coalesce(g.csam_alerted_at, '-infinity');
+    update public.galleries set csam_alerted_at = now() where id = g.id;
+    alert := true;
+  end if;
+  return jsonb_build_object('status', 'ok', 'reportId', rid, 'ownerId', g.owner_id, 'photoId', ph,
+                            'alert', alert, 'pendingCount', pending);
 end;
 $$;
 
@@ -1444,7 +1583,10 @@ language sql stable security definer set search_path = '' as $$
       'watermark', s.watermark,
       'branding', s.branding,
       'accessLog', s.access_log,
-      'suspended', pr.sharing_suspended_at is not null))
+      'suspended', pr.sharing_suspended_at is not null,
+      -- "Storage full — some gallery previews can't be prepared": a preview was refused past the overflow
+      -- allowance and the account is still past it.
+      'previewsBlocked', coalesce(public._previews_blocked(pr), false)))
   from public.profiles pr
   cross join lateral public._plan_rules(pr.plan_id) r
   cross join lateral public._share_rules(pr.plan_id) s
@@ -1562,6 +1704,11 @@ revoke execute on function
   public._gallery_expiry(text, date),
   public._gallery_log(uuid, text, text, text, integer),
   public._owner_email(uuid),
+  public._lock_galleries(uuid),
+  public._watermark_ready(public.branding),
+  public._share_overflow(bigint),
+  public._previews_blocked(public.profiles),
+  public._note_previews_blocked(uuid),
   public._guest_info(public.galleries, bytea)
 from service_role;
 grant execute on function
@@ -1593,10 +1740,11 @@ grant execute on function
   public.gallery_unlock_reserve(uuid, bytea, boolean),
   public.gallery_unlock_succeeded(bigint),
   public.guest_photos(uuid, integer, integer, bytea),
-  public.guest_media(uuid, uuid, text),
+  public.guest_media(uuid, uuid, text, boolean),
+  public.note_previews_blocked(uuid),
   public.record_rendition(uuid, uuid, text, text, bigint, integer, integer),
   public.gallery_event(uuid, text, text, text, integer),
-  public.guest_set_favourite(uuid, bytea, uuid, boolean),
+  public.guest_set_favourite(uuid, bytea, uuid, boolean, bytea),
   public.guest_send_favourites(uuid, bytea, text, text),
   public.apply_safety_hold(uuid, uuid),
   public.photo_file(uuid, uuid),

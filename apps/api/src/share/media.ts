@@ -13,6 +13,7 @@ import { contentDisposition } from '../library/files';
 import { fetchCached, nonce, stores } from '../library/objects';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
+import { guestDownloadName } from './names';
 
 type Ctx = Context<HonoEnv>;
 
@@ -64,11 +65,15 @@ export async function forgetState(hashPg: string): Promise<void> {
 // ---- renditions -----------------------------------------------------------------------------------------
 interface MediaPlan {
   ownerId: string;
-  filename: string;
+  /** For download names (never the member's file name). */
+  galleryName: string;
+  position: number;
   width: number | null;
   height: number | null;
   rendition: { key: string } | null;
   unavailable?: 'pending' | 'not_allowed';
+  /** pending because the account is past its storage allowance (the member is told in Settings). */
+  storageFull?: boolean;
   source: { key: string; editVersion: number };
   watermark: {
     key: string;
@@ -79,11 +84,14 @@ interface MediaPlan {
   wmVersion: number;
 }
 
-/** Media responses: private browser cache, sandboxed, never sniffed. */
-export function mediaHeaders(h: Headers, contentType: string, length: string | null) {
+/**
+ * Media responses: private browser cache, sandboxed, never sniffed. `revalidate`: the owner's preview, which
+ * must not outlive the session in the browser cache (no-cache plus an ETag, checked after the session).
+ */
+export function mediaHeaders(h: Headers, contentType: string, length: string | null, revalidate = false) {
   h.set('Content-Type', contentType);
   if (length) h.set('Content-Length', length);
-  h.set('Cache-Control', 'private, max-age=3600');
+  h.set('Cache-Control', revalidate ? 'private, no-cache' : 'private, max-age=3600');
   h.set('Content-Security-Policy', "default-src 'none'; sandbox; frame-ancestors 'none'");
   h.set('X-Content-Type-Options', 'nosniff');
   h.set('Cross-Origin-Resource-Policy', 'same-origin');
@@ -92,10 +100,20 @@ export function mediaHeaders(h: Headers, contentType: string, length: string | n
 class Unavailable extends Error {
   constructor(
     readonly status: 404 | 409 | 502 | 503,
-    readonly code: 'not_found' | 'conflict' | 'server' | 'storage_full',
+    readonly code: 'not_found' | 'conflict' | 'server' | 'pending',
   ) {
     super(code);
   }
+}
+
+/** Seconds a guest waits before asking again for an image still being prepared. */
+const PENDING_RETRY = 30;
+/** "Not yet" (425 Too Early): the guest page shows a Preparing tile and retries. Never cached. */
+function pendingResponse(c: Ctx): Response {
+  return c.json(fail('pending', { retryAfter: PENDING_RETRY }), 425, {
+    'Retry-After': String(PENDING_RETRY),
+    'Cache-Control': 'no-store',
+  });
 }
 
 /** Long edge of the rendition the binding will make (for sizing the watermark). */
@@ -139,17 +157,21 @@ async function makeRendition(
     if (cap) t = t.transform({ width: cap, height: cap, fit: 'scale-down' });
     if (m.watermark) {
       const wm = await shared.get(m.watermark.key);
-      if (wm) {
-        const w = Math.max(48, Math.round(long * (m.watermark.position === 'tiled' ? 0.16 : 0.22)));
-        t = t.draw(
-          c.env.IMAGES.input(wm.body).transform({ width: w, height: w, fit: 'scale-down' }),
-          drawOptions(m.watermark, long),
-        );
+      // Never unwatermarked: without the watermark image there's no rendition yet.
+      if (!wm) {
+        await src.body.cancel().catch(() => undefined);
+        throw new Unavailable(503, 'pending');
       }
+      const w = Math.max(48, Math.round(long * (m.watermark.position === 'tiled' ? 0.16 : 0.22)));
+      t = t.draw(
+        c.env.IMAGES.input(wm.body).transform({ width: w, height: w, fit: 'scale-down' }),
+        drawOptions(m.watermark, long),
+      );
     }
     const out = await t.output({ format: 'image/jpeg', quality: RENDITIONS[size].quality });
     bytes = new Uint8Array(await out.response().arrayBuffer());
   } catch (err) {
+    if (err instanceof Unavailable) throw err;
     logError(c.get('requestId'), 'rendition_transform', err);
     throw new Unavailable(502, 'server');
   }
@@ -177,7 +199,8 @@ async function makeRendition(
     keep = rec.status === 'ok';
     if (rec.status === 'ok') return key;
     if (rec.status === 'exists' && rec.key) return rec.key;
-    if (rec.status === 'storage_full') throw new Unavailable(503, 'storage_full');
+    // Past the storage allowance (record_rendition flagged the account for Settings): not yet, for guests.
+    if (rec.status === 'storage_full') throw new Unavailable(503, 'pending');
     if (rec.status === 'gone') throw new Unavailable(409, 'conflict');
     throw new Unavailable(502, 'server');
   } catch (err) {
@@ -204,8 +227,14 @@ async function dropShared(c: Ctx, keys: string[]) {
 /**
  * Cloudflare blocked a rendition (a CSAM Scanning Tool match): hold the photo, suspend the account's sharing,
  * tell the safety team (ids only). The guest sees a plain 404.
+ *
+ * Cloudflare documents no response header or body that identifies a CSAM Scanning Tool block, so every 451
+ * from our own media host is treated as a match (nothing else on that host returns 451). It is logged under
+ * its own name for review, and the hold is idempotent: a photo already held, or an account already
+ * suspended, isn't held, suspended or reported again.
  */
 async function safetyHold(c: Ctx, galleryId: string, photoId: string, tokenHashPg: string | null) {
+  logError(c.get('requestId'), 'safety_451', new Error('media host returned 451'));
   try {
     const r = await rpc<{ ownerId: string; alreadyHeld: boolean } | null>(c.env, 'apply_safety_hold', {
       p_gallery: galleryId,
@@ -233,8 +262,10 @@ async function safetyHold(c: Ctx, galleryId: string, photoId: string, tokenHashP
 }
 
 export interface ServeOptions {
-  /** web and full downloads: served as an attachment. */
+  /** web and full downloads: served as an attachment, only if the gallery's downloads allow it now. */
   download?: boolean;
+  /** The owner's preview: `private, no-cache` with an ETag (304 when unchanged), after the session check. */
+  revalidate?: boolean;
   /** For the state cache to forget a held gallery. */
   tokenHashPg?: string | null;
   /** Called once the bytes are on their way (download events). */
@@ -254,9 +285,21 @@ export async function serveRendition(
       p_gallery: galleryId,
       p_photo: photoId,
       p_size: size,
+      p_download: o.download === true,
     });
-    if (!m || m.unavailable) return c.json(fail('not_found'), 404);
+    if (!m || m.unavailable === 'not_allowed') return c.json(fail('not_found'), 404);
+    if (m.unavailable) {
+      if (m.storageFull) await notePreviewsBlocked(c, m.ownerId);
+      return pendingResponse(c);
+    }
     const key = m.rendition?.key ?? (await makeRendition(c, galleryId, photoId, size, m));
+    const etag = o.revalidate ? await keyTag(key) : null;
+    if (etag && ifNoneMatch(c.req.header('If-None-Match'), etag)) {
+      const h = new Headers({ ETag: etag });
+      mediaHeaders(h, 'image/jpeg', null, true);
+      h.delete('Content-Type');
+      return new Response(null, { status: 304, headers: h });
+    }
     const res = await fetchCached(c.env, key);
     if (res.status === 451) {
       await res.body?.cancel().catch(() => undefined);
@@ -269,21 +312,46 @@ export async function serveRendition(
       return c.json(fail('server'), 502);
     }
     const out = new Response(res.body, { status: 200 });
-    mediaHeaders(out.headers, 'image/jpeg', res.headers.get('Content-Length'));
+    mediaHeaders(out.headers, 'image/jpeg', res.headers.get('Content-Length'), o.revalidate === true);
+    if (etag) out.headers.set('ETag', etag);
     if (o.download) {
-      const base = m.filename.replace(/\.[^.]{1,8}$/, '').slice(0, 120) || 'photo';
       out.headers.set(
         'Content-Disposition',
-        contentDisposition(`${base}${size === 'full' ? '' : '-web'}.jpg`),
+        contentDisposition(guestDownloadName(m.galleryName, m.position, size === 'full' ? 'full' : 'web')),
       );
     }
     if (o.onServed) await o.onServed();
     return out;
   } catch (err) {
-    if (err instanceof Unavailable) return c.json(fail(err.code), err.status);
+    if (err instanceof Unavailable) {
+      return err.code === 'pending' ? pendingResponse(c) : c.json(fail(err.code), err.status);
+    }
     logError(c.get('requestId'), 'media', err);
     return c.json(fail('server'), 500);
   }
+}
+
+/** A strong ETag for a stored object: its key is unique per content (a new nonce for every rendition). */
+async function keyTag(key: string): Promise<string> {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key)));
+  return `"${[...d.slice(0, 12)].map((b) => b.toString(16).padStart(2, '0')).join('')}"`;
+}
+function ifNoneMatch(header: string | undefined, etag: string): boolean {
+  if (!header) return false;
+  return header.split(',').some((t) => t.trim().replace(/^W\//, '') === etag);
+}
+
+/** Flags the account for Settings ("Storage full — some gallery previews can't be prepared"). */
+async function notePreviewsBlocked(c: Ctx, ownerId: string) {
+  const env = c.env;
+  const requestId = c.get('requestId');
+  await background(c, async () => {
+    try {
+      await rpc(env, 'note_previews_blocked', { p_owner: ownerId });
+    } catch (err) {
+      logError(requestId, 'previews_blocked', err);
+    }
+  });
 }
 
 /** Serves a branding logo from zephyr-shared through the media host. */

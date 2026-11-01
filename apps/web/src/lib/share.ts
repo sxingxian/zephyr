@@ -20,7 +20,7 @@ import {
   type SharingLimits,
   type Usage,
 } from '@zephyr/shared/client';
-import { api } from './api';
+import { ApiFailure, api } from './api';
 import { expectedUser, putBytes } from './library';
 
 /**
@@ -114,6 +114,32 @@ export const deleteBrandingAsset = (kind: BrandingAssetKind) =>
     method: 'DELETE',
     headers: expectedUser(),
   }).then((r) => r.branding);
+
+// ---------------------------------------------------------------- readiness
+/** Fields newer servers add (phase 5 review): optional, so older replies still work. */
+export type BrandingState = Branding & { watermarkReady?: boolean };
+export type GalleryState = GalleryDetail & {
+  watermarkReady?: boolean;
+  /** Some guest previews can't be prepared because the member's storage is full. */
+  storageFull?: boolean;
+};
+
+/**
+ * Whether guests can be given watermarked images: a logo watermark needs the logo, a text watermark needs its
+ * drawn image. The server's own flag wins when it sends one.
+ */
+export function watermarkReady(b: BrandingState | null | undefined): boolean {
+  if (!b) return false;
+  if (typeof b.watermarkReady === 'boolean') return b.watermarkReady;
+  return b.watermark.kind === 'logo' ? b.hasLogo : b.watermark.hasImage;
+}
+
+/** The reason a branding image can't be removed (the API answers 409 while live galleries use it). */
+export function assetInUseMessage(e: unknown, kind: BrandingAssetKind): string | null {
+  if (!(e instanceof ApiFailure) || e.status !== 409 || e.code === 'session_changed') return null;
+  const what = kind === 'logo' ? 'logo' : 'watermark';
+  return `Your ${what} is used by live galleries. Turn the watermark off in those galleries first, or replace the ${what} instead.`;
+}
 
 /** The owner's preview of a gallery as guests see it (no passcode; served by the guest page). */
 export const galleryPreviewPath = (id: string) => `/g/preview/${encodeURIComponent(id)}`;

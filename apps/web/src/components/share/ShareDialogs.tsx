@@ -22,6 +22,7 @@ import {
   maxLinkDays,
   PLAN_NAME,
   sharingLimits,
+  watermarkReady,
 } from '../../lib/share';
 import { shareRenders } from '../../lib/shareRenders';
 import { useUsage } from '../../lib/usage';
@@ -119,12 +120,14 @@ export function ExtrasSwitches({
     <div className="sh-extras">
       {EXTRA_ROWS.map((r) => {
         const allowed = Boolean(limits[r.limit]);
-        const needsWatermark = r.key === 'watermark' && allowed && branding && !branding.watermark.hasImage;
+        // The watermark can only be turned on once one is set up; a gallery that has it on can always turn it off.
+        const needsWatermark = r.key === 'watermark' && allowed && !watermarkReady(branding);
+        const on = allowed && value[r.key];
         return (
           <Switch
             key={r.key}
-            checked={allowed && value[r.key]}
-            disabled={!allowed || Boolean(needsWatermark)}
+            checked={on}
+            disabled={!allowed || (needsWatermark && !on)}
             onChange={(on) => onChange({ ...value, [r.key]: on })}
             label={
               <span className="sh-switch-label">
@@ -134,9 +137,16 @@ export function ExtrasSwitches({
             }
             hint={
               needsWatermark ? (
-                <>
-                  Set one up first in <Link to="/settings/sharing">Settings › Sharing &amp; branding</Link>
-                </>
+                on ? (
+                  <>
+                    Your watermark isn’t set up, so guests see “Preparing” until it is. Fix it in{' '}
+                    <Link to="/settings/sharing">Settings › Sharing &amp; branding</Link>
+                  </>
+                ) : (
+                  <>
+                    Set one up first in <Link to="/settings/sharing">Settings › Sharing &amp; branding</Link>
+                  </>
+                )
               ) : allowed ? (
                 r.hint
               ) : (
@@ -153,7 +163,7 @@ export function ExtrasSwitches({
 function defaultExtras(limits: SharingLimits, branding: Branding | null): GalleryExtras {
   return {
     favourites: limits.guestFavourites,
-    watermark: limits.watermark && Boolean(branding?.watermark.hasImage),
+    watermark: limits.watermark && watermarkReady(branding),
     branding: limits.branding,
     accessLog: limits.accessLog,
   };

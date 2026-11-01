@@ -1,6 +1,7 @@
 import type { GalleryDownloads, GuestPhoto } from '@zephyr/shared/client';
 import { Icon } from '@zephyr/ui';
 import { type PointerEvent, useEffect, useId, useRef, useState } from 'react';
+import { GuestImage } from './GuestImage';
 import { useReport } from './Report';
 
 export interface ViewerProps {
@@ -213,15 +214,15 @@ export function Viewer(p: ViewerProps) {
         )}
       </header>
       <div className="g-viewer__stage" onPointerDown={onPointerDown} onPointerUp={onPointerUp}>
-        <img
+        <GuestImage
           key={photo.id}
+          variant="viewer"
           src={photo.view}
           alt={`Shot ${p.index + 1} of ${total}`}
           width={photo.width || undefined}
           height={photo.height || undefined}
-          referrerPolicy="no-referrer"
           draggable={false}
-          onError={p.onImageError}
+          onExpired={p.onImageError}
         />
         <button
           type="button"
