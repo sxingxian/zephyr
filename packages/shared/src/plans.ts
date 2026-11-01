@@ -15,6 +15,10 @@ export interface PlanLimits {
   guestFullRes: boolean;
   peopleGrouping: boolean;
   branding: boolean;
+  /** Studio gallery extras (phase 5). */
+  guestFavourites: boolean;
+  watermark: boolean;
+  accessLog: boolean;
   seats: number;
   ads: boolean;
   priorityQueue: boolean;
@@ -50,6 +54,9 @@ export const PLANS: readonly Plan[] = [
       guestFullRes: false,
       peopleGrouping: false,
       branding: false,
+      guestFavourites: false,
+      watermark: false,
+      accessLog: false,
       seats: 1,
       ads: true,
       priorityQueue: false,
@@ -71,6 +78,9 @@ export const PLANS: readonly Plan[] = [
       guestFullRes: true,
       peopleGrouping: true,
       branding: false,
+      guestFavourites: false,
+      watermark: false,
+      accessLog: false,
       seats: 1,
       ads: false,
       priorityQueue: false,
@@ -92,6 +102,9 @@ export const PLANS: readonly Plan[] = [
       guestFullRes: true,
       peopleGrouping: true,
       branding: true,
+      guestFavourites: true,
+      watermark: true,
+      accessLog: true,
       seats: 3,
       ads: false,
       priorityQueue: true,
