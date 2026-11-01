@@ -77,6 +77,23 @@ export interface CropSettings {
   perspectiveV?: number;
   perspectiveH?: number;
 }
+/**
+ * Phase 6: studio background removal. The mask is a greyscale PNG stored next to the photo (AI_API.mask), made
+ * in the cloud from the untouched preview; everything else here is applied on the device and can be changed
+ * any time. Only the server sets `mask` (when a background-removal job finishes); a save may keep or drop it
+ * but never point it at another photo's mask.
+ */
+export interface CutoutSettings {
+  mask: string; // uuid of the photo's mask
+  bg: 'transparent' | 'white' | 'color' | 'original';
+  color?: string; // #rrggbb with bg 'color'
+  shadow?: 'none' | 'soft' | 'contact';
+  shadowStrength?: number; // 0–100
+  /** Edge feather, in pixels at 2048 px (0–20). */
+  softness?: number;
+  /** Pull the edge in (−) or push it out (+), −10…10. */
+  shift?: number;
+}
 export interface EditRecipe {
   v: 1;
   light?: LightSettings;
@@ -85,9 +102,27 @@ export interface EditRecipe {
   detail?: DetailSettings;
   effects?: EffectsSettings;
   crop?: CropSettings;
+  cutout?: CutoutSettings;
 }
-export type EditSection = 'light' | 'color' | 'mixer' | 'detail' | 'effects' | 'crop';
-export const EDIT_SECTIONS: readonly EditSection[] = ['light', 'color', 'mixer', 'detail', 'effects', 'crop'];
+export type EditSection = 'light' | 'color' | 'mixer' | 'detail' | 'effects' | 'crop' | 'cutout';
+export const EDIT_SECTIONS: readonly EditSection[] = [
+  'light',
+  'color',
+  'mixer',
+  'detail',
+  'effects',
+  'crop',
+  'cutout',
+];
+/** Sections that can be copied and pasted between photos: a cut-out belongs to its own photo. */
+export const PASTE_SECTIONS: readonly EditSection[] = [
+  'light',
+  'color',
+  'mixer',
+  'detail',
+  'effects',
+  'crop',
+];
 /** Sections a saved recipe may carry: never the crop (photos are framed differently). */
 export const RECIPE_SECTIONS: readonly EditSection[] = ['light', 'color', 'mixer', 'detail', 'effects'];
 /** Sections ticked by default when pasting. */
@@ -125,6 +160,11 @@ export const RANGES = {
     angle: { min: -45, max: 45, step: 0.1 },
     perspectiveV: { min: -100, max: 100, step: 1 },
     perspectiveH: { min: -100, max: 100, step: 1 },
+  },
+  cutout: {
+    shadowStrength: { min: 0, max: 100, step: 1 },
+    softness: { min: 0, max: 20, step: 0.5 },
+    shift: { min: -10, max: 10, step: 0.5 },
   },
 } as const;
 
@@ -196,6 +236,32 @@ function normalizeCrop(src: unknown): CropSettings | undefined {
   return Object.keys(out).length ? out : undefined;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const HEX_RE = /^#[0-9a-f]{6}$/;
+function normalizeCutout(src: unknown): CutoutSettings | undefined {
+  if (!src || typeof src !== 'object') return undefined;
+  const s = src as Record<string, unknown>;
+  const mask = typeof s.mask === 'string' ? s.mask.toLowerCase() : '';
+  if (!UUID_RE.test(mask)) return undefined;
+  const bg = (['transparent', 'white', 'color', 'original'] as const).find((b) => b === s.bg) ?? 'white';
+  const out: CutoutSettings = { mask, bg };
+  if (bg === 'color') {
+    const c = typeof s.color === 'string' ? s.color.toLowerCase() : '';
+    out.color = HEX_RE.test(c) ? c : '#ffffff';
+  }
+  const shadow = (['none', 'soft', 'contact'] as const).find((x) => x === s.shadow);
+  if (shadow && shadow !== 'none' && bg !== 'transparent' && bg !== 'original') {
+    out.shadow = shadow;
+    const st = num(s.shadowStrength, RANGES.cutout.shadowStrength);
+    if (st !== undefined) out.shadowStrength = st;
+  }
+  const soft = num(s.softness, RANGES.cutout.softness);
+  if (soft !== undefined) out.softness = soft;
+  const shift = num(s.shift, RANGES.cutout.shift);
+  if (shift !== undefined) out.shift = shift;
+  return out;
+}
+
 /**
  * Clamps, rounds and drops neutral values; unknown keys are discarded. Keys are emitted in a fixed order so the
  * same edit always serialises identically. Never throws: anything unusable becomes "no change".
@@ -221,6 +287,8 @@ export function normalizeRecipe(input: unknown): EditRecipe {
   if (effects) out.effects = effects;
   const crop = normalizeCrop(src.crop);
   if (crop) out.crop = crop;
+  const cutout = normalizeCutout(src.cutout);
+  if (cutout) out.cutout = cutout;
   return out;
 }
 

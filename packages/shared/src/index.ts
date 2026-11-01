@@ -1,3 +1,5 @@
+export * from './ai-schemas';
+export * from './ai-types';
 export * from './api-schemas';
 export * from './api-types';
 export * from './edit-schemas';

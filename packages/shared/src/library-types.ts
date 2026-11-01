@@ -135,6 +135,10 @@ export interface PhotoListQuery {
   sort?: 'taken' | 'added';
   cursor?: string;
   limit?: number; // ≤ 200
+  /** Phase 6: photos tagged with this scene (SceneId). */
+  scene?: string;
+  /** Phase 6: photos with this person's faces (face grouping on). */
+  person?: string;
 }
 export interface PhotoPatchBody {
   favourite?: boolean;

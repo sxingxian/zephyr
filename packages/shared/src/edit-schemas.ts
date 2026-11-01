@@ -1,9 +1,9 @@
 import { z } from 'zod';
 import {
-  EDIT_SECTIONS,
   type EditRecipe,
   MAX_RECIPE_BYTES,
   normalizeRecipe,
+  PASTE_SECTIONS,
   pickSections,
   RECIPE_NAME_MAX,
   RECIPE_SECTIONS,
@@ -68,12 +68,28 @@ export const recipeSchema = z
       .partial()
       .strict()
       .optional(),
+    cutout: z
+      .object({
+        mask: z.string().uuid(),
+        bg: z.enum(['transparent', 'white', 'color', 'original']),
+        color: z
+          .string()
+          .regex(/^#[0-9a-fA-F]{6}$/)
+          .optional(),
+        shadow: z.enum(['none', 'soft', 'contact']).optional(),
+        shadowStrength: finite.optional(),
+        softness: finite.optional(),
+        shift: finite.optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .transform((r) => normalizeRecipe(r))
   .refine((r) => new TextEncoder().encode(JSON.stringify(r)).length <= MAX_RECIPE_BYTES, 'recipe too large');
 
-const sectionsSchema = z.array(z.enum(EDIT_SECTIONS as [string, ...string[]])).max(EDIT_SECTIONS.length);
+/** Paste and apply never carry a cut-out (it belongs to its own photo). */
+const sectionsSchema = z.array(z.enum(PASTE_SECTIONS as [string, ...string[]])).max(PASTE_SECTIONS.length);
 
 export const editSaveSchema = z.object({
   recipe: recipeSchema,

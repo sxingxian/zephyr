@@ -77,6 +77,7 @@ export const SECTION_LABELS: Record<EditSection, string> = {
   detail: 'Detail',
   effects: 'Effects',
   crop: 'Crop & straighten',
+  cutout: 'Background removal',
 };
 export const SECTION_HINTS: Record<EditSection, string> = {
   light: 'Exposure, contrast, highlights, shadows, whites, blacks',
@@ -85,6 +86,7 @@ export const SECTION_HINTS: Record<EditSection, string> = {
   detail: 'Sharpening, noise reduction',
   effects: 'Vignette',
   crop: 'Off by default: photos are usually framed differently',
+  cutout: 'Belongs to its own photo; never pasted',
 };
 
 export const BANDS: { band: HueBand; label: string; color: string }[] = [

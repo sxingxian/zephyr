@@ -81,6 +81,8 @@ export type ApiErrorCode =
   | 'limit_reached' // a plan count is used up (e.g. live galleries)
   | 'pending' // guest media (503 with Retry-After): that image is still being prepared (edit not rendered, watermark not ready, storage full); retry later
   | 'asset_in_use' // branding (409): the image is drawn by the watermark of a live gallery
+  | 'insufficient_credits' // phase 6 (402): not enough cloud credits; see `needed` and `balance`
+  | 'feature_off' // phase 6 (403): this Zephyr AI feature is switched off in Admin, or by the member
   | 'server';
 
 export interface ApiError {
@@ -96,6 +98,11 @@ export interface ApiError {
   pausedUntil?: string;
   /** asset_in_use: how many live galleries' watermark uses the branding image. */
   galleries?: number;
+  /** insufficient_credits: credits the request needs, and the member's balance. */
+  needed?: number;
+  balance?: number;
+  /** conflict on a device job: the device that holds it. */
+  holder?: string;
 }
 export interface Accepted {
   ok: true;

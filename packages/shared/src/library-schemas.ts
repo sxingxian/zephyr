@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { SCENES } from './ai-types';
 import { MAX_UPLOAD_BATCH } from './library-types';
 
 /** Server-side request schemas for the phase 3 library API. */
@@ -54,6 +55,8 @@ export const photoListQuerySchema = z.object({
   sort: z.enum(['taken', 'added']).optional(),
   cursor: z.string().max(200).optional(),
   limit: z.coerce.number().int().min(1).max(200).optional(),
+  scene: z.enum(SCENES).optional(),
+  person: uuid.optional(),
 });
 export const photoPatchSchema = z
   .object({ favourite: z.boolean(), filename: filenameSchema })

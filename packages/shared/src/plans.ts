@@ -14,6 +14,8 @@ export interface PlanLimits {
   maxLinkDays: number | null;
   guestFullRes: boolean;
   peopleGrouping: boolean;
+  /** Phase 6: Cleanup (duplicates, blurry photos, similar bursts). */
+  qualityCleanup: boolean;
   branding: boolean;
   /** Studio gallery extras (phase 5). */
   guestFavourites: boolean;
@@ -53,6 +55,7 @@ export const PLANS: readonly Plan[] = [
       maxLinkDays: 7,
       guestFullRes: false,
       peopleGrouping: false,
+      qualityCleanup: false,
       branding: false,
       guestFavourites: false,
       watermark: false,
@@ -77,6 +80,7 @@ export const PLANS: readonly Plan[] = [
       maxLinkDays: null,
       guestFullRes: true,
       peopleGrouping: true,
+      qualityCleanup: true,
       branding: false,
       guestFavourites: false,
       watermark: false,
@@ -101,6 +105,7 @@ export const PLANS: readonly Plan[] = [
       maxLinkDays: null,
       guestFullRes: true,
       peopleGrouping: true,
+      qualityCleanup: true,
       branding: true,
       guestFavourites: true,
       watermark: true,

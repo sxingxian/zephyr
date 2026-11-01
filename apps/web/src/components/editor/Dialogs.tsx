@@ -1,9 +1,9 @@
 import {
   BUILT_IN_RECIPES,
   DEFAULT_PASTE_SECTIONS,
-  EDIT_SECTIONS,
   type EditRecipe,
   type EditSection,
+  PASTE_SECTIONS,
   type PhotoItem,
   RECIPE_NAME_MAX,
   type SavedRecipe,
@@ -94,7 +94,7 @@ export function PasteDialog({
     >
       <fieldset className="echecks">
         <legend>Paste these settings</legend>
-        {EDIT_SECTIONS.map((s) => (
+        {PASTE_SECTIONS.map((s) => (
           <label key={s} className="echecks__row">
             <input
               type="checkbox"
