@@ -28,6 +28,7 @@ import {
   adminSeenIsFresh,
   appendCookies,
   endSession,
+  recentlyAuthenticated,
   resolveSession,
   sessionCookies,
   signedInWithPasskey,
@@ -52,6 +53,7 @@ import {
 } from '../http';
 import { rpc, UpstreamError } from '../supabase';
 import type { HonoEnv, StaffContext } from '../types';
+import { registerAdminAiRoutes } from './admin-ai';
 import { sendInvite } from './invites';
 
 const WINDOW = 15 * 60;
@@ -118,6 +120,7 @@ function requireStaff(opts: { allowEnrol?: boolean; write?: boolean } = {}): Mid
       displayName: staff.displayName ?? null,
       enrolOnly,
       accessToken: s.accessToken,
+      recentPasskey: !enrolOnly && recentlyAuthenticated(s.claims),
     });
     appendCookies(c, [await adminSeenCookie(c.env, s.userId)]);
     await next();
@@ -613,3 +616,6 @@ adminRoutes.post('/v1/signups/requests/decide', requireStaff({ write: true }), a
     return c.json(fail('server'), 500);
   }
 });
+
+// ---- Zephyr AI (phase 6) ---------------------------------------------------------------------------
+registerAdminAiRoutes(adminRoutes, requireStaff);

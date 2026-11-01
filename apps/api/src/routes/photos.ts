@@ -41,6 +41,8 @@ photoRoutes.get('/', async (c) => {
       p_sort: q.sort ?? 'taken',
       p_cursor: q.cursor ?? null,
       p_limit: q.limit ?? 60,
+      p_scene: q.scene ?? null,
+      p_person: q.person ?? null,
     });
     if (!page) return c.json(fail('not_found'), 404);
     return c.json({ ok: true, items: page.items, nextCursor: page.nextCursor } satisfies Page<PhotoItem>);
@@ -153,6 +155,33 @@ function mediaHeaders(contentType: string): Headers {
     'Cross-Origin-Resource-Policy': 'same-origin',
   });
 }
+
+/**
+ * Phase 6: a background mask (8-bit greyscale PNG). The key comes from the database, for the owner's own
+ * photo only. Mask ids are never reused, so the response can be cached privately for good.
+ */
+photoRoutes.get('/:id/masks/:mask', async (c) => {
+  const id = c.req.param('id');
+  const mask = c.req.param('mask');
+  if (!UUID.test(id) || !UUID.test(mask)) return c.json(fail('not_found'), 404);
+  try {
+    const key = await rpc<string | null>(c.env, 'ai_mask_key', {
+      p_owner: ownerOf(c),
+      p_photo: id,
+      p_mask: mask,
+    });
+    if (!key) return c.json(fail('not_found'), 404);
+    const obj = await c.env.PHOTOS.get(key);
+    if (!obj || !('body' in obj)) return c.json(fail('not_found'), 404);
+    const h = mediaHeaders('image/png');
+    h.set('Cache-Control', 'private, max-age=31536000, immutable');
+    h.set('Content-Length', String(obj.size));
+    return new Response(c.req.method === 'HEAD' ? null : obj.body, { status: 200, headers: h });
+  } catch (err) {
+    logError(c.get('requestId'), 'photo_mask', err);
+    return c.json(fail('server'), 500);
+  }
+});
 
 photoRoutes.get('/:id/:kind', async (c) => {
   const id = c.req.param('id');

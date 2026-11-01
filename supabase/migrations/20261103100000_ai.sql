@@ -1648,10 +1648,11 @@ declare
   last_id uuid;
 begin
   select c.at, c.id into c_at, c_id from public._parse_cursor(p_cursor) c;
-  select coalesce(jsonb_agg(jsonb_build_object('id', x.id) order by x.created_at desc, x.id desc) filter (where x.rn <= lim), '[]'::jsonb),
+  select coalesce(jsonb_agg(jsonb_build_object('id', x.id, 'takenAt', x.taken_at) order by x.created_at desc, x.id desc)
+                    filter (where x.rn <= lim), '[]'::jsonb),
          count(*)::integer, max(x.created_at) filter (where x.rn = lim), (array_agg(x.id) filter (where x.rn = lim))[1]
     into rows, n, last_at, last_id
-    from (select p.id, p.created_at, row_number() over (order by p.created_at desc, p.id desc) rn
+    from (select p.id, p.created_at, p.taken_at, row_number() over (order by p.created_at desc, p.id desc) rn
             from public.photos p left join public.photo_signals s on s.photo_id = p.id
            where p.owner_id = p_owner and p.status = 'ready' and p.has_thumb
              and (s.photo_id is null or s.version < p_version)

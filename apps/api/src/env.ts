@@ -82,7 +82,11 @@ export interface Env {
 
 /** The slice of the Workers AI binding the API uses. */
 export interface WorkersAi {
-  run(model: string, inputs: Record<string, unknown>, options?: { gateway?: { id: string; skipCache?: boolean } }): Promise<unknown>;
+  run(
+    model: string,
+    inputs: Record<string, unknown>,
+    options?: { gateway?: { id: string; skipCache?: boolean } },
+  ): Promise<unknown>;
 }
 /** Messages on the zephyr-ai queue. */
 export type AiMessage = { t: 'bg'; item: string } | { t: 'scene'; photo: string; owner: string };

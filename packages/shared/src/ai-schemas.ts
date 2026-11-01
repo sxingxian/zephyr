@@ -125,7 +125,7 @@ export const cleanupIgnoreSchema = z
   .object({ kind: z.enum(['duplicates', 'blurry']), photoIds: z.array(uuid).min(1).max(500) })
   .strict();
 
-/** 128 float32 little-endian = 512 bytes = 684 base64 characters. */
+/** 128 float32 little-endian = 512 bytes = 684 base64 characters (683 + one '='). */
 const embedding = z.string().regex(/^[A-Za-z0-9+/]{683}=$/);
 const unit = z.number().finite().min(0).max(1);
 export const facesSchema = z

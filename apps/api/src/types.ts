@@ -17,6 +17,8 @@ export interface StaffContext {
   displayName: string | null;
   enrolOnly: boolean;
   accessToken: string;
+  /** Signed in with a passkey in the last 10 minutes (risk-raising admin changes need it). */
+  recentPasskey: boolean;
 }
 export type Variables = {
   requestId: string;

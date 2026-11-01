@@ -22,8 +22,8 @@ const formatDate = (iso: string) =>
     timeZoneName: 'short',
   });
 
-/** One layout for every sharing email: a heading, paragraphs, an optional quote and button. */
-function layout(
+/** One layout for every sharing (and phase 6 AI) email: a heading, paragraphs, an optional quote and button. */
+export function layout(
   subject: string,
   heading: string,
   paras: string[],

@@ -272,6 +272,7 @@ select pg_temp.ok((public.ai_jobs_list(:mei, 'finished') #>> '{counts,finished}'
 
 -- ---- Signals, cleanup and scenes ----------------------------------------------------------------
 select pg_temp.ok((public.ai_signals_pending(:mei, 1) ->> 'remaining')::integer = 4, 'four photos need signals');
+select pg_temp.ok((public.ai_signals_pending(:mei, 1) -> 'photos' -> 0) ? 'takenAt', 'pending signals carry takenAt for the night rule');
 select pg_temp.ok(public.ai_signals_save(:mei, 1, jsonb_build_array(
   jsonb_build_object('id', (select v from t where k = 'p1'), 'phash', 'ffff0000aaaa5555', 'sharpness', 120.5, 'brightness', 0.1, 'night', true),
   jsonb_build_object('id', (select v from t where k = 'w1'), 'phash', '0000000000000000', 'sharpness', 1, 'brightness', 0.5, 'night', false))) = 1,
