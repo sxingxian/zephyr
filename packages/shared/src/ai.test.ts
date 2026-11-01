@@ -178,6 +178,13 @@ describe('AI schemas', () => {
     ).toBe(true);
     expect(aiMemberSettingsSchema.safeParse({ faceGrouping: false }).success).toBe(true);
     expect(aiMemberSettingsSchema.safeParse({}).success).toBe(false);
+    // Only the current wording can be agreed to.
+    expect(
+      aiMemberSettingsSchema.safeParse({
+        faceGrouping: true,
+        faceConsent: { version: 2, rightsConfirmed: true },
+      }).success,
+    ).toBe(false);
   });
   it('signals: hex hash, bounded numbers, at most 100', () => {
     const one = { id: MASK, phash: 'ABCDEF0123456789', sharpness: 12.5, brightness: 0.4, night: false };

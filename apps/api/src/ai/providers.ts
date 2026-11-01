@@ -62,7 +62,9 @@ export function toBase64(bytes: Uint8Array): string {
 }
 const B64 = /^[A-Za-z0-9+/]*={0,2}$/;
 export function fromBase64(s: string, maxBytes: number): Uint8Array {
-  const clean = s.replace(/\s+/g, '');
+  // Checked before any copy is made: the response body is already the largest thing held in memory.
+  if ((s.length / 4) * 3 > maxBytes * 1.05 + 1024) throw new ProviderFailure('bad_output', 'too_large');
+  const clean = /\s/.test(s) ? s.replace(/\s+/g, '') : s;
   if (clean.length % 4 !== 0 || !B64.test(clean) || (clean.length / 4) * 3 > maxBytes + 3) {
     throw new ProviderFailure('bad_output', 'base64');
   }
@@ -96,6 +98,7 @@ async function readJson(res: Response, maxBytes: number): Promise<unknown> {
     all.set(p, o);
     o += p.byteLength;
   }
+  parts.length = 0; // let the chunks go before the text and the parsed object exist too
   try {
     return JSON.parse(new TextDecoder().decode(all));
   } catch {

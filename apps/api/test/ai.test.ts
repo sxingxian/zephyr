@@ -1,9 +1,25 @@
-import { ADMIN_AI_API, AI_API, type AiSettings } from '@zephyr/shared';
-import { zlibSync } from 'fflate';
+import {
+  ADMIN_AI_API,
+  AI_API,
+  AI_FAILURE_BUDGET,
+  type AiSettings,
+  FACE_CONSENT_VERSION,
+  MAX_PEOPLE,
+} from '@zephyr/shared';
+import { Unzlib, zlibSync } from 'fflate';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { handleAiBatch, processBgItem, processScene } from '../src/ai/consumer';
+import migration from '../../../supabase/migrations/20261103100000_ai.sql?raw';
+import { bgWorstCase, handleAiBatch, processBgItem, processScene } from '../src/ai/consumer';
 import { runAiCron } from '../src/ai/cron';
-import { encodeMask, encodePng, MaskError, readMask, resizeMask, sameAspect } from '../src/ai/png';
+import {
+  encodeMask,
+  encodePng,
+  INFLATE_SLICE,
+  MaskError,
+  readMask,
+  resizeMask,
+  sameAspect,
+} from '../src/ai/png';
 import { falCutout, ProviderFailure, runwareCutout } from '../src/ai/providers';
 import { clearAiSettingsCache } from '../src/ai/settings';
 import type { AiMessage } from '../src/env';
@@ -12,10 +28,12 @@ import {
   accessToken,
   aiLimiter,
   aiQueue,
+  aiReadLimiter,
   type Call,
   call,
   credential,
   env,
+  facesLimiter,
   initKeys,
   installFetch,
   type Jar,
@@ -116,7 +134,7 @@ const runwareOk: Provider = (c) =>
     : undefined;
 const falOk: Provider = (c) =>
   c.url === `${GW}/fal/fal-ai/bria/background/remove`
-    ? json({ image: { url: `data:image/png;base64,${b64(cutoutPng(80, 60))}` } })
+    ? json({ image: { url: `data:image/png;base64,${b64(cutoutPng(20, 15))}` } })
     : undefined;
 const down: Provider = (c) => (c.url.startsWith(GW) ? json({ error: 'x' }, 500) : undefined);
 
@@ -160,6 +178,55 @@ describe('mask PNG reader', () => {
     const end = small.subarray(small.length - 12);
     const bomb = new Uint8Array([...head, ...chunk, ...end]);
     expect(() => readMask(bomb, 1e7)).toThrow(/bomb/);
+  });
+
+  it('bounds the decoded size by the preview, checked before inflating', () => {
+    const bounds = { width: 40, height: 30, aspectTolerance: 0.02 };
+    expect(readMask(cutoutPng(40, 30), 1e6, bounds).width).toBe(40);
+    expect(readMask(cutoutPng(20, 15), 1e6, bounds).width).toBe(20);
+    expect(() => readMask(cutoutPng(80, 60), 1e6, bounds)).toThrow(/size/);
+    expect(() => readMask(cutoutPng(30, 30), 1e6, bounds)).toThrow(/aspect/);
+  });
+
+  it('inflates in small slices, so a real bomb is stopped after a few MB', () => {
+    // A raw zlib stream with one fixed-Huffman block: a literal 0, then length-258/distance-1 copies. 1 MB of
+    // it inflates to ~160 MB; IHDR claims 1024×1024 grey (≈1 MB). fflate inflates a whole push before its
+    // callback runs, so pushing this in one piece would build the 160 MB buffer first.
+    const bits: number[] = [];
+    const put = (v: number, n: number) => {
+      for (let i = 0; i < n; i++) bits.push((v >> i) & 1);
+    };
+    const code = (v: number, n: number) => {
+      for (let i = n - 1; i >= 0; i--) bits.push((v >> i) & 1);
+    };
+    put(1, 1); // BFINAL
+    put(1, 2); // fixed Huffman
+    code(0x30, 8); // literal 0
+    const pairs = Math.floor((1024 * 1024 * 8) / 13);
+    for (let k = 0; k < pairs; k++) {
+      code(0b11000101, 8); // length 258 (symbol 285)
+      code(0, 5); // distance 1
+    }
+    code(0, 7); // end of block
+    const body = new Uint8Array(Math.ceil(bits.length / 8));
+    for (let i = 0; i < bits.length; i++)
+      if (bits[i]) body[i >> 3] = (body[i >> 3] as number) | (1 << (i & 7));
+    const idat = new Uint8Array([0x78, 0x01, ...body, 0, 0, 0, 1]);
+    const small = encodePng(1024, 1024, 0, new Uint8Array(1024 * 1024));
+    const head = small.subarray(0, 33);
+    const chunkBytes = new Uint8Array(12 + idat.length);
+    new DataView(chunkBytes.buffer).setUint32(0, idat.length);
+    chunkBytes.set([0x49, 0x44, 0x41, 0x54], 4);
+    chunkBytes.set(idat, 8);
+    const bomb = new Uint8Array([...head, ...chunkBytes, ...small.subarray(small.length - 12)]);
+    const push = vi.spyOn(Unzlib.prototype, 'push');
+    const t0 = performance.now();
+    expect(() => readMask(bomb, 8 * 1024 * 1024)).toThrow(/bomb/);
+    expect(performance.now() - t0).toBeLessThan(2000);
+    const sizes = push.mock.calls.map(([chunk]) => (chunk as Uint8Array).byteLength);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(INFLATE_SLICE);
+    // ~1 MB of output allowed, ~630 KB per slice at most: it stops within a few slices.
+    expect(sizes.length).toBeLessThan(10);
   });
 
   it('checks aspect and resizes', () => {
@@ -264,6 +331,38 @@ describe('background-removal consumer', () => {
     expect(world.calls.some((c) => c.url.includes('/original'))).toBe(false);
   });
 
+  it('reserves the worst case of an item before the first call', async () => {
+    await storePreview(40, 30);
+    world.external = runwareOk;
+    await processBgItem(env, ITEM);
+    expect(bgWorstCase(SETTINGS)).toBe(2 * 600 + 18000);
+    expect(rpcArgs('ai_item_begin')[0]?.p_estimate).toBe(19200);
+    expect(bgWorstCase({ ...SETTINGS, bgFallback: 'none' })).toBe(1200);
+  });
+
+  it('never asks a provider again after rejecting its output', async () => {
+    await storePreview(40, 30);
+    let runware = 0;
+    world.external = (c) => {
+      if (c.url.endsWith('/custom-runware/v1')) {
+        runware += 1;
+        return json({ data: [{ imageBase64Data: b64(cutoutPng(30, 30)) }] });
+      }
+      return falOk(c);
+    };
+    expect(await processBgItem(env, ITEM)).toBe('completed');
+    expect(runware).toBe(1);
+    expect(rpcArgs('ai_item_complete')[0]?.p_provider).toBe('fal_bria');
+  });
+
+  it('keeps the stored mask when recording it fails (the sweep removes it if no row does)', async () => {
+    await storePreview(40, 30);
+    world.external = runwareOk;
+    world.rpc.ai_item_complete = () => new Response('down', { status: 503 });
+    await expect(processBgItem(env, ITEM)).rejects.toBeTruthy();
+    expect([...r2.objects.keys()].some((k) => k.startsWith(`u/${MEI.id}/p/${PHOTO}/m/`))).toBe(true);
+  });
+
   it('tries the primary twice, then the fallback', async () => {
     await storePreview(40, 30);
     let runware = 0;
@@ -355,6 +454,27 @@ describe('scene tags consumer', () => {
     });
     const [args] = rpcArgs('ai_scene_done');
     expect(args?.p_scenes).toEqual([expect.objectContaining({ scene: 'beach' })]);
+  });
+
+  it('settles on the day the reservation was made', async () => {
+    world.rpc.ai_scene_begin = () => ({ status: 'go', day: '2026-10-31', alerts: [] });
+    world.rpc.ai_scene_done = () => ({ status: 'ok' });
+    await r2.put(`u/${MEI.id}/p/${PHOTO}/thumb`, jpeg(16, 12));
+    workersAi.result = [{ label: 'SEASHORE', score: 0.6 }];
+    await processScene(env, PHOTO, MEI.id);
+    expect(rpcArgs('ai_scene_done')[0]?.p_day).toBe('2026-10-31');
+  });
+
+  it('settles and retries later when the run breaks after the reservation', async () => {
+    world.rpc.ai_scene_begin = () => ({ status: 'go', day: '2026-11-01', alerts: [] });
+    world.rpc.ai_scene_done = () => ({ status: 'retry' });
+    vi.spyOn(env.PHOTOS, 'get').mockRejectedValueOnce(new Error('r2 down'));
+    await expect(processScene(env, PHOTO, MEI.id)).rejects.toThrow('r2 down');
+    expect(rpcArgs('ai_scene_done')[0]).toMatchObject({
+      p_scenes: 'retry',
+      p_reserved: 20,
+      p_day: '2026-11-01',
+    });
   });
 
   it('records a failure when Workers AI fails', async () => {
@@ -473,7 +593,7 @@ describe('member AI routes', () => {
     expect(embeddingLiteral('AAAA')).toBeNull();
   });
 
-  it('serves a mask to its owner only, cached privately', async () => {
+  it('serves a mask to its owner only, revalidated on every use', async () => {
     const j = await signedIn(MEI);
     const mask = '60000000-0000-4000-8000-000000000001';
     const key = `u/${MEI.id}/p/${PHOTO}/m/${mask}.png`;
@@ -482,10 +602,56 @@ describe('member AI routes', () => {
     const res = await call(AI_API.mask(PHOTO, mask), { jar: j });
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toBe('image/png');
-    expect(res.headers.get('Cache-Control')).toBe('private, max-age=31536000, immutable');
+    expect(res.headers.get('Cache-Control')).toBe('private, no-cache');
+    const etag = must(res.headers.get('ETag'));
+    expect(etag).toBe(`"m-${mask}"`);
+    const again = await call(AI_API.mask(PHOTO, mask), { jar: j, headers: { 'If-None-Match': etag } });
+    expect(again.status).toBe(304);
+    expect(await again.text()).toBe('');
+    // The ownership check comes first: a cached ETag never answers for a mask the member can't read.
+    world.rpc.ai_mask_key = () => null;
+    expect(
+      (await call(AI_API.mask(PHOTO, mask), { jar: j, headers: { 'If-None-Match': etag } })).status,
+    ).toBe(404);
     expect((await call(AI_API.mask(PHOTO, '60000000-0000-4000-8000-000000000002'), { jar: j })).status).toBe(
       404,
     );
+  });
+
+  it('limits face batches and reads separately, and answers busy with a short retry', async () => {
+    const j = await signedIn(MEI);
+    const enc = Buffer.from(new Float32Array(128).fill(0.1).buffer).toString('base64');
+    const body = {
+      v: 1,
+      photos: [{ id: PHOTO, faces: [{ box: [0.1, 0.1, 0.2, 0.2], score: 0.9, embedding: enc }] }],
+    };
+    world.rpc.ai_faces_add = () => ({ error: 'busy' });
+    const busy = await call(AI_API.faces, { jar: j, body });
+    expect(busy.status).toBe(429);
+    expect(busy.headers.get('Retry-After')).toBe('5');
+    facesLimiter.ok = false;
+    expect((await call(AI_API.faces, { jar: j, body })).status).toBe(429);
+    expect(facesLimiter.keys).toContain(`faces:${MEI.id}`);
+    world.rpc.ai_cleanup_ignore = () => 1;
+    expect(
+      (await call(AI_API.cleanupIgnore, { jar: j, body: { kind: 'blurry', photoIds: [PHOTO] } })).status,
+    ).toBe(200);
+    world.rpc.ai_status = () => ({ enabled: true });
+    expect((await call(AI_API.status, { jar: j })).status).toBe(200);
+    aiReadLimiter.ok = false;
+    expect((await call(AI_API.status, { jar: j })).status).toBe(429);
+  });
+
+  it('accepts consent only to the current wording', async () => {
+    const j = await signedIn(MEI);
+    world.rpc.ai_member_settings_update = () => ({ enabled: true });
+    const res = await call(AI_API.settings, {
+      jar: j,
+      method: 'PATCH',
+      body: { faceGrouping: true, faceConsent: { version: 2, rightsConfirmed: true } },
+    });
+    expect(res.status).toBe(400);
+    expect(rpcCalls('ai_member_settings_update')).toHaveLength(0);
   });
 
   it('maps plan and switch refusals', async () => {
@@ -611,5 +777,19 @@ describe('admin Zephyr AI', () => {
     const res = await call(ADMIN_AI_API.jobs, { jar: j, access });
     expect(res.status).toBe(200);
     expect(await read(res)).toMatchObject({ ok: true, latency: [], counts: { pending: 1 } });
+  });
+});
+
+describe('AI constants match the migration', () => {
+  it('failure budget, people cap and consent version', () => {
+    expect(migration).toContain(
+      `_ai_failure_budget() returns integer\nlanguage sql immutable set search_path = '' as $$ select ${AI_FAILURE_BUDGET} $$;`,
+    );
+    expect(migration).toContain(
+      `_ai_people_max() returns integer\nlanguage sql immutable set search_path = '' as $$ select ${MAX_PEOPLE} $$;`,
+    );
+    expect(migration).toContain(
+      `_ai_face_consent_version() returns integer\nlanguage sql immutable set search_path = '' as $$ select ${FACE_CONSENT_VERSION} $$;`,
+    );
   });
 });

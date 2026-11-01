@@ -7,6 +7,7 @@ import {
   CUTOUT_SHADOWS,
   DEVICE_LABEL_MAX,
   DEVICE_STEPS,
+  FACE_CONSENT_VERSION,
   FACE_LIMITS,
   FACE_MODEL_VERSION,
   JOB_TITLE_MAX,
@@ -28,7 +29,10 @@ const text = (max: number) => z.string().transform(clean).pipe(z.string().min(1)
 export const aiMemberSettingsSchema = z
   .object({
     faceGrouping: z.boolean(),
-    faceConsent: z.object({ version: z.number().int().min(1), rightsConfirmed: z.literal(true) }).strict(),
+    /** Only the current wording can be agreed to. */
+    faceConsent: z
+      .object({ version: z.literal(FACE_CONSENT_VERSION), rightsConfirmed: z.literal(true) })
+      .strict(),
     sceneTags: z.boolean(),
     cleanup: z.boolean(),
   })

@@ -158,7 +158,7 @@ function mediaHeaders(contentType: string): Headers {
 
 /**
  * Phase 6: a background mask (8-bit greyscale PNG). The key comes from the database, for the owner's own
- * photo only. Mask ids are never reused, so the response can be cached privately for good.
+ * photo only. Cached privately but revalidated on every use (ETag = the mask id, which never changes bytes).
  */
 photoRoutes.get('/:id/masks/:mask', async (c) => {
   const id = c.req.param('id');
@@ -171,10 +171,23 @@ photoRoutes.get('/:id/masks/:mask', async (c) => {
       p_mask: mask,
     });
     if (!key) return c.json(fail('not_found'), 404);
+    // Revalidated on every use (like thumbnails and previews), so a browser never shows a mask the member
+    // can no longer read, e.g. after signing out on a shared device or deleting the photo. A mask id never
+    // changes its bytes, so the ETag is the id and a revalidation costs one database lookup, no R2 read.
+    const etag = `"m-${mask.toLowerCase()}"`;
+    const inm = c.req.header('If-None-Match') ?? '';
+    if (inm.split(',').some((t) => t.trim().replace(/^W\//, '') === etag)) {
+      const h = mediaHeaders('image/png');
+      h.set('Cache-Control', 'private, no-cache');
+      h.set('ETag', etag);
+      h.delete('Content-Type');
+      return new Response(null, { status: 304, headers: h });
+    }
     const obj = await c.env.PHOTOS.get(key);
     if (!obj || !('body' in obj)) return c.json(fail('not_found'), 404);
     const h = mediaHeaders('image/png');
-    h.set('Cache-Control', 'private, max-age=31536000, immutable');
+    h.set('Cache-Control', 'private, no-cache');
+    h.set('ETag', etag);
     h.set('Content-Length', String(obj.size));
     return new Response(c.req.method === 'HEAD' ? null : obj.body, { status: 200, headers: h });
   } catch (err) {

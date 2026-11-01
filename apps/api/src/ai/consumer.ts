@@ -19,7 +19,7 @@ import { logError } from '../http';
 import { imageInfo } from '../library/files';
 import { deleteKeys, photoKey } from '../library/storage';
 import { rpc } from '../supabase';
-import { encodeMask, MaskError, readMask, resizeMask, sameAspect } from './png';
+import { encodeMask, MaskError, readMask, resizeMask } from './png';
 import {
   type CallLog,
   classifyScene,
@@ -33,6 +33,21 @@ import { aiSettings } from './settings';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Attempts on the primary provider before the fallback gets one. */
 export const PRIMARY_ATTEMPTS = 2;
+
+/** The calls one item may make: the primary up to PRIMARY_ATTEMPTS times, then the fallback once. */
+export function bgPlan(s: AiSettings): { provider: BgProvider; role: 'primary' | 'fallback' }[] {
+  const plan: { provider: BgProvider; role: 'primary' | 'fallback' }[] = [];
+  for (let k = 0; k < PRIMARY_ATTEMPTS; k++) plan.push({ provider: s.bgProvider, role: 'primary' });
+  if (s.bgFallback !== 'none' && s.bgFallback !== s.bgProvider)
+    plan.push({ provider: s.bgFallback, role: 'fallback' });
+  return plan;
+}
+/**
+ * What one item can cost at most: every call in its plan. This is what's reserved before the first call,
+ * so whatever the calls end up costing stays inside the caps.
+ */
+export const bgWorstCase = (s: AiSettings) =>
+  bgPlan(s).reduce((n, step) => n + providerEstimate(s, step.provider), 0);
 
 export interface SpendAlert {
   scope: string;
@@ -86,7 +101,7 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
   const s = await aiSettings(env);
   const begin = await rpc<Begin>(env, 'ai_item_begin', {
     p_item: itemId,
-    p_estimate: providerEstimate(s, s.bgProvider),
+    p_estimate: bgWorstCase(s),
   });
   if (begin.status === 'wait') {
     await sendSpendAlerts(env, begin.alerts, s.atCap);
@@ -109,14 +124,13 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
   if (!info) return failed('no_preview');
   const mime = info.format === 'jpeg' ? 'image/jpeg' : 'image/webp';
 
-  const plan: { provider: BgProvider; role: 'primary' | 'fallback' }[] = [];
-  for (let k = 0; k < PRIMARY_ATTEMPTS; k++) plan.push({ provider: s.bgProvider, role: 'primary' });
-  if (s.bgFallback !== 'none' && s.bgFallback !== s.bgProvider)
-    plan.push({ provider: s.bgFallback, role: 'fallback' });
-
+  const plan = bgPlan(s);
   let last: ProviderError = 'provider_error';
   let spent = 0;
+  /** A provider whose output we rejected isn't asked again: the same photo would most likely fail the same way. */
+  const rejected = new Set<BgProvider>();
   for (const step of plan) {
+    if (rejected.has(step.provider)) continue;
     const t0 = Date.now();
     try {
       const r = await cutoutCall(step.provider)(env, s, preview, mime);
@@ -124,12 +138,15 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
       spent += cost;
       let mask: { width: number; height: number; data: Uint8Array };
       try {
-        mask = readMask(r.png, MASK_LIMITS.providerMaxBytes);
+        // Bounded by the preview's own size, checked before anything is inflated.
+        mask = readMask(r.png, MASK_LIMITS.providerMaxBytes, {
+          width: info.width,
+          height: info.height,
+          aspectTolerance: MASK_LIMITS.aspectTolerance,
+        });
       } catch (err) {
         throw new ProviderFailure('bad_output', err instanceof MaskError ? err.reason : 'png');
       }
-      if (!sameAspect(mask, info, MASK_LIMITS.aspectTolerance))
-        throw new ProviderFailure('bad_output', 'aspect');
       const scale = Math.min(1, MASK_LIMITS.maxEdge / Math.max(info.width, info.height));
       const out = resizeMask(
         mask,
@@ -143,25 +160,20 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
       const maskId = crypto.randomUUID();
       const key = `u/${ownerId}/p/${photoId}/m/${maskId}.png`;
       await env.PHOTOS.put(key, png, { httpMetadata: { contentType: 'image/png' } });
-      let done: { status: string; deleteKeys?: string[] };
-      try {
-        done = await rpc<{ status: string; deleteKeys?: string[] }>(env, 'ai_item_complete', {
-          p_item: itemId,
-          p_mask: maskId,
-          p_key: key,
-          p_bytes: png.byteLength,
-          p_width: out.width,
-          p_height: out.height,
-          p_provider: step.provider,
-          p_cost: spent,
-          p_latency_ms: Date.now() - t0,
-          p_calls: calls,
-        });
-      } catch (err) {
-        // The orphan sweep removes the mask if no row records it.
-        await deleteKeys(env.PHOTOS, [key]).catch(() => undefined);
-        throw err;
-      }
+      // If this call fails (or its answer is lost after it committed), the mask is left in place: the
+      // orphan sweep removes it later if no row records it. Deleting it here could break a recipe that does.
+      const done = await rpc<{ status: string; deleteKeys?: string[] }>(env, 'ai_item_complete', {
+        p_item: itemId,
+        p_mask: maskId,
+        p_key: key,
+        p_bytes: png.byteLength,
+        p_width: out.width,
+        p_height: out.height,
+        p_provider: step.provider,
+        p_cost: spent,
+        p_latency_ms: Date.now() - t0,
+        p_calls: calls,
+      });
       const drop = (done.deleteKeys ?? []).filter(
         (k) => typeof k === 'string' && k.startsWith(`u/${ownerId}/p/`),
       );
@@ -171,6 +183,7 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
     } catch (err) {
       if (!(err instanceof ProviderFailure)) throw err;
       last = err.reason;
+      if (err.reason === 'bad_output') rejected.add(step.provider);
       calls.push({
         provider: step.provider,
         role: step.role,
@@ -184,7 +197,7 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
 }
 
 type SceneBegin =
-  | { status: 'go'; alerts?: SpendAlert[] }
+  | { status: 'go'; day?: string; alerts?: SpendAlert[] }
   | { status: 'wait'; alerts?: SpendAlert[] }
   | { status: 'skip' };
 
@@ -205,6 +218,8 @@ export async function processScene(
   await sendSpendAlerts(env, begin.status === 'skip' ? undefined : begin.alerts, s.atCap);
   if (begin.status === 'wait') return 'waiting';
   if (begin.status !== 'go') return 'skipped';
+  // Settled on the day the reservation was made (a run can cross midnight UTC).
+  const day = typeof begin.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(begin.day) ? begin.day : null;
   const done = (scenes: unknown, calls: CallLog[]) =>
     rpc(env, 'ai_scene_done', {
       p_owner: owner,
@@ -213,27 +228,42 @@ export async function processScene(
       p_reserved: estimate,
       p_cost: calls.length ? estimate : 0,
       p_calls: calls,
+      p_day: day,
     });
-  const obj = await env.PHOTOS.get(photoKey(owner, photo, 'thumb'));
-  if (!obj || !('body' in obj)) {
-    await done('retry', []);
-    return 'waiting';
-  }
-  const thumb = new Uint8Array(await obj.arrayBuffer());
+  let called = false;
   const t0 = Date.now();
   try {
-    const labels = await classifyScene(env, s, thumb);
-    const scenes = sceneForLabels(labels)
-      .filter((x) => x.scene !== 'night' && x.score >= SCENE_MIN_SCORE)
-      .slice(0, 5);
-    await done(scenes, [{ provider: 'workers_ai', role: 'primary', ok: true, ms: Date.now() - t0 }]);
-    return 'done';
+    const obj = await env.PHOTOS.get(photoKey(owner, photo, 'thumb'));
+    if (!obj || !('body' in obj)) {
+      await done('retry', []);
+      return 'waiting';
+    }
+    const thumb = new Uint8Array(await obj.arrayBuffer());
+    called = true;
+    try {
+      const labels = await classifyScene(env, s, thumb);
+      const scenes = sceneForLabels(labels)
+        .filter((x) => x.scene !== 'night' && x.score >= SCENE_MIN_SCORE)
+        .slice(0, 5);
+      await done(scenes, [{ provider: 'workers_ai', role: 'primary', ok: true, ms: Date.now() - t0 }]);
+      return 'done';
+    } catch (err) {
+      if (!(err instanceof ProviderFailure)) throw err;
+      await done(null, [
+        { provider: 'workers_ai', role: 'primary', ok: false, ms: Date.now() - t0, error: err.code },
+      ]);
+      return 'failed';
+    }
   } catch (err) {
-    if (!(err instanceof ProviderFailure)) throw err;
-    await done(null, [
-      { provider: 'workers_ai', role: 'primary', ok: false, ms: Date.now() - t0, error: err.code },
-    ]);
-    return 'failed';
+    // Anything unexpected after the reservation (R2, the database): settle it and let the backfill try
+    // again in an hour, so reservations never pile up against the caps. Then retry the message as usual.
+    await done(
+      'retry',
+      called
+        ? [{ provider: 'workers_ai', role: 'primary', ok: false, ms: Date.now() - t0, error: 'run' }]
+        : [],
+    ).catch(() => undefined);
+    throw err;
   }
 }
 

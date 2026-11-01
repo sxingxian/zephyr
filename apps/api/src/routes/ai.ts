@@ -61,8 +61,17 @@ aiRoutes.use('*', async (c, next) =>
 aiRoutes.use('*', requireMember);
 /** Writes: the shared-device check (X-Zephyr-Expected-User) and the per-member AI write limit. */
 const writes: MiddlewareHandler<HonoEnv> = async (c, next) => {
-  if (c.req.method === 'GET' || c.req.method === 'HEAD') return next();
+  if (c.req.method === 'GET' || c.req.method === 'HEAD') {
+    // Reads have their own, roomier limit: the people list and cleanup pages are the heavier queries.
+    if (!(await c.env.AI_READ_LIMITER.limit({ key: `ai-read:${ownerOf(c)}` })).success)
+      return rateLimited(c, 60);
+    return next();
+  }
   if (!(await c.env.AI_LIMITER.limit({ key: `ai:${ownerOf(c)}` })).success) return rateLimited(c, 60);
+  // Face batches are matched in Postgres against all of the member's people: kept to 10 a minute.
+  if (c.req.method === 'POST' && c.req.path.endsWith('/ai/faces')) {
+    if (!(await c.env.FACES_LIMITER.limit({ key: `faces:${ownerOf(c)}` })).success) return rateLimited(c, 60);
+  }
   return expectedUser(c, next);
 };
 aiRoutes.use('*', writes);
@@ -89,6 +98,9 @@ function blocked(c: Ctx, error: string | undefined) {
       return c.json(fail('feature_off'), 403);
     case 'rate_limited':
       return rateLimited(c, 60);
+    case 'busy':
+      // Another face request of this member holds the faces lock: try again in a few seconds.
+      return rateLimited(c, 5);
     case 'held':
     case 'finished':
     case 'lost':

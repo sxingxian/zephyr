@@ -60,6 +60,19 @@
       "name": "AI_LIMITER",
       "namespace_id": "1007",
       "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      // Phase 6: face batches per member (keyed by user id). Each is up to 20 photos × 30 faces and is matched
+      // against the member's people in Postgres, so this stays low.
+      "name": "FACES_LIMITER",
+      "namespace_id": "1008",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      // Phase 6: Zephyr AI reads per member (status, queue, people, scenes, cleanup pages, credit history).
+      "name": "AI_READ_LIMITER",
+      "namespace_id": "1009",
+      "simple": { "limit": 300, "period": 60 }
     }
   ],
   // Private photo bucket: no public access, no r2.dev URL. Every byte goes through this Worker.
@@ -87,6 +100,9 @@
         "queue": "zephyr-ai",
         "max_batch_size": 5,
         "max_batch_timeout": 5,
+        // At most 4 batches (20 items) in flight: bounds the provider calls running at once, and with them
+        // how far spend can run ahead of the reservations the caps check.
+        "max_concurrency": 4,
         "max_retries": 3,
         "dead_letter_queue": "zephyr-ai-dlq"
       }
