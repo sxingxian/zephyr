@@ -5,6 +5,7 @@
 # - Spend caps: two consumers reserving at the cap can't both pass it.
 # - Refunds: two failure reports for one item refund it once.
 # - Faces: an add racing "turn off and delete" never leaves face data behind.
+# - Scenes: a result racing "scene tags off" never leaves tags behind, re-tags included, and never deadlocks.
 set -euo pipefail
 read -r -a psql <<<"$PSQL_ARGS"
 P() { "${psql[@]}" -At "$@"; }
@@ -81,4 +82,26 @@ wait
 rm -f "$out1"
 [ "$r" = "busy" ] || fail "faces lock held: got '$r', want 'busy'"
 echo "ok - a faces request waits at most 3 s for the lock, then says busy"
+# Scenes: a result and an opt-out serialise on the member's scenes lock, whichever starts first (re-review #2).
+scene_pid=71000000-0000-0000-0000-000000000002
+scene_round() { # $1: 'done-first' | 'optout-first'; $2: give the photo old tags first (a re-tag)
+  P -c "select public.ai_member_settings_update('$owner', '{\"sceneTags\": true}');" >/dev/null
+  P -c "update public.photos set scene_state = null, scene_retry_at = null, scene_run = null, scene_reserved = 0 where id = '$scene_pid';" >/dev/null
+  if [ "$2" = retag ]; then
+    P -c "insert into public.photo_scenes (photo_id, owner_id, scene, score) values ('$scene_pid', '$owner', 'food', 0.9) on conflict do nothing;" >/dev/null
+  fi
+  local run
+  run="$(P -c "select public.ai_scene_begin('$owner', '$scene_pid', 0) ->> 'run'")"
+  [ -n "$run" ] || fail "scene begin gave no run"
+  local done_sql="public.ai_scene_done('$owner', '$scene_pid', '[{\"scene\": \"beach\", \"score\": 0.9}]', 0, 0, '[]', null, '$run') ->> 'status'"
+  local off_sql="(public.ai_member_settings_update('$owner', '{\"sceneTags\": false}') #>> '{member,sceneTags}')"
+  if [ "$1" = done-first ]; then r="$(run_pair "$done_sql" "$off_sql")"; else r="$(run_pair "$off_sql" "$done_sql")"; fi
+  [ "$(P -c "select count(*) from public.photo_scenes where owner_id = '$owner'")" = 0 ] \
+    || fail "scene tags survived the opt-out ($1, $2): got '$r'"
+}
+scene_round done-first new
+scene_round optout-first new
+scene_round done-first retag
+scene_round optout-first retag
+echo "ok - a scene result racing scene-tags-off leaves no tags, re-tags included, without deadlock"
 echo "All AI race tests passed."

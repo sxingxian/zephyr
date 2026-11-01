@@ -274,7 +274,9 @@ select pg_temp.ok((public.ai_device_progress(:mei, (select (v #>> '{job,id}')::u
                    null, array[(select v from t where k = 'p3')]) #>> '{job,status}') = 'done', 'the job finishes');
 -- Runner tokens: two tabs of one sign-in never run the same job (client review #2).
 insert into r values ('dj2', public.ai_device_job_create(:mei, array[(select v from t where k = 'p2'), (select v from t where k = 'p3')],
-  '{"steps": ["hdr"]}', 'Tabs', 'Chrome on Mac', 'session-t'));
+  '{"steps": ["hdr"]}', 'Tabs', 'Chrome on Mac', 'session-t', 'AAAAAAAAAAAAAAAAAAAAAA'));
+select pg_temp.ok((select lease_runner = 'AAAAAAAAAAAAAAAAAAAAAA' from public.ai_jobs where id = (select (v #>> '{job,id}')::uuid from r where k = 'dj2')),
+  'a new device job is leased to the creating tab''s runner token (re-review #6)');
 select pg_temp.ok((public.ai_device_claim(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'Chrome on Mac', 'session-t',
                    'AAAAAAAAAAAAAAAAAAAAAA') ->> 'error') is null, 'the creating tab claims with its runner token');
 select pg_temp.ok((public.ai_device_claim(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'Chrome on Mac', 'session-t',
@@ -293,6 +295,18 @@ update public.ai_jobs set lease_until = now() - interval '1 second' where id = (
 select pg_temp.ok((public.ai_device_claim(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'), 'Chrome on Mac', 'session-t',
                    'BBBBBBBBBBBBBBBBBBBBBB') ->> 'error') is null, 'once the lease lapses another tab can continue');
 select public.ai_device_pause(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj2'));
+-- A job created by a client that sends no runner token: a tab with a token can't take its live lease, and the
+-- creator's progress without a token still counts (re-review #6).
+insert into r values ('dj3', public.ai_device_job_create(:mei, array[(select v from t where k = 'p2')],
+  '{"steps": ["hdr"]}', 'Old client', 'Chrome on Mac', 'session-o'));
+select pg_temp.ok((public.ai_device_claim(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj3'), 'Chrome on Mac', 'session-o',
+                   'CCCCCCCCCCCCCCCCCCCCCC') ->> 'error') = 'held', 'a tab with a token can''t take a token-less live lease');
+select pg_temp.ok((public.ai_device_progress(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj3'), 'session-o',
+                   null, null, 'CCCCCCCCCCCCCCCCCCCCCC') ->> 'error') = 'lost', 'nor report on it');
+select pg_temp.ok((public.ai_device_progress(:mei, (select (v #>> '{job,id}')::uuid from r where k = 'dj3'), 'session-o',
+                   null, null) ->> 'error') is null, 'the token-less creator still reports');
+select pg_temp.ok((public.ai_device_job_create(:mei, array[(select v from t where k = 'p2')], '{"steps": ["hdr"]}', null, 'Mac', 's',
+                   'bad token!') ->> 'error') = 'invalid', 'a malformed runner token at create is refused');
 select pg_temp.ok((select lease_runner is null from public.ai_jobs where id = (select (v #>> '{job,id}')::uuid from r where k = 'dj2')),
   'pause releases the runner too');
 select pg_temp.ok((public.ai_device_job_create(:mei, array[(select v from t where k = 'p2')], '{"steps": ["color_match"], "reference": "a6000000-0000-0000-0000-00000000dead"}',
@@ -310,9 +324,11 @@ select pg_temp.ok(public.ai_signals_save(:mei, 1, '[{"id": "x", "phash": "zz"}]'
 select pg_temp.ok((public.ai_cleanup_page(:mei) -> 'photos' -> 0 ->> 'phash') = 'ffff0000aaaa5555', 'cleanup returns the hash as hex');
 select pg_temp.ok((public.ai_cleanup_page(:wei) ->> 'error') = 'plan', 'cleanup needs Pro or Studio');
 select pg_temp.ok(public.ai_cleanup_ignore(:mei, 'blurry', array[(select v from t where k = 'p1')]) = 1, 'keep a blurry photo');
-select pg_temp.ok((public.ai_scene_begin(:mei, (select v from t where k = 'p2'), 20) ->> 'status') = 'go', 'scene tagging goes');
+insert into r values ('sp2', public.ai_scene_begin(:mei, (select v from t where k = 'p2'), 20));
+select pg_temp.ok((select v ->> 'status' from r where k = 'sp2') = 'go', 'scene tagging goes');
 select pg_temp.ok((public.ai_scene_done(:mei, (select v from t where k = 'p2'), '[{"scene": "food", "score": 0.8}, {"scene": "nope", "score": 1}]',
-                   20, 20, '[{"provider": "workers_ai", "ok": true, "ms": 300}]') ->> 'status') = 'ok', 'scene tags recorded');
+                   20, 20, '[{"provider": "workers_ai", "ok": true, "ms": 300}]', null, (select (v ->> 'run')::uuid from r where k = 'sp2'))
+                   ->> 'status') = 'ok', 'scene tags recorded');
 select pg_temp.ok((select count(*) = 1 from public.photo_scenes where photo_id = (select v from t where k = 'p2')), 'unknown scenes are dropped');
 select pg_temp.ok(public.ai_scenes(:mei) @> '[{"scene": "food", "count": 1}, {"scene": "night", "count": 1}]', 'scenes include Night from signals');
 select pg_temp.ok(jsonb_array_length(public.list_photos(:mei, 'library', null, null, null, null, 'taken', null, 60, 'food') -> 'items') = 1,
@@ -471,35 +487,118 @@ select pg_temp.ok((select status = 'canceled' and credits = 0 and reserved_micro
                         where id = (select (v #>> '{}')::uuid from r where k = 'ci'))
                   and pg_temp.balance(:rev1) = 1000, 'and is canceled, refunded and its reservation settled');
 
--- A late provider result for an item that moved on still counts its cost.
+-- A late provider result for a run taken over as stuck counts nothing more: its whole reservation (the run's
+-- worst case) was counted as spent when it was taken over (re-review #4).
 select pg_temp.ok((select coalesce(sum(spent_micros), 0) from public.ai_user_spend_daily where owner_id = :rev1 and day = public._ai_today()) = 1800,
   'the stuck reservation is counted as spent');
-select public.ai_item_failed((select (v #>> '{}')::uuid from r where k = 'ci'), 'provider_error', 700, '[]');
-select pg_temp.ok((select spent_micros from public.ai_user_spend_daily where owner_id = :rev1 and day = public._ai_today()) = 2500,
-  'a late failure report still records what the call cost');
+select public.ai_item_failed((select (v #>> '{}')::uuid from r where k = 'ci'), 'provider_error', 700, '[]', 1);
+select pg_temp.ok((select spent_micros from public.ai_user_spend_daily where owner_id = :rev1 and day = public._ai_today()) = 1800,
+  'a late failure report after a takeover isn''t counted twice');
 
--- Daily failure budget: past it, items wait until tomorrow.
+-- A late report from attempt 1 while attempt 2 runs changes nothing (re-review #4).
+insert into r values ('ljob', public.ai_bg_job_create(:rev1, array[(select v from t where k = 'r3')], '{"bg": "white"}', null, false));
+insert into r values ('li', to_jsonb((select (v -> 'items' ->> 0)::uuid from r where k = 'ljob')));
+select public.ai_item_begin((select (v #>> '{}')::uuid from r where k = 'li'), 1800);
+update public.ai_job_items set started_at = now() - interval '20 minutes' where id = (select (v #>> '{}')::uuid from r where k = 'li');
+select pg_temp.ok((public.ai_item_begin((select (v #>> '{}')::uuid from r where k = 'li'), 1800) ->> 'attempts')::integer = 2,
+  'a stuck item is run again as attempt 2');
+select pg_temp.ok((public.ai_item_failed((select (v #>> '{}')::uuid from r where k = 'li'), 'provider_error', 700, '[]', 1) ->> 'status') = 'skip',
+  'attempt 1''s late failure is ignored');
+select pg_temp.ok((select status = 'processing' from public.ai_job_items where id = (select (v #>> '{}')::uuid from r where k = 'li')),
+  'and doesn''t fail attempt 2');
+select pg_temp.ok((public.ai_item_complete((select (v #>> '{}')::uuid from r where k = 'li'), 'a7000000-0000-4000-8000-000000000001',
+                    public._mask_key(:rev1, (select v from t where k = 'r3'), 'a7000000-0000-4000-8000-000000000001'),
+                    100, 10, 10, 'runware', 600, 10, '[]', 1) ->> 'status') = 'gone', 'attempt 1''s late mask is refused');
+select pg_temp.ok(not exists (select 1 from public.photo_masks where id = 'a7000000-0000-4000-8000-000000000001')
+                  and (select status = 'processing' from public.ai_job_items where id = (select (v #>> '{}')::uuid from r where k = 'li')),
+  'and attaches nothing');
+
+-- An item that finishes after the account was scheduled for deletion keeps nothing and is refunded (re-review #5).
+select public.ai_job_cancel(:rev1, (select (v #>> '{job,id}')::uuid from r where k = 'ljob'));
+select public.ai_item_failed((select (v #>> '{}')::uuid from r where k = 'li'), 'provider_error', 0, '[]', 2);
+insert into r values ('djob', public.ai_bg_job_create(:rev1, array[(select v from t where k = 'r3')], '{"bg": "white"}', null, false));
+insert into r values ('di', to_jsonb((select (v -> 'items' ->> 0)::uuid from r where k = 'djob')));
+select public.ai_item_begin((select (v #>> '{}')::uuid from r where k = 'di'), 1800);
+insert into r values ('dbal', to_jsonb(pg_temp.balance(:rev1)));
+select public.request_account_deletion(:rev1);
+select pg_temp.ok((public.ai_item_complete((select (v #>> '{}')::uuid from r where k = 'di'), 'a7000000-0000-4000-8000-000000000002',
+                    public._mask_key(:rev1, (select v from t where k = 'r3'), 'a7000000-0000-4000-8000-000000000002'),
+                    100, 10, 10, 'runware', 600, 10, '[]', 1) ->> 'status') = 'gone', 'a result after deletion was scheduled is dropped');
+select pg_temp.ok(not exists (select 1 from public.photo_masks where id = 'a7000000-0000-4000-8000-000000000002'), 'no mask row');
+select pg_temp.ok((select status = 'canceled' and credits = 0 from public.ai_job_items where id = (select (v #>> '{}')::uuid from r where k = 'di')),
+  'the item is canceled');
+select pg_temp.ok(pg_temp.balance(:rev1) = (select (v #>> '{}')::integer + 1 from r where k = 'dbal'), 'and its credit refunded');
+select pg_temp.ok(not exists (select 1 from public.photo_edits where photo_id = (select v from t where k = 'r3') and recipe ? 'cutout'),
+  'and no cut-out is attached');
+select public.restore_account(:rev1);
+
+-- Daily failure budget: past it, items wait until tomorrow. It counts provider failures as they happen, so
+-- retrying failed items doesn't reset it, and a retry counts toward the per-minute job limit (re-review #1).
+update public.ai_user_spend_daily set failures = 0 where owner_id = :rev1 and day = public._ai_today();
+insert into public.ai_user_spend_daily (day, owner_id, failures) values (public._ai_today(), :rev1, public._ai_failure_budget() - 1)
+on conflict (day, owner_id) do update set failures = public._ai_failure_budget() - 1;
 insert into r values ('fjob', public.ai_bg_job_create(:rev1, array[(select v from t where k = 'r1')], '{"bg": "white"}', null, false));
-insert into public.ai_job_items (job_id, owner_id, photo_id, seq, filename, status, error, finished_at)
-select (select (v #>> '{job,id}')::uuid from r where k = 'fjob'), :rev1, (select v from t where k = 'r1'), 100 + k, 'x.jpg', 'failed', 'bad_output', now()
-  from generate_series(1, public._ai_failure_budget()) k;
+select public.ai_item_begin((select (v #>> '{items,0}')::uuid from r where k = 'fjob'), 1800);
+select public.ai_item_failed((select (v #>> '{items,0}')::uuid from r where k = 'fjob'), 'bad_output', 600, '[]', 1);
+select pg_temp.ok((select failures from public.ai_user_spend_daily where owner_id = :rev1 and day = public._ai_today()) = public._ai_failure_budget(),
+  'a provider failure counts against the budget');
+select pg_temp.ok((public.ai_job_retry(:rev1, (select (v #>> '{job,id}')::uuid from r where k = 'fjob'), null) ->> 'error') is null,
+  'the failed item is retried');
+select pg_temp.ok((select failures from public.ai_user_spend_daily where owner_id = :rev1 and day = public._ai_today()) = public._ai_failure_budget(),
+  'retrying doesn''t reset the count');
 select pg_temp.ok(public.ai_item_begin((select (v #>> '{items,0}')::uuid from r where k = 'fjob'), 1800)
-                  @> '{"status": "wait", "capped": "failures"}', 'a member past the daily failure budget waits until tomorrow');
+                  @> '{"status": "wait", "capped": "failures"}', 'a member past the daily failure budget waits until tomorrow, retries included');
+update public.ai_settings set member_jobs_per_minute = (select count(*) from public.ai_job_requests where owner_id = :rev1 and at > now() - interval '1 minute');
+select pg_temp.ok((public.ai_job_retry(:rev1, (select (v #>> '{job,id}')::uuid from r where k = 'fjob'), null) ->> 'error') in ('rate_limited', 'nothing')
+                  and (public.ai_bg_job_create(:rev1, array[(select v from t where k = 'r2')], '{"bg": "white"}', null, false) ->> 'error') = 'rate_limited',
+  'creations and retries share the per-minute job limit');
+update public.ai_settings set member_jobs_per_minute = 60;
+update public.ai_job_items set status = 'failed', error = 'provider_error', finished_at = now()
+ where id = (select (v #>> '{items,0}')::uuid from r where k = 'fjob');
+update public.ai_settings set member_jobs_per_minute = (select count(*) from public.ai_job_requests where owner_id = :rev1 and at > now() - interval '1 minute');
+select pg_temp.ok((public.ai_job_retry(:rev1, (select (v #>> '{job,id}')::uuid from r where k = 'fjob'), null) ->> 'error') = 'rate_limited',
+  'a retry over the per-minute job limit is refused');
+update public.ai_settings set member_jobs_per_minute = 60;
 
 -- Scenes: a result after the member turned scene tags off is dropped; the reservation settles on its day.
-select pg_temp.ok((public.ai_scene_begin(:rev2, (select v from t where k = 's1'), 20) ->> 'status') = 'go', 'scene begin: go');
+insert into r values ('sb1', public.ai_scene_begin(:rev2, (select v from t where k = 's1'), 20));
+select pg_temp.ok((select v ->> 'status' = 'go' and (v ->> 'run') is not null from r where k = 'sb1'), 'scene begin: go, with a run token');
 select public.ai_member_settings_update(:rev2, '{"sceneTags": false}');
 select pg_temp.ok((public.ai_scene_done(:rev2, (select v from t where k = 's1'), '[{"scene": "beach", "score": 0.9}]', 20, 20, '[]',
-                    public._ai_today()) ->> 'status') = 'skip'
+                    public._ai_today(), (select (v ->> 'run')::uuid from r where k = 'sb1')) ->> 'status') = 'skip'
                   and not exists (select 1 from public.photo_scenes where owner_id = :rev2), 'scene tags after an opt-out are dropped');
 select pg_temp.ok((select reserved_micros = 0 and spent_micros = 20 from public.ai_user_spend_daily where owner_id = :rev2 and day = public._ai_today()),
   'and the reservation is settled');
+-- The same run reporting again (a lost reply, then the consumer's catch path) is a no-op (re-review #3).
+select pg_temp.ok((public.ai_scene_done(:rev2, (select v from t where k = 's1'), '"retry"', 20, 20, '[]',
+                    public._ai_today(), (select (v ->> 'run')::uuid from r where k = 'sb1')) ->> 'status') = 'stale',
+  'a repeated report is stale');
+select pg_temp.ok((select spent_micros = 20 and reserved_micros = 0 from public.ai_user_spend_daily where owner_id = :rev2 and day = public._ai_today())
+                  and (select scene_retry_at is null from public.photos where id = (select v from t where k = 's1')),
+  'and settles and changes nothing more');
 select public.ai_member_settings_update(:rev2, '{"sceneTags": true}');
-select pg_temp.ok((public.ai_scene_begin(:rev2, (select v from t where k = 's1'), 20) ->> 'day') = public._ai_today()::text,
-  'begin says which day it reserved on');
-select public.ai_scene_done(:rev2, (select v from t where k = 's1'), '"retry"', 20, 0, '[]', public._ai_today());
+insert into r values ('sb2', public.ai_scene_begin(:rev2, (select v from t where k = 's1'), 20));
+select pg_temp.ok((select v ->> 'day' from r where k = 'sb2') = public._ai_today()::text, 'begin says which day it reserved on');
+select pg_temp.ok((public.ai_scene_done(:rev2, (select v from t where k = 's1'), '[{"scene": "beach", "score": 0.9}]', 20, 20, '[]',
+                    public._ai_today()) ->> 'status') = 'stale', 'a report without the run token is refused while a run is in flight');
+select public.ai_scene_done(:rev2, (select v from t where k = 's1'), '"retry"', 20, 0, '[]', public._ai_today(),
+                            (select (v ->> 'run')::uuid from r where k = 'sb2'));
 select pg_temp.ok((select scene_retry_at > now() + interval '50 minutes' from public.photos where id = (select v from t where k = 's1')),
   'a retry waits an hour');
+select pg_temp.ok((public.ai_scene_begin(:rev2, (select v from t where k = 's1'), 20) ->> 'status') = 'wait',
+  'begin waits while the retry time hasn''t come (re-review #3)');
+-- A run that never reported is taken over: its reservation counts as spent and its late report as nothing.
+update public.photos set scene_retry_at = null where id = (select v from t where k = 's1');
+insert into r values ('sb3', public.ai_scene_begin(:rev2, (select v from t where k = 's1'), 20));
+insert into r values ('sb4', public.ai_scene_begin(:rev2, (select v from t where k = 's1'), 20));
+select pg_temp.ok((select (v ->> 'status') = 'go' from r where k = 'sb4')
+                  and (public.ai_scene_done(:rev2, (select v from t where k = 's1'), '[]', 20, 20, '[]', public._ai_today(),
+                        (select (v ->> 'run')::uuid from r where k = 'sb3')) ->> 'status') = 'stale',
+  'a run taken over can''t report later');
+select pg_temp.ok((public.ai_scene_done(:rev2, (select v from t where k = 's1'), '"retry"', 20, 0, '[]', public._ai_today(),
+                    (select (v ->> 'run')::uuid from r where k = 'sb4')) ->> 'status') = 'retry', 'the current run reports');
+select pg_temp.ok((select reserved_micros = 0 and spent_micros = 40 from public.ai_user_spend_daily where owner_id = :rev2 and day = public._ai_today()),
+  'and every reservation is settled, the taken-over run counted as spent once');
 select pg_temp.ok(not (public.ai_scene_backfill(2000) @> jsonb_build_array(jsonb_build_object('photo', (select v from t where k = 's1')))),
   'the backfill skips it until then');
 update public.photos set scene_retry_at = null where id = (select v from t where k = 's1');

@@ -80,9 +80,20 @@ create table public.ai_user_spend_daily (
   owner_id uuid not null references auth.users (id) on delete cascade,
   spent_micros bigint not null default 0 check (spent_micros >= 0),
   reserved_micros bigint not null default 0 check (reserved_micros >= 0),
+  -- Provider-caused failures today (refunded). Only ever increases: retrying failed items doesn't reset it.
+  failures integer not null default 0 check (failures >= 0),
   primary key (day, owner_id)
 );
 alter table public.ai_user_spend_daily enable row level security;
+
+-- Every job creation and retry, for member_jobs_per_minute (append-only; pruned after a day).
+create table public.ai_job_requests (
+  id bigint generated always as identity primary key,
+  owner_id uuid not null references auth.users (id) on delete cascade,
+  at timestamptz not null default now()
+);
+create index ai_job_requests_owner on public.ai_job_requests (owner_id, at);
+alter table public.ai_job_requests enable row level security;
 
 -- One email per (day, scope, threshold).
 create table public.ai_spend_alerts (
@@ -257,7 +268,11 @@ alter table public.photos
   add column scene_queued_at timestamptz,
   add column faces_version integer not null default 0 check (faces_version >= 0),
   -- Not before this time (cap reached, cloud paused, thumbnail not there yet): the backfill skips it until then.
-  add column scene_retry_at timestamptz;
+  add column scene_retry_at timestamptz,
+  -- The scene run in flight (from ai_scene_begin) and its reservation; ai_scene_done settles only that run, once.
+  add column scene_run uuid,
+  add column scene_reserved bigint not null default 0 check (scene_reserved >= 0),
+  add column scene_reserved_day date;
 create index photos_scene_due on public.photos (created_at desc) where status = 'ready' and scene_state is null;
 
 create table public.photo_scenes (
@@ -589,6 +604,33 @@ language sql volatile set search_path = '' as $$
      and coalesce(c.value ->> 'role', 'primary') in ('primary', 'fallback');
 $$;
 
+-- Job creations and retries per member per minute (call under the member's credits lock). True and recorded
+-- when allowed.
+create function public._ai_job_request(p_owner uuid, p_per_minute integer) returns boolean
+language plpgsql volatile set search_path = '' as $$
+begin
+  if (select count(*) from public.ai_job_requests where owner_id = p_owner and at > now() - interval '1 minute')
+     >= p_per_minute then
+    return false;
+  end if;
+  insert into public.ai_job_requests (owner_id) values (p_owner);
+  return true;
+end;
+$$;
+
+-- A provider-caused failure counts against the member's daily failure budget (under the spend lock, the same
+-- order as every settle: credits lock, then spend lock).
+create function public._ai_failure_count(p_owner uuid) returns void
+language plpgsql volatile set search_path = '' as $$
+declare
+  d date := public._ai_today();
+begin
+  perform pg_advisory_xact_lock(hashtextextended('zephyr:ai-spend:' || d::text, 0));
+  insert into public.ai_user_spend_daily (day, owner_id, failures) values (d, p_owner, 1)
+  on conflict (day, owner_id) do update set failures = public.ai_user_spend_daily.failures + 1;
+end;
+$$;
+
 -- ---- credits ---------------------------------------------------------------------------------
 create function public._credits_lock(p_owner uuid) returns void
 language sql volatile set search_path = '' as $$
@@ -756,6 +798,9 @@ begin
   if it.status in ('completed', 'failed', 'canceled') then return; end if;
   if it.reserved_micros > 0 then
     perform public._ai_spend_settle('bg_removal', it.owner_id, it.reserved_day, it.reserved_micros, 0);
+  end if;
+  if p_error in ('provider_timeout', 'provider_error', 'bad_output') then
+    perform public._ai_failure_count(it.owner_id);
   end if;
   update public.ai_job_items
      set status = 'failed', error = p_error, finished_at = now(), reserved_micros = 0, wait_until = null
@@ -1009,6 +1054,9 @@ begin
     end if;
   end if;
   if want_scenes is not null then
+    -- The member's scenes lock (ai_scene_done takes it first too): a result in flight either commits before
+    -- this delete sees it, or waits and then reads the opt-out.
+    perform pg_advisory_xact_lock(hashtextextended('zephyr:scenes:' || p_owner::text, 0));
     update public.ai_member_settings set scene_tags = want_scenes, updated_at = now() where owner_id = p_owner;
     if not want_scenes then
       delete from public.photo_scenes where owner_id = p_owner;
@@ -1093,8 +1141,7 @@ begin
   if cardinality(ids) > coalesce(r.batch_size, 25) then return jsonb_build_object('error', 'batch'); end if;
 
   perform public._credits_lock(p_owner);
-  if (select count(*) from public.ai_jobs where owner_id = p_owner and created_at > now() - interval '1 minute')
-     >= s.member_jobs_per_minute then
+  if not public._ai_job_request(p_owner, s.member_jobs_per_minute) then
     return jsonb_build_object('error', 'rate_limited');
   end if;
   foreach pid in array ids loop
@@ -1139,7 +1186,7 @@ $$;
 
 -- Creates a device job, held by the creating session. Returns {job, remaining, skipped} | {error}.
 create function public.ai_device_job_create(p_owner uuid, p_photo_ids uuid[], p_params jsonb, p_title text,
-  p_device text, p_session text) returns jsonb
+  p_device text, p_session text, p_runner text default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   s public.ai_settings := public._ai_settings();
@@ -1154,6 +1201,7 @@ declare
   device text := left(nullif(btrim(regexp_replace(coalesce(p_device, ''), '[[:cntrl:]]', '', 'g')), ''), 40);
 begin
   if not exists (select 1 from public.profiles where id = p_owner) then return null; end if;
+  if p_runner is not null and p_runner !~ '^[A-Za-z0-9_-]{22}$' then return jsonb_build_object('error', 'invalid'); end if;
   if p_params is null or jsonb_typeof(p_params) <> 'object' or jsonb_typeof(p_params -> 'steps') <> 'array'
      or jsonb_array_length(p_params -> 'steps') = 0 or device is null then
     return jsonb_build_object('error', 'invalid');
@@ -1172,8 +1220,7 @@ begin
   if ids is null or cardinality(ids) = 0 then return jsonb_build_object('error', 'no_photos', 'skipped', skipped); end if;
   if cardinality(ids) > coalesce(r.batch_size, 25) then return jsonb_build_object('error', 'batch'); end if;
   perform public._credits_lock(p_owner);
-  if (select count(*) from public.ai_jobs where owner_id = p_owner and created_at > now() - interval '1 minute')
-     >= s.member_jobs_per_minute then
+  if not public._ai_job_request(p_owner, s.member_jobs_per_minute) then
     return jsonb_build_object('error', 'rate_limited');
   end if;
   foreach pid in array ids loop
@@ -1184,10 +1231,10 @@ begin
     end if;
   end loop;
   if cardinality(ok_ids) = 0 then return jsonb_build_object('error', 'no_photos', 'skipped', skipped); end if;
-  insert into public.ai_jobs (owner_id, kind, title, params, lease_device, lease_session, lease_until)
+  insert into public.ai_jobs (owner_id, kind, title, params, lease_device, lease_session, lease_runner, lease_until)
   values (p_owner, 'device',
           left(coalesce(title, 'Zephyr AI · ' || cardinality(ok_ids) || case when cardinality(ok_ids) = 1 then ' photo' else ' photos' end), 80),
-          p_params, device, left(p_session, 64), now() + interval '120 seconds')
+          p_params, device, left(p_session, 64), p_runner, now() + interval '120 seconds')
   returning * into j;
   insert into public.ai_job_items (job_id, owner_id, photo_id, seq, filename)
   select j.id, p_owner, u.id, (u.n - 1)::integer, p.filename
@@ -1302,6 +1349,9 @@ begin
      and p.status = 'ready' and p.has_preview and p.safety_hold_at is null
      and (p_items is null or i.id = any (p_items));
   if ids is null then return jsonb_build_object('error', 'nothing'); end if;
+  if not public._ai_job_request(p_owner, s.member_jobs_per_minute) then
+    return jsonb_build_object('error', 'rate_limited');
+  end if;
   b := public._credits_roll(p_owner);
   needed := cardinality(ids) * s.bg_credits_per_photo;
   if b.balance < needed then
@@ -1336,9 +1386,10 @@ begin
   select * into j from public.ai_jobs where id = p_job and owner_id = p_owner and kind = 'device' for update;
   if not found then return null; end if;
   if j.state = 'canceled' or j.finished_at is not null then return jsonb_build_object('error', 'finished'); end if;
+  -- A live lease belongs to one tab: another session, or another tab of this one (including a client that sends
+  -- no runner token where the holder has one, or the other way round), is refused.
   if j.lease_until > now() and j.state = 'active'
-     and (j.lease_session is distinct from left(p_session, 64)
-          or (j.lease_runner is not null and j.lease_runner is distinct from p_runner)) then
+     and (j.lease_session is distinct from left(p_session, 64) or j.lease_runner is distinct from p_runner) then
     return jsonb_build_object('error', 'held', 'holder', j.lease_device);
   end if;
   update public.ai_jobs
@@ -1362,7 +1413,7 @@ begin
   select * into j from public.ai_jobs where id = p_job and owner_id = p_owner and kind = 'device' for update;
   if not found then return null; end if;
   if j.state <> 'active' or j.lease_session is distinct from left(p_session, 64) or j.lease_until is null
-     or (j.lease_runner is not null and j.lease_runner is distinct from p_runner) then
+     or j.lease_runner is distinct from p_runner then
     return jsonb_build_object('error', 'lost');
   end if;
   update public.ai_job_items set status = 'completed', finished_at = now()
@@ -1476,9 +1527,8 @@ begin
   end if;
   -- Daily failure budget: provider failures are refunded, so a member whose photos keep failing (and costing
   -- us) waits until tomorrow once they reach it.
-  if (select count(*) from public.ai_job_items f
-       where f.owner_id = o and f.status = 'failed' and f.error in ('provider_timeout', 'provider_error', 'bad_output')
-         and f.finished_at >= public._ai_next_midnight() - interval '1 day') >= public._ai_failure_budget() then
+  if coalesce((select u.failures from public.ai_user_spend_daily u where u.day = public._ai_today() and u.owner_id = o), 0)
+     >= public._ai_failure_budget() then
     until := public._ai_next_midnight();
     update public.ai_job_items set status = 'pending', wait_until = until, enqueued_at = null where id = p_item;
     return jsonb_build_object('status', 'wait', 'until', until, 'capped', 'failures', 'alerts', '[]'::jsonb);
@@ -1504,7 +1554,8 @@ $$;
 -- version (unrendered) and keeps at most 2 masks per photo.
 -- {status: 'ok', version, deleteKeys} | {status: 'gone', deleteKeys} (the Worker deletes those objects).
 create function public.ai_item_complete(p_item uuid, p_mask uuid, p_key text, p_bytes integer, p_width integer,
-  p_height integer, p_provider text, p_cost bigint, p_latency_ms integer, p_calls jsonb) returns jsonb
+  p_height integer, p_provider text, p_cost bigint, p_latency_ms integer, p_calls jsonb, p_attempt integer default null)
+returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   o uuid;
@@ -1521,14 +1572,25 @@ begin
   perform public._credits_lock(o);
   select * into it from public.ai_job_items where id = p_item for update;
   perform public._ai_log_calls('bg_removal', p_calls);
-  if it.status <> 'processing' then
-    -- Moved on meanwhile (canceled, or taken over as stuck): its reservation was settled then, but the calls
-    -- this run made still cost money.
-    perform public._ai_spend_settle('bg_removal', o, null, 0, coalesce(p_cost, 0));
+  if it.status <> 'processing' or (p_attempt is not null and it.attempts is distinct from p_attempt) then
+    -- A late report from a run that was taken over as stuck: its reservation (the worst case of the run) was
+    -- counted as spent then, so nothing more is counted now.
     return jsonb_build_object('status', 'gone', 'deleteKeys', jsonb_build_array(p_key));
   end if;
   -- Photo row before the spend lock (the same order as every other path).
   select * into ph from public.photos where id = it.photo_id and owner_id = o for update;
+  -- The account was scheduled for deletion while this ran: keep nothing (no mask row, so the object goes),
+  -- count what the call cost, and refund the member.
+  if exists (select 1 from public.profiles pr where pr.id = o and (pr.deletion_due is not null or pr.deleted_at is not null)) then
+    perform public._ai_spend_settle('bg_removal', o, it.reserved_day, it.reserved_micros, coalesce(p_cost, 0));
+    update public.ai_job_items
+       set status = 'canceled', finished_at = now(), reserved_micros = 0, wait_until = null,
+           cost_micros = coalesce(p_cost, 0), provider = p_provider
+     where id = p_item;
+    perform public._ai_refund_item(p_item);
+    perform public._ai_job_touch(it.job_id);
+    return jsonb_build_object('status', 'gone', 'deleteKeys', jsonb_build_array(p_key));
+  end if;
   perform public._ai_spend_settle('bg_removal', o, it.reserved_day, it.reserved_micros, coalesce(p_cost, 0), 1, it.credits);
   update public.ai_job_items set reserved_micros = 0, cost_micros = coalesce(p_cost, 0), provider = p_provider,
          latency_ms = least(greatest(coalesce(p_latency_ms, 0), 0), 3600000)
@@ -1568,7 +1630,8 @@ end;
 $$;
 
 -- A provider attempt that ended without a mask: fails the item (refunded) and settles its spend.
-create function public.ai_item_failed(p_item uuid, p_error text, p_cost bigint, p_calls jsonb) returns jsonb
+create function public.ai_item_failed(p_item uuid, p_error text, p_cost bigint, p_calls jsonb, p_attempt integer default null)
+returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   o uuid;
@@ -1582,8 +1645,8 @@ begin
   perform public._credits_lock(o);
   select * into it from public.ai_job_items where id = p_item for update;
   perform public._ai_log_calls('bg_removal', p_calls);
-  if it.status <> 'processing' then
-    perform public._ai_spend_settle('bg_removal', o, null, 0, coalesce(p_cost, 0));
+  if it.status <> 'processing' or (p_attempt is not null and it.attempts is distinct from p_attempt) then
+    -- Late report from a run taken over as stuck: already counted as spent (its whole reservation).
     return jsonb_build_object('status', 'skip');
   end if;
   perform public._ai_spend_settle('bg_removal', o, it.reserved_day, it.reserved_micros, coalesce(p_cost, 0));
@@ -1604,11 +1667,19 @@ declare
   ph public.photos;
   m record;
   res jsonb;
+  run uuid;
 begin
   select * into ph from public.photos where id = p_photo and owner_id = p_owner for update;
-  if not found or ph.status <> 'ready' or not ph.has_thumb or ph.safety_hold_at is not null or ph.scene_state = 'done' then
+  if not found then return jsonb_build_object('status', 'skip'); end if;
+  -- A run that never reported (the Worker died): its reservation counts as spent, and it can't report later.
+  if ph.scene_run is not null then
+    perform public._ai_spend_settle('scene_tags', p_owner, ph.scene_reserved_day, ph.scene_reserved, ph.scene_reserved);
+    update public.photos set scene_run = null, scene_reserved = 0, scene_reserved_day = null where id = p_photo;
+  end if;
+  if ph.status <> 'ready' or not ph.has_thumb or ph.safety_hold_at is not null or ph.scene_state = 'done' then
     return jsonb_build_object('status', 'skip');
   end if;
+  if ph.scene_retry_at > now() then return jsonb_build_object('status', 'wait', 'alerts', '[]'::jsonb); end if;
   select * into m from public._ai_member(p_owner);
   if not public._ai_feature(s, 'scene_tags') or not m.scene_tags
      or exists (select 1 from public.profiles pr where pr.id = p_owner and (pr.deletion_due is not null or pr.deleted_at is not null)) then
@@ -1626,27 +1697,42 @@ begin
      where id = p_photo;
     return jsonb_build_object('status', 'wait', 'alerts', res -> 'alerts');
   end if;
-  update public.photos set scene_state = 'pending', scene_queued_at = coalesce(scene_queued_at, now()), scene_retry_at = null
+  run := gen_random_uuid();
+  update public.photos set scene_state = 'pending', scene_queued_at = coalesce(scene_queued_at, now()), scene_retry_at = null,
+         scene_run = run, scene_reserved = greatest(coalesce(p_estimate, 0), 0), scene_reserved_day = public._ai_today()
    where id = p_photo;
-  return jsonb_build_object('status', 'go', 'day', public._ai_today(), 'alerts', res -> 'alerts');
+  return jsonb_build_object('status', 'go', 'day', public._ai_today(), 'run', run, 'alerts', res -> 'alerts');
 end;
 $$;
 
 -- Records scene tags ([{scene, score}]), a failure (p_scenes null) or 'retry' (tag it again later), settling the
 -- reservation of p_reserved.
 create function public.ai_scene_done(p_owner uuid, p_photo uuid, p_scenes jsonb, p_reserved bigint, p_cost bigint,
-  p_calls jsonb, p_day date default null) returns jsonb
+  p_calls jsonb, p_day date default null, p_run uuid default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
-  ready boolean;
+  ph public.photos;
   s public.ai_settings := public._ai_settings();
   m record;
 begin
-  -- Photo row before the spend lock. The reservation is settled on the day it was made (p_day).
-  select p.status = 'ready' into ready from public.photos p where p.id = p_photo and p.owner_id = p_owner for update;
-  perform public._ai_spend_settle('scene_tags', p_owner, p_day, p_reserved, coalesce(p_cost, 0));
+  -- The member's scenes lock first (ai_member_settings_update takes it too), so an opt-out and a result can't
+  -- interleave; then the photo row, then the spend lock.
+  perform pg_advisory_xact_lock(hashtextextended('zephyr:scenes:' || p_owner::text, 0));
+  select * into ph from public.photos p where p.id = p_photo and p.owner_id = p_owner for update;
+  if p_run is not null or ph.scene_run is not null then
+    -- Only the run in flight reports, once: a repeat (a lost reply, then the catch path), a run taken over by
+    -- ai_scene_begin, or a report without the run's token changes nothing and counts nothing more.
+    if ph.id is null or ph.scene_run is distinct from p_run then
+      return jsonb_build_object('status', 'stale');
+    end if;
+    perform public._ai_spend_settle('scene_tags', p_owner, ph.scene_reserved_day, ph.scene_reserved, coalesce(p_cost, 0));
+    update public.photos set scene_run = null, scene_reserved = 0, scene_reserved_day = null where id = p_photo;
+  else
+    -- The reservation is settled on the day it was made (p_day).
+    perform public._ai_spend_settle('scene_tags', p_owner, p_day, p_reserved, coalesce(p_cost, 0));
+  end if;
   perform public._ai_log_calls('scene_tags', p_calls);
-  if not coalesce(ready, false) then return jsonb_build_object('status', 'skip'); end if;
+  if ph.id is null or ph.status <> 'ready' then return jsonb_build_object('status', 'skip'); end if;
   if p_scenes = '"retry"'::jsonb then
     -- The thumbnail wasn't there yet (or the run broke): the backfill tries again in an hour.
     update public.photos set scene_state = null, scene_queued_at = null, scene_retry_at = now() + interval '1 hour'
@@ -2488,6 +2574,7 @@ declare
 begin
   delete from public.ai_calls where at < now() - interval '7 days';
   get diagnostics calls = row_count;
+  delete from public.ai_job_requests where at < now() - interval '1 day';
   delete from public.ai_jobs where finished_at < now() - interval '90 days';
   get diagnostics jobs = row_count;
   delete from public.ai_spend_daily where day < public._ai_today() - 400;
@@ -2508,6 +2595,7 @@ $$;
 -- Privileges: service_role only. Internal helpers (_*) are callable by no role but their owner.
 -- ---------------------------------------------------------------------------------------------
 revoke all on public.ai_settings, public.ai_spend_daily, public.ai_user_spend_daily, public.ai_spend_alerts, public.ai_spend_capped, public.ai_calls,
+  public.ai_job_requests,
   public.ai_member_settings, public.credit_balances, public.credit_ledger, public.ai_jobs, public.ai_job_items,
   public.photo_masks, public.photo_signals, public.photo_scenes, public.people, public.faces, public.face_rejections
 from anon, authenticated;
@@ -2540,6 +2628,8 @@ revoke execute on function
   public._ai_item_json(public.ai_job_items),
   public._ai_job_touch(uuid),
   public._ai_item_fail(uuid, text),
+  public._ai_job_request(uuid, integer),
+  public._ai_failure_count(uuid),
   public._mask_key(uuid, uuid, uuid),
   public._photo_keys(uuid, uuid),
   public._ai_faces_delete(uuid),
@@ -2561,7 +2651,7 @@ grant execute on function
   public.ai_member_settings_update(uuid, jsonb),
   public.ai_credit_history(uuid, text, integer),
   public.ai_bg_job_create(uuid, uuid[], jsonb, text, boolean),
-  public.ai_device_job_create(uuid, uuid[], jsonb, text, text, text),
+  public.ai_device_job_create(uuid, uuid[], jsonb, text, text, text, text),
   public.ai_jobs_list(uuid, text, text, text),
   public.ai_job_get(uuid, uuid, integer, text),
   public.ai_job_cancel(uuid, uuid, text),
@@ -2571,10 +2661,10 @@ grant execute on function
   public.ai_device_pause(uuid, uuid, text),
   public.ai_mask_key(uuid, uuid, uuid),
   public.ai_item_begin(uuid, bigint),
-  public.ai_item_complete(uuid, uuid, text, integer, integer, integer, text, bigint, integer, jsonb),
-  public.ai_item_failed(uuid, text, bigint, jsonb),
+  public.ai_item_complete(uuid, uuid, text, integer, integer, integer, text, bigint, integer, jsonb, integer),
+  public.ai_item_failed(uuid, text, bigint, jsonb, integer),
   public.ai_scene_begin(uuid, uuid, bigint),
-  public.ai_scene_done(uuid, uuid, jsonb, bigint, bigint, jsonb, date),
+  public.ai_scene_done(uuid, uuid, jsonb, bigint, bigint, jsonb, date, uuid),
   public.ai_scenes(uuid),
   public.ai_signals_pending(uuid, integer, text, integer),
   public.ai_signals_save(uuid, integer, jsonb),
