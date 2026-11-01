@@ -339,6 +339,11 @@ button.ai-card__head {
   font-size: 12.5px;
   color: var(--muted);
 }
+.ai-phone-credits > span:last-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
 .ai-phone-credits strong {
   color: var(--ink);
   font-family: var(--mono);
@@ -452,6 +457,10 @@ button.ai-card__head {
     -4px 0;
 }
 .ai-swatches {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -495,6 +504,10 @@ button.ai-card__head {
 
 /* ---------- batch dialog ---------- */
 .ai-steps {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
