@@ -33,13 +33,42 @@
       "name": "EDIT_LIMITER",
       "namespace_id": "1003",
       "simple": { "limit": 600, "period": 60 }
+    },
+    {
+      // Phase 5: sharing writes per member (keyed by user id): gallery changes, passcodes, renders,
+      // branding, and reading a gallery's link again.
+      "name": "SHARE_LIMITER",
+      "namespace_id": "1004",
+      "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      // Guest page and API calls per network (token lookups, unlocks, favourites, reports). Durable
+      // passcode limits are in Postgres (gallery_attempts).
+      "name": "GUEST_LIMITER",
+      "namespace_id": "1005",
+      "simple": { "limit": 60, "period": 60 }
+    },
+    {
+      // Guest image requests per network: a gallery page loads many thumbnails at once.
+      "name": "MEDIA_LIMITER",
+      "namespace_id": "1006",
+      "simple": { "limit": 1200, "period": 60 }
     }
   ],
   // Private photo bucket: no public access, no r2.dev URL. Every byte goes through this Worker.
   // Give it two lifecycle rules (R2 › bucket › Settings › Object lifecycle rules): "abort incomplete
   // multipart uploads after 1 day", so parts the clean-up job can't reach never linger, and "delete objects
   // with prefix staging/ after 2 days", which empties leftover staged variants (src/library/storage.ts).
-  "r2_buckets": [{ "binding": "PHOTOS", "bucket_name": "zephyr-photos" }],
+  "r2_buckets": [
+    { "binding": "PHOTOS", "bucket_name": "zephyr-photos" },
+    // Phase 5: guest renditions and branding assets (o/<ownerId>/…). No r2.dev URL. Its only public way in
+    // is the custom domain MEDIA_HOST, behind a WAF rule that blocks requests without the X-Zephyr-Media
+    // secret (docs/setup.md), so the Worker's fetches pass Cloudflare's cache and CSAM Scanning Tool.
+    { "binding": "SHARED", "bucket_name": "zephyr-shared" }
+  ],
+  // Cloudflare Images (enable Images Paid before launch): every guest rendition and branding asset is
+  // re-encoded with it.
+  "images": { "binding": "IMAGES" },
   // Library clean-up jobs (src/jobs.ts): expired uploads, Trash purges, account purges.
   "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
@@ -57,9 +86,19 @@
     // Cloudflare Access application protecting zephyr.midnightpoetry.studio/admin*.
     "CF_ACCESS_TEAM_DOMAIN": "YOUR-TEAM.cloudflareaccess.com",
     "CF_ACCESS_AUD": "REPLACE_WITH_ACCESS_APPLICATION_AUD",
-    "EMAIL_FROM": "Zephyr <hello@zephyr.midnightpoetry.studio>"
+    "EMAIL_FROM": "Zephyr <hello@zephyr.midnightpoetry.studio>",
+    // Phase 5: the zephyr-shared custom domain, and where safety alerts (CSAM matches and reports) go.
+    "MEDIA_HOST": "media.midnightpoetry.studio",
+    "SAFETY_ALERT_EMAIL": "safety@midnightpoetry.studio"
   }
   // Secrets (wrangler secret put …): SUPABASE_SECRET_KEY, TURNSTILE_SECRET_KEY, IP_HASH_SECRET,
   // SESSION_HMAC_SECRET, RESEND_API_KEY. (SUPABASE_SERVICE_ROLE_KEY is still read if the new name
   // isn't set.)
+  // Phase 5 secrets (each 32+ random bytes; GALLERY_LINK_KEY exactly 32 bytes, base64):
+  //   GALLERY_PEPPER       keys passcode HMACs (changing it invalidates every passcode)
+  //   GALLERY_LINK_KEY     AES-256-GCM key for gallery links at rest (changing it loses "copy link" for
+  //                        existing galleries; the links themselves keep working)
+  //   GUEST_COOKIE_SECRET  signs guests' unlock cookies (changing it re-locks every guest)
+  //   MEDIA_URL_SECRET     signs guest media URLs (changing it breaks URLs for up to an hour)
+  //   MEDIA_HOST_SECRET    the X-Zephyr-Media value the media host's WAF rule requires
 }

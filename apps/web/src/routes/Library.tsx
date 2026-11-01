@@ -16,6 +16,7 @@ import {
 } from '../components/LibraryBits';
 import { PhotoGrid } from '../components/PhotoGrid';
 import { Shell } from '../components/Shell';
+import { useShareGallery } from '../components/share/ShareDialogs';
 import { useUploadPicker } from '../components/Uploads';
 import { errorMessage } from '../lib/api';
 import { emitLibrary } from '../lib/bus';
@@ -34,7 +35,7 @@ const SORTS: { value: Sort; label: string }[] = [
 ];
 export const SOON = 'Coming soon';
 
-/** Favourite, Add to album, Move to Trash, plus the not-yet-available Edit, Zephyr AI and Share. */
+/** Edit, Share, Favourite, Add to album, Move to Trash, plus the not-yet-available Zephyr AI. */
 export function useLibraryActions(list: PhotoList, sel: Selection, extra: BarAction[] = []) {
   const toast = useToast();
   const [picker, setPicker] = useState(false);
@@ -73,12 +74,13 @@ export function useLibraryActions(list: PhotoList, sel: Selection, extra: BarAct
     });
 
   const editing = useEditActions(list, sel);
+  const sharing = useShareGallery();
   const actions: BarAction[] = [
     ...editing.actions,
     { icon: 'breeze', label: 'Zephyr AI', soon: SOON },
     { icon: 'folder', label: 'Add to album', onClick: () => setPicker(true) },
     { icon: 'heart', label: allFav ? 'Unfavourite' : 'Favourite', onClick: favourite, busy: busy === 'fav' },
-    { icon: 'share', label: 'Share', soon: SOON },
+    { icon: 'share', label: 'Share', onClick: () => sharing.open(ids) },
     ...extra,
     { icon: 'trash', label: 'Move to Trash', onClick: trash, busy: busy === 'trash', danger: true },
   ];
@@ -86,6 +88,7 @@ export function useLibraryActions(list: PhotoList, sel: Selection, extra: BarAct
     <>
       <AlbumPicker open={picker} photoIds={ids} onClose={() => setPicker(false)} onDone={() => sel.clear()} />
       {editing.dialogs}
+      {sharing.dialogs}
     </>
   );
   return { actions, pickerEl };

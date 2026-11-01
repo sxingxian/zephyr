@@ -37,6 +37,32 @@ export interface Env {
   EDIT_LIMITER: RateLimit;
   /** Private photo bucket (zephyr-photos): originals and variants under u/<ownerId>/p/<photoId>/. */
   PHOTOS: R2Bucket;
+
+  // ---- Phase 5: sharing ----
+  /** Guest renditions and branding assets (zephyr-shared), under o/<ownerId>/. Read through MEDIA_HOST. */
+  SHARED: R2Bucket;
+  /** Cloudflare Images binding: every guest rendition and branding asset is re-encoded with it. */
+  IMAGES: ImagesBinding;
+  /** The zephyr-shared custom domain (media.midnightpoetry.studio), reachable only with MEDIA_HOST_SECRET. */
+  MEDIA_HOST: string;
+  /** Sent as X-Zephyr-Media to the media host; its WAF rule blocks every request without it. */
+  MEDIA_HOST_SECRET: string;
+  /** Keys passcode HMACs (a database leak alone can't be brute-forced offline). */
+  GALLERY_PEPPER: string;
+  /** AES-256-GCM key (32 random bytes, base64) encrypting gallery link tokens at rest, so owners can copy links again. */
+  GALLERY_LINK_KEY: string;
+  /** Signs guests' unlock cookies. */
+  GUEST_COOKIE_SECRET: string;
+  /** Signs guest media URLs (one hour). */
+  MEDIA_URL_SECRET: string;
+  /** Where CSAM matches and CSAM reports are sent (the safety team's address). */
+  SAFETY_ALERT_EMAIL: string;
+  /** Per-member sharing writes. */
+  SHARE_LIMITER: RateLimit;
+  /** Guest page and API calls per network (token lookups included). */
+  GUEST_LIMITER: RateLimit;
+  /** Guest media requests per network. */
+  MEDIA_LIMITER: RateLimit;
 }
 
 export const list = (v: string | undefined): string[] =>

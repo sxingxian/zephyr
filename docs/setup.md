@@ -56,9 +56,39 @@ Nothing here is committed; each value goes into Cloudflare, Supabase, Resend or 
      to finish; uploads expire after 24 hours).
 
    The clean-up job removes what it knows about; these rules catch anything it missed.
-5. Create an API token with _Workers Scripts: Edit_, _Workers Routes: Edit_, _Workers R2 Storage: Edit_ and
+5. **Shared galleries (phase 5):**
+   1. **Guest image bucket:** create the R2 bucket `zephyr-shared`, with no r2.dev URL, and connect the custom
+      domain `media.midnightpoetry.studio` (proxied). It holds only re-encoded copies made for guests.
+   2. **Lock the media host:** under _Security › WAF › Custom rules_, add a rule with the expression
+      `http.host eq "media.midnightpoetry.studio" and not any(http.request.headers["x-zephyr-media"][*] eq "<MEDIA_HOST_SECRET>")`
+      and the action **Block**. Only the API Worker sends that header. From a normal browser, a request to
+      `https://media.midnightpoetry.studio/anything` must get 403.
+   3. **Images:** enable Cloudflare Images on the account and switch to **Images Paid** before launch, so
+      re-encoding can't stop when the free 5,000 a month run out. The API Worker uses the `IMAGES` binding.
+   4. **Child-safety scanning:** under _Caching › Configuration › CSAM Scanning Tool_, enable the tool for the
+      zone with a monitored email. **Launch gate:** ask Cloudflare support to confirm in writing that images the
+      API Worker fetches from `media.midnightpoetry.studio` through the cache are scanned, and note the answer
+      and date here.
+   5. **API Worker secrets** (each `openssl rand -base64 48`, except where noted):
+
+      ```sh
+      pnpm exec wrangler secret put GALLERY_PEPPER       # passcode check; rotating it breaks every passcode
+      pnpm exec wrangler secret put GALLERY_LINK_KEY     # exactly 32 bytes: openssl rand -base64 32; rotating it loses "Copy link"
+      pnpm exec wrangler secret put GUEST_COOKIE_SECRET  # rotating it signs every guest out
+      pnpm exec wrangler secret put MEDIA_URL_SECRET     # rotating it expires every guest image link
+      pnpm exec wrangler secret put MEDIA_HOST_SECRET    # must match the WAF rule above
+      ```
+   6. **Vars:** set `MEDIA_HOST` (`media.midnightpoetry.studio`) and `SAFETY_ALERT_EMAIL` (a monitored address:
+      child-safety matches and reports are sent there).
+   7. **Rate limits:** the rate-limit namespaces in `apps/api/wrangler.jsonc` (`SHARE_LIMITER`, `GUEST_LIMITER`,
+      `MEDIA_LIMITER`) are created on deploy.
+   8. **After the first deploy:** share a gallery and check that:
+      - a guest image has no EXIF data;
+      - an original over 70 MB downloads at full size (if it can't be transformed, guests get an error for that photo);
+      - the media host blocks direct requests.
+6. Create an API token with _Workers Scripts: Edit_, _Workers Routes: Edit_, _Workers R2 Storage: Edit_ and
    _Zone: Read_ on midnightpoetry.studio.
-6. Deploy order: the API (`zephyr-api`, which also runs the 15-minute clean-up job), then the landing Worker (custom domain `zephyr.midnightpoetry.studio`,
+7. Deploy order: the API (`zephyr-api`, which also runs the 15-minute clean-up job), then the landing Worker (custom domain `zephyr.midnightpoetry.studio`,
    includes /admin), then the app Worker (custom domain `zephyrapp.midnightpoetry.studio`).
 
 ## 4. GitHub (Settings › Environments › production)

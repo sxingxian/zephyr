@@ -18,7 +18,7 @@ const LIBRARY: NavDef[] = [
   { label: 'People', icon: 'people' },
   { label: 'Places & scenes', icon: 'pin' },
   { label: 'Favourites', icon: 'heart', to: '/favourites' },
-  { label: 'Shared galleries', icon: 'share' },
+  { label: 'Shared galleries', icon: 'share', to: '/shared' },
   { label: 'Cleanup', icon: 'sparkGrid' },
   { label: 'Trash', icon: 'trash', to: '/trash' },
 ];
@@ -165,7 +165,7 @@ function TabBar() {
           <Icon name="plus" size={24} />
         </button>
       </span>
-      {tab(undefined, 'link', 'Shared')}
+      {tab('/shared', 'link', 'Shared')}
       {tab('/you', 'user', 'You')}
     </nav>
   );

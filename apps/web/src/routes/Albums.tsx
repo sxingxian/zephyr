@@ -12,9 +12,19 @@ import {
 } from '../components/LibraryBits';
 import { PhotoGrid } from '../components/PhotoGrid';
 import { Shell } from '../components/Shell';
+import { useShareGallery } from '../components/share/ShareDialogs';
 import { errorMessage } from '../lib/api';
 import { emitLibrary, onLibrary } from '../lib/bus';
-import { bulk, createAlbum, deleteAlbum, getAlbum, listAlbums, patchAlbum, thumbUrl } from '../lib/library';
+import {
+  allPhotoIds,
+  bulk,
+  createAlbum,
+  deleteAlbum,
+  getAlbum,
+  listAlbums,
+  patchAlbum,
+  thumbUrl,
+} from '../lib/library';
 import { usePhotoList } from '../lib/photos';
 import { useSelection } from '../lib/selection';
 import { EmptyHint, GridSkeleton, useLibraryActions } from './Library';
@@ -249,6 +259,19 @@ export function AlbumPage({ albumId }: { albumId: string }) {
   const list = usePhotoList(query);
   const sel = useSelection();
   const ids = [...sel.selected];
+  const sharing = useShareGallery();
+  const shareAlbum = async () => {
+    setBusy('share');
+    try {
+      const all = await allPhotoIds({ view: 'library', albumId });
+      if (all.length) sharing.open(all, album?.name ?? '');
+      else toast.show('Add photos to this album first.', 'bad');
+    } catch (e) {
+      toast.show(errorMessage(e), 'bad');
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const removeFromAlbum = async () => {
     setBusy('remove');
@@ -352,6 +375,15 @@ export function AlbumPage({ albumId }: { albumId: string }) {
         <>
           <Button
             size="sm"
+            icon="share"
+            onClick={shareAlbum}
+            busy={busy === 'share'}
+            disabled={!album?.photoCount}
+          >
+            Share album
+          </Button>
+          <Button
+            size="sm"
             kind="ghost"
             onClick={() => {
               setName(album?.name ?? '');
@@ -428,6 +460,7 @@ export function AlbumPage({ albumId }: { albumId: string }) {
         />
       )}
       {pickerEl}
+      {sharing.dialogs}
       <Dialog
         open={renaming}
         onClose={() => setRenaming(false)}

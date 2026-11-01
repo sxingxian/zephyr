@@ -4,6 +4,7 @@ import { NavLink } from 'react-router';
 const ITEMS: { label: string; icon: IconName; to?: string }[] = [
   { label: 'Account & security', icon: 'shield', to: '/settings/security' },
   { label: 'Invite friends', icon: 'mail', to: '/settings/invites' },
+  { label: 'Sharing & branding', icon: 'share', to: '/settings/sharing' },
   { label: 'Appearance', icon: 'sun' },
   { label: 'Plan & billing', icon: 'card' },
   { label: 'Privacy & data', icon: 'database' },

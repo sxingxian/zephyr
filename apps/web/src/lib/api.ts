@@ -69,6 +69,11 @@ const KNOWN: ApiErrorCode[] = [
   'too_large',
   'storage_full',
   'session_changed',
+  'wrong_passcode',
+  'gallery_paused',
+  'sharing_suspended',
+  'plan_required',
+  'limit_reached',
   'server',
 ];
 
@@ -170,6 +175,16 @@ export function errorMessage(err: unknown): string {
       return 'That file is larger than your plan allows.';
     case 'storage_full':
       return 'Your storage is full. Free up space or upgrade to upload more.';
+    case 'plan_required':
+      return 'That needs a different plan. See Plans to upgrade.';
+    case 'sharing_suspended':
+      return 'Sharing is paused on your account while we review a report. Contact support.';
+    case 'limit_reached':
+      return 'That’s the most this allows. Remove something first, then try again.';
+    case 'wrong_passcode':
+      return 'That passcode isn’t right.';
+    case 'gallery_paused':
+      return 'This gallery is paused after too many wrong passcodes. Try again later.';
     default:
       return 'Something went wrong on our side. Try again in a minute.';
   }

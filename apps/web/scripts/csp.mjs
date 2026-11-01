@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { GUEST_HEADERS } from '../worker/guestHeaders.js';
 
 const dist = fileURLToPath(new URL('../dist', import.meta.url));
 const walk = (d) =>
@@ -13,6 +14,11 @@ const pages = walk(dist).filter((f) => f.endsWith('.html'));
 const hashes = new Set();
 for (const file of pages) {
   const html = readFileSync(file, 'utf8');
+  // The guest page's policy has no room for script hashes: it must not carry any inline script at all.
+  if (file.endsWith('guest.html') && /<script(?![^>]*\bsrc=)[^>]*>[\s\S]*?<\/script>/.test(html))
+    throw new Error('guest.html must not contain inline scripts');
+  if (file.endsWith('guest.html') && /registerSW|serviceWorker/.test(html))
+    throw new Error('guest.html must not register the service worker');
   for (const m of html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)) {
     if (/type="application\/(ld\+)?json"/.test(m[0])) continue;
     hashes.add(`'sha256-${createHash('sha256').update(m[1]).digest('base64')}'`);
@@ -41,6 +47,16 @@ const csp = [
   'upgrade-insecure-requests',
 ].join('; ');
 
+// The guest page (served for /g/* by the Worker, which sets these same headers) replaces the app's policy.
+const guestBlock = (path) =>
+  `\n${path}\n${Object.keys(GUEST_HEADERS)
+    .filter((k) => k !== 'Content-Type')
+    .map((k) => `  ! ${k}`)
+    .join('\n')}\n${Object.entries(GUEST_HEADERS)
+    .filter(([k]) => k !== 'Content-Type')
+    .map(([k, v]) => `  ${k}: ${v}`)
+    .join('\n')}\n`;
+
 const headers = `/*
   Content-Security-Policy: ${csp}
   Strict-Transport-Security: max-age=63072000; includeSubDomains
@@ -64,6 +80,6 @@ const headers = `/*
 
 /index.html
   Cache-Control: no-cache
-`;
+${guestBlock('/guest')}${guestBlock('/guest.html')}`;
 writeFileSync(join(dist, '_headers'), headers);
 console.log(`_headers written · ${pages.length} page(s) · ${hashes.size} inline script hash(es)`);

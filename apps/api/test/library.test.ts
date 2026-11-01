@@ -661,6 +661,10 @@ describe('trash and clean-up', () => {
         variantsPublished: 0,
         variantsLost: 0,
         rateLimitRows: 0,
+        galleryRenditionsPurged: 0,
+        galleriesDeleted: 0,
+        shareObjectsDeleted: 0,
+        expiryReminders: 0,
       },
     });
   });

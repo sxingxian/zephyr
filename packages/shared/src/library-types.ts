@@ -189,6 +189,8 @@ export interface Usage {
   fileTypes: FileTypeId[];
   maxFileBytes: number;
   batchSize: number;
+  /** Phase 5: sharing limits for the member's plan (older servers omit it). */
+  sharing?: import('./share-types').SharingLimits;
 }
 export interface DeleteAccountBody {
   confirm: 'DELETE';

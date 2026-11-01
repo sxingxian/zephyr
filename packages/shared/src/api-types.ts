@@ -74,6 +74,11 @@ export type ApiErrorCode =
   | 'too_large'
   | 'storage_full'
   | 'session_changed' // uploads: X-Zephyr-Expected-User names a different user than the session (shared device)
+  | 'wrong_passcode' // guest gallery unlock (phase 5): see `remaining` and `turnstile`
+  | 'gallery_paused' // too many wrong passcodes from anywhere: unlocking paused until `pausedUntil`
+  | 'sharing_suspended' // the account's sharing is suspended pending a safety review
+  | 'plan_required' // the member's plan doesn't include this (e.g. full-size downloads, Studio extras)
+  | 'limit_reached' // a plan count is used up (e.g. live galleries)
   | 'server';
 
 export interface ApiError {
@@ -81,6 +86,12 @@ export interface ApiError {
   error: ApiErrorCode;
   /** Seconds before retrying (rate_limited). */
   retryAfter?: number;
+  /** wrong_passcode: attempts left for this network in the current window. */
+  remaining?: number;
+  /** wrong_passcode: the next attempt needs a Turnstile token. */
+  turnstile?: boolean;
+  /** gallery_paused: when unlocking reopens (ISO). */
+  pausedUntil?: string;
 }
 export interface Accepted {
   ok: true;
@@ -108,6 +119,10 @@ export const TURNSTILE_ACTIONS = {
   emailStart: 'email_start',
   emailVerify: 'email_verify',
   inviteCode: 'invite_code',
+  /** Guest gallery passcode (phase 5). */
+  galleryUnlock: 'gallery_unlock',
+  /** Guest abuse report (phase 5). */
+  galleryReport: 'gallery_report',
 } as const;
 export interface SessionUser {
   id: string;

@@ -7,6 +7,8 @@ import {
   GUEST_NOTE_MAX,
   MAX_GALLERY_PHOTOS,
   PASSCODE_RE,
+  REPORT_DETAILS_MAX,
+  REPORT_REASONS,
 } from './share-types';
 
 /** Server-side request schemas for the phase 5 sharing API. */
@@ -80,4 +82,12 @@ export const guestUnlockSchema = z
   .strict();
 export const guestSendSchema = z
   .object({ name: line(GUEST_NAME_MAX).pipe(z.string().min(1)), note: text(GUEST_NOTE_MAX).optional() })
+  .strict();
+export const guestReportSchema = z
+  .object({
+    reason: z.enum(REPORT_REASONS),
+    photoId: uuid.optional(),
+    details: text(REPORT_DETAILS_MAX).optional(),
+    turnstileToken: z.string().min(1).max(2048),
+  })
   .strict();

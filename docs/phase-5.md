@@ -21,7 +21,8 @@ Decisions:
 - **Link and passcode:**
   - Each gallery gets an unguessable link, `zephyrapp.midnightpoetry.studio/g/<43-char token>` (256 bits).
   - A 6-digit passcode is optional; it is on by default, and turning it off shows a warning.
-  - The link and passcode are shown once. Afterwards the member can regenerate the passcode (which ends every unlocked guest session) or turn it off.
+  - The passcode is shown once. Afterwards the member can regenerate it (which ends every unlocked guest session) or turn it off.
+  - The link can be copied again at any time from the gallery page. It is looked up by its SHA-256 hash and also stored encrypted (AES-256-GCM, key `GALLERY_LINK_KEY`, gallery id as associated data), so a database leak alone doesn't reveal links.
 - **Expiry and revoke:**
   - Galleries expire at the end of the chosen day, capped by the plan's `max_link_days` (7 on Free) and a system ceiling of 365 days.
   - Revoke is permanent: the link stops working at once and the gallery's renditions are deleted.
@@ -47,6 +48,8 @@ Decisions:
   - Gallery page with Photos, Favourites (Studio), Activity (Studio) and Settings tabs.
   - Copy link, new passcode, open as a guest (preview for the owner, no passcode), revoke, reopen a paused gallery.
   - Settings › Sharing & branding (Studio): logo, studio name, accent colour (from a contrast-checked set), and a watermark (text drawn on the device, or the logo, plus position and opacity).
+- **Reports:** "Report this gallery" (footer, or a single photo from the viewer) works without unlocking: a reason, optional details and Turnstile. Reports go to `gallery_reports`. A child-safety report emails `SAFETY_ALERT_EMAIL` at once (no image in the email) and is written to `audit_log`. Limit: 10 per network per day. Staff review comes in phase 8.
+- **Owner preview:** `/g/preview/<galleryId>` shows the guest page to the owner (member session, no passcode, no events, no favourites or downloads).
 - **Notifications:** emails through Resend when:
   - a gallery is paused after wrong passcodes;
   - a guest sends favourites (at most one email per gallery per hour, summarising);
@@ -61,7 +64,7 @@ Decisions:
 - **Limits** (`PASSCODE_LIMITS`), counted per attempt before checking (the same pattern as email codes):
   - 5 failures per gallery per network (IPv6 grouped by /64) every 15 minutes, as SRS NFR-SEC-01 requires.
   - Turnstile after 2 failures from a network.
-  - 25 failures per gallery from anywhere in 15 minutes pauses the gallery for 15 minutes and emails the owner (423 `gallery_paused`).
+  - 25 failures per gallery from anywhere in 15 minutes pauses unlocking for 15 minutes and emails the owner (423 `gallery_paused`). Guests who already unlocked keep access.
   - Networks are kept only as HMAC hashes (as in phase 1). Attempt rows are deleted after 2 days.
 - **Unknown tokens:** these get 404 after the same work as a real lookup, and token lookups are rate-limited per network (60 a minute), so links can't be enumerated.
 - **Unlock cookie:** a successful unlock sets `__Host-zg-<first 12 hex of gallery id>`.
@@ -78,7 +81,7 @@ guest → /api/v1/g/<token>/m/<photoId>/<size>?e=<exp>&s=<sig>   (API Worker: ve
 ```
 
 **The media hostname:**
-- The `zephyr-shared` R2 bucket holds only renditions made for guests, at random keys `g/<galleryId>/<photoId>/<size>-<nonce>`.
+- The `zephyr-shared` R2 bucket holds only renditions made for guests, at random keys `o/<ownerId>/g/<galleryId>/<photoId>/<size>-<nonce>` (branding assets under `o/<ownerId>/b/`). The owner prefix lets an account purge delete by prefix. Full-size renders from the member's device go to the photos bucket under `u/<ownerId>/g/…`. Deletions go through a queue drained by the clean-up job, which re-checks key shapes so it can never touch an original.
 - Its custom domain is behind a WAF custom rule (Free plan: 5 rules), set up during deployment (`docs/setup.md`): _block_ when `http.host eq "media.midnightpoetry.studio"` and the `X-Zephyr-Media` header doesn't match a secret. The Worker sends that header; anyone else is blocked.
 - The bucket has no r2.dev URL. Objects carry `Cache-Control: public, max-age=86400`.
 
@@ -93,7 +96,7 @@ guest → /api/v1/g/<token>/m/<photoId>/<size>?e=<exp>&s=<sig>   (API Worker: ve
 **Signed URLs:**
 - The signature is `HMAC(MEDIA_URL_SECRET, galleryId ‖ photoId ‖ size ‖ generation ‖ exp)`, and URLs last one hour.
 - They are issued only in the photo list, after unlock.
-- Each request also checks the gallery's state (live, not paused, same passcode generation) through a 60-second cached lookup, so revoking takes effect within a minute even for URLs already handed out.
+- Each image request checks the gallery in the database, so revoking or expiry takes effect at once, even for URLs already handed out. A new passcode stops old URLs within 60 seconds (a cached state check).
 
 **Renditions** are always re-encoded on the server with the Cloudflare Images binding (`IMAGES`) and never served from member uploads directly. Re-encoding strips metadata and normalises the image.
 - **`grid` (640 px) and `view` (2048 px):** made from the member's edited preview (phase 4), or the original preview when the photo is unedited.
@@ -102,7 +105,7 @@ guest → /api/v1/g/<token>/m/<photoId>/<size>?e=<exp>&s=<sig>   (API Worker: ve
   - For edited or RAW photos, the member's device renders a full-size JPEG after the gallery is created or the edit changes (the phase 4 exporter). It is uploaded to `PUT /galleries/:id/renders/:photoId?v=<editVersion>`, checked like an upload (signature, size, dimensions), then re-encoded. Until it's ready, guests see "Preparing" for that photo.
 - **Watermark:** drawn into every guest rendition with `.draw()` when on. Text watermarks are drawn on the member's device as a PNG and uploaded like the logo, because the binding can't draw text. Originals and the member's own library never carry it.
 - **When they're made:** lazily on the first guest request for that size, then reused. A rendition is keyed to the photo's edit version and the watermark version, so an edit or a watermark change makes a new one and the old one is deleted.
-- **Storage:** rendition bytes count toward the member's storage while the gallery exists, recorded under the storage lock like edited variants.
+- **Storage:** rendition bytes count toward the member's storage while the gallery exists, recorded under the storage lock like edited variants. Grid and view renditions are recorded even when storage is full, so a full account doesn't break its galleries. Full-size renditions and device renders are refused when storage is full.
 - **Cost:** the Images binding bills unique transformations (5,000 a month free, then $0.50 per 1,000; repeats in the same month count once). Enable Images Paid before launch so the free allowance can't run out mid-month.
 - **Cleanup:** revoke, expiry and removal delete renditions (the clean-up job sweeps them). Cached copies at the media host can't be reached by anyone but the Worker, which refuses ended galleries, and they age out within a day.
 

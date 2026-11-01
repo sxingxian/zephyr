@@ -67,4 +67,18 @@
     - **Shared devices:** the edit clipboard, the render queue, open edit sessions, exports and the RAW worker are
       reset with the upload queue when the session ends.
 
-Later phases add passcode galleries, ads isolation, CSAM scanning and face-data opt-in. See the design decisions doc.
+13. **Shared galleries (phase 5):**
+    - **Links:** 256-bit tokens, looked up by hash and kept encrypted (AES-256-GCM) so the owner can copy them again.
+      Guest pages and API replies send no referrer and are never cached.
+    - **Passcodes** (optional per gallery, on by default):
+      - kept as an HMAC with a server-side pepper and checked in constant time;
+      - every attempt is counted before it's checked: 5 per network per 15 minutes, Turnstile after 2, and a
+        gallery-wide pause after 25;
+      - a new passcode signs every guest out. - **Guest images:** always re-encoded on the server (Cloudflare Images), with no metadata. They are served only
+        through the API Worker, using one-hour signed URLs, and the database is checked on every request. The media
+        host behind it is closed to everyone but the Worker (WAF rule) and sits behind the Cloudflare cache for CSAM
+        scanning. - **Safety:** a scanner block puts the photo on hold everywhere, suspends sharing for the account, alerts
+        `SAFETY_ALERT_EMAIL` and preserves the photo. Guests can report a gallery without unlocking it. - **Branding:** a member's branding can only use preset accent colours and re-encoded images, and guest-visible
+        text is plain text.
+
+Later phases add ads isolation, the admin Safety queue and face-data opt-in. See the design decisions doc.

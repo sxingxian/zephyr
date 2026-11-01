@@ -4,6 +4,9 @@ import { fail, logError } from './http';
 import { adminRoutes } from './routes/admin';
 import { albumRoutes } from './routes/albums';
 import { appAuthRoutes } from './routes/app-auth';
+import { brandingRoutes } from './routes/branding';
+import { galleryRoutes } from './routes/galleries';
+import { guestRoutes } from './routes/guest';
 import { inviteRoutes } from './routes/invites';
 import { meRoutes } from './routes/me';
 import { photoRoutes } from './routes/photos';
@@ -52,6 +55,8 @@ app.use('/admin/api/*', rejectDuplicateCookies('admin'));
 // Members and the landing page (same origin on each host, via the site Workers' service bindings).
 app.route('/api', publicRoutes);
 app.route('/api/v1/auth', appAuthRoutes);
+// Before /api/v1/me, so its own guards answer these paths.
+app.route('/api/v1/me/branding', brandingRoutes);
 app.route('/api/v1/me', meRoutes);
 app.route('/api/v1/invites', inviteRoutes);
 app.route('/api/v1/uploads', uploadRoutes);
@@ -59,6 +64,9 @@ app.route('/api/v1/photos', photoRoutes);
 app.route('/api/v1/albums', albumRoutes);
 app.route('/api/v1/trash', trashRoutes);
 app.route('/api/v1/recipes', recipeRoutes);
+// Sharing (phase 5): members' galleries, and guests (the link token is the capability).
+app.route('/api/v1/galleries', galleryRoutes);
+app.route('/api/v1/g', guestRoutes);
 // Admin console (zephyr.midnightpoetry.studio/admin, behind Cloudflare Access).
 app.route('/admin/api', adminRoutes);
 

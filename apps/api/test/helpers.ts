@@ -7,6 +7,7 @@ import { vi } from 'vitest';
 import { app } from '../src/app';
 import { CODE_TIMING } from '../src/auth/code-limits';
 import type { Env } from '../src/env';
+import { images, imagesBinding } from './images';
 import { MockR2 } from './r2';
 
 export const SB = 'https://db.test';
@@ -26,6 +27,21 @@ export const uploadLimiter = { ok: true, keys: [] as string[] };
 export const editLimiter = { ok: true, keys: [] as string[] };
 /** The PHOTOS bucket binding. */
 export const r2 = new MockR2();
+/** The SHARED bucket binding (phase 5: guest renditions and branding). */
+export const shared = new MockR2();
+/** Phase 5 per-member and per-network limiters. */
+export const shareLimiter = { ok: true, keys: [] as string[] };
+export const guestLimiter = { ok: true, keys: [] as string[] };
+export const mediaLimiter = { ok: true, keys: [] as string[] };
+const fakeLimiter = (l: { ok: boolean; keys: string[] }) =>
+  ({
+    limit: async ({ key }: { key: string }) => {
+      l.keys.push(key);
+      return { success: l.ok };
+    },
+  }) as unknown as RateLimit;
+export const MEDIA_HOST = 'media.test';
+export const MEDIA_SECRET = 'media-host-secret';
 
 export const env: Env = {
   ENVIRONMENT: 'test',
@@ -63,6 +79,18 @@ export const env: Env = {
     },
   } as unknown as RateLimit,
   PHOTOS: r2 as unknown as R2Bucket,
+  SHARED: shared as unknown as R2Bucket,
+  IMAGES: imagesBinding,
+  MEDIA_HOST,
+  MEDIA_HOST_SECRET: MEDIA_SECRET,
+  GALLERY_PEPPER: 'gallery-pepper',
+  GALLERY_LINK_KEY: btoa(String.fromCharCode(...new Uint8Array(32).map((_, i) => i * 7 + 3))),
+  GUEST_COOKIE_SECRET: 'guest-cookie-secret',
+  MEDIA_URL_SECRET: 'media-url-secret',
+  SAFETY_ALERT_EMAIL: 'safety@zephyr.test',
+  SHARE_LIMITER: fakeLimiter(shareLimiter),
+  GUEST_LIMITER: fakeLimiter(guestLimiter),
+  MEDIA_LIMITER: fakeLimiter(mediaLimiter),
 };
 
 // ---- keys --------------------------------------------------------------------------------------------
@@ -156,6 +184,8 @@ export interface World {
   onUserDeleted?: (id: string) => void;
   /** Bearer tokens GoTrue was asked to sign out globally. */
   globalLogouts: string[];
+  /** The media host (zephyr-shared behind Cloudflare): keys it blocks with 451, whether it's down, what was fetched. */
+  media: { blocked: Set<string>; down: boolean; fetched: string[] };
 }
 export const world: World = {} as World;
 
@@ -195,7 +225,14 @@ export function resetWorld() {
     limits: new Map(),
     onUserDeleted: undefined,
     globalLogouts: [],
+    media: { blocked: new Set(), down: false, fetched: [] },
   } satisfies World);
+  shared.reset();
+  images.reset();
+  for (const l of [shareLimiter, guestLimiter, mediaLimiter]) {
+    l.ok = true;
+    l.keys.length = 0;
+  }
   limiterOk = true;
   limiterKeys.length = 0;
   uploadLimiter.ok = true;
@@ -429,6 +466,23 @@ export function installFetch() {
         if (world.resendStatus === 200)
           world.emails.push({ to: b.to[0] ?? '', subject: b.subject, html: b.html, text: b.text });
         return json({ id: 'email-1' }, world.resendStatus);
+      }
+      if (url.startsWith(`https://${MEDIA_HOST}/`)) {
+        // The WAF rule: anything without the secret is blocked.
+        if (headers.get('X-Zephyr-Media') !== MEDIA_SECRET) return new Response('blocked', { status: 403 });
+        const key = url.slice(`https://${MEDIA_HOST}/`.length).split('/').map(decodeURIComponent).join('/');
+        world.media.fetched.push(key);
+        if (world.media.down) return new Response('down', { status: 502 });
+        if (world.media.blocked.has(key))
+          return new Response('Unavailable For Legal Reasons', { status: 451 });
+        const o = await shared.get(key);
+        if (!o || !('body' in o)) return new Response('not found', { status: 404 });
+        return new Response(o.body, {
+          headers: {
+            'Content-Type': o.httpMetadata?.contentType ?? 'application/octet-stream',
+            'Content-Length': String(o.size),
+          },
+        });
       }
       if (url.startsWith(`${SB}/rest/v1/rpc/`)) {
         const fn = url.slice(`${SB}/rest/v1/rpc/`.length);

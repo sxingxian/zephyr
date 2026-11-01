@@ -3,6 +3,7 @@ import '@fontsource-variable/geist-mono/wght.css';
 import '@zephyr/ui/styles.css';
 import './styles.css';
 import './editor.css';
+import './share.css';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { RouterProvider } from 'react-router';

@@ -16,6 +16,11 @@ export const SHARE_API = {
     `/api/v1/galleries/${encodeURIComponent(id)}/renders/${encodeURIComponent(photoId)}?v=${editVersion}`,
   /** Photos in this gallery that still need a full-size render from the member's device. */
   galleryRenderQueue: (id: string) => `/api/v1/galleries/${encodeURIComponent(id)}/renders`, // GET → { ok, pending: { photoId, editVersion }[] }
+  /** The gallery's guest link again (owner only; 404 once revoked). */
+  galleryLink: (id: string) => `/api/v1/galleries/${encodeURIComponent(id)}/link`, // GET → { ok, url }
+  /** Owner preview: the guest page's data without a passcode (no events, no favourites or downloads). */
+  galleryPreview: (id: string) => `/api/v1/galleries/${encodeURIComponent(id)}/preview`, // GET → GuestGalleryInfo
+  galleryPreviewPhotos: (id: string) => `/api/v1/galleries/${encodeURIComponent(id)}/preview/photos`, // GET ?cursor → GuestPhotoPage
   branding: '/api/v1/me/branding', // GET → { ok, branding: Branding } · PUT BrandingBody → { ok, branding }
   brandingAsset: (kind: BrandingAssetKind) => `/api/v1/me/branding/${kind}`, // PUT image bytes (PNG/JPEG/WEBP) → { ok, branding } · DELETE → { ok, branding }
 
@@ -26,6 +31,8 @@ export const SHARE_API = {
   guestFavourite: (token: string, photoId: string) =>
     `/api/v1/g/${token}/favourites/${encodeURIComponent(photoId)}`, // PUT → 204 · DELETE → 204
   guestSend: (token: string) => `/api/v1/g/${token}/favourites/send`, // POST GuestSendBody → { ok }
+  /** Works with the link alone (no unlock). 202 { ok } · 400 verification_failed (Turnstile) · 429 rate_limited. */
+  guestReport: (token: string) => `/api/v1/g/${token}/report`, // POST GuestReportBody
 } as const;
 
 /** Where guests open a gallery (on the app host). The token never appears anywhere else. */
@@ -69,6 +76,25 @@ export interface GalleryExtras {
   watermark: boolean;
   branding: boolean;
   accessLog: boolean;
+}
+
+/**
+ * The member's sharing limits, from their plan's live `plan_limits` row. Returned by GET /api/v1/me/usage as
+ * `Usage.sharing` so the app can show what's possible before the server enforces it.
+ */
+export interface SharingLimits {
+  /** Live galleries allowed (null = unlimited) and how many are live now. */
+  galleries: number | null;
+  liveGalleries: number;
+  /** Longest link in days (null = the system ceiling, MAX_LINK_DAYS_SYSTEM). */
+  maxLinkDays: number | null;
+  guestFullRes: boolean;
+  guestFavourites: boolean;
+  watermark: boolean;
+  branding: boolean;
+  accessLog: boolean;
+  /** Sharing suspended pending a safety review: new galleries are refused and existing ones show as ended. */
+  suspended?: boolean;
 }
 
 // ---------------------------------------------------------------- member side
@@ -247,4 +273,16 @@ export interface GuestPhotoPage {
 export interface GuestSendBody {
   name: string;
   note?: string;
+}
+
+/** Why a guest reports a gallery. */
+export const REPORT_REASONS = ['csam', 'violence', 'copyright', 'privacy', 'other'] as const;
+export type ReportReason = (typeof REPORT_REASONS)[number];
+export const REPORT_DETAILS_MAX = 1000;
+export interface GuestReportBody {
+  reason: ReportReason;
+  /** Optional: the photo being reported (ignored unless it's in the gallery). */
+  photoId?: string;
+  details?: string;
+  turnstileToken: string;
 }

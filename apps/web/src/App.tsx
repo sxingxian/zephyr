@@ -4,16 +4,20 @@ import { createBrowserRouter, Outlet, type RouteObject, useLocation, useNavigate
 import { EditTray } from './components/editor/EditTray';
 import { PublicOnly, RequireAuth } from './components/Guards';
 import { LibraryHost } from './components/LibraryHost';
+import { ShareTray } from './components/share/ShareTray';
 import { UploadProvider } from './components/Uploads';
 import { safeReturnPath } from './lib/returnPath';
 import { SessionProvider, useSession } from './lib/session';
 import { About } from './routes/About';
 import { AccountDeleted } from './routes/AccountScheduled';
 import { AlbumsPage } from './routes/Albums';
+import { GalleriesPage } from './routes/Galleries';
+import { GalleryPage } from './routes/Gallery';
 import { InviteFriends } from './routes/Invites';
 import { Join } from './routes/Join';
 import { NotFound } from './routes/NotFound';
 import { Security } from './routes/Security';
+import { SharingSettings } from './routes/SharingSettings';
 import { SignIn } from './routes/SignIn';
 import { SignInCode } from './routes/SignInCode';
 import { SignUp } from './routes/SignUp';
@@ -30,6 +34,7 @@ function Uploads({ children }: { children: React.ReactNode }) {
     <UploadProvider enabled={on}>
       {children}
       {on && <EditTray />}
+      {on && <ShareTray />}
     </UploadProvider>
   );
 }
@@ -73,6 +78,9 @@ export const routes: RouteObject[] = [
       },
       { path: '/albums', element: auth(<AlbumsPage />) },
       { path: '/trash', element: auth(<TrashPage />) },
+      { path: '/shared', element: auth(<GalleriesPage />) },
+      { path: '/shared/:galleryId', element: auth(<GalleryPage />) },
+      { path: '/shared/:galleryId/:tab', element: auth(<GalleryPage />) },
       { path: '/account-deleted', element: <AccountDeleted /> },
       { path: '/sign-in', element: pub(<SignIn />) },
       { path: '/sign-in/code', element: pub(<SignInCode />) },
@@ -83,6 +91,7 @@ export const routes: RouteObject[] = [
       { path: '/settings', element: auth(<Security />) },
       { path: '/settings/security', element: auth(<Security />) },
       { path: '/settings/invites', element: auth(<InviteFriends />) },
+      { path: '/settings/sharing', element: auth(<SharingSettings />) },
       { path: '/settings/about', element: auth(<About />) },
       { path: '/you', element: auth(<You />) },
       { path: '*', element: <NotFound /> },

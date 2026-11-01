@@ -4,8 +4,11 @@
  * to repeat. One audit row per run that did something, with counts only.
  */
 import { gotrue } from './auth/gotrue';
+import { sendEmail } from './email/resend';
+import { galleryExpiringEmail } from './email/share-templates';
 import type { Env } from './env';
 import { logError } from './http';
+import { deleteAll, deleteUnder, stores } from './library/objects';
 import {
   deleteKeys,
   deletePrefix,
@@ -27,6 +30,9 @@ export const JOB_LIMITS = {
   pagesPerAccount: 10,
   /** Objects the orphan sweep looks at per run (one R2 list page; the cursor carries over). */
   sweepPage: 1000,
+  /** Galleries per sharing clean-up step, and queued object deletions per run. */
+  shareCleanup: 100,
+  shareDeletions: 500,
 } as const;
 
 export interface CleanupCounts {
@@ -38,6 +44,10 @@ export interface CleanupCounts {
   variantsPublished: number;
   variantsLost: number;
   rateLimitRows: number;
+  galleryRenditionsPurged: number;
+  galleriesDeleted: number;
+  shareObjectsDeleted: number;
+  expiryReminders: number;
 }
 
 interface ExpiredUpload {
@@ -50,6 +60,8 @@ interface DueAccount {
   ownerId: string;
   prefix: string;
   stagingPrefix: string;
+  /** Phase 5: guest renditions and branding in zephyr-shared. */
+  sharedPrefix?: string;
   uploads: { r2Key: string; r2UploadId: string }[];
 }
 
@@ -71,6 +83,10 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
     variantsPublished: 0,
     variantsLost: 0,
     rateLimitRows: 0,
+    galleryRenditionsPurged: 0,
+    galleriesDeleted: 0,
+    shareObjectsDeleted: 0,
+    expiryReminders: 0,
   };
 
   // 1. Uploads left unfinished for 24 hours. The database claims them first (rows and reservation go
@@ -116,9 +132,12 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
         for (const u of a.uploads) await abortMultipart(env, u.r2Key, u.r2UploadId);
         const photos = await deletePrefix(env.PHOTOS, a.prefix, JOB_LIMITS.pagesPerAccount);
         const staged = await deletePrefix(env.PHOTOS, a.stagingPrefix, JOB_LIMITS.pagesPerAccount);
+        const shared = a.sharedPrefix
+          ? await deleteUnder(stores(env).shared, a.sharedPrefix, JOB_LIMITS.pagesPerAccount)
+          : { deleted: 0, complete: true };
         const res = {
-          deleted: photos.deleted + staged.deleted,
-          complete: photos.complete && staged.complete,
+          deleted: photos.deleted + staged.deleted + shared.deleted,
+          complete: photos.complete && staged.complete && shared.complete,
         };
         counts.objectsDeleted += res.deleted;
         if (!res.complete) {
@@ -152,14 +171,33 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
     logError(requestId, 'job_orphan_sweep', err);
   }
 
-  // 6. Old rate-limit rows (pg_cron does this daily too).
+  // 6. Sharing: renditions of ended galleries, gallery data 30 days after the end, old attempts and events,
+  // expiry reminders (each sent once: the database marks it before returning it).
+  try {
+    const r = await shareCleanup(env, requestId);
+    counts.galleryRenditionsPurged = r.purged;
+    counts.galleriesDeleted = r.deleted;
+    counts.expiryReminders = r.reminders;
+  } catch (err) {
+    logError(requestId, 'job_share_cleanup', err);
+  }
+
+  // 7. Queued share-object deletions (renditions, renders and branding assets whose rows went, and prefixes
+  // of deleted galleries). Objects first, then the queue rows; a failure leaves them for the next run.
+  try {
+    counts.shareObjectsDeleted = await drainShareDeletions(env, requestId);
+  } catch (err) {
+    logError(requestId, 'job_share_deletions', err);
+  }
+
+  // 8. Old rate-limit rows (pg_cron does this daily too).
   try {
     counts.rateLimitRows = await rpc<number>(env, 'purge_rate_limits');
   } catch (err) {
     logError(requestId, 'job_rate_limits', err);
   }
 
-  const { rateLimitRows: _routine, ...library } = counts;
+  const { rateLimitRows: _routine, expiryReminders: _sent, ...library } = counts;
   if (Object.values(library).some((n) => n > 0)) {
     try {
       await rpc(env, 'record_cleanup', { p_details: counts });
@@ -280,4 +318,91 @@ export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> 
     await rpc(env, 'set_job_state', { p_key: 'orphan_sweep_cursor', p_value: null });
   }
   return orphans.length;
+}
+
+interface ShareCleanup {
+  reminders: { galleryId: string; ownerEmail: string | null; name: string; expiresAt: string }[];
+  purged: number;
+  deleted: number;
+}
+
+export async function shareCleanup(env: Env, requestId = 'cron') {
+  const r = await rpc<ShareCleanup>(env, 'due_share_cleanup', { p_limit: JOB_LIMITS.shareCleanup });
+  let sent = 0;
+  for (const m of r.reminders) {
+    if (!m.ownerEmail) continue;
+    try {
+      await sendEmail(env, {
+        to: m.ownerEmail,
+        ...galleryExpiringEmail({
+          galleryName: m.name,
+          galleryId: m.galleryId,
+          expiresAt: m.expiresAt,
+          appUrl: env.APP_URL,
+        }),
+        idempotencyKey: `expiring-${m.galleryId}-${m.expiresAt}`,
+      });
+      sent += 1;
+    } catch (err) {
+      logError(requestId, 'expiry_email', err);
+    }
+  }
+  return { purged: r.purged, deleted: r.deleted, reminders: sent };
+}
+
+interface QueuedDeletion {
+  id: number;
+  bucket: 'shared' | 'photos';
+  key: string;
+  prefix: boolean;
+}
+
+const SHARE_ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+/**
+ * What the queue may delete, checked again here so no bug upstream can reach members' originals: in
+ * zephyr-photos only full-size renders (`u/<owner>/g/<gallery>/…`), in zephyr-shared anything under
+ * `o/<owner>/`; prefixes only a whole gallery's.
+ */
+const QUEUE_SHAPES = {
+  photos: {
+    key: new RegExp(`^u/${SHARE_ID}/g/${SHARE_ID}/${SHARE_ID}/full-[0-9]+-[0-9a-f]{32}$`),
+    prefix: new RegExp(`^u/${SHARE_ID}/g/${SHARE_ID}/$`),
+  },
+  shared: {
+    key: new RegExp(
+      `^o/${SHARE_ID}/(g/${SHARE_ID}/${SHARE_ID}/(grid|view|full)|b/(logo|watermark))-[0-9a-f]{32}$`,
+    ),
+    prefix: new RegExp(`^o/${SHARE_ID}/g/${SHARE_ID}/$`),
+  },
+} as const;
+
+export async function drainShareDeletions(env: Env, requestId = 'cron'): Promise<number> {
+  const all = await rpc<QueuedDeletion[]>(env, 'due_share_deletions', { p_limit: JOB_LIMITS.shareDeletions });
+  const due = all.filter((d) => {
+    const shape = QUEUE_SHAPES[d.bucket];
+    const ok = shape && (d.prefix ? shape.prefix : shape.key).test(d.key);
+    if (!ok) logError(requestId, 'share_deletion_shape', new Error(`queue ${d.id}`));
+    return ok;
+  });
+  if (!due.length) return 0;
+  const s = stores(env);
+  const done: number[] = [];
+  let deleted = 0;
+  for (const bucket of ['shared', 'photos'] as const) {
+    const keys = due.filter((d) => d.bucket === bucket && !d.prefix);
+    if (keys.length) {
+      deleted += await deleteAll(
+        s[bucket],
+        keys.map((d) => d.key),
+      );
+      done.push(...keys.map((d) => d.id));
+    }
+    for (const d of due.filter((x) => x.bucket === bucket && x.prefix)) {
+      const r = await deleteUnder(s[bucket], d.key, 2);
+      deleted += r.deleted;
+      if (r.complete) done.push(d.id);
+    }
+  }
+  if (done.length) await rpc(env, 'confirm_share_deletions', { p_ids: done });
+  return deleted;
 }
