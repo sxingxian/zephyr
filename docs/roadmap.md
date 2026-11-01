@@ -7,8 +7,8 @@
 | 3     | Library: uploads through the API into private R2, browser thumbnails and RAW previews, albums, search, favourites, trash, account deletion and clean-up jobs                                     | Done   |
 | 4     | Editor: WebGL adjustments, recipes, copy/paste, batch, RAW decoding (Wasm)                                                                                                                       | Done   |
 | 5     | Sharing: passcode galleries, guest view, rate limits, expiry and revoke, CSAM scanning route                                                                                                     | Done   |
-| 6     | Zephyr AI: on-device features, cloud background removal (after the bake-off), AI Gateway, spend caps                                                                                             | Next   |
-| 7     | Billing: Stripe Checkout, Billing, Customer Portal, webhooks, credits and top-ups                                                                                                                |        |
+| 6     | Zephyr AI: on-device features, cloud background removal (after the bake-off), AI Gateway, spend caps                                                                                             | Done   |
+| 7     | Billing: Stripe Checkout, Billing, Customer Portal, webhooks, credits and top-ups                                                                                                                | Next   |
 | 8     | Admin portal: users, safety, AI controls, plan limits, ads, audit, roles; Cloudflare Access on /admin; storage provider switch (R2, another S3-compatible cloud service, or on-premises storage) |        |
 
 ## Phase 8 note: switching storage provider

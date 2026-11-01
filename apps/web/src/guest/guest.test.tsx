@@ -280,12 +280,13 @@ describe('guest page states', () => {
     mockApi(() => json(404, { ok: false, error: 'not_found' }));
     render(<GuestApp pathname={`/g/${TOKEN}`} />);
     await screen.findByRole('heading', { name: 'This link doesn’t work' });
-    expect(document.title).toBe('Link not working');
+    // The title is set in an effect after the render, so wait for it (slow CI runners).
+    await waitFor(() => expect(document.title).toBe('Link not working'));
     cleanup();
     mockApi(galleryApi({ info: { state: 'ended', name: '', brand: { ...INFO.brand, studioName: '' } } }));
     render(<GuestApp pathname={`/g/${TOKEN}`} />);
     await screen.findByRole('heading', { name: 'This gallery has ended' });
-    expect(document.title).toBe('Gallery ended');
+    await waitFor(() => expect(document.title).toBe('Gallery ended'));
     const info = (state: string, name: string, studioName: string) => ({
       kind: 'info',
       info: { state, name, brand: { studioName } },
