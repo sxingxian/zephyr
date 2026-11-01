@@ -2,7 +2,9 @@ import { Button, Chip, Icon } from '@zephyr/ui';
 import type { ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { Avatar } from '../components/Avatar';
+import { CreditsMeter } from '../components/ai/AiBits';
 import { Shell, StorageMeter } from '../components/Shell';
+import { useAiStatus, useRunningJobs } from '../lib/aiClient';
 import { initials, useSession } from '../lib/session';
 
 const PLAN_LABEL = { free: 'Free plan', pro: 'Pro plan', studio: 'Studio plan' } as const;
@@ -20,6 +22,9 @@ function Group({ title, children }: { title: string; children: ReactNode }) {
 export function You() {
   const { user, signOut } = useSession();
   const nav = useNavigate();
+  const ai = useAiStatus();
+  const running = useRunningJobs();
+  const aiOn = !ai || ai.enabled;
   if (!user) return null;
   const out = async () => {
     await signOut();
@@ -41,8 +46,31 @@ export function You() {
             {user.plan === 'free' && <Chip size="sm">With ads</Chip>}
           </div>
           <StorageMeter />
-          <p className="z-hint">Cloud AI credits and upgrades are coming soon.</p>
+          <CreditsMeter />
+          <p className="z-hint">Plan upgrades and credit top-ups are coming soon.</p>
         </section>
+        {aiOn && (
+          <Group title="Zephyr AI">
+            {(
+              [
+                ['/people', 'people', 'People'],
+                ['/scenes', 'pin', 'Scenes'],
+                ['/cleanup', 'sparkGrid', 'Cleanup'],
+                ['/ai/queue', 'stack', 'AI queue'],
+                ['/settings/ai', 'settings', 'AI settings & credits'],
+              ] as const
+            ).map(([to, icon, label]) => (
+              <Link key={to} to={to} className="you-row">
+                <span className="you-row__icon">
+                  <Icon name={icon} size={17} />
+                </span>
+                <span className="you-row__label">{label}</span>
+                {to === '/ai/queue' && running > 0 && <span className="z-muted">{running} running</span>}
+                <Icon name="chevR" size={16} />
+              </Link>
+            ))}
+          </Group>
+        )}
         <Group title="Library">
           <Link to="/favourites" className="you-row">
             <span className="you-row__icon">

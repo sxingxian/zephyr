@@ -1,7 +1,9 @@
 import {
   type EditRecipe,
+  type EditSection,
   EMPTY_RECIPE,
   isEmptyRecipe,
+  mergeRecipe,
   normalizeRecipe,
   type PhotoEdit,
   recipeJson,
@@ -266,6 +268,34 @@ export class EditSession {
     this.recipe = theirs;
     this.emit();
   }
+  /**
+   * Phase 6: take an edit the server made on the member's request (a background removal finishing). Waits
+   * for any save in flight, then moves to the server's version as one undo step. Local changes not saved yet
+   * are kept: only `sections` (by default the cut-out) come from the server, and the merge is saved on top.
+   */
+  async adoptServer(edit: PhotoEdit, sections: readonly EditSection[] = ['cutout']): Promise<void> {
+    if (this.closed) return;
+    if (this.inflight) await this.inflight.catch(() => {});
+    if (this.closed || (this.version !== null && edit.version <= this.version && this.status !== 'conflict'))
+      return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    const server = normalizeRecipe(edit.recipe);
+    const localDirty = recipeJson(this.committed) !== this.savedJson || this.status === 'conflict';
+    const next = localDirty ? mergeRecipe(this.committed, server, sections) : server;
+    this.past.push(this.committed);
+    if (this.past.length > HISTORY_LIMIT) this.past.shift();
+    this.future = [];
+    this.conflict = null;
+    this.version = edit.version;
+    this.savedJson = recipeJson(server);
+    this.committed = next;
+    this.recipe = next;
+    this.status = 'saved';
+    if (!localDirty) this.deps.onSaved?.(this.photoId, edit, server);
+    this.schedule();
+  }
+
   /** "Keep mine": save over the newer version. */
   keepMine(): void {
     const c = this.conflict;

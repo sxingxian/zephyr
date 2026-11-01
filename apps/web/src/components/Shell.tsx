@@ -1,9 +1,11 @@
 import { Button, Chip, Icon, type IconName, Wordmark } from '@zephyr/ui';
 import { type ReactNode, useLayoutEffect, useRef } from 'react';
 import { Link, NavLink, useLocation } from 'react-router';
+import { useAiStatus, useRunningJobs } from '../lib/aiClient';
 import { initials, useSession } from '../lib/session';
 import { formatOf, useUsage } from '../lib/usage';
 import { Avatar } from './Avatar';
+import { CreditsMeter } from './ai/AiBits';
 import { useUploadPicker } from './Uploads';
 
 interface NavDef {
@@ -11,23 +13,21 @@ interface NavDef {
   icon: IconName;
   to?: string;
   count?: 'photos';
+  /** Phase 6: a Zephyr AI page, hidden while Zephyr AI is switched off for everyone. */
+  ai?: boolean;
 }
 const LIBRARY: NavDef[] = [
   { label: 'Library', icon: 'library', to: '/', count: 'photos' },
   { label: 'Albums', icon: 'folder', to: '/albums' },
-  { label: 'People', icon: 'people' },
-  { label: 'Places & scenes', icon: 'pin' },
+  { label: 'People', icon: 'people', to: '/people', ai: true },
+  { label: 'Scenes', icon: 'pin', to: '/scenes', ai: true },
   { label: 'Favourites', icon: 'heart', to: '/favourites' },
   { label: 'Shared galleries', icon: 'share', to: '/shared' },
-  { label: 'Cleanup', icon: 'sparkGrid' },
+  { label: 'Cleanup', icon: 'sparkGrid', to: '/cleanup', ai: true },
   { label: 'Trash', icon: 'trash', to: '/trash' },
 ];
-const AI: NavDef[] = [
-  { label: 'Batch queue', icon: 'stack' },
-  { label: 'Presets', icon: 'breeze' },
-];
 
-function Item({ d, count }: { d: NavDef; count?: number }) {
+function Item({ d, count, chip }: { d: NavDef; count?: number; chip?: ReactNode }) {
   if (!d.to) {
     return (
       <span className="nav-item nav-item--off" aria-disabled="true">
@@ -42,6 +42,7 @@ function Item({ d, count }: { d: NavDef; count?: number }) {
       <Icon name={d.icon} size={18} />
       <span className="nav-item__label">{d.label}</span>
       {count !== undefined && <span className="nav-item__count">{count.toLocaleString('en')}</span>}
+      {chip}
     </NavLink>
   );
 }
@@ -79,22 +80,43 @@ export function StorageMeter() {
 function Sidebar() {
   const { user } = useSession();
   const usage = useUsage();
+  const ai = useAiStatus();
+  const running = useRunningJobs();
   const plan = user?.plan ?? 'free';
+  // Zephyr AI pages show unless an admin switched Zephyr AI off for everyone.
+  const aiOn = !ai || ai.enabled;
   return (
     <nav className="sidebar" aria-label="Main">
       <Link to="/" className="sidebar__brand" aria-label="Zephyr library">
         <Wordmark size={21} />
       </Link>
       <div className="sidebar__group">
-        {LIBRARY.map((d) => (
+        {LIBRARY.filter((d) => aiOn || !d.ai).map((d) => (
           <Item key={d.label} d={d} count={d.count && usage ? usage.photoCount : undefined} />
         ))}
       </div>
       <div className="sidebar__group">
         <span className="sidebar__heading">Zephyr AI</span>
-        {AI.map((d) => (
-          <Item key={d.label} d={d} />
-        ))}
+        {aiOn ? (
+          <>
+            <Item
+              d={{ label: 'AI queue', icon: 'stack', to: '/ai/queue' }}
+              chip={
+                running > 0 ? (
+                  <Chip tone="acc" size="sm">
+                    {running} running
+                  </Chip>
+                ) : undefined
+              }
+            />
+            <Item d={{ label: 'AI settings', icon: 'settings', to: '/settings/ai' }} />
+          </>
+        ) : (
+          <span className="sidebar__paused">
+            <Icon name="breeze" size={16} />
+            Zephyr AI is paused
+          </span>
+        )}
       </div>
       <div className="sidebar__spacer" />
       <div className="sidebar__plan">
@@ -105,10 +127,7 @@ function Sidebar() {
           </Link>
         </div>
         <StorageMeter />
-        <div className="meter__row meter__row--soon">
-          <span>Cloud AI credits</span>
-          <span className="nav-item__soon">Coming soon</span>
-        </div>
+        <CreditsMeter />
       </div>
     </nav>
   );

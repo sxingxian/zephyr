@@ -20,7 +20,7 @@ export function comparePhotos(a: PhotoItem, b: PhotoItem, sort: PhotoListQuery['
 
 /** Whether a newly uploaded photo belongs in a list (search results are left to the server). */
 export function matchesQuery(p: PhotoItem, q: PhotoListQuery): boolean {
-  if (q.q || q.albumId || q.from || q.to) return false;
+  if (q.q || q.albumId || q.from || q.to || q.scene || q.person) return false;
   switch (q.view ?? 'library') {
     case 'library':
       return !p.trashedAt;
