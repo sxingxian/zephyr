@@ -2380,3 +2380,22 @@ a.nav-item:hover {
     bottom: calc(90px + env(safe-area-inset-bottom));
   }
 }
+
+/* ---------- Phase 6: Zephyr AI bits used by the app frame (the rest is in ai.css, loaded with its pages) ---------- */
+.page-loading {
+  min-height: 50vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sidebar__paused {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.meter__bar--good > span {
+  background: var(--good);
+}

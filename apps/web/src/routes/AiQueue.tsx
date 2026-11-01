@@ -19,6 +19,7 @@ import { errorMessage } from '../lib/api';
 import { deviceRunner, type LocalJob, useDeviceRunner } from '../lib/deviceRunner';
 import { thumbUrl } from '../lib/library';
 import { EmptyHint } from './Library';
+import '../ai.css';
 
 /** The AI queue (phase 6): cloud background-removal jobs and on-device batches, across devices. */
 

@@ -24,6 +24,7 @@ import { usePhotoList } from '../lib/photos';
 import { useSelection } from '../lib/selection';
 import { useScanner } from '../lib/useScanner';
 import { EmptyHint, GridSkeleton } from './Library';
+import '../ai.css';
 
 /** People (phase 6): opt-in face grouping, found on the device and kept in the account. */
 

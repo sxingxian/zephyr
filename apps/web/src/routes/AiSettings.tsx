@@ -21,6 +21,7 @@ import {
 } from '../lib/aiClient';
 import { errorMessage } from '../lib/api';
 import { useSession } from '../lib/session';
+import '../ai.css';
 
 /** Settings › Zephyr AI (phase 6): face grouping, scene tags, cleanup, and cloud credits with history. */
 

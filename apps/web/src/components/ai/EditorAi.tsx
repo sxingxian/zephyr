@@ -10,18 +10,19 @@ import {
   type PhotoItem,
   RANGES,
 } from '@zephyr/shared/client';
-import { Button, Chip, Dialog, Field, Icon, type IconName, Note, Spinner, Switch } from '@zephyr/ui';
+import { Button, Chip, Field, Icon, type IconName, Note, Spinner, Switch } from '@zephyr/ui';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { createJob, getJob, isAvailable, isOn, refreshAiStatus, useAiStatus } from '../../lib/aiClient';
 import { ApiFailure, errorMessage } from '../../lib/api';
 import type { EditSession } from '../../lib/editor/session';
 import { getEdit } from '../../lib/edits';
 import { thumbUrl } from '../../lib/library';
-import { usePhotoList } from '../../lib/photos';
 import { sessionUserId } from '../../lib/sessionGuard';
 import type { Edit } from '../editor/Panels';
 import { Slider } from '../editor/Slider';
 import { AiPausedNote, CloudPausedBanner, CreditStrip, plural, WhereChip } from './AiBits';
+import { ReferencePicker } from './ReferencePicker';
+import '../../ai.css';
 
 /**
  * The editor's Zephyr AI tab (phase 6). Auto-enhance, HDR and colour match run on this device through the
@@ -146,58 +147,6 @@ function Strength({
       onInput={onChange}
       onCommit={(v) => v !== undefined && onChange(v)}
     />
-  );
-}
-
-/** Picks a reference photo from the member's library. */
-export function ReferencePicker({
-  open,
-  onClose,
-  onPick,
-  exclude,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onPick: (p: PhotoItem) => void;
-  exclude?: string;
-}) {
-  return (
-    <Dialog open={open} onClose={onClose} title="Pick a reference photo">
-      {open && (
-        <ReferenceGrid
-          onPick={(p) => {
-            onPick(p);
-            onClose();
-          }}
-          exclude={exclude}
-        />
-      )}
-    </Dialog>
-  );
-}
-function ReferenceGrid({ onPick, exclude }: { onPick: (p: PhotoItem) => void; exclude?: string }) {
-  const list = usePhotoList({ view: 'library', sort: 'taken' });
-  const items = list.items.filter((p) => p.id !== exclude && p.hasThumb);
-  return (
-    <div className="ai-refgrid-wrap">
-      <p className="edlg-note">Every photo you match is moved toward this one’s colour and tone.</p>
-      {list.initial ? (
-        <Spinner size={18} label="Loading photos" />
-      ) : (
-        <div className="ai-refgrid">
-          {items.map((p) => (
-            <button key={p.id} type="button" className="ai-refgrid__item" onClick={() => onPick(p)}>
-              <img src={thumbUrl(p.id)} alt={p.filename} loading="lazy" />
-            </button>
-          ))}
-        </div>
-      )}
-      {list.hasMore && (
-        <Button size="sm" kind="ghost" busy={list.loading} onClick={list.loadMore}>
-          Show more
-        </Button>
-      )}
-    </div>
   );
 }
 

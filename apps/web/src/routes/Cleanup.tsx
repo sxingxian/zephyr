@@ -13,6 +13,7 @@ import { bulk, thumbUrl } from '../lib/library';
 import { formatBytes, refreshUsage } from '../lib/usage';
 import { useScanner } from '../lib/useScanner';
 import { EmptyHint, GridSkeleton } from './Library';
+import '../ai.css';
 
 /**
  * Cleanup (phase 6, Pro and Studio): duplicates, blurry photos and similar bursts, grouped on this device from

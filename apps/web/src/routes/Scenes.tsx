@@ -12,6 +12,7 @@ import { thumbUrl } from '../lib/library';
 import { usePhotoList } from '../lib/photos';
 import { useSelection } from '../lib/selection';
 import { EmptyHint, GridSkeleton, useLibraryActions } from './Library';
+import '../ai.css';
 
 /** Scenes (phase 6): tags from Workers AI on each photo's small preview, plus Night from the device. */
 

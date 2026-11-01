@@ -3,7 +3,7 @@ import { Button, Mascot, Note, useToast } from '@zephyr/ui';
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { AlbumPicker } from '../components/AlbumPicker';
-import { useAiBatch } from '../components/ai/BatchDialog';
+import { useAiBatch } from '../components/ai/useAiBatch';
 import { useEditActions } from '../components/editor/LibraryEdit';
 import {
   type BarAction,

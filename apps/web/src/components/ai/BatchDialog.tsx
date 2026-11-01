@@ -9,7 +9,8 @@ import { type ReactNode, useEffect, useState } from 'react';
 import { createJob, deviceLabel, isAvailable, isOn, refreshAiStatus, useAiStatus } from '../../lib/aiClient';
 import { ApiFailure, errorMessage } from '../../lib/api';
 import { plural, WhereChip } from './AiBits';
-import { ReferencePicker } from './EditorAi';
+import { ReferencePicker } from './ReferencePicker';
+import '../../ai.css';
 
 /**
  * "Zephyr AI for N photos" (phase 6, AiBatch): pick device steps (auto-enhance, HDR, colour match) and/or the
@@ -368,25 +369,4 @@ export function BatchDialog({
       <ReferencePicker open={picker} onClose={() => setPicker(false)} onPick={setReference} />
     </Dialog>
   );
-}
-
-/** Library selection hook: the "Zephyr AI" action and its dialog. */
-export function useAiBatch() {
-  const status = useAiStatus();
-  const [ids, setIds] = useState<string[] | null>(null);
-  const [title, setTitle] = useState<string | undefined>(undefined);
-  const available =
-    (Boolean(status?.enabled) &&
-      (['auto_enhance', 'hdr', 'color_match'] as const).some((f) => isOn(status, f))) ||
-    isAvailable(status, 'bg_removal');
-  return {
-    available,
-    open: (photoIds: string[], t?: string) => {
-      setTitle(t);
-      setIds(photoIds);
-    },
-    dialog: (
-      <BatchDialog open={ids !== null} photoIds={ids ?? []} title={title} onClose={() => setIds(null)} />
-    ),
-  };
 }

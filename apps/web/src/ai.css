@@ -1,22 +1,5 @@
 /* Phase 6: Zephyr AI (editor AI tab, batches, AI queue, People, Scenes, Cleanup, Settings › Zephyr AI). */
 
-.page-loading {
-  min-height: 50vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.sidebar__paused {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  font-size: 13px;
-  color: var(--muted);
-}
-.meter__bar--good > span {
-  background: var(--good);
-}
 .ai-section-head {
   display: flex;
   align-items: baseline;
