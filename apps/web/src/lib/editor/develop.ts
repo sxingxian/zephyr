@@ -280,3 +280,135 @@ export function developSrgb8(
   const out = developPixel(lin, localLum ?? luma(...lin), u, v, p);
   return out.map((c) => Math.round(toSrgb(c) * 255)) as [number, number, number];
 }
+
+// ------------------------------------------------------------ cut-out composite (phase 6)
+/**
+ * Parameters of the composite pass, from the recipe's `cutout` and the mask. The shader (COMPOSITE in
+ * shaders.ts) and `compositePixel` read the same values.
+ */
+export interface CompositeParams {
+  /** 1: transparent background (alpha = mask), 2: solid colour. */
+  mode: 1 | 2;
+  /** Background colour, linear light. */
+  bg: [number, number, number];
+  /** Edge shift as an exponent on the mask: < 1 pushes the edge out, > 1 pulls it in. */
+  gamma: number;
+  /** Mip level the mask is sampled at (edge softness, and no aliasing when the output is smaller). */
+  lod: number;
+  /** 0: none, 1: soft drop shadow, 2: contact shadow. */
+  shadow: 0 | 1 | 2;
+  /** 0–1. */
+  strength: number;
+  /** Soft shadow: how far below the subject (source uv). */
+  offset: number;
+  /** Contact shadow ellipse: centre x, bottom y, radius x, radius y (source uv). */
+  contact: [number, number, number, number];
+}
+
+const hexToLinear = (hex: string): [number, number, number] => {
+  const n = Number.parseInt(hex.slice(1), 16);
+  return [fromSrgb(((n >> 16) & 255) / 255), fromSrgb(((n >> 8) & 255) / 255), fromSrgb((n & 255) / 255)];
+};
+
+/**
+ * `maskEdge`: the mask's long edge in pixels. `outEdgeInSource`: how many output pixels span the source's long
+ * edge (output long edge ÷ the crop's share of the source), so a small render samples a smaller mip.
+ */
+export function compositeParams(
+  cutout: {
+    bg: string;
+    color?: string;
+    shadow?: string;
+    shadowStrength?: number;
+    softness?: number;
+    shift?: number;
+  },
+  maskEdge: number,
+  outEdgeInSource: number,
+  contact: [number, number, number, number] | null,
+): CompositeParams {
+  const soft = cutout.softness ?? 0;
+  const softLod = Math.log2(1 + (soft * maskEdge) / 2048);
+  const minLod = Math.log2(Math.max(1, maskEdge / Math.max(1, outEdgeInSource)));
+  const mode = cutout.bg === 'transparent' ? 1 : 2;
+  const shadow =
+    mode === 2 && cutout.shadow === 'soft' ? 1 : mode === 2 && cutout.shadow === 'contact' && contact ? 2 : 0;
+  return {
+    mode,
+    bg: cutout.bg === 'color' && cutout.color ? hexToLinear(cutout.color) : [1, 1, 1],
+    gamma: 2 ** (-(cutout.shift ?? 0) / 5),
+    lod: Math.max(softLod, minLod),
+    shadow,
+    strength: shadow ? clamp((cutout.shadowStrength ?? 0) / 100) : 0,
+    offset: 0.025,
+    contact: contact ?? [0.5, 1, 0.1, 0.025],
+  };
+}
+
+/** Bilinear sample of a one-byte-per-pixel image at uv (texel centres at +0.5, clamped edges), 0–1. */
+export function sampleBilinear(l: { w: number; h: number; data: Uint8Array }, u: number, v: number): number {
+  const x = clamp(u) * l.w - 0.5;
+  const y = clamp(v) * l.h - 0.5;
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const fx = x - x0;
+  const fy = y - y0;
+  const at = (xx: number, yy: number) =>
+    l.data[Math.min(l.h - 1, Math.max(0, yy)) * l.w + Math.min(l.w - 1, Math.max(0, xx))] as number;
+  const top = at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx;
+  const bot = at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx;
+  return (top * (1 - fy) + bot * fy) / 255;
+}
+
+/** Trilinear sample across a mip chain (what textureLod does with LINEAR_MIPMAP_LINEAR). */
+export function sampleMip(
+  levels: { w: number; h: number; data: Uint8Array }[],
+  u: number,
+  v: number,
+  lod: number,
+): number {
+  const top = levels.length - 1;
+  const l = clamp(lod, 0, top);
+  const a = Math.floor(l);
+  const f = l - a;
+  const s0 = sampleBilinear(levels[a] as (typeof levels)[number], u, v);
+  if (f === 0 || a >= top) return s0;
+  return s0 * (1 - f) + sampleBilinear(levels[a + 1] as (typeof levels)[number], u, v) * f;
+}
+
+/** The shadow amount at source uv (0–1) from the blurred mask or the contact ellipse. */
+export function shadowAt(
+  p: CompositeParams,
+  blurSample: (u: number, v: number) => number,
+  u: number,
+  v: number,
+): number {
+  if (p.shadow === 1) return blurSample(u, clamp(v - p.offset));
+  if (p.shadow === 2) {
+    const dx = (u - p.contact[0]) / p.contact[2];
+    const dy = (v - p.contact[1]) / p.contact[3];
+    return Math.exp(-(dx * dx + dy * dy));
+  }
+  return 0;
+}
+
+/**
+ * Composites one developed pixel (sRGB 8-bit) over the background. `m` is the mask sample (0–1), `sh` the
+ * shadow amount. Returns RGBA 8-bit: for a transparent background the photo's colour with alpha from the mask.
+ */
+export function compositePixel(
+  px: [number, number, number],
+  m: number,
+  sh: number,
+  p: CompositeParams,
+): [number, number, number, number] {
+  const a = clamp(m) ** p.gamma;
+  if (p.mode === 1) return [px[0], px[1], px[2], Math.round(a * 255)];
+  const k = 1 - p.strength * 0.6 * sh;
+  const out = [0, 1, 2].map((i) => {
+    const photo = fromSrgb((px[i] as number) / 255);
+    const bg = (p.bg[i] as number) * k;
+    return Math.round(toSrgb(bg + (photo - bg) * a) * 255);
+  });
+  return [out[0] as number, out[1] as number, out[2] as number, 255];
+}

@@ -7,6 +7,7 @@ import {
   recipeJson,
 } from '@zephyr/shared/client';
 import { ApiFailure, errorMessage } from '../api';
+import { activeCutout, getMask, loadMask } from './cutout';
 import { onEditorReset } from './resets';
 
 /**
@@ -82,6 +83,7 @@ export class EditSession {
     this.savedJson = recipeJson(this.recipe);
     this.version = initial?.version ?? null;
     this.snap = this.makeSnap();
+    this.watchMask();
   }
 
   subscribe = (fn: () => void) => {
@@ -92,6 +94,7 @@ export class EditSession {
   };
   getSnapshot = () => this.snap;
   private emit() {
+    this.watchMask();
     this.snap = this.makeSnap();
     for (const s of this.subs) s();
   }
@@ -105,6 +108,31 @@ export class EditSession {
       conflict: this.conflict,
       version: this.version,
     };
+  }
+
+  /**
+   * Phase 6: when the recipe shows a cut-out whose mask isn't loaded yet, load it, then hand out a fresh
+   * recipe object so the editor renders again with the cut-out. A failed load leaves the photo showing its
+   * background (the renderer skips a cut-out without a mask).
+   */
+  private maskWanted: string | null = null;
+  private watchMask() {
+    const c = activeCutout(this.recipe);
+    if (!c || c.mask === this.maskWanted || getMask(c.mask)) return;
+    this.maskWanted = c.mask;
+    const id = c.mask;
+    loadMask(this.photoId, id, this.ctrl.signal).then(
+      () => {
+        if (this.closed || activeCutout(this.recipe)?.mask !== id) return;
+        this.recipe = { ...this.recipe };
+        if (recipeJson(this.committed) === recipeJson(this.recipe)) this.committed = this.recipe;
+        this.snap = this.makeSnap();
+        for (const sub of this.subs) sub();
+      },
+      () => {
+        // Not retried for this photo while it stays open (no request on every slider move).
+      },
+    );
   }
 
   /** Live change while dragging: shown, not recorded or saved yet. */

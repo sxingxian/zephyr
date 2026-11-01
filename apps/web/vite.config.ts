@@ -78,6 +78,10 @@ export default defineConfig(({ mode, command }) => {
             '**/*symbols*',
             'guest.html',
             'assets/guest-*',
+            // Zephyr AI's face engine loads on demand (onnxruntime and its worker): never precached for everyone.
+            // Its models are kept in Cache Storage once used; the hashed WebAssembly file in the HTTP cache.
+            'assets/ort.*',
+            'assets/faces.worker-*',
           ],
           navigateFallback: '/index.html',
           // /g/* is the guest gallery: always from the network, never the member app shell.

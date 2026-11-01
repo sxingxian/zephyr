@@ -1,7 +1,8 @@
 import type { EditRecipe, PhotoItem } from '@zephyr/shared/client';
 import { getEdit } from '../edits';
 import { withRenderer } from './background';
-import { encodeJpeg } from './encode';
+import { activeCutout, loadMask } from './cutout';
+import { encodeJpeg, encodePng } from './encode';
 import { fitLongEdge, outputSize } from './geometry';
 import {
   ExportProblem,
@@ -29,12 +30,17 @@ export interface ExportOptions {
   size: ExportSize;
   /** JPEG quality 0.3–1. */
   quality: number;
+  /**
+   * Phase 6: 'png' keeps a transparent cut-out's transparency (lossless, larger). JPEG (the default) puts a
+   * transparent background on white.
+   */
+  format?: 'jpeg' | 'png';
   signal?: AbortSignal;
   onProgress?: (done: number, total: number) => void;
 }
 
 /**
- * Renders one photo's original through its recipe, at the chosen size, as a metadata-free JPEG. The signal
+ * Renders one photo's original through its recipe, at the chosen size, as a metadata-free JPEG (or PNG). The signal
  * stops it between steps: fetching, decoding, rendering and encoding.
  */
 export async function renderExport(
@@ -43,6 +49,11 @@ export async function renderExport(
   o: ExportOptions,
 ): Promise<Blob> {
   const r = recipe ?? (await getEdit(photo.id, o.signal))?.recipe ?? null;
+  stopIf(o.signal);
+  // A background removal renders with its mask; if the mask can't load, the export fails rather than
+  // quietly leaving the cut-out out.
+  const cut = activeCutout(r);
+  if (cut) await loadMask(photo.id, cut.mask, o.signal);
   stopIf(o.signal);
   return withRenderer(async (gl) => {
     stopIf(o.signal);
@@ -66,9 +77,12 @@ export async function renderExport(
         height: s.height,
         baselineEv: loaded.baselineEv,
       });
-      const jpeg = await encodeJpeg(px, s.width, s.height, o.quality);
+      const out =
+        o.format === 'png'
+          ? await encodePng(px, s.width, s.height)
+          : await encodeJpeg(px, s.width, s.height, o.quality);
       stopIf(o.signal);
-      return jpeg;
+      return out;
     } finally {
       releaseSource(loaded.source);
     }

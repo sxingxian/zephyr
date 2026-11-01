@@ -3,7 +3,20 @@
  * CPU reference in develop.ts. Also times slider re-renders at proxy size. Run by e2e/shader-check.mjs.
  */
 import type { EditRecipe } from '@zephyr/shared/client';
-import { developParams, developPixel, fromSrgb, luma, toSrgb } from '../src/lib/editor/develop';
+import { type buildMask, loadMask, setMaskDeps } from '../src/lib/editor/cutout';
+import {
+  compositeParams,
+  compositePixel,
+  developParams,
+  developPixel,
+  fromSrgb,
+  luma,
+  sampleBilinear,
+  sampleMip,
+  shadowAt,
+  toSrgb,
+} from '../src/lib/editor/develop';
+import { apply, outputSize, outputToSource } from '../src/lib/editor/geometry';
 import { Renderer } from '../src/lib/editor/gl';
 import { toHalf } from '../src/lib/editor/rawCommon';
 
@@ -144,6 +157,66 @@ function compareRaw(
   return { name: `RAW ${name}`, maxDiff, pixels: w * h };
 }
 
+/** A soft-edged ellipse (the "subject") with a stalk to the bottom edge, as a greyscale mask. */
+function makeMask(w: number, h: number): Uint8Array {
+  const d = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const dx = (x + 0.5 - w * 0.5) / (w * 0.3);
+      const dy = (y + 0.5 - h * 0.45) / (h * 0.32);
+      const r = Math.sqrt(dx * dx + dy * dy);
+      let v = Math.max(0, Math.min(1, (1.08 - r) / 0.16));
+      if (Math.abs(x + 0.5 - w * 0.5) < w * 0.06 && y > h * 0.5 && y < h * 0.9) v = 1;
+      d[y * w + x] = Math.round(v * 255);
+    }
+  return d;
+}
+
+/**
+ * Cut-out composite: renders with and without the cut-out, and checks the cut-out pixels against
+ * `compositePixel` applied to the GPU's own developed pixels (so geometry resampling isn't compared twice).
+ */
+async function compareCutout(
+  name: string,
+  r: Renderer,
+  src: HTMLCanvasElement,
+  recipe: EditRecipe,
+  mask: ReturnType<typeof buildMask>,
+): Promise<Result> {
+  const w = src.width;
+  const h = src.height;
+  r.setSource({ kind: 'bitmap', bitmap: src, width: w, height: h });
+  const full = outputSize(recipe.crop, { width: w, height: h });
+  const plain = r.renderPixels({
+    recipe: { ...recipe, cutout: undefined },
+    width: full.width,
+    height: full.height,
+  });
+  const out = r.renderPixels({ recipe, width: full.width, height: full.height });
+  const cut = recipe.cutout as NonNullable<EditRecipe['cutout']>;
+  const p = compositeParams(cut, Math.max(mask.width, mask.height), Math.max(w, h), mask.contact);
+  const m = outputToSource(recipe.crop, { width: w, height: h });
+  let maxDiff = 0;
+  for (let y = 0; y < full.height; y++)
+    for (let x = 0; x < full.width; x++) {
+      const i = (y * full.width + x) * 4;
+      let [u, v] = apply(m, (x + 0.5) / full.width, (y + 0.5) / full.height);
+      u = Math.min(1, Math.max(0, u));
+      v = Math.min(1, Math.max(0, v));
+      const ms = sampleMip(mask.levels, u, v, p.lod);
+      const sh = shadowAt(p, (a, b) => sampleBilinear(mask.blur, a, b), u, v);
+      const want = compositePixel(
+        [plain[i] as number, plain[i + 1] as number, plain[i + 2] as number],
+        ms,
+        sh,
+        p,
+      );
+      for (let k = 0; k < 4; k++)
+        maxDiff = Math.max(maxDiff, Math.abs((want[k] as number) - (out[i + k] as number)));
+    }
+  return { name: `cut-out ${name}`, maxDiff, pixels: full.width * full.height };
+}
+
 async function run() {
   // Let the page finish loading first: the checks below are long and synchronous.
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -192,6 +265,43 @@ async function run() {
       }),
     );
   }
+
+  // Cut-out composite (phase 6): a mask smaller than the photo, every background and shadow, edge shift and
+  // softness, and a rotated crop (the mask follows the geometry).
+  const MID = '0f3c1d2e-4a5b-4c6d-8e7f-a0b1c2d3e4f5';
+  const mw = 80;
+  const mh = 54;
+  const maskData = makeMask(mw, mh);
+  setMaskDeps({
+    fetchMask: async () => new Blob([]),
+    decode: async () => ({ width: mw, height: mh, data: maskData }),
+  });
+  const mask = await loadMask('photo', MID);
+  const cutCases: [string, EditRecipe][] = [
+    ['white', { v: 1, cutout: { mask: MID, bg: 'white' } }],
+    ['transparent (alpha)', { v: 1, cutout: { mask: MID, bg: 'transparent' } }],
+    [
+      'colour + soft shadow',
+      { v: 1, cutout: { mask: MID, bg: 'color', color: '#e9e1d3', shadow: 'soft', shadowStrength: 60 } },
+    ],
+    [
+      'white + contact shadow',
+      { v: 1, cutout: { mask: MID, bg: 'white', shadow: 'contact', shadowStrength: 80 } },
+    ],
+    ['shift out, softness 6', { v: 1, cutout: { mask: MID, bg: 'white', shift: 6, softness: 6 } }],
+    ['shift in', { v: 1, cutout: { mask: MID, bg: 'color', color: '#0d1117', shift: -8 } }],
+    [
+      'rotated crop + edits',
+      {
+        v: 1,
+        light: { exposure: 0.3 },
+        crop: { angle: 7, rect: { x: 0.1, y: 0.05, w: 0.7, h: 0.8 } },
+        cutout: { mask: MID, bg: 'white', shadow: 'soft', shadowStrength: 40 },
+      },
+    ],
+  ];
+  for (const [n, rec] of cutCases) results.push(await compareCutout(n, r, grad, rec, mask));
+  setMaskDeps(null);
 
   // RAW sources: baseline exposure and the base curve before the recipe.
   const rawGrad = makeRaw(96, 64);

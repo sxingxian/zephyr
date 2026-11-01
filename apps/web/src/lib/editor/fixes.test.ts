@@ -227,6 +227,7 @@ describe('edited variants from the editor’s source', () => {
     const gl = {
       sourceSize: { width: 4000, height: 3000 },
       renderPixels,
+      cutoutReady: () => true,
     } as unknown as import('./gl').Renderer;
     const p = renderVariantsFrom(gl, { v: 1 }, 0);
     // Synchronously, before anything awaits:
