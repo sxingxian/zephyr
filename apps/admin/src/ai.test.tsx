@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import type { AdminAiJobsResult, AiSettings, AiSpendToday } from '@zephyr/shared/client';
+import type { AdminAiJobsResult, AiSettings, AiSettingsPatch, AiSpendToday } from '@zephyr/shared/client';
 import { createMemoryRouter, RouterProvider } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { routes } from './App';
@@ -85,6 +85,14 @@ const JOBS: AdminAiJobsResult = {
   spend: SPEND,
 };
 
+/** Like the API: a patch's nested objects (caps, costs, features) merge into the current settings. */
+const patched = (p: AiSettingsPatch): AiSettings => ({
+  ...SETTINGS,
+  ...p,
+  features: { ...SETTINGS.features, ...p.features },
+  costs: { ...SETTINGS.costs, ...p.costs },
+  caps: { ...SETTINGS.caps, ...p.caps },
+});
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 type Call = { url: string; method: string; body: unknown };
@@ -111,7 +119,7 @@ function mock(role: string, extra?: (c: Call) => Response | undefined) {
       if (url.endsWith('/ai/settings') && c.method === 'GET')
         return json(200, { ok: true, settings: SETTINGS, spend: SPEND });
       if (url.endsWith('/ai/settings') && c.method === 'PATCH')
-        return json(200, { ok: true, settings: { ...SETTINGS, ...(c.body as object) }, spend: SPEND });
+        return json(200, { ok: true, settings: patched(c.body as AiSettingsPatch), spend: SPEND });
       if (url.endsWith('/ai/jobs')) return json(200, JOBS);
       if (url.endsWith('/auth/passkey/options'))
         return json(200, { ok: true, challengeId: 'ch1', options: { challenge: 'x', allowCredentials: [] } });
