@@ -76,14 +76,16 @@ jobs:
           CF_ACCESS_TEAM_DOMAIN: ${{ vars.CF_ACCESS_TEAM_DOMAIN }}
           CF_ACCESS_AUD: ${{ vars.CF_ACCESS_AUD }}
         run: |
-          for v in SUPABASE_URL SUPABASE_PUBLISHABLE_KEY CF_ACCESS_TEAM_DOMAIN CF_ACCESS_AUD; do
+          for v in SUPABASE_URL SUPABASE_PUBLISHABLE_KEY CF_ACCESS_TEAM_DOMAIN CF_ACCESS_AUD CLOUDFLARE_ACCOUNT_ID; do
             test -n "${!v}" || { echo "Set the $v variable"; exit 1; }
           done
+          # Phase 6: the AI Gateway lives in the same Cloudflare account.
           pnpm exec wrangler deploy \
             --var "SUPABASE_URL:$SUPABASE_URL" \
             --var "SUPABASE_PUBLISHABLE_KEY:$SUPABASE_PUBLISHABLE_KEY" \
             --var "CF_ACCESS_TEAM_DOMAIN:$CF_ACCESS_TEAM_DOMAIN" \
-            --var "CF_ACCESS_AUD:$CF_ACCESS_AUD"
+            --var "CF_ACCESS_AUD:$CF_ACCESS_AUD" \
+            --var "AI_GATEWAY_ACCOUNT_ID:$CLOUDFLARE_ACCOUNT_ID"
 
   landing:
     needs: [guard, api]
