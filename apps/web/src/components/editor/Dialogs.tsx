@@ -244,6 +244,8 @@ export interface ExportChoice {
   size: ExportSize;
   quality: number;
   name: string;
+  /** Phase 6: PNG keeps a transparent cut-out's transparency; JPEG puts it on white. */
+  format: 'jpeg' | 'png';
 }
 
 /** Export one photo or several: size, JPEG quality, then Download or Save as copy. */
@@ -256,9 +258,12 @@ export function ExportDialog({
   onClose,
   onDownload,
   onSaveCopy,
+  transparent = false,
 }: {
   open: boolean;
   photos: Pick<PhotoItem, 'filename' | 'fileType'>[];
+  /** Phase 6: the photo has a transparent cut-out background, so offer PNG (single photo only). */
+  transparent?: boolean;
   /** Output size of the single photo at full size, when known. */
   dims?: { width: number; height: number } | null;
   thumb?: string | null;
@@ -273,17 +278,21 @@ export function ExportDialog({
   const [size, setSize] = useState<'full' | '2048' | 'custom'>('full');
   const [custom, setCustom] = useState('3000');
   const [quality, setQuality] = useState(90);
+  const [format, setFormat] = useState<'jpeg' | 'png'>('jpeg');
   const [name, setName] = useState('');
+  const canPng = transparent && !batch;
+  const fmt = canPng ? format : 'jpeg';
   const [busy, setBusy] = useState<null | 'download' | 'copy'>(null);
   const [progress, setProgress] = useState<[number, number] | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     if (open) {
-      setName(first ? exportName(first.filename) : 'photo-edited.jpg');
+      setFormat(canPng ? 'png' : 'jpeg');
+      setName(first ? exportName(first.filename, canPng ? 'png' : 'jpeg') : 'photo-edited.jpg');
       setError(null);
       setProgress(null);
     }
-  }, [open, first]);
+  }, [open, first, canPng]);
   const choice = (): ExportChoice => ({
     size:
       size === 'full'
@@ -293,8 +302,13 @@ export function ExportDialog({
             edge: size === '2048' ? 2048 : Math.min(16000, Math.max(256, Number(custom) || 3000)),
           },
     quality: quality / 100,
-    name: name.trim() || 'photo-edited.jpg',
+    name: name.trim() || (fmt === 'png' ? 'photo-edited.png' : 'photo-edited.jpg'),
+    format: fmt,
   });
+  const pickFormat = (f: 'jpeg' | 'png') => {
+    setFormat(f);
+    if (first) setName((n) => n.replace(/\.(png|jpe?g)$/i, '') + (f === 'png' ? '.png' : '.jpg'));
+  };
   const pixels = (() => {
     const d = dims ?? { width: 6000, height: 4000 };
     if (size === 'full') return d.width * d.height;
@@ -302,7 +316,8 @@ export function ExportDialog({
     const k = Math.min(1, edge / Math.max(d.width, d.height));
     return d.width * d.height * k * k;
   })();
-  const each = estimateJpegBytes(pixels, quality / 100);
+  // A PNG of a cut-out is roughly 2 bytes a pixel; JPEG as estimated for exports.
+  const each = fmt === 'png' ? Math.round(pixels * 2) : estimateJpegBytes(pixels, quality / 100);
   const total = each * photos.length;
   // A .zip that can't stream to disk is held in memory: too big a one would crash the tab.
   const streams = typeof (window as { showSaveFilePicker?: unknown }).showSaveFilePicker === 'function';
@@ -400,6 +415,30 @@ export function ExportDialog({
             </label>
           ))}
         </fieldset>
+        {canPng && (
+          <fieldset className="esize">
+            <legend>Format</legend>
+            {(
+              [
+                ['png', 'PNG', 'Keeps the transparent background'],
+                ['jpeg', 'JPEG', 'Smaller; the background turns white'],
+              ] as const
+            ).map(([v, a, b]) => (
+              <label key={v} className="esize__opt">
+                <span className="esize__title">
+                  <input
+                    type="radio"
+                    name="export-format"
+                    checked={fmt === v}
+                    onChange={() => pickFormat(v)}
+                  />
+                  {a}
+                </span>
+                <span className="esize__hint">{b}</span>
+              </label>
+            ))}
+          </fieldset>
+        )}
         {size === 'custom' && (
           <Field
             label="Long edge (pixels)"
@@ -408,40 +447,42 @@ export function ExportDialog({
             onChange={(e) => setCustom(e.target.value.replace(/\D/g, '').slice(0, 5))}
           />
         )}
-        <div
-          className="eslider is-changed esq"
-          style={
-            {
-              '--pos': `${((quality - 50) / 50) * 100}%`,
-              '--fl': '0%',
-              '--fw': `${((quality - 50) / 50) * 100}%`,
-            } as React.CSSProperties
-          }
-        >
-          <div className="eslider__head">
-            <label htmlFor="export-quality">JPEG quality</label>
-            <output htmlFor="export-quality">
-              {quality} · {qualityLabel}
-            </output>
+        {fmt === 'jpeg' && (
+          <div
+            className="eslider is-changed esq"
+            style={
+              {
+                '--pos': `${((quality - 50) / 50) * 100}%`,
+                '--fl': '0%',
+                '--fw': `${((quality - 50) / 50) * 100}%`,
+              } as React.CSSProperties
+            }
+          >
+            <div className="eslider__head">
+              <label htmlFor="export-quality">JPEG quality</label>
+              <output htmlFor="export-quality">
+                {quality} · {qualityLabel}
+              </output>
+            </div>
+            <div className="eslider__rail">
+              <span className="eslider__track" aria-hidden="true" />
+              <span className="eslider__fill" aria-hidden="true" />
+              <input
+                id="export-quality"
+                type="range"
+                min={50}
+                max={100}
+                step={1}
+                value={quality}
+                onChange={(e) => setQuality(Number(e.target.value))}
+              />
+            </div>
+            <span className="esec__hint">
+              About {formatBytes(total)}
+              {batch ? ' in total' : ''} · sRGB colour, so it looks right everywhere
+            </span>
           </div>
-          <div className="eslider__rail">
-            <span className="eslider__track" aria-hidden="true" />
-            <span className="eslider__fill" aria-hidden="true" />
-            <input
-              id="export-quality"
-              type="range"
-              min={50}
-              max={100}
-              step={1}
-              value={quality}
-              onChange={(e) => setQuality(Number(e.target.value))}
-            />
-          </div>
-          <span className="esec__hint">
-            About {formatBytes(total)}
-            {batch ? ' in total' : ''} · sRGB colour, so it looks right everywhere
-          </span>
-        </div>
+        )}
         {batch ? (
           <div className="ezipnote">
             <span>

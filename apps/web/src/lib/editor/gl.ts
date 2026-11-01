@@ -1,10 +1,12 @@
 import type { CropRect, EditRecipe } from '@zephyr/shared/client';
-import { developParams } from './develop';
-import { fitLongEdge, type Mat3, outputToSource, type Size } from './geometry';
-import { BLUR, DENOISE, DEVELOP, GEOMETRY, LUM, SHARPEN, VERT } from './shaders';
+import { activeCutout, type CutoutMask, getMask } from './cutout';
+import { compositeParams, developParams } from './develop';
+import { fitLongEdge, type Mat3, outputSize, outputToSource, type Size } from './geometry';
+import { BLUR, COMPOSITE, DENOISE, DEVELOP, GEOMETRY, LUM, SHARPEN, VERT } from './shaders';
 
 /**
- * The editor's WebGL 2 pipeline: geometry → (luminance mask) → develop → denoise → sharpen. One instance
+ * The editor's WebGL 2 pipeline: geometry → (luminance mask) → develop → denoise → sharpen → (cut-out
+ * composite, when the recipe has a background removal and its mask is loaded, see cutout.ts). One instance
  * renders the live view, thumbnails and exports, so a photo looks the same everywhere.
  *
  * The geometry result and luminance mask are cached per crop and size, so dragging a light or colour slider
@@ -33,6 +35,8 @@ export interface RenderOptions {
   before?: boolean;
   /** Baseline exposure for RAW sources, applied before their base curve (see rawCommon.ts). */
   baselineEv?: number;
+  /** Show a transparent cut-out background as a checkerboard (the live view; set by renderView). */
+  checker?: boolean;
 }
 
 const LUM_EDGE = 64;
@@ -75,6 +79,8 @@ export class Renderer {
   private targets = new Map<string, Target>();
   private geomKey = '';
   private lost = false;
+  /** The cut-out mask on the GPU (one at a time: the photo being rendered). */
+  private maskTex: { id: string; mask: WebGLTexture; blur: WebGLTexture } | null = null;
   readonly maxTexture: number;
 
   constructor(canvas?: HTMLCanvasElement | OffscreenCanvas) {
@@ -347,6 +353,97 @@ export class Renderer {
     return cur;
   }
 
+  // ------------------------------------------------------------ cut-out
+  private uploadMask(m: CutoutMask): { mask: WebGLTexture; blur: WebGLTexture } {
+    if (this.maskTex?.id === m.id) return this.maskTex;
+    const gl = this.gl;
+    this.dropMask();
+    const mask = gl.createTexture();
+    const blur = gl.createTexture();
+    if (!mask || !blur) throw new Error('WebGL texture');
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.bindTexture(gl.TEXTURE_2D, mask);
+    gl.texStorage2D(gl.TEXTURE_2D, m.levels.length, gl.R8, m.width, m.height);
+    // Every level is uploaded from the CPU-built chain (not generateMipmap, whose filter is up to the driver),
+    // so the shader samples exactly what the CPU reference does.
+    m.levels.forEach((l, i) => {
+      gl.texSubImage2D(gl.TEXTURE_2D, i, 0, 0, l.w, l.h, gl.RED, gl.UNSIGNED_BYTE, l.data);
+    });
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, blur);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, m.blur.w, m.blur.h);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, m.blur.w, m.blur.h, gl.RED, gl.UNSIGNED_BYTE, m.blur.data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.maskTex = { id: m.id, mask, blur };
+    return this.maskTex;
+  }
+  private dropMask() {
+    if (!this.maskTex) return;
+    this.gl.deleteTexture(this.maskTex.mask);
+    this.gl.deleteTexture(this.maskTex.blur);
+    this.maskTex = null;
+  }
+
+  /**
+   * The cut-out for this render, if the recipe has one whose mask is loaded. `outEdgeInSource`: output pixels
+   * across the source's long edge.
+   */
+  private cutoutFor(recipe: EditRecipe | null, outEdgeInSource: number) {
+    const c = activeCutout(recipe);
+    const m = c ? getMask(c.mask) : null;
+    if (!c || !m) return null;
+    return { m, p: compositeParams(c, Math.max(m.width, m.height), outEdgeInSource, m.contact) };
+  }
+
+  private composite(
+    src: Target,
+    key: string,
+    cut: NonNullable<ReturnType<Renderer['cutoutFor']>>,
+    m: Mat3,
+    split: number,
+    checker: boolean,
+  ): Target {
+    const gl = this.gl;
+    const tex = this.uploadMask(cut.m);
+    const t = this.target(`${key}:cut`, src.w, src.h, 'rgba8');
+    const p = cut.p;
+    this.draw(this.program('composite', COMPOSITE), t, t.w, t.h, (prog) => {
+      this.bindTex(prog, 'u_src', 0, src.tex);
+      this.bindTex(prog, 'u_mask', 1, tex.mask);
+      this.bindTex(prog, 'u_blur', 2, tex.blur);
+      gl.uniformMatrix3fv(this.u(prog, 'u_m'), true, new Float32Array(m));
+      gl.uniform1i(this.u(prog, 'u_mode'), p.mode);
+      gl.uniform3f(this.u(prog, 'u_bg'), p.bg[0], p.bg[1], p.bg[2]);
+      gl.uniform1f(this.u(prog, 'u_gamma'), p.gamma);
+      gl.uniform1f(this.u(prog, 'u_lod'), p.lod);
+      gl.uniform1f(this.u(prog, 'u_strength'), p.strength);
+      gl.uniform1f(this.u(prog, 'u_offset'), p.offset);
+      gl.uniform1i(this.u(prog, 'u_shadow'), p.shadow);
+      gl.uniform4f(this.u(prog, 'u_contact'), p.contact[0], p.contact[1], p.contact[2], p.contact[3]);
+      gl.uniform1f(this.u(prog, 'u_split'), split);
+      gl.uniform1i(this.u(prog, 'u_checker'), checker ? 1 : 0);
+    });
+    return t;
+  }
+  /** False when the recipe shows a cut-out whose mask isn't loaded (rendering now would leave it out). */
+  cutoutReady(recipe: EditRecipe | null): boolean {
+    const c = activeCutout(recipe);
+    return !c || Boolean(getMask(c.mask));
+  }
+  /** Output pixels across the source's long edge, for an output of w × h showing `crop`. */
+  private outEdgeInSource(recipe: EditRecipe | null, w: number, h: number, ignoreRect?: boolean): number {
+    const full = outputSize(recipe?.crop, this.srcSize, ignoreRect);
+    const k = Math.max(w, h) / Math.max(1, full.width, full.height);
+    return k * Math.max(this.srcSize.width, this.srcSize.height);
+  }
+
   /**
    * Renders into an 8-bit target (rows top-first) and returns it. The geometry pass and mask are reused
    * when only develop settings changed.
@@ -376,13 +473,17 @@ export class Renderer {
       o.baselineEv ?? 0,
     );
     const scale = Math.max(o.width, o.height) / 2048;
-    return this.detail(out, key, recipe, scale, split);
+    const fin = this.detail(out, key, recipe, scale, split);
+    const cut = this.cutoutFor(recipe, this.outEdgeInSource(recipe, o.width, o.height, o.ignoreRect));
+    if (!cut) return fin;
+    const m = outputToSource(crop, this.srcSize, { ignoreRect: o.ignoreRect });
+    return this.composite(fin, key, cut, m, split, Boolean(o.checker));
   }
 
   /** Draws to the visible canvas (resizing it) and returns the 8-bit result for the histogram. */
   renderView(o: RenderOptions): void {
     const gl = this.gl;
-    const t = this.renderTo('view', o);
+    const t = this.renderTo('view', { ...o, checker: true });
     const c = this.canvas;
     if (c.width !== o.width || c.height !== o.height) {
       c.width = o.width;
@@ -454,6 +555,7 @@ export class Renderer {
     this.geometry(ggeom, outputToSource(crop, this.srcSize, { ignoreRect: o.ignoreRect }));
     const lum = this.lumMask(ggeom, 'tile:global');
     const scale = Math.max(W, H) / 2048;
+    const cut = this.cutoutFor(recipe, this.outEdgeInSource(recipe, W, H, o.ignoreRect));
     const step = MAX_TILE - 2 * PAD;
     for (let y0 = 0; y0 < H; y0 += step) {
       for (let x0 = 0; x0 < W; x0 += step) {
@@ -467,7 +569,8 @@ export class Renderer {
         const th = py1 - py0;
         const region = { x: px0 / W, y: py0 / H, w: tw / W, h: th / H };
         const geom = this.target('tile:geom', tw, th, this.linearFormat());
-        this.geometry(geom, outputToSource(crop, this.srcSize, { ignoreRect: o.ignoreRect, region }));
+        const tileM = outputToSource(crop, this.srcSize, { ignoreRect: o.ignoreRect, region });
+        this.geometry(geom, tileM);
         // The mask is sampled by tile uv: give develop a mask cut to this tile.
         const tileLum = this.target(
           'tile:lum',
@@ -485,7 +588,8 @@ export class Renderer {
         });
         const dev = this.target('tile:out', tw, th, 'rgba8');
         this.develop(geom, tileLum, dev, recipe, region, W / H, -1, o.baselineEv ?? 0);
-        const fin = this.detail(dev, 'tile', recipe, scale, -1);
+        const detailed = this.detail(dev, 'tile', recipe, scale, -1);
+        const fin = cut ? this.composite(detailed, 'tile', cut, tileM, -1, false) : detailed;
         const buf = new Uint8Array(tw * th * 4);
         gl.bindFramebuffer(gl.FRAMEBUFFER, fin.fb);
         gl.readPixels(0, 0, tw, th, gl.RGBA, gl.UNSIGNED_BYTE, buf);
@@ -507,6 +611,7 @@ export class Renderer {
       gl.deleteTexture(t.tex);
     }
     this.targets.clear();
+    this.dropMask();
     if (this.src) gl.deleteTexture(this.src);
     this.src = null;
     for (const p of this.progs.values()) gl.deleteProgram(p);

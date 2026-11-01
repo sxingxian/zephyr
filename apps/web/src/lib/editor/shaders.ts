@@ -233,3 +233,40 @@ void main() {
   float detail = luma(c0.rgb) - luma(b);
   o = vec4(clamp(c0.rgb + u_amount * 1.4 * detail, 0.0, 1.0), 1.0);
 }`;
+
+/**
+ * Phase 6 cut-out: the developed photo (sRGB 8-bit) over a background, using the photo's mask. The mask is
+ * sampled in source space through the same output → source matrix as the geometry pass, so crops, rotation
+ * and perspective line up. Mirrors `compositePixel` in develop.ts.
+ */
+export const COMPOSITE = `${HEAD}
+uniform sampler2D u_src;
+uniform sampler2D u_mask;   // R8 with a CPU-built mip chain
+uniform sampler2D u_blur;   // R8, blurred ≤ 512 px copy (soft shadow)
+uniform mat3 u_m;
+uniform int u_mode;         // 1 transparent, 2 solid
+uniform vec3 u_bg;          // linear
+uniform float u_gamma, u_lod, u_strength, u_offset;
+uniform int u_shadow;       // 0 none, 1 soft, 2 contact
+uniform vec4 u_contact;
+uniform float u_split;
+uniform bool u_checker;     // live view: show transparency as a checkerboard
+void main() {
+  vec2 uv = fragUv();
+  vec4 c0 = texture(u_src, uv);
+  if (u_split >= 0.0 && uv.x < u_split) { o = c0; return; }
+  vec3 p = u_m * vec3(uv, 1.0);
+  vec2 s = clamp(p.xy / p.z, vec2(0.0), vec2(1.0));
+  float a = pow(clamp(textureLod(u_mask, s, u_lod).r, 0.0, 1.0), u_gamma);
+  if (u_mode == 1 && !u_checker) { o = vec4(c0.rgb, a); return; }
+  vec3 bg = u_bg;
+  if (u_mode == 1) {
+    vec2 cell = floor(gl_FragCoord.xy / 8.0);
+    bg = mod(cell.x + cell.y, 2.0) < 1.0 ? vec3(1.0) : vec3(0.79);
+  }
+  float sh = 0.0;
+  if (u_shadow == 1) sh = texture(u_blur, vec2(s.x, clamp(s.y - u_offset, 0.0, 1.0))).r;
+  else if (u_shadow == 2) { vec2 d = (s - u_contact.xy) / u_contact.zw; sh = exp(-dot(d, d)); }
+  vec3 bgs = bg * (1.0 - u_strength * 0.6 * sh);
+  o = vec4(toSrgb(mix(bgs, fromSrgb(c0.rgb), a)), 1.0);
+}`;

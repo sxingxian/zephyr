@@ -29,22 +29,26 @@ function cleanBase(s: string): string {
 }
 
 /** "IMG_2041.CR2" → "IMG_2041-edited.jpg", with anything unsafe for a file name removed. */
-export function exportName(filename: string): string {
+export function exportName(filename: string, format: 'jpeg' | 'png' = 'jpeg'): string {
   const base = cleanBase(filename.replace(/\.[^.]+$/, '')) || 'photo';
-  return `${base}-edited.jpg`;
+  return `${base}-edited.${format === 'png' ? 'png' : 'jpg'}`;
 }
 
 /**
  * A name the member typed for an export, made safe: unsafe characters replaced, trimmed, at most 120
- * characters before the extension, and always ending in .jpg (or .jpeg if they typed that). Falls back to
- * the photo's own export name when nothing usable is left.
+ * characters before the extension, and always ending in .jpg (or .jpeg if they typed that; .png for a PNG
+ * export). Falls back to the photo's own export name when nothing usable is left.
  */
-export function cleanExportName(typed: string, sourceFilename: string): string {
+export function cleanExportName(
+  typed: string,
+  sourceFilename: string,
+  format: 'jpeg' | 'png' = 'jpeg',
+): string {
   const t = typed.trim();
-  const m = /\.(jpe?g)$/i.exec(t);
-  const ext = m ? `.${(m[1] as string).toLowerCase()}` : '.jpg';
+  const m = (format === 'png' ? /\.(png|jpe?g)$/i : /\.(jpe?g)$/i).exec(t);
+  const ext = format === 'png' ? '.png' : m ? `.${(m[1] as string).toLowerCase()}` : '.jpg';
   const base = cleanBase(m ? t.slice(0, -m[0].length) : t);
-  return base ? `${base}${ext}` : exportName(sourceFilename);
+  return base ? `${base}${ext}` : exportName(sourceFilename, format);
 }
 
 /** A problem with an export the member can act on; its message is shown as it is. */

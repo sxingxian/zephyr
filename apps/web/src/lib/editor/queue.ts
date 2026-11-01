@@ -287,6 +287,12 @@ export function renderVariantsSync(
   geo: typeof import('./geometry'),
   encodeVariant: typeof import('./encode').encodeVariant,
 ): Promise<Rendered> {
+  // A cut-out whose mask isn't in memory yet: the queue renders from the stored preview instead.
+  if (!gl.cutoutReady(recipe)) {
+    const missing = Promise.reject(new Error('The cut-out mask isn’t loaded yet.'));
+    missing.catch(() => undefined); // handled by the queue later; not an unhandled rejection
+    return missing;
+  }
   const full = geo.outputSize(recipe.crop, gl.sourceSize);
   const jobs = (['preview', 'thumb'] as const).map((kind) => {
     const s = geo.fitLongEdge(full, VARIANT_LIMITS[kind].maxEdge);
@@ -298,10 +304,15 @@ export function renderVariantsSync(
 
 /** Batch path: the stored preview (camera JPEG for a RAW) through the recipe. */
 async function renderWithGpu(photoId: string, recipe: EditRecipe): Promise<Rendered> {
-  const [{ withRenderer }, { loadPreview, releaseSource }] = await Promise.all([
+  const [{ withRenderer }, { loadPreview, releaseSource }, { activeCutout, loadMask }] = await Promise.all([
     import('./background'),
     import('./sources'),
+    import('./cutout'),
   ]);
+  // A background removal needs its mask first; if it can't load, the render fails (and can be retried)
+  // rather than storing thumbnails without the cut-out.
+  const cut = activeCutout(recipe);
+  if (cut) await loadMask(photoId, cut.mask);
   return withRenderer(async (gl) => {
     const loaded = await loadPreview(photoId, Math.min(gl.maxTexture, 4096));
     try {
