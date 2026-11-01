@@ -200,7 +200,8 @@ export const CUTOUT_SOURCE_EDGE = 2048;
 export const MASK_LIMITS = {
   maxEdge: 2048,
   maxBytes: 2 * 1024 * 1024,
-  providerMaxBytes: 16 * 1024 * 1024,
+  /** A provider's PNG for a ≤ 2048 px source is well under this (decoded size is bounded by the source too). */
+  providerMaxBytes: 8 * 1024 * 1024,
   aspectTolerance: 0.02,
 } as const;
 
@@ -329,6 +330,11 @@ export interface DeviceProgressBody {
 }
 /** A device lease lasts this long without progress; then the job shows "Waiting for this device". */
 export const DEVICE_LEASE_SECONDS = 120;
+/**
+ * Refunded provider failures (timeouts, errors, rejected output) a member can have in one UTC day; after
+ * that their background removals wait until tomorrow. Mirrors public._ai_failure_budget().
+ */
+export const AI_FAILURE_BUDGET = 50;
 export const DEVICE_LABEL_MAX = 40;
 export const JOB_TITLE_MAX = 80;
 
@@ -456,6 +462,11 @@ export const FACE_LIMITS = {
 } as const;
 /** Unnamed groups appear once they have this many faces. */
 export const MIN_PERSON_FACES = 3;
+/**
+ * People (groups) a member can have. Beyond it the oldest unnamed one-face groups are pruned (their faces
+ * stay, unassigned), which bounds the work of matching each new face. Mirrors public._ai_people_max().
+ */
+export const MAX_PEOPLE = 3000;
 export const PERSON_NAME_MAX = 60;
 export interface FacesPendingPage {
   ok: true;

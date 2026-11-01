@@ -90,19 +90,22 @@ Messages carry ids only, never image bytes or URLs. The consumer:
    - **fal:** `POST https://gateway.ai.cloudflare.com/v1/<acct>/<gw>/fal/<falModel>`, with body `{ image_url: 'data:…', sync_mode: true }` and headers `Authorization: Key FAL_KEY` and `X-Fal-Store-IO: 0`. The cost is `costs.falMicros`.
    - **Gateway auth:** when `AI_GATEWAY_TOKEN` is set, every call carries `cf-aig-authorization: Bearer <token>` (authenticated gateway).
    - **Development only:** without `AI_GATEWAY_ID` the calls go straight to the providers. Production refuses to start cloud work without a gateway.
-3. **Timeouts and fallback:** 30 s per call, and the item is tried twice on the primary. After the second failure it goes to `bgFallback` once, if that's set. The provider used is recorded on the item.
+3. **Timeouts and fallback:** 30 s per call, and the item is tried twice on the primary. After the second failure it goes to `bgFallback` once, if that's set. A provider whose output was rejected (`bad_output`) isn't asked again for that item. The provider used is recorded on the item.
+   - **Reservation:** before the first call, `ai_item_begin` reserves the item's worst case (every primary attempt plus the fallback), so whatever the calls cost stays inside the caps; it's settled to the real cost afterwards.
+   - **Failure budget:** provider failures are refunded, so once a member has `AI_FAILURE_BUDGET` (50) refunded provider failures in a UTC day, their further items wait until tomorrow.
+   - **Concurrency:** the queue consumer runs at most 4 batches (20 items) at once (`max_concurrency`).
 4. **Output check** (`apps/api/src/ai/png.ts`): the result is untrusted and goes through a strict PNG reader built on `fflate` inflate.
    - Signature and IHDR are checked.
    - Bit depth must be 8.
    - Colour types 0, 4 or 6 are accepted; anything else is `bad_output`.
-   - Dimensions must be at most 4096 and match the source's aspect within `MASK_LIMITS.aspectTolerance`.
-   - Decompressed size is bounded before inflating, and the input is capped at `providerMaxBytes`.
+   - Dimensions are checked straight after IHDR, before anything is allocated or inflated: no larger than the source preview, with its aspect within `MASK_LIMITS.aspectTolerance`.
+   - The input is capped at `providerMaxBytes` (8 MB), and the IDAT data is inflated in 4 KB slices into a buffer of exactly the expected size. fflate inflates a whole push before calling back, so slicing is what stops a decompression bomb after a few MB.
    - The alpha channel is extracted (or grey, for type 0). The mask is scaled to the preview's size when it differs, then re-encoded as an 8-bit greyscale PNG (filter 0, fflate deflate).
    - A mask over `MASK_LIMITS.maxBytes` is `bad_output`.
    - The provider's RGB pixels are thrown away.
-5. **Store:** `PHOTOS` key `u/<owner>/p/<photo>/m/<maskId>.png`, a row in `photo_masks`, and at most 2 masks per photo (older ones are deleted).
-6. **Apply:** `ai_attach_mask(owner, photo, mask, apply)` sets the photo's recipe `cutout` to `{ mask, …apply }` as a new edit version, the same as a save from another tab. It marks the edit unrendered so the app re-renders thumbnails.
-7. **Spend:** `ai_spend_add(day, feature, owner, micros)` records the real (or estimated) cost.
+5. **Store:** `PHOTOS` key `u/<owner>/p/<photo>/m/<maskId>.png`, a row in `photo_masks`, and at most 2 masks per photo (older ones are deleted). If recording the row fails (or its reply is lost), the object is left alone: the orphan sweep deletes `m/` keys no row records once they're an hour old.
+6. **Apply:** `ai_item_complete` records the mask and, in the same transaction, sets the photo's recipe `cutout` to `{ mask, …apply }` as a new edit version, the same as a save from another tab. It marks the edit unrendered so the app re-renders thumbnails. (There's no separate `ai_attach_mask` function.)
+7. **Spend:** `ai_item_complete` / `ai_item_failed` settle the reservation to the real (or estimated) cost through `_ai_spend_settle`, on the day it was reserved. A report for an item that moved on meanwhile (canceled, or taken over as stuck) still records what its calls cost.
 
 **Scene tags.** Upload complete enqueues `{t:'scene'}` when scene tags are on (Admin and member) and not capped. The cron backfills older photos of members with scene tags on, at most 500 per run. The consumer:
 - reads the original thumbnail (`…/thumb`, 512 px);
@@ -111,7 +114,10 @@ Messages carry ids only, never image bytes or URLs. The consumer:
 - stores rows in `photo_scenes`, plus `night` from the device signals;
 - sets `photos.scene_state` (`done` / `failed` / `skipped`).
 
-Failures are not retried more than the queue's retries. Turning scene tags off deletes the member's scene rows.
+Failures are not retried more than the queue's retries. Turning scene tags off deletes the member's scene rows, and a result that arrives after that (or after Admin turned scene tags off) is dropped.
+- `ai_scene_begin` returns the day it reserved on, and `ai_scene_done` settles on that day. If a run breaks after the reservation (R2 or the database), the consumer reports `retry`, which settles it.
+- Photos that have to wait get `photos.scene_retry_at` instead of going straight back into the backfill: cap reached → tomorrow, cloud paused → 15 minutes, thumbnail not there yet or a broken run → 1 hour.
+- The backfill skips members at their daily per-member cap and accounts scheduled for deletion, so one capped member can't fill every run.
 
 **Spend caps:** `ai_spend_daily(day, feature)` and `ai_user_spend_daily(day, owner)` are in micro-dollars. `ai_spend_reserve(day, feature, owner, estimate)`:
 - runs under an advisory lock per day;
@@ -121,8 +127,11 @@ Failures are not retried more than the queue's retries. Turning scene tags off d
 After the call, the reservation is settled to the real cost. When a cap is first crossed on a day, and on each threshold in `alerts`, `ai_spend_alerts(day, scope, threshold)` makes sure an email goes to the Owners (and Finance with `owners_finance`) only once. With `atCap: 'alert_only'`, work continues past the cap but still emails.
 
 **Member rate limits:**
-- `AI_LIMITER` (new ratelimit binding, namespace 1007): 120 AI writes a minute per member.
+- `AI_LIMITER` (namespace 1007): 120 AI writes a minute per member.
+- `FACES_LIMITER` (namespace 1008): 10 face batches a minute per member.
+- `AI_READ_LIMITER` (namespace 1009): 300 AI reads a minute per member.
 - `memberJobsPerMinute` is enforced in Postgres for job creation.
+- Face-data writes (add, merge, move, rename) wait at most 3 s for the member's faces lock (`lock_timeout`), then answer 429 with `Retry-After: 5` instead of piling up on the lock and the connection pool. (A function-level `statement_timeout` doesn't bound the running RPC in Postgres, so the work itself is bounded instead: see the people cap below.)
 
 ## Device features
 
@@ -178,7 +187,7 @@ A background scanner (`scanner.ts`) runs while the app is open and idle (request
   1. L2-normalises each embedding and drops any that isn't finite or is zero.
   2. Stores the face (`faces.embedding vector(128)`, pgvector).
   3. Matches it to the owner's people by centroid cosine similarity ≥ `FACE_LIMITS.match`, skipping people the face was rejected from.
-  4. Otherwise starts a new unnamed person.
+  4. Otherwise starts a new unnamed person. A member has at most `MAX_PEOPLE` (3000) people: beyond it the oldest unnamed one-face people are pruned (their faces stay, unassigned), which bounds the per-face scan. A per-owner HNSW index isn't used: pgvector can't scope an approximate index to one owner without losing recall.
   5. Updates the person's centroid as a renormalised running mean, and sets `photos.faces_version`.
 - **Who shows:** people with at least `MIN_PERSON_FACES` faces, or a name.
 - **Suggestions:** auto-matches to named people with similarity < `FACE_LIMITS.sure` that aren't confirmed yet.
@@ -190,9 +199,10 @@ A background scanner (`scanner.ts`) runs while the app is open and idle (request
 - **Privacy:**
   - Face rows are only ever readable by their owner, through the API.
   - They're never in logs, never sent to a provider, and never compared across accounts (every query filters by owner).
-  - Turning face grouping off (or `DELETE /faces`) deletes faces, people and rejections in one transaction and clears the consent.
+  - Turning face grouping off (or `DELETE /faces`) deletes faces, people and rejections in one transaction and clears the consent. Every face write checks the opt-out again after taking the member's faces lock, so a scan racing the opt-out can't store anything.
+  - Scheduling account deletion deletes the face data at once (a restore brings the account back with face grouping off), and cancels and refunds pending cloud work.
   - If the plan loses `people_grouping`, scanning stops at once and the cron deletes the face data 30 days later. The member is emailed when it stops and again 3 days before deletion.
-- **Consent:** turning it on needs `faceConsent: { version: FACE_CONSENT_VERSION, rightsConfirmed: true }`. The version and time are stored, and `audit_log` gets `ai.face_grouping.on` / `off` (no face data).
+- **Consent:** turning it on needs `faceConsent: { version: FACE_CONSENT_VERSION, rightsConfirmed: true }`; any other version is refused (zod and SQL). The version and time are stored, and `audit_log` gets `ai.face_grouping.on` / `off` (no face data).
 
 **Device jobs (batches across devices):** `POST /ai/jobs { kind: 'device' }` stores the photo list, steps and parameters, and the creating device claims it.
 - **Lease:** a device holds a lease (`DEVICE_LEASE_SECONDS`). It processes photos in order and posts progress after each one or every 2 s, which renews the lease.
@@ -202,7 +212,7 @@ A background scanner (`scanner.ts`) runs while the app is open and idle (request
 
 ## Cut-out rendering (`apps/web/src/lib/editor`)
 
-- The mask is fetched once per photo (owner route, `Cache-Control: private, max-age=31536000, immutable`; the mask id is unique) and uploaded as an R8 texture.
+- The mask is fetched once per photo (owner route, `Cache-Control: private, no-cache` with `ETag` = the mask id, so the browser revalidates every use and a 304 costs one database lookup) and uploaded as an R8 texture.
 - The geometry pass samples it with the same transform as the photo, so crops, rotation and perspective line up.
 - **New pass `COMPOSITE`** after sharpen:
   - `a = smoothstep(0.5 − w − shift', 0.5 + w − shift', m)`, with `w` from `softness`.
@@ -214,7 +224,7 @@ A background scanner (`scanner.ts`) runs while the app is open and idle (request
   - Edited variants of transparent cut-outs upload as WEBP with alpha.
   - Shared full-size renders flatten onto white.
 - **Paste dialog:** uses `PASTE_SECTIONS`; a cut-out is never pasted.
-- **Saves:** may keep or drop `cutout` but never point it at a mask the photo doesn't own. `save_edit` checks this and `ai_attach_mask` is the only writer of a new mask id.
+- **Saves:** may keep or drop `cutout` but never point it at a mask the photo doesn't own. `save_edit` refuses it (`invalid`); any other writer (bulk paste or apply) has the foreign cut-out dropped by the `photo_edits` trigger, keeping the rest of the recipe, instead of failing the whole request. `ai_item_complete` is the only writer of a new mask id. "Save as copy" uploads a rendered file as a new photo and never carries a recipe.
 
 ## Data model (migration `20261103100000_ai.sql`)
 

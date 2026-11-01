@@ -28,11 +28,23 @@ const CHANNELS: Record<number, number> = { 0: 1, 4: 2, 6: 4 };
 const u32 = (b: Uint8Array, i: number) =>
   ((b[i] ?? 0) * 0x1000000 + (((b[i + 1] ?? 0) << 16) | ((b[i + 2] ?? 0) << 8) | (b[i + 3] ?? 0))) >>> 0;
 
+/** Compressed bytes fed to the inflater at a time: one push can inflate at most ~1032× this, so a bomb is
+ * stopped after a few MB instead of after inflating all of it (fflate inflates a whole push before calling back). */
+export const INFLATE_SLICE = 4096;
+
+/** The image the mask is for: the provider's PNG may be no larger, and must have the same aspect. */
+export interface MaskBounds {
+  width: number;
+  height: number;
+  aspectTolerance: number;
+}
+
 /**
- * Reads a provider's PNG and returns its mask channel. `maxBytes` bounds the compressed input.
- * Throws MaskError for anything unexpected.
+ * Reads a provider's PNG and returns its mask channel. `maxBytes` bounds the compressed input; `bounds`
+ * (the source preview's size) bounds the decoded size, checked straight after IHDR so nothing larger is
+ * ever allocated or inflated. Throws MaskError for anything unexpected.
  */
-export function readMask(png: Uint8Array, maxBytes: number): Mask {
+export function readMask(png: Uint8Array, maxBytes: number, bounds?: MaskBounds): Mask {
   if (png.byteLength > maxBytes) throw new MaskError('too_large');
   if (png.byteLength < 8 + 25 || SIGNATURE.some((v, i) => png[i] !== v)) throw new MaskError('not_png');
   let i = 8;
@@ -62,6 +74,10 @@ export function readMask(png: Uint8Array, maxBytes: number): Mask {
       if (compression !== 0 || filter !== 0 || interlace !== 0) throw new MaskError('format');
       if (width < 1 || height < 1 || width > PNG_MAX_EDGE || height > PNG_MAX_EDGE)
         throw new MaskError('size');
+      if (bounds) {
+        if (width > bounds.width || height > bounds.height) throw new MaskError('size');
+        if (!sameAspect({ width, height }, bounds, bounds.aspectTolerance)) throw new MaskError('aspect');
+      }
       sawHeader = true;
     } else if (kind === 'IDAT') {
       idat.push(png.subarray(start, end));
@@ -94,8 +110,17 @@ export function readMask(png: Uint8Array, maxBytes: number): Mask {
   });
   try {
     for (let k = 0; k < idat.length; k++) {
-      z.push(idat[k] as Uint8Array, k === idat.length - 1);
-      if (overflow) throw new MaskError('bomb');
+      const part = idat[k] as Uint8Array;
+      const lastPart = k === idat.length - 1;
+      if (part.byteLength === 0) {
+        if (lastPart) z.push(part, true);
+        continue;
+      }
+      for (let o = 0; o < part.byteLength; o += INFLATE_SLICE) {
+        const end = Math.min(part.byteLength, o + INFLATE_SLICE);
+        z.push(part.subarray(o, end), lastPart && end === part.byteLength);
+        if (overflow) throw new MaskError('bomb');
+      }
     }
   } catch (err) {
     if (err instanceof MaskError) throw err;

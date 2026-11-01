@@ -623,6 +623,25 @@ describe('clean-up knows about edited variants', () => {
   });
 });
 
+describe('clean-up knows about masks (phase 6)', () => {
+  it('the sweep deletes masks no row records after an hour, keeps recorded and fresh ones', async () => {
+    const p = await stored(MEI.id);
+    const m = (n: number) => `u/${MEI.id}/p/${p.id}/m/6${n}000000-0000-4000-8000-000000000000.png`;
+    const kept = m(1);
+    const stale = m(2);
+    const fresh = m(3);
+    db.maskKeys.set(p.id, [kept]);
+    for (const k of [kept, stale, fresh]) await r2.put(k, 'x');
+    r2.backdate(kept, 2 * 3600_000);
+    r2.backdate(stale, 2 * 3600_000);
+    const counts = await runCleanup(env);
+    expect(counts.orphansDeleted).toBe(1);
+    expect(r2.objects.has(stale)).toBe(false);
+    expect(r2.objects.has(kept)).toBe(true);
+    expect(r2.objects.has(fresh)).toBe(true);
+  });
+});
+
 describe('editor constants match the migration', () => {
   it('recipe size cap and variant caps', () => {
     expect(migration).toContain(`octet_length(recipe::text) <= ${MAX_RECIPE_BYTES}`);

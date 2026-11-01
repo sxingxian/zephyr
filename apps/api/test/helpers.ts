@@ -48,6 +48,8 @@ export const workersAi = {
   fail: false,
 };
 export const aiLimiter = { ok: true, keys: [] as string[] };
+export const facesLimiter = { ok: true, keys: [] as string[] };
+export const aiReadLimiter = { ok: true, keys: [] as string[] };
 export const MEDIA_HOST = 'media.test';
 export const MEDIA_SECRET = 'media-host-secret';
 
@@ -117,6 +119,8 @@ export const env: Env = {
     },
   } as unknown as Queue<import('../src/env').AiMessage>,
   AI_LIMITER: fakeLimiter(aiLimiter),
+  FACES_LIMITER: fakeLimiter(facesLimiter),
+  AI_READ_LIMITER: fakeLimiter(aiReadLimiter),
   AI_GATEWAY_ACCOUNT_ID: 'acct123',
   AI_GATEWAY_ID: 'zephyr-test',
   AI_GATEWAY_TOKEN: 'gateway-token',
@@ -268,6 +272,10 @@ export function resetWorld() {
   workersAi.fail = false;
   aiLimiter.ok = true;
   aiLimiter.keys.length = 0;
+  facesLimiter.ok = true;
+  facesLimiter.keys.length = 0;
+  aiReadLimiter.ok = true;
+  aiReadLimiter.keys.length = 0;
   shared.reset();
   images.reset();
   for (const l of [shareLimiter, guestLimiter, mediaLimiter]) {

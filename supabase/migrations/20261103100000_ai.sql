@@ -198,6 +198,7 @@ create index ai_job_items_due on public.ai_job_items (wait_until nulls first) wh
 create index ai_job_items_processing on public.ai_job_items (started_at) where status = 'processing';
 create index ai_job_items_photo on public.ai_job_items (photo_id) where status in ('pending', 'processing');
 create index ai_job_items_failed on public.ai_job_items (finished_at) where status = 'failed';
+create index ai_job_items_owner_failed on public.ai_job_items (owner_id, finished_at) where status = 'failed';
 
 create table public.credit_ledger (
   id uuid primary key default gen_random_uuid(),
@@ -252,7 +253,9 @@ create index photo_signals_owner on public.photo_signals (owner_id);
 alter table public.photos
   add column scene_state text check (scene_state in ('pending', 'done', 'failed', 'skipped')),
   add column scene_queued_at timestamptz,
-  add column faces_version integer not null default 0 check (faces_version >= 0);
+  add column faces_version integer not null default 0 check (faces_version >= 0),
+  -- Not before this time (cap reached, cloud paused, thumbnail not there yet): the backfill skips it until then.
+  add column scene_retry_at timestamptz;
 create index photos_scene_due on public.photos (created_at desc) where status = 'ready' and scene_state is null;
 
 create table public.photo_scenes (
@@ -366,8 +369,10 @@ $$;
 create function public._edit_cutout_guard() returns trigger
 language plpgsql set search_path = '' as $$
 begin
+  -- save_edit refuses this case outright ({status: 'invalid'}). Anything else that writes a recipe (bulk
+  -- paste or apply, a copy) keeps the photo's other settings and loses only the cut-out that isn't its own.
   if not public._edit_cutout_ok(new.photo_id, new.owner_id, new.recipe) then
-    raise exception 'cut-out mask belongs to another photo' using errcode = 'check_violation';
+    new.recipe := new.recipe - 'cutout';
   end if;
   return new;
 end;
@@ -383,6 +388,10 @@ language sql stable set search_path = '' as $$ select (now() at time zone 'utc')
 
 create function public._ai_next_midnight() returns timestamptz
 language sql stable set search_path = '' as $$ select ((now() at time zone 'utc')::date + 1)::timestamp at time zone 'utc' $$;
+
+-- Refunded provider failures a member may have in one UTC day before their items wait (AI_FAILURE_BUDGET).
+create function public._ai_failure_budget() returns integer
+language sql immutable set search_path = '' as $$ select 50 $$;
 
 create function public._ai_period(p_at timestamptz default now()) returns date
 language sql stable set search_path = '' as $$ select date_trunc('month', p_at at time zone 'utc')::date $$;
@@ -979,7 +988,8 @@ begin
   if want_faces is true and not m.face_grouping then
     if not public._ai_feature(s, 'face_grouping') then return jsonb_build_object('error', 'feature_off'); end if;
     if not coalesce(r.people_grouping, false) then return jsonb_build_object('error', 'plan'); end if;
-    if consent_v is null or consent_v < 1 or (p_patch #>> '{faceConsent,rightsConfirmed}') is distinct from 'true' then
+    if consent_v is distinct from public._ai_face_consent_version()
+       or (p_patch #>> '{faceConsent,rightsConfirmed}') is distinct from 'true' then
       return jsonb_build_object('error', 'consent');
     end if;
     update public.ai_member_settings
@@ -1406,8 +1416,20 @@ begin
   if it.status = 'pending' and it.wait_until > now() then return jsonb_build_object('status', 'wait', 'until', it.wait_until, 'alerts', '[]'::jsonb); end if;
   select * into j from public.ai_jobs where id = it.job_id;
   if j.kind <> 'bg_removal' then return jsonb_build_object('status', 'skip'); end if;
-  if j.state = 'canceled' then
-    update public.ai_job_items set status = 'canceled', finished_at = now() where id = p_item;
+  -- A stuck reservation from a lost run is settled as spent (the provider may have charged).
+  if it.status = 'processing' and it.reserved_micros > 0 then
+    perform public._ai_spend_settle('bg_removal', o, it.reserved_day, it.reserved_micros, it.reserved_micros);
+    update public.ai_job_items set reserved_micros = 0 where id = p_item;
+    it.reserved_micros := 0;
+  end if;
+  -- Canceled job, or the account is scheduled for deletion: the item is canceled and refunded.
+  if j.state = 'canceled'
+     or exists (select 1 from public.profiles pr where pr.id = o and (pr.deletion_due is not null or pr.deleted_at is not null)) then
+    if it.reserved_micros > 0 then
+      perform public._ai_spend_settle('bg_removal', o, it.reserved_day, it.reserved_micros, 0);
+    end if;
+    update public.ai_job_items set status = 'canceled', finished_at = now(), reserved_micros = 0, wait_until = null
+     where id = p_item;
     perform public._ai_refund_item(p_item);
     perform public._ai_job_touch(j.id);
     return jsonb_build_object('status', 'skip');
@@ -1435,11 +1457,21 @@ begin
     update public.ai_job_items set status = 'pending', wait_until = until, enqueued_at = null where id = p_item;
     return jsonb_build_object('status', 'wait', 'until', until, 'alerts', '[]'::jsonb);
   end if;
-  -- A stuck reservation from a lost run is settled as spent (the provider may have charged).
   if it.reserved_micros > 0 then
     perform public._ai_spend_settle('bg_removal', o, it.reserved_day, it.reserved_micros, it.reserved_micros);
     update public.ai_job_items set reserved_micros = 0 where id = p_item;
   end if;
+  -- Daily failure budget: provider failures are refunded, so a member whose photos keep failing (and costing
+  -- us) waits until tomorrow once they reach it.
+  if (select count(*) from public.ai_job_items f
+       where f.owner_id = o and f.status = 'failed' and f.error in ('provider_timeout', 'provider_error', 'bad_output')
+         and f.finished_at >= public._ai_next_midnight() - interval '1 day') >= public._ai_failure_budget() then
+    until := public._ai_next_midnight();
+    update public.ai_job_items set status = 'pending', wait_until = until, enqueued_at = null where id = p_item;
+    return jsonb_build_object('status', 'wait', 'until', until, 'capped', 'failures', 'alerts', '[]'::jsonb);
+  end if;
+  -- p_estimate is the worst case of one item (every primary attempt plus the fallback), so the reservation
+  -- covers whatever the calls can cost.
   res := public._ai_spend_reserve('bg_removal', o, greatest(coalesce(p_estimate, 0), 0));
   if not (res ->> 'ok')::boolean then
     until := public._ai_next_midnight();
@@ -1477,6 +1509,9 @@ begin
   select * into it from public.ai_job_items where id = p_item for update;
   perform public._ai_log_calls('bg_removal', p_calls);
   if it.status <> 'processing' then
+    -- Moved on meanwhile (canceled, or taken over as stuck): its reservation was settled then, but the calls
+    -- this run made still cost money.
+    perform public._ai_spend_settle('bg_removal', o, null, 0, coalesce(p_cost, 0));
     return jsonb_build_object('status', 'gone', 'deleteKeys', jsonb_build_array(p_key));
   end if;
   -- Photo row before the spend lock (the same order as every other path).
@@ -1534,7 +1569,10 @@ begin
   perform public._credits_lock(o);
   select * into it from public.ai_job_items where id = p_item for update;
   perform public._ai_log_calls('bg_removal', p_calls);
-  if it.status <> 'processing' then return jsonb_build_object('status', 'skip'); end if;
+  if it.status <> 'processing' then
+    perform public._ai_spend_settle('bg_removal', o, null, 0, coalesce(p_cost, 0));
+    return jsonb_build_object('status', 'skip');
+  end if;
   perform public._ai_spend_settle('bg_removal', o, it.reserved_day, it.reserved_micros, coalesce(p_cost, 0));
   update public.ai_job_items set reserved_micros = 0, cost_micros = coalesce(p_cost, 0) where id = p_item;
   perform public._ai_item_fail(p_item, p_error);
@@ -1559,45 +1597,59 @@ begin
     return jsonb_build_object('status', 'skip');
   end if;
   select * into m from public._ai_member(p_owner);
-  if not public._ai_feature(s, 'scene_tags') or not m.scene_tags then
+  if not public._ai_feature(s, 'scene_tags') or not m.scene_tags
+     or exists (select 1 from public.profiles pr where pr.id = p_owner and (pr.deletion_due is not null or pr.deleted_at is not null)) then
     update public.photos set scene_state = null, scene_queued_at = null where id = p_photo;
     return jsonb_build_object('status', 'skip');
   end if;
   if s.cloud_paused then
-    update public.photos set scene_state = null, scene_queued_at = null where id = p_photo;
+    update public.photos set scene_state = null, scene_queued_at = null, scene_retry_at = now() + interval '15 minutes'
+     where id = p_photo;
     return jsonb_build_object('status', 'wait', 'alerts', '[]'::jsonb);
   end if;
   res := public._ai_spend_reserve('scene_tags', p_owner, greatest(coalesce(p_estimate, 0), 0));
   if not (res ->> 'ok')::boolean then
-    update public.photos set scene_state = null, scene_queued_at = null where id = p_photo;
+    update public.photos set scene_state = null, scene_queued_at = null, scene_retry_at = public._ai_next_midnight()
+     where id = p_photo;
     return jsonb_build_object('status', 'wait', 'alerts', res -> 'alerts');
   end if;
-  update public.photos set scene_state = 'pending', scene_queued_at = coalesce(scene_queued_at, now()) where id = p_photo;
-  return jsonb_build_object('status', 'go', 'alerts', res -> 'alerts');
+  update public.photos set scene_state = 'pending', scene_queued_at = coalesce(scene_queued_at, now()), scene_retry_at = null
+   where id = p_photo;
+  return jsonb_build_object('status', 'go', 'day', public._ai_today(), 'alerts', res -> 'alerts');
 end;
 $$;
 
 -- Records scene tags ([{scene, score}]), a failure (p_scenes null) or 'retry' (tag it again later), settling the
 -- reservation of p_reserved.
 create function public.ai_scene_done(p_owner uuid, p_photo uuid, p_scenes jsonb, p_reserved bigint, p_cost bigint,
-  p_calls jsonb) returns jsonb
+  p_calls jsonb, p_day date default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   ready boolean;
+  s public.ai_settings := public._ai_settings();
+  m record;
 begin
-  -- Photo row before the spend lock.
+  -- Photo row before the spend lock. The reservation is settled on the day it was made (p_day).
   select p.status = 'ready' into ready from public.photos p where p.id = p_photo and p.owner_id = p_owner for update;
-  perform public._ai_spend_settle('scene_tags', p_owner, public._ai_today(), p_reserved, coalesce(p_cost, 0));
+  perform public._ai_spend_settle('scene_tags', p_owner, p_day, p_reserved, coalesce(p_cost, 0));
   perform public._ai_log_calls('scene_tags', p_calls);
   if not coalesce(ready, false) then return jsonb_build_object('status', 'skip'); end if;
   if p_scenes = '"retry"'::jsonb then
-    -- The thumbnail wasn't there yet: the backfill tries again later.
-    update public.photos set scene_state = null, scene_queued_at = null where id = p_photo;
+    -- The thumbnail wasn't there yet (or the run broke): the backfill tries again in an hour.
+    update public.photos set scene_state = null, scene_queued_at = null, scene_retry_at = now() + interval '1 hour'
+     where id = p_photo;
     return jsonb_build_object('status', 'retry');
+  end if;
+  -- Scene tags turned off (by the member or in Admin) while this photo was being tagged: keep nothing.
+  select * into m from public._ai_member(p_owner);
+  if not public._ai_feature(s, 'scene_tags') or not m.scene_tags then
+    delete from public.photo_scenes where photo_id = p_photo;
+    update public.photos set scene_state = null, scene_queued_at = null where id = p_photo;
+    return jsonb_build_object('status', 'skip');
   end if;
   delete from public.photo_scenes where photo_id = p_photo;
   if p_scenes is null or jsonb_typeof(p_scenes) <> 'array' then
-    update public.photos set scene_state = 'failed' where id = p_photo;
+    update public.photos set scene_state = 'failed', scene_retry_at = null where id = p_photo;
     return jsonb_build_object('status', 'failed');
   end if;
   insert into public.photo_scenes (photo_id, owner_id, scene, score)
@@ -1608,7 +1660,7 @@ begin
                                  'animals', 'architecture', 'interiors', 'vehicles', 'documents')
      and jsonb_typeof(x.value -> 'score') = 'number'
   on conflict do nothing;
-  update public.photos set scene_state = 'done' where id = p_photo;
+  update public.photos set scene_state = 'done', scene_retry_at = null where id = p_photo;
   return jsonb_build_object('status', 'ok');
 end;
 $$;
@@ -1754,6 +1806,42 @@ language sql stable set search_path = '' as $$
               when not (select m.face_grouping from public._ai_member(p_owner) m) then 'off' end;
 $$;
 
+-- Face-grouping limits (docs/phase-6.md): consent wording version, and people per member. Beyond the cap the
+-- oldest unnamed single-face people are pruned (their faces stay, unassigned); this bounds the per-face scan.
+create function public._ai_face_consent_version() returns integer
+language sql immutable set search_path = '' as $$ select 1 $$;
+create function public._ai_people_max() returns integer
+language sql immutable set search_path = '' as $$ select 3000 $$;
+
+-- Takes the member's faces lock, waiting at most the caller's lock_timeout (3 s for member requests). False
+-- when it couldn't: the request answers 429 instead of piling up on the lock and the connection pool.
+create function public._ai_faces_lock(p_owner uuid) returns boolean
+language plpgsql volatile set search_path = '' as $$
+begin
+  perform pg_advisory_xact_lock(hashtextextended('zephyr:faces:' || p_owner::text, 0));
+  return true;
+exception when lock_not_available then
+  return false;
+end;
+$$;
+
+-- Deletes up to p_n of the member's oldest unnamed people with at most one face. Returns how many went.
+create function public._ai_people_prune(p_owner uuid, p_n integer) returns integer
+language plpgsql volatile set search_path = '' as $$
+declare
+  k integer;
+begin
+  with victims as (
+    select pe.id from public.people pe
+     where pe.owner_id = p_owner and pe.name is null and pe.face_count <= 1
+     order by pe.updated_at, pe.id limit greatest(p_n, 0)
+  )
+  delete from public.people pe using victims v where pe.id = v.id;
+  get diagnostics k = row_count;
+  return k;
+end;
+$$;
+
 create function public._ai_person_recount(p_person uuid) returns void
 language plpgsql volatile set search_path = '' as $$
 declare
@@ -1810,9 +1898,9 @@ $$;
 -- matching each to the owner's people by centroid cosine similarity ≥ p_match, or starting a new person.
 -- p_items: [{id, faces: [{box: [x,y,w,h], score, embedding: '[…128 floats…]'}]}]. {saved} | {error}.
 create function public.ai_faces_add(p_owner uuid, p_version integer, p_match real, p_items jsonb) returns jsonb
-language plpgsql volatile security definer set search_path = '' as $$
+language plpgsql volatile security definer set search_path = '' set lock_timeout = '3s' as $$
 declare
-  blk text := public._ai_faces_block(p_owner);
+  blk text;
   item jsonb;
   f jsonb;
   pid uuid;
@@ -1822,13 +1910,19 @@ declare
   touched uuid[] := '{}';
   person uuid;
   saved integer := 0;
+  people_n integer;
+  pmax integer := public._ai_people_max();
 begin
-  if blk is not null then return jsonb_build_object('error', blk); end if;
   if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) > 20 or p_version < 1
      or p_match is null or p_match not between 0 and 1 then
     return jsonb_build_object('error', 'invalid');
   end if;
-  perform pg_advisory_xact_lock(hashtextextended('zephyr:faces:' || p_owner::text, 0));
+  if not public._ai_faces_lock(p_owner) then return jsonb_build_object('error', 'busy'); end if;
+  -- Checked only now, under the lock: an opt-out ("turn off and delete") that committed while this request
+  -- waited must win, so no face data is ever stored without consent.
+  blk := public._ai_faces_block(p_owner);
+  if blk is not null then return jsonb_build_object('error', blk); end if;
+  select count(*)::integer into people_n from public.people where owner_id = p_owner;
   for item in select x.value from jsonb_array_elements(p_items) x loop
     continue when coalesce(item ->> 'id', '') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
                or jsonb_typeof(item -> 'faces') <> 'array' or jsonb_array_length(item -> 'faces') > 30;
@@ -1858,8 +1952,18 @@ begin
                                  updated_at = now()
          where id = person;
       else
-        insert into public.people (owner_id, embedding_sum, face_count) values (p_owner, emb, 1) returning id into person;
-        sim := 1;
+        if people_n >= pmax then
+          people_n := people_n - public._ai_people_prune(p_owner, 200);
+        end if;
+        if people_n >= pmax then
+          -- Nothing left to prune (every group has a name or more faces): keep the face, unassigned.
+          person := null;
+          sim := null;
+        else
+          insert into public.people (owner_id, embedding_sum, face_count) values (p_owner, emb, 1) returning id into person;
+          people_n := people_n + 1;
+          sim := 1;
+        end if;
       end if;
       insert into public.faces (owner_id, photo_id, person_id, box, score, embedding, similarity)
       select p_owner, pid, person, array(select least(greatest(b.value::real, 0), 1) from jsonb_array_elements_text(f -> 'box') with ordinality b(value, n) order by b.n),
@@ -1921,12 +2025,14 @@ $$;
 
 -- PersonPatchBody (keys present are applied; name null clears). {person} | {error} | null.
 create function public.ai_person_patch(p_owner uuid, p_person uuid, p_patch jsonb) returns jsonb
-language plpgsql volatile security definer set search_path = '' as $$
+language plpgsql volatile security definer set search_path = '' set lock_timeout = '3s' as $$
 declare
-  blk text := public._ai_faces_block(p_owner);
+  blk text;
   pe public.people;
   nm text;
 begin
+  if not public._ai_faces_lock(p_owner) then return jsonb_build_object('error', 'busy'); end if;
+  blk := public._ai_faces_block(p_owner);
   if blk is not null then return jsonb_build_object('error', blk); end if;
   select * into pe from public.people where id = p_person and owner_id = p_owner for update;
   if not found then return null; end if;
@@ -1956,14 +2062,16 @@ $$;
 
 -- Moves every face of p_from into p_person and deletes them. {person} | {error} | null.
 create function public.ai_person_merge(p_owner uuid, p_person uuid, p_from uuid[]) returns jsonb
-language plpgsql volatile security definer set search_path = '' as $$
+language plpgsql volatile security definer set search_path = '' set lock_timeout = '3s' as $$
 declare
-  blk text := public._ai_faces_block(p_owner);
+  blk text;
   pe public.people;
   ids uuid[];
 begin
+  if not public._ai_faces_lock(p_owner) then return jsonb_build_object('error', 'busy'); end if;
+  -- Under the lock, so a concurrent opt-out that committed first wins.
+  blk := public._ai_faces_block(p_owner);
   if blk is not null then return jsonb_build_object('error', blk); end if;
-  perform pg_advisory_xact_lock(hashtextextended('zephyr:faces:' || p_owner::text, 0));
   select * into pe from public.people where id = p_person and owner_id = p_owner for update;
   if not found then return null; end if;
   select array_agg(id) into ids from public.people where owner_id = p_owner and id = any (p_from[1:50]) and id <> p_person;
@@ -1982,18 +2090,20 @@ $$;
 -- {person (null if it went), to?} | {error} | null.
 create function public.ai_person_faces(p_owner uuid, p_person uuid, p_action text, p_photo_ids uuid[], p_face_ids uuid[],
   p_to text default null) returns jsonb
-language plpgsql volatile security definer set search_path = '' as $$
+language plpgsql volatile security definer set search_path = '' set lock_timeout = '3s' as $$
 declare
-  blk text := public._ai_faces_block(p_owner);
+  blk text;
   pe public.people;
   ids uuid[];
   target uuid;
 begin
-  if blk is not null then return jsonb_build_object('error', blk); end if;
   if p_action not in ('remove', 'confirm', 'move') or ((p_photo_ids is null) = (p_face_ids is null)) then
     return jsonb_build_object('error', 'invalid');
   end if;
-  perform pg_advisory_xact_lock(hashtextextended('zephyr:faces:' || p_owner::text, 0));
+  if not public._ai_faces_lock(p_owner) then return jsonb_build_object('error', 'busy'); end if;
+  -- Under the lock, so a concurrent opt-out that committed first wins.
+  blk := public._ai_faces_block(p_owner);
+  if blk is not null then return jsonb_build_object('error', blk); end if;
   select * into pe from public.people where id = p_person and owner_id = p_owner for update;
   if not found then return null; end if;
   select array_agg(f.id) into ids from public.faces f
@@ -2007,6 +2117,10 @@ begin
     update public.faces set person_id = null, assigned_by = 'user', confirmed = false where id = any (ids);
   else
     if p_to = 'new' then
+      if (select count(*) from public.people where owner_id = p_owner) >= public._ai_people_max()
+         and public._ai_people_prune(p_owner, 200) = 0 then
+        return jsonb_build_object('error', 'invalid');
+      end if;
       insert into public.people (owner_id) values (p_owner) returning id into target;
     elsif coalesce(p_to, '') ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
       select id into target from public.people where id = p_to::uuid and owner_id = p_owner and id <> p_person;
@@ -2057,6 +2171,40 @@ begin
   return n;
 end;
 $$;
+
+-- When an account is scheduled for deletion (profiles.deletion_due set), its biometric data goes at once (a
+-- restore brings the account back with face grouping off), and its pending cloud work is canceled and refunded.
+create function public._ai_on_account_deletion() returns trigger
+language plpgsql set search_path = '' as $$
+declare
+  it public.ai_job_items;
+  n integer;
+begin
+  n := public._ai_faces_delete(new.id);
+  if n > 0 then
+    perform public._audit(null, 'ai.face_grouping.account_deletion', new.id::text, jsonb_build_object('faces', n));
+  end if;
+  perform public._credits_lock(new.id);
+  for it in select i.* from public.ai_job_items i
+             where i.owner_id = new.id and i.status = 'pending'
+             order by i.job_id, i.seq for update loop
+    if it.reserved_micros > 0 then
+      perform public._ai_spend_settle('bg_removal', new.id, it.reserved_day, it.reserved_micros, 0);
+    end if;
+    update public.ai_job_items set status = 'canceled', finished_at = now(), reserved_micros = 0, wait_until = null
+     where id = it.id;
+    perform public._ai_refund_item(it.id);
+  end loop;
+  update public.ai_jobs set state = 'canceled', lease_device = null, lease_session = null, lease_until = null, updated_at = now()
+   where owner_id = new.id and state <> 'canceled' and finished_at is null;
+  perform public._ai_job_touch(j.id) from public.ai_jobs j where j.owner_id = new.id;
+  update public.photos set scene_state = null, scene_queued_at = null where owner_id = new.id and scene_state = 'pending';
+  return new;
+end;
+$$;
+create trigger profiles_ai_account_deletion after update of deletion_due on public.profiles
+  for each row when (old.deletion_due is null and new.deletion_due is not null)
+  execute function public._ai_on_account_deletion();
 
 -- ---------------------------------------------------------------------------------------------
 -- Admin
@@ -2216,8 +2364,8 @@ begin
   end if;
   with due as (
     select i.id from public.ai_job_items i join public.ai_jobs j on j.id = i.job_id
-     where j.kind = 'bg_removal' and j.state = 'active'
-       and ((i.status = 'pending' and (i.wait_until is null or i.wait_until <= now())
+     where j.kind = 'bg_removal'
+       and ((j.state = 'active' and i.status = 'pending' and (i.wait_until is null or i.wait_until <= now())
              and (i.enqueued_at is null or i.enqueued_at < now() - interval '10 minutes'))
             or (i.status = 'processing' and i.started_at < now() - interval '10 minutes'
                 and (i.enqueued_at is null or i.enqueued_at < now() - interval '10 minutes')))
@@ -2244,15 +2392,24 @@ create function public.ai_scene_backfill(p_limit integer) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   out jsonb;
+  s public.ai_settings := public._ai_settings();
+  d date := public._ai_today();
 begin
-  if public._ai_cloud_paused() is not null or not public._ai_feature(public._ai_settings(), 'scene_tags') then
+  if public._ai_cloud_paused() is not null or not public._ai_feature(s, 'scene_tags') then
     return '[]'::jsonb;
   end if;
   with due as (
     select p.id from public.photos p
       left join public.ai_member_settings m on m.owner_id = p.owner_id
+      join public.profiles pr on pr.id = p.owner_id
      where p.status = 'ready' and p.has_thumb and p.safety_hold_at is null and coalesce(m.scene_tags, true)
+       and pr.deletion_due is null and pr.deleted_at is null
+       and (p.scene_retry_at is null or p.scene_retry_at <= now())
        and (p.scene_state is null or (p.scene_state = 'pending' and p.scene_queued_at < now() - interval '1 day'))
+       -- Members at their daily cap wait for tomorrow instead of filling every run.
+       and not exists (select 1 from public.ai_user_spend_daily u
+                        where u.day = d and u.owner_id = p.owner_id
+                          and u.spent_micros + u.reserved_micros + greatest(s.cost_scene_micros, 1) > s.cap_user_micros)
      order by p.created_at desc
      limit least(greatest(coalesce(p_limit, 500), 1), 2000)
      for update of p skip locked
@@ -2375,7 +2532,13 @@ revoke execute on function
   public._ai_faces_delete(uuid),
   public._ai_faces_block(uuid),
   public._ai_person_recount(uuid),
-  public._ai_person_json(public.people)
+  public._ai_person_json(public.people),
+  public._ai_face_consent_version(),
+  public._ai_people_max(),
+  public._ai_faces_lock(uuid),
+  public._ai_people_prune(uuid, integer),
+  public._ai_failure_budget(),
+  public._ai_on_account_deletion()
 from service_role;
 grant execute on function
   public.list_photos(uuid, text, uuid, text, date, date, text, text, integer, text, uuid),
@@ -2398,7 +2561,7 @@ grant execute on function
   public.ai_item_complete(uuid, uuid, text, integer, integer, integer, text, bigint, integer, jsonb),
   public.ai_item_failed(uuid, text, bigint, jsonb),
   public.ai_scene_begin(uuid, uuid, bigint),
-  public.ai_scene_done(uuid, uuid, jsonb, bigint, bigint, jsonb),
+  public.ai_scene_done(uuid, uuid, jsonb, bigint, bigint, jsonb, date),
   public.ai_scenes(uuid),
   public.ai_signals_pending(uuid, integer, text, integer),
   public.ai_signals_save(uuid, integer, jsonb),

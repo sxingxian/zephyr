@@ -65,12 +65,15 @@ export function newEditKey(owner: string, photo: string, version: number, kind: 
 const ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/(original|thumb|preview)$`);
 const EDIT_KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/edit-([1-9][0-9]{0,9})-(thumb|preview)-[0-9a-f]{32}$`);
+/** Phase 6: a background mask, `u/<owner>/p/<photo>/m/<maskId>.png`. */
+const MASK_KEY_RE = new RegExp(`^u/(${ID})/p/(${ID})/m/(${ID})\\.png$`);
 /** A photo key whose ids are spelled in any case: one that only matches this was never written canonically. */
 const ANY_CASE_PHOTO_KEY_RE = new RegExp(`^u/${ID}/p/${ID}/`, 'i');
 const CANONICAL_PHOTO_KEY_RE = new RegExp(`^u/${ID}/p/${ID}/`);
 export type ParsedKey =
   | { owner: string; photo: string; kind: PhotoKind }
-  | { owner: string; photo: string; kind: 'edit'; version: number; variant: VariantKey };
+  | { owner: string; photo: string; kind: 'edit'; version: number; variant: VariantKey }
+  | { owner: string; photo: string; kind: 'mask'; mask: string };
 /**
  * True for a `u/<owner>/p/<photo>/…` key whose ids aren't in canonical lower-case form. Nothing records,
  * counts or serves such a key, so the orphan sweep deletes it.
@@ -78,7 +81,7 @@ export type ParsedKey =
 export function isNonCanonicalPhotoKey(key: string): boolean {
   return ANY_CASE_PHOTO_KEY_RE.test(key) && !CANONICAL_PHOTO_KEY_RE.test(key);
 }
-/** Parses a photo object key (`u/…`, including edited variants), or null for anything else. */
+/** Parses a photo object key (`u/…`, including edited variants and masks), or null for anything else. */
 export function parseKey(key: string): ParsedKey | null {
   const m = KEY_RE.exec(key);
   if (m) return { owner: m[1] as string, photo: m[2] as string, kind: m[3] as PhotoKind };
@@ -92,6 +95,8 @@ export function parseKey(key: string): ParsedKey | null {
       variant: e[4] as VariantKey,
     };
   }
+  const mk = MASK_KEY_RE.exec(key);
+  if (mk) return { owner: mk[1] as string, photo: mk[2] as string, kind: 'mask', mask: mk[3] as string };
   return null;
 }
 

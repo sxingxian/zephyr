@@ -281,15 +281,18 @@ interface PhotoRowState {
   /** The edited-variant objects the photo's edit records (the only `edit-*` keys that count). */
   editThumbKey?: string | null;
   editPreviewKey?: string | null;
+  /** Phase 6: the masks the photo's rows record (the only `m/` keys that count). */
+  maskKeys?: string[];
 }
 
 /**
  * Deletes photo objects (`u/`) nothing accounts for: keys whose photo row is gone or belongs to someone
- * else, keys whose ids aren't spelled in canonical lower case, and edited variants
- * (`edit-<version>-<kind>-<nonce>`) that aren't the object the photo's edit records,
- * once they're over an hour old (a variant PUT may be between its write and its record). Keys of
- * existing photos (including in-flight uploads) and keys of any other shape are left alone; `staging/`
- * isn't swept (an R2 lifecycle rule empties it after 2 days).
+ * else, keys whose ids aren't spelled in canonical lower case, and, once they're over an hour old (a
+ * write may be between storing the object and recording it), edited variants
+ * (`edit-<version>-<kind>-<nonce>`) that aren't the object the photo's edit records and masks
+ * (`m/<maskId>.png`) that no `photo_masks` row records. Keys of existing photos (including in-flight
+ * uploads) and keys of any other shape are left alone; `staging/` isn't swept (an R2 lifecycle rule
+ * empties it after 2 days).
  */
 export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> {
   const cursor = await rpc<string | null>(env, 'get_job_state', { p_key: 'orphan_sweep_cursor' });
@@ -316,6 +319,11 @@ export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> 
       // older than any PUT can take between its write and its record, it goes.
       const recorded = k.variant === 'thumb' ? row.editThumbKey : row.editPreviewKey;
       if (recorded !== key && now - uploaded > LIBRARY_LIMITS.editGraceMs) return [key];
+    }
+    if (k.kind === 'mask') {
+      // A mask is stored just before its row is written (and kept when the reply to that write is lost), so
+      // one with no row is removed once it's older than that can take.
+      if (!(row.maskKeys ?? []).includes(key) && now - uploaded > LIBRARY_LIMITS.editGraceMs) return [key];
     }
     return [];
   });

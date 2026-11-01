@@ -98,6 +98,8 @@ export const db = {
   jobState: new Map<string, string | null>(),
   edits: new Map<string, Edit>(),
   recipes: new Map<string, Recipe>(),
+  /** Phase 6: recorded mask keys per photo (photo_masks). */
+  maskKeys: new Map<string, string[]>(),
   /** Every library RPC's p_owner, to prove the Worker only ever passes the session's user. */
   owners: [] as string[],
 };
@@ -109,6 +111,7 @@ export function resetDb() {
   db.profiles.clear();
   db.jobState.clear();
   db.edits.clear();
+  db.maskKeys.clear();
   db.recipes.clear();
   db.owners.length = 0;
 }
@@ -638,6 +641,7 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
             activeUpload,
             editThumbKey: e?.thumbKey ?? null,
             editPreviewKey: e?.previewKey ?? null,
+            maskKeys: db.maskKeys.get(id) ?? [],
           },
         ];
       }),

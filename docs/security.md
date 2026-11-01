@@ -97,23 +97,35 @@
       checked against strict patterns; API keys live in Worker secrets. Providers get the photo's ≤ 2048 px preview
       inline, never the original or a link to our storage; fal storage is off (`X-Fal-Store-IO: 0`); a provider
       result that is a URL instead of inline data is refused.
-    - **Untrusted output:** masks go through a strict PNG reader (8-bit grey, grey+alpha or RGBA; no interlace,
-      palette or odd sizes; input capped; inflated into a buffer of exactly the expected size, so a decompression
-      bomb stops at once), must match the photo's aspect, and are stored re-encoded as greyscale. The provider's
-      RGB pixels are discarded.
+    - **Untrusted output:** masks go through a strict PNG reader (8-bit grey, grey+alpha or RGBA; no interlace or
+      palette; input capped at 8 MB). The size is checked against the source preview straight after IHDR (never
+      larger, same aspect), and IDAT data is inflated in 4 KB slices into a buffer of exactly that size, so a
+      decompression bomb stops after a few MB. Masks are stored re-encoded as greyscale; the provider's RGB pixels
+      are discarded. A mask with no database row (a crash between storing and recording it) is removed by the
+      orphan sweep after an hour, never by the request that might have recorded it.
     - **Money:** credits are charged when a job is created and refunded once per failed or canceled item, under a
-      per-member advisory lock; a balance can't go negative. Every provider call first reserves its estimated cost
-      under the day's lock, so parallel consumers can't pass a daily cap; the reservation is settled to the real
-      cost afterwards.
-    - **Face data (biometric):** off by default, on only with recorded consent (version and time, audit log), Pro
-      and Studio only. Faces are found on the device; face codes are stored per member, never returned to any
-      client, never logged, never compared across accounts. Turning it off deletes every face, person and
-      rejection at once; a plan that loses people grouping stops scanning and the data is deleted 30 days later,
-      with emails.
+      per-member advisory lock; a balance can't go negative. Before an item's first provider call, its worst case
+      (every primary attempt plus the fallback) is reserved under the day's lock, so parallel consumers can't pass
+      a daily cap; it's settled to the real cost on the day it was reserved, and a late report still records what
+      its calls cost. A provider whose output was rejected isn't asked again for that item; at most 20 items are in
+      flight; and a member with 50 refunded provider failures in a day waits until tomorrow. Items stuck in
+      processing are picked up again even when their job was canceled, and refunded and settled.
+    - **Face data (biometric):** off by default, on only with recorded consent to the current wording (version and
+      time, audit log), Pro and Studio only. Faces are found on the device; face codes are stored per member, never
+      returned to any client, never logged, never compared across accounts. Every face write re-checks the opt-out
+      after taking the member's faces lock, so a scan racing "Turn off and delete" stores nothing. Turning it off
+      deletes every face, person and rejection at once; scheduling account deletion does too; a plan that loses
+      people grouping stops scanning and the data is deleted 30 days later, with emails.
+    - **Load:** face batches (10 a minute), AI writes (120) and AI reads (300) have per-member limits; face writes
+      wait at most 3 s for the faces lock, then answer 429; a member has at most 3000 people (the oldest unnamed
+      one-face groups are pruned), which bounds the per-face matching.
     - **Admin:** any change that could raise spend or turn something on needs a passkey sign-in in the last 10
       minutes, is audited with a before/after diff and emails every Owner; switching things off or lowering a cap
       saves at once, so a one-person team can always pull the kill switch.
     - **Shared devices:** AI writes carry `X-Zephyr-Expected-User`; device-job leases belong to a sign-in session.
-      Masks are served to their owner only, privately cached under ids that are never reused.
+      Masks are served to their owner only, privately cached but revalidated on every use (`no-cache` + ETag), so a
+      browser never shows a mask its member can no longer read.
+    - **Account deletion:** scheduling it deletes face data, cancels and refunds pending cloud work, and the scene
+      backfill and the queue consumer skip the account.
 
 Later phases add ads isolation and the admin Safety queue. See the design decisions doc.

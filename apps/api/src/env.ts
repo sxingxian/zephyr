@@ -71,6 +71,10 @@ export interface Env {
   AI_QUEUE: Queue<AiMessage>;
   /** Per-member AI writes (job creation, settings, signals, faces, people). */
   AI_LIMITER: RateLimit;
+  /** Phase 6: face batches per member (10 a minute). */
+  FACES_LIMITER: RateLimit;
+  /** Phase 6: Zephyr AI reads per member (300 a minute). */
+  AI_READ_LIMITER: RateLimit;
   /** Cloudflare account id and gateway id of the AI Gateway every cloud AI call goes through. */
   AI_GATEWAY_ACCOUNT_ID?: string;
   AI_GATEWAY_ID?: string;
