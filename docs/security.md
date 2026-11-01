@@ -80,7 +80,7 @@
       through the API Worker, using one-hour signed URLs, and the database is checked on every request. The media
       host behind it is closed to everyone but the Worker (WAF rule) and sits behind the Cloudflare cache for CSAM
       scanning. An edited photo whose edited preview isn't ready, or a watermarked gallery whose watermark image is
-      missing, is served as "Preparing", never as the unedited or unwatermarked original. Downloads are re-checked
+      missing, is served as "Preparing", never as the unedited or unwatermarked original, and a cropped photo's guest size is its cropped shape. Downloads are re-checked
       against the gallery's current settings on every request, and download names never use the member's file
       names.
     - **Safety:** a scanner block puts the photo on hold everywhere, suspends sharing for the account, alerts
