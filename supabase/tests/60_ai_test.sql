@@ -161,14 +161,20 @@ select pg_temp.ok((public.save_edit(:mei, (select v from t where k = 'p2'),
 select pg_temp.ok((public.save_edit(:mei, (select v from t where k = 'p1'),
                    '{"v": 1, "cutout": {"mask": "b6000000-0000-0000-0000-000000000001", "bg": "transparent"}}', 2) ->> 'status') = 'ok',
   'save_edit keeps the photo''s own mask');
-do $$ begin
-  begin
-    update public.photo_edits set recipe = '{"v": 1, "cutout": {"mask": "b6000000-0000-0000-0000-0000000000ff", "bg": "white"}}'
-     where photo_id = (select v from t where k = 'p1');
-    raise exception 'FAILED: unknown mask accepted';
-  exception when check_violation then raise notice 'ok - no writer can point a recipe at an unknown mask';
-  end;
-end $$;
+-- Any other writer: the foreign cut-out is dropped (never stored), the rest of the recipe is kept.
+update public.photo_edits set recipe = '{"v": 1, "light": {"exposure": 0.5}, "cutout": {"mask": "b6000000-0000-0000-0000-0000000000ff", "bg": "white"}}'
+ where photo_id = (select v from t where k = 'p1');
+select pg_temp.ok((select recipe from public.photo_edits where photo_id = (select v from t where k = 'p1'))
+                  = '{"v": 1, "light": {"exposure": 0.5}}'::jsonb, 'no writer can point a recipe at an unknown mask (it is dropped)');
+-- Bulk apply with another photo's mask doesn't fail the request: that photo just keeps no foreign cut-out.
+select pg_temp.ok((public.apply_bulk_edits(:mei, jsonb_build_array(jsonb_build_object(
+                    'photoId', (select v from t where k = 'p2'), 'baseVersion', null,
+                    'recipe', '{"v": 1, "light": {"contrast": 10}, "cutout": {"mask": "b6000000-0000-0000-0000-000000000001", "bg": "white"}}'::jsonb)))
+                   -> 'applied' -> 0 #>> '{edit,recipe}')::jsonb = '{"v": 1, "light": {"contrast": 10}}'::jsonb,
+  'bulk apply drops a foreign cut-out instead of failing');
+-- Put p1's own cut-out back for the tests below.
+update public.photo_edits set recipe = '{"v": 1, "cutout": {"mask": "b6000000-0000-0000-0000-000000000001", "bg": "transparent"}}'
+ where photo_id = (select v from t where k = 'p1');
 
 -- Failure: refunded once.
 insert into r values ('b2', public.ai_item_begin((select (v #>> '{}')::uuid from r where k = 'i2'), 2000));
@@ -378,6 +384,106 @@ select pg_temp.ok(public.ai_alert_recipients('owners_finance') ? 'finance.ai@zep
 select pg_temp.ok(public.admin_ai_jobs('a6000000-0000-0000-0000-0000000000f3') ? 'providers', 'any staff can read AI jobs');
 select pg_temp.ok(public.admin_ai_jobs(:mei) is null, 'members can''t');
 select pg_temp.ok((public.ai_prune() ? 'calls'), 'prune runs');
+
+-- ---- Security review fixes -----------------------------------------------------------------------
+insert into auth.users (id, email, email_confirmed_at) values
+  ('a6000000-0000-0000-0000-000000000011', 'rev1.ai@example.com', now()),
+  ('a6000000-0000-0000-0000-000000000012', 'rev2.ai@example.com', now());
+update public.profiles set plan_id = 'pro' where id in ('a6000000-0000-0000-0000-000000000011', 'a6000000-0000-0000-0000-000000000012');
+\set rev1 '\'a6000000-0000-0000-0000-000000000011\''
+\set rev2 '\'a6000000-0000-0000-0000-000000000012\''
+update public.ai_settings set cap_total_micros = 10000000, cap_bg_micros = 8000000, cap_scene_micros = 2000000,
+                              cap_user_micros = 500000, cloud_paused = false, enabled = true, f_scene_tags = true, f_bg_removal = true,
+                              f_face_grouping = true;
+insert into t values ('r1', pg_temp.photo(:rev1, 'r1.jpg')), ('r2', pg_temp.photo(:rev1, 'r2.jpg')),
+  ('r3', pg_temp.photo(:rev1, 'r3.jpg')), ('s1', pg_temp.photo(:rev2, 's1.jpg'));
+
+-- Consent is only for the current wording.
+select pg_temp.ok((public.ai_member_settings_update(:rev1, '{"faceGrouping": true, "faceConsent": {"version": 2, "rightsConfirmed": true}}')
+                   ->> 'error') = 'consent', 'consent to another wording version is refused');
+
+-- Faces: an add that runs after an opt-out stores nothing (the block is checked under the lock).
+select public.ai_member_settings_update(:rev1, '{"faceGrouping": true, "faceConsent": {"version": 1, "rightsConfirmed": true}}');
+select public.ai_member_settings_update(:rev1, '{"faceGrouping": false}');
+select pg_temp.ok((public.ai_faces_add(:rev1, 1, 0.42, jsonb_build_array(jsonb_build_object('id', (select v from t where k = 'r1'),
+                   'faces', jsonb_build_array(jsonb_build_object('box', '[0.1,0.1,0.2,0.2]'::jsonb, 'score', 0.9, 'embedding', pg_temp.vec(1)))))) ->> 'error') = 'off'
+                  and not exists (select 1 from public.faces where owner_id = :rev1), 'faces after an opt-out are refused');
+
+-- People cap: beyond it, the oldest unnamed single-face people are pruned and faces still save.
+select public.ai_member_settings_update(:rev1, '{"faceGrouping": true, "faceConsent": {"version": 1, "rightsConfirmed": true}}');
+insert into public.people (owner_id, embedding_sum, face_count, updated_at)
+select :rev1, pg_temp.vec(1 + (k % 120), 1 + ((k + 7) % 120), 0.3)::extensions.vector, 1, now() - interval '1 day'
+  from generate_series(1, public._ai_people_max()) k;
+select pg_temp.ok((public.ai_faces_add(:rev1, 1, 0.99, jsonb_build_array(jsonb_build_object('id', (select v from t where k = 'r2'),
+                   'faces', jsonb_build_array(jsonb_build_object('box', '[0.1,0.1,0.2,0.2]'::jsonb, 'score', 0.9, 'embedding', pg_temp.vec(128, 3, 0.5)))))) ->> 'saved')::integer = 1,
+  'a face saves at the people cap');
+select pg_temp.ok((select count(*) from public.people where owner_id = :rev1) <= public._ai_people_max(), 'people never pass the cap');
+select pg_temp.ok((select count(*) from public.people where owner_id = :rev1) = public._ai_people_max() - 199, 'the oldest unnamed single-face people were pruned');
+select public.ai_faces_delete_all(:rev1);
+
+-- Account deletion scheduled: face data goes at once; pending cloud items are canceled and refunded.
+select public.ai_member_settings_update(:rev1, '{"faceGrouping": true, "faceConsent": {"version": 1, "rightsConfirmed": true}}');
+select public.ai_faces_add(:rev1, 1, 0.42, jsonb_build_array(jsonb_build_object('id', (select v from t where k = 'r1'),
+  'faces', jsonb_build_array(jsonb_build_object('box', '[0.1,0.1,0.2,0.2]'::jsonb, 'score', 0.9, 'embedding', pg_temp.vec(5))))));
+select public.ai_status(:rev1);
+insert into r values ('rjob', public.ai_bg_job_create(:rev1, array[(select v from t where k = 'r3')], '{"bg": "white"}', null, false));
+select pg_temp.ok(pg_temp.balance(:rev1) = 999, 'one credit charged');
+select public.request_account_deletion(:rev1);
+select pg_temp.ok(not exists (select 1 from public.faces where owner_id = :rev1) and not exists (select 1 from public.people where owner_id = :rev1),
+  'scheduling deletion deletes face data at once');
+select pg_temp.ok(pg_temp.balance(:rev1) = 1000 and (select status from public.ai_job_items where owner_id = :rev1) = 'canceled',
+  'scheduling deletion cancels and refunds pending cloud work');
+select pg_temp.ok(public.restore_account(:rev1) and (public.ai_status(:rev1) #>> '{member,faceGrouping}') = 'false',
+  'a restored account has face grouping off');
+
+-- Canceled job with an item stuck in processing: picked up again, refunded and settled.
+insert into r values ('cjob', public.ai_bg_job_create(:rev1, array[(select v from t where k = 'r3')], '{"bg": "white"}', null, false));
+insert into r values ('ci', to_jsonb((select (v -> 'items' ->> 0)::uuid from r where k = 'cjob')));
+select public.ai_item_begin((select (v #>> '{}')::uuid from r where k = 'ci'), 1800);
+select public.ai_job_cancel(:rev1, (select (v #>> '{job,id}')::uuid from r where k = 'cjob'));
+update public.ai_job_items set started_at = now() - interval '20 minutes', enqueued_at = null where id = (select (v #>> '{}')::uuid from r where k = 'ci');
+select pg_temp.ok(public.ai_due_items(100) ? (select v #>> '{}' from r where k = 'ci'), 'a stuck item of a canceled job is due again');
+select public.ai_item_begin((select (v #>> '{}')::uuid from r where k = 'ci'), 1800);
+select pg_temp.ok((select status = 'canceled' and credits = 0 and reserved_micros = 0 from public.ai_job_items
+                        where id = (select (v #>> '{}')::uuid from r where k = 'ci'))
+                  and pg_temp.balance(:rev1) = 1000, 'and is canceled, refunded and its reservation settled');
+
+-- A late provider result for an item that moved on still counts its cost.
+select pg_temp.ok((select coalesce(sum(spent_micros), 0) from public.ai_user_spend_daily where owner_id = :rev1 and day = public._ai_today()) = 1800,
+  'the stuck reservation is counted as spent');
+select public.ai_item_failed((select (v #>> '{}')::uuid from r where k = 'ci'), 'provider_error', 700, '[]');
+select pg_temp.ok((select spent_micros from public.ai_user_spend_daily where owner_id = :rev1 and day = public._ai_today()) = 2500,
+  'a late failure report still records what the call cost');
+
+-- Daily failure budget: past it, items wait until tomorrow.
+insert into r values ('fjob', public.ai_bg_job_create(:rev1, array[(select v from t where k = 'r1')], '{"bg": "white"}', null, false));
+insert into public.ai_job_items (job_id, owner_id, photo_id, seq, filename, status, error, finished_at)
+select (select (v #>> '{job,id}')::uuid from r where k = 'fjob'), :rev1, (select v from t where k = 'r1'), 100 + k, 'x.jpg', 'failed', 'bad_output', now()
+  from generate_series(1, public._ai_failure_budget()) k;
+select pg_temp.ok(public.ai_item_begin((select (v #>> '{items,0}')::uuid from r where k = 'fjob'), 1800)
+                  @> '{"status": "wait", "capped": "failures"}', 'a member past the daily failure budget waits until tomorrow');
+
+-- Scenes: a result after the member turned scene tags off is dropped; the reservation settles on its day.
+select pg_temp.ok((public.ai_scene_begin(:rev2, (select v from t where k = 's1'), 20) ->> 'status') = 'go', 'scene begin: go');
+select public.ai_member_settings_update(:rev2, '{"sceneTags": false}');
+select pg_temp.ok((public.ai_scene_done(:rev2, (select v from t where k = 's1'), '[{"scene": "beach", "score": 0.9}]', 20, 20, '[]',
+                    public._ai_today()) ->> 'status') = 'skip'
+                  and not exists (select 1 from public.photo_scenes where owner_id = :rev2), 'scene tags after an opt-out are dropped');
+select pg_temp.ok((select reserved_micros = 0 and spent_micros = 20 from public.ai_user_spend_daily where owner_id = :rev2 and day = public._ai_today()),
+  'and the reservation is settled');
+select public.ai_member_settings_update(:rev2, '{"sceneTags": true}');
+select pg_temp.ok((public.ai_scene_begin(:rev2, (select v from t where k = 's1'), 20) ->> 'day') = public._ai_today()::text,
+  'begin says which day it reserved on');
+select public.ai_scene_done(:rev2, (select v from t where k = 's1'), '"retry"', 20, 0, '[]', public._ai_today());
+select pg_temp.ok((select scene_retry_at > now() + interval '50 minutes' from public.photos where id = (select v from t where k = 's1')),
+  'a retry waits an hour');
+select pg_temp.ok(not (public.ai_scene_backfill(2000) @> jsonb_build_array(jsonb_build_object('photo', (select v from t where k = 's1')))),
+  'the backfill skips it until then');
+update public.photos set scene_retry_at = null where id = (select v from t where k = 's1');
+insert into public.ai_user_spend_daily (day, owner_id, spent_micros) values (public._ai_today(), :rev2, 600000)
+on conflict (day, owner_id) do update set spent_micros = 600000;
+select pg_temp.ok(not (public.ai_scene_backfill(2000) @> jsonb_build_array(jsonb_build_object('photo', (select v from t where k = 's1')))),
+  'members at their daily cap are skipped by the backfill');
 
 -- ---- Privileges ---------------------------------------------------------------------------------
 select pg_temp.ok(not has_function_privilege('anon', 'public.ai_status(uuid)', 'execute')
