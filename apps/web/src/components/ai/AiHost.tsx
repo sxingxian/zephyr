@@ -33,6 +33,16 @@ export function AiHost() {
     };
   }, [on, signals, faces]);
 
+  // Unmounted when the member signs out or the account becomes scheduled for deletion: stop finding faces and
+  // running device jobs here at once (the server would refuse them anyway).
+  useEffect(
+    () => () => {
+      void import('../../lib/ai/scanner').then(({ scanner }) => scanner.stop());
+      void import('../../lib/deviceRunner').then(({ deviceRunner }) => deviceRunner.stopAll());
+    },
+    [],
+  );
+
   // Device jobs this device held (its lease is still live): carry on.
   useEffect(() => {
     if (!enabled) return;

@@ -12,11 +12,10 @@ import {
 import { SettingsNav } from '../components/SettingsNav';
 import { Shell } from '../components/Shell';
 import {
-  deleteFaceData,
   fetchCredits,
   patchAiSettings,
-  refreshAiStatus,
   setAiStatus,
+  turnOffFaceGrouping,
   useAiStatus,
 } from '../lib/aiClient';
 import { errorMessage } from '../lib/api';
@@ -202,8 +201,7 @@ export function AiSettingsPage() {
     }
   };
   const deleteFaces = async () => {
-    await deleteFaceData();
-    await refreshAiStatus();
+    await turnOffFaceGrouping();
     toast.show('Face grouping is off and all face data was deleted.', 'good');
   };
 

@@ -1,4 +1,9 @@
-import type { AiJobSummary, DeviceJobParams, PhotoItem } from '@zephyr/shared/client';
+import {
+  type AiJobSummary,
+  type DeviceJobParams,
+  type PhotoItem,
+  RUNNER_TOKEN_RE,
+} from '@zephyr/shared/client';
 import { useSyncExternalStore } from 'react';
 import { claimJob, deviceLabel, pauseJob, postProgress, refreshAiStatus } from './aiClient';
 import { ApiFailure } from './api';
@@ -13,26 +18,67 @@ import { onSessionEnd, sessionUserId } from './sessionGuard';
  * lease lapses and any of the member's devices can "Continue here".
  *
  * Everything is bound to the member who started it: the session ending stops every job at once.
+ *
+ * One runner per job: a Web Lock (`zephyr-dj:<id>`) keeps a second tab of this browser from running the same
+ * job, and the lease carries this tab's runner token, so another tab or device of the same sign-in can't
+ * claim or report on it either (409). Photos edited after the job started are left alone (never stacked).
  */
 
 type Photo = Pick<PhotoItem, 'id' | 'filename' | 'fileType' | 'hasPreview'>;
 export interface RunnerDeps {
   owner(): string | null;
-  claim(id: string, device: string): Promise<{ job: AiJobSummary; remaining: string[] }>;
-  progress(id: string, body: { done?: string[]; failed?: string[] }, owner: string): Promise<unknown>;
+  claim(id: string, device: string, runner: string): Promise<{ job: AiJobSummary; remaining: string[] }>;
+  progress(
+    id: string,
+    body: { done?: string[]; failed?: string[]; runner: string },
+    owner: string,
+  ): Promise<unknown>;
   pause(id: string): Promise<unknown>;
   photo(id: string, signal: AbortSignal): Promise<Photo>;
   /** One photo through the device steps ('done' / 'unchanged' count as done). Throws to stop the whole job. */
   run(
     photo: Photo,
     params: DeviceJobParams,
-    ctx: { owner: string; signal: AbortSignal; reference?: unknown },
+    ctx: { owner: string; signal: AbortSignal; reference?: unknown; since?: string },
   ): Promise<{ status: string }>;
   /** The colour-match reference, loaded once per job. */
   reference(photoId: string, signal: AbortSignal): Promise<unknown>;
   device(): string;
   now(): number;
   changed(): void;
+  /** This tab's runner token (kept for the tab's life, reloads included). */
+  runner(): string;
+  /**
+   * Runs `fn` holding this browser's lock for the job, or returns false at once when another tab holds it.
+   * Browsers without Web Locks just run it (the server's runner check still applies).
+   */
+  exclusive(id: string, fn: () => Promise<void>): Promise<boolean>;
+}
+
+/** 16 random bytes, base64url: 22 characters (RUNNER_TOKEN_RE). */
+function newRunnerToken(): string {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  return btoa(String.fromCharCode(...b))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+let tabRunner: string | null = null;
+/** Per tab: sessionStorage survives a reload of this tab (so it can pick its own lease back up) but not a new tab. */
+export function tabRunnerToken(): string {
+  if (tabRunner) return tabRunner;
+  try {
+    const kept = sessionStorage.getItem('zephyr-runner');
+    if (kept && RUNNER_TOKEN_RE.test(kept)) {
+      tabRunner = kept;
+      return kept;
+    }
+    tabRunner = newRunnerToken();
+    sessionStorage.setItem('zephyr-runner', tabRunner);
+  } catch {
+    tabRunner ??= newRunnerToken();
+  }
+  return tabRunner;
 }
 
 export interface LocalJob {
@@ -49,7 +95,7 @@ const HEARTBEAT_MS = 30_000;
 
 const defaultDeps: RunnerDeps = {
   owner: sessionUserId,
-  claim: (id, device) => claimJob(id, device),
+  claim: (id, device, runner) => claimJob(id, device, runner),
   progress: (id, body, owner) => postProgress(id, body, owner),
   pause: (id) => pauseJob(id),
   photo: (id, signal) => getPhoto(id, signal),
@@ -64,6 +110,19 @@ const defaultDeps: RunnerDeps = {
   device: () => deviceLabel(),
   now: () => Date.now(),
   changed: () => void refreshAiStatus(),
+  runner: tabRunnerToken,
+  async exclusive(id, fn) {
+    const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
+    if (!locks?.request) {
+      await fn();
+      return true;
+    }
+    return locks.request(`zephyr-dj:${id}`, { ifAvailable: true }, async (lock) => {
+      if (!lock) return false;
+      await fn();
+      return true;
+    });
+  },
 };
 
 export class DeviceRunner {
@@ -98,14 +157,28 @@ export class DeviceRunner {
     this.jobs.set(job.id, { ctrl, local });
     this.emit();
     try {
-      const claimed = await this.deps.claim(job.id, this.deps.device());
-      const params = claimed.job.params ?? job.params;
-      local.total = claimed.remaining.length;
-      this.emit();
-      await this.work(job.id, owner, params, claimed.remaining, ctrl.signal, local);
+      const ran = await this.deps.exclusive(job.id, async () => {
+        const runner = this.deps.runner();
+        const claimed = await this.deps.claim(job.id, this.deps.device(), runner);
+        const params = claimed.job.params ?? job.params;
+        if (!params) return;
+        local.total = claimed.remaining.length;
+        this.emit();
+        await this.work(
+          job.id,
+          owner,
+          params,
+          claimed.remaining,
+          ctrl.signal,
+          local,
+          runner,
+          claimed.job.createdAt,
+        );
+      });
+      if (!ran) local.state = 'lost'; // another tab of this browser is running it
     } catch (e) {
-      if (ctrl.signal.aborted || (e as Error).name === 'AbortError') local.state = 'stopped';
-      else if (e instanceof ApiFailure && e.code === 'conflict') local.state = 'lost';
+      if (e instanceof ApiFailure && e.code === 'conflict') local.state = 'lost';
+      else if (ctrl.signal.aborted || (e as Error).name === 'AbortError') local.state = 'stopped';
       else {
         local.state = 'error';
         local.error = e instanceof ApiFailure ? e.code : (e as Error)?.message || 'failed';
@@ -126,21 +199,39 @@ export class DeviceRunner {
     remaining: string[],
     signal: AbortSignal,
     local: LocalJob,
+    runner: string,
+    since: string,
   ) {
     let done: string[] = [];
     let failed: string[] = [];
     let last = this.deps.now();
+    const live = () => !signal.aborted && this.deps.owner() === owner;
     const flush = async (force: boolean) => {
       if (!force && this.deps.now() - last < POST_EVERY_MS) return;
-      const body = { done, failed };
+      const body = { done, failed, runner };
       done = [];
       failed = [];
       last = this.deps.now();
-      await this.deps.progress(id, body, owner);
+      try {
+        await this.deps.progress(id, body, owner);
+      } catch (e) {
+        // Not recorded: keep the ids for the next report (the server keeps those photos pending meanwhile).
+        done = [...body.done, ...done];
+        failed = [...body.failed, ...failed];
+        throw e;
+      }
     };
-    // A slow photo (a big RAW) mustn't let the lease lapse.
+    // A slow photo (a big RAW) mustn't let the lease lapse. Never for a stopped job or another member.
+    const ctrl = this.jobs.get(id)?.ctrl;
     const beat = setInterval(() => {
-      if (this.deps.now() - last >= HEARTBEAT_MS) void flush(true).catch(() => {});
+      if (!live() || this.deps.now() - last < HEARTBEAT_MS) return;
+      void flush(true).catch((e) => {
+        // The lease went to another runner: stop here at once rather than carry on unrecorded.
+        if (e instanceof ApiFailure && e.code === 'conflict') {
+          local.state = 'lost';
+          ctrl?.abort();
+        }
+      });
     }, HEARTBEAT_MS / 3);
     try {
       const reference =
@@ -153,7 +244,7 @@ export class DeviceRunner {
         let ok = false;
         try {
           const photo = await this.deps.photo(photoId, signal);
-          const r = await this.deps.run(photo, params, { owner, signal, reference });
+          const r = await this.deps.run(photo, params, { owner, signal, reference, since });
           ok = r.status === 'done' || r.status === 'unchanged';
         } catch (e) {
           // A missing photo fails just that photo; anything that stops the job is rethrown.
@@ -172,9 +263,14 @@ export class DeviceRunner {
       await flush(true);
     } finally {
       clearInterval(beat);
-      if (signal.aborted && (done.length || failed.length) && this.deps.owner() === owner) {
+      if (
+        signal.aborted &&
+        local.state !== 'lost' &&
+        (done.length || failed.length) &&
+        this.deps.owner() === owner
+      ) {
         // Stopped by pause: still report what finished.
-        await this.deps.progress(id, { done, failed }, owner).catch(() => {});
+        await this.deps.progress(id, { done, failed, runner }, owner).catch(() => {});
       }
     }
   }

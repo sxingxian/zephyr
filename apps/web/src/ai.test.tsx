@@ -729,3 +729,199 @@ describe('Settings › Zephyr AI', () => {
     await waitFor(() => expect(calls.find((c) => c.url === '/api/v1/ai/faces')?.method).toBe('DELETE'));
   });
 });
+
+// ---------------------------------------------------------------- client review fixes
+describe('client review fixes', () => {
+  it('#1 turning face grouping off stops the face pass first, then deletes, then reads a fresh status', async () => {
+    const { scanner } = await import('./lib/ai/scanner');
+    const order: string[] = [];
+    const stop = vi.spyOn(scanner, 'stopFaces').mockImplementation(async () => {
+      order.push('stopFaces');
+    });
+    mockApi((url, method) => {
+      if (url === '/api/v1/ai/faces' && method === 'DELETE') {
+        order.push('DELETE');
+        return new Response(null, { status: 204 });
+      }
+      if (url === '/api/v1/ai' && order.includes('DELETE')) {
+        order.push('status');
+        return json(200, { ok: true, ...status({ member: { ...status().member, faceGrouping: false } }) });
+      }
+      return undefined;
+    });
+    const { turnOffFaceGrouping } = await import('./lib/aiClient');
+    await turnOffFaceGrouping();
+    expect(order).toEqual(['stopFaces', 'DELETE', 'status']);
+    stop.mockRestore();
+  });
+
+  it('#1 a status request that started before a change never overwrites the newer one', async () => {
+    const { getAiStatus, refreshAiStatus } = await import('./lib/aiClient');
+    let release: (r: Response) => void = () => {};
+    const slow = new Promise<Response>((r) => (release = r));
+    let n = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/api/v1/ai') {
+          n += 1;
+          if (n === 1) return slow; // the poll that started before the delete
+          return json(200, { ok: true, ...status({ member: { ...status().member, faceGrouping: false } }) });
+        }
+        return json(200, {
+          ok: true,
+          jobs: [],
+          nextCursor: null,
+          counts: { running: 0, finished: 0, failed: 0 },
+        });
+      }),
+    );
+    const old = refreshAiStatus();
+    // A plain refresh shares the request in flight for the same member…
+    expect(refreshAiStatus()).toBe(old);
+    // …a fresh one doesn't, and wins even though the old answer arrives later.
+    await refreshAiStatus({ fresh: true });
+    release(json(200, { ok: true, ...status() }));
+    await old;
+    expect(getAiStatus()?.member.faceGrouping).toBe(false);
+    expect(n).toBe(2);
+  });
+
+  it('#1 a request in flight for one member is never shared with the next', async () => {
+    const { refreshAiStatus } = await import('./lib/aiClient');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Promise<Response>(() => {})),
+    );
+    const a = refreshAiStatus();
+    setSessionUserId('u2');
+    const b = refreshAiStatus();
+    expect(b).not.toBe(a);
+  });
+
+  it('#7 "Retry all failed" shows what it can cost and only retries after confirming', async () => {
+    mockApi((url, method) => {
+      if (url.startsWith('/api/v1/ai/jobs?'))
+        return json(200, {
+          ok: true,
+          jobs: [JOB],
+          nextCursor: null,
+          counts: { running: 1, finished: 0, failed: 1 },
+        });
+      if (url.startsWith('/api/v1/ai/jobs/cj/retry') && method === 'POST')
+        return json(200, { ok: true, job: JOB });
+      if (url.startsWith('/api/v1/ai/jobs/cj'))
+        return json(200, { ok: true, job: JOB, items: [], nextCursor: null });
+      return undefined;
+    });
+    renderAt('/ai/queue');
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry all failed · 1 credit' }));
+    expect(calls.some((c) => c.url.includes('/retry'))).toBe(false);
+    const dlg = (await screen.findByText('Retry 1 failed photo?')).closest('dialog') as HTMLElement;
+    fireEvent.click(within(dlg).getByRole('button', { name: 'Retry · up to 1 credit' }));
+    await waitFor(() => expect(calls.filter((c) => c.url.includes('/retry'))).toHaveLength(1));
+    expect(calls.find((c) => c.url.includes('/retry'))?.body).toEqual({});
+  });
+
+  it('#8 Cleanup’s trash request names the member it was started for', async () => {
+    mockApi((url) =>
+      url.startsWith('/api/v1/ai/cleanup')
+        ? json(200, {
+            ok: true,
+            photos: [cp(P1, 'ffff0000ffff0000', 500, 3000), cp(P2, 'ffff0000ffff0001', 300, 2000)],
+            nextCursor: null,
+          })
+        : url === '/api/v1/photos/bulk'
+          ? json(200, { ok: true, affected: 1 })
+          : undefined,
+    );
+    renderAt('/cleanup');
+    fireEvent.click(await screen.findByRole('button', { name: 'Keep best, move 1 other to Trash' }));
+    const f = fetch as unknown as ReturnType<typeof vi.fn>;
+    await waitFor(() => expect(f.mock.calls.some(([u]) => u === '/api/v1/photos/bulk')).toBe(true));
+    const [, init] = f.mock.calls.find(([u]) => u === '/api/v1/photos/bulk') as [string, RequestInit];
+    expect((init.headers as Record<string, string>)['x-zephyr-expected-user']).toBe('u1');
+  });
+
+  it('#10 the editor’s job wait backs off, doesn’t poll while hidden, and gives up after the limit', async () => {
+    const { JOB_WAIT, waitForJob } = await import('./components/ai/EditorAi');
+    const slept: number[] = [];
+    let polls = 0;
+    let hidden = 0;
+    const res = await waitForJob('j1', new AbortController().signal, {
+      sleep: async (ms) => {
+        slept.push(ms);
+      },
+      visible: async () => {
+        hidden += 1; // called before every poll
+      },
+      get: async () => {
+        polls += 1;
+        return {
+          ok: true,
+          job: { ...JOB, status: 'waiting' },
+          items: [],
+          nextCursor: null,
+        } as Awaited<ReturnType<typeof import('./lib/aiClient').getJob>>;
+      },
+    });
+    expect(res).toEqual({ ok: false, timeout: true });
+    expect(slept.slice(0, JOB_WAIT.fastPolls).every((ms) => ms === JOB_WAIT.fastMs)).toBe(true);
+    expect(Math.max(...slept)).toBe(JOB_WAIT.maxMs);
+    expect(hidden).toBe(slept.length);
+    expect(polls).toBeLessThan(60); // ~10 minutes, not hours of 5 s polls
+  });
+
+  it('a 429 on a face write is waited out briefly before it shows', async () => {
+    const { politely } = await import('./lib/aiClient');
+    const { ApiFailure } = await import('./lib/api');
+    let n = 0;
+    const waits: number[] = [];
+    const out = await politely(
+      async () => {
+        n += 1;
+        if (n < 3) throw new ApiFailure('rate_limited', 429, 5);
+        return 'ok';
+      },
+      2,
+      async (ms) => {
+        waits.push(ms);
+      },
+    );
+    expect(out).toBe('ok');
+    expect(waits).toEqual([5000, 5000]);
+    await expect(
+      politely(
+        async () => {
+          throw new ApiFailure('rate_limited', 429, 60);
+        },
+        2,
+        async () => {},
+      ),
+    ).rejects.toBeInstanceOf(ApiFailure); // a long wait is shown, not sat through
+  });
+
+  it('a tab keeps one runner token (22 base64url characters) across reloads of that tab', async () => {
+    const { tabRunnerToken } = await import('./lib/deviceRunner');
+    const t = tabRunnerToken();
+    expect(t).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    expect(tabRunnerToken()).toBe(t);
+    expect(sessionStorage.getItem('zephyr-runner')).toBe(t);
+  });
+
+  it('stops the scanner and device jobs when the signed-in app goes away (pending deletion, sign-out)', async () => {
+    const { scanner } = await import('./lib/ai/scanner');
+    const { deviceRunner } = await import('./lib/deviceRunner');
+    const stop = vi.spyOn(scanner, 'stop');
+    const stopAll = vi.spyOn(deviceRunner, 'stopAll');
+    mockApi(() => undefined);
+    renderAt('/ai/queue');
+    await screen.findByRole('heading', { name: 'AI queue', level: 1 }).catch(() => undefined);
+    await waitFor(() => expect(calls.some((c) => c.url === '/api/v1/ai')).toBe(true));
+    cleanup();
+    await waitFor(() => expect(stop).toHaveBeenCalled());
+    await waitFor(() => expect(stopAll).toHaveBeenCalled());
+    stop.mockRestore();
+    stopAll.mockRestore();
+  });
+});

@@ -4,7 +4,7 @@ import { type CSSProperties, type ReactNode, useEffect, useState } from 'react';
 import { Link } from 'react-router';
 import { pausedUntil, useAiStatus } from '../../lib/aiClient';
 import { errorMessage } from '../../lib/api';
-import { previewUrl, thumbUrl } from '../../lib/library';
+import { originalPreviewUrl, originalThumbUrl } from '../../lib/edits';
 
 /** Plural helper: "1 credit", "12 credits". */
 export const plural = (n: number, one: string, many = `${one}s`) =>
@@ -136,7 +136,9 @@ export function FaceCrop({
   const style: CSSProperties = {
     width: size,
     height: size,
-    backgroundImage: `url("${original === 'thumb' ? thumbUrl(photoId) : previewUrl(photoId)}")`,
+    // Face boxes are measured on the untouched preview, so the crop uses the untouched images too (an edit
+    // may crop, rotate or cut the photo out). The 512 px thumbnail is enough unless the face is small in it.
+    backgroundImage: `url("${original === 'thumb' || bw * 512 * (1 + pad * 2) >= size * 0.6 ? originalThumbUrl(photoId) : originalPreviewUrl(photoId)}")`,
     backgroundSize: `${100 / w}% ${100 / h}%`,
     backgroundPosition: `${w >= 1 ? 0 : (x / (1 - w)) * 100}% ${h >= 1 ? 0 : (y / (1 - h)) * 100}%`,
   };

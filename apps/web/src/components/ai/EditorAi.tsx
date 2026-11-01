@@ -156,30 +156,96 @@ type BgState =
   | { s: 'failed'; text: string }
   | { s: 'error'; text: string };
 
-/** Polls a one-photo background-removal job until it settles. */
-async function waitForJob(
+/** How the editor waits for its one-photo background removal (client review #10). */
+export const JOB_WAIT = {
+  /** The first polls are quick (a cut-out usually takes a few seconds)… */
+  fastPolls: 10,
+  fastMs: 2000,
+  /** …then each wait grows by half, up to this. */
+  maxMs: 30_000,
+  /** Visible waiting time before the editor stops polling and points to the AI queue instead. */
+  limitMs: 10 * 60_000,
+} as const;
+export type JobWait = { ok: true } | { ok: false; error: AiItemError | null } | { ok: false; timeout: true };
+export interface JobWaitDeps {
+  get: typeof getJob;
+  sleep(ms: number, signal: AbortSignal): Promise<void>;
+  /** Resolves when the tab is visible (at once if it is). */
+  visible(signal: AbortSignal): Promise<void>;
+  now(): number;
+}
+const stopped = () => new DOMException('Stopped.', 'AbortError');
+const jobWaitDeps: JobWaitDeps = {
+  get: getJob,
+  sleep: (ms, signal) =>
+    new Promise((resolve, reject) => {
+      if (signal.aborted) return reject(stopped());
+      const t = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(t);
+        reject(stopped());
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }),
+  visible: (signal) =>
+    new Promise((resolve, reject) => {
+      if (signal.aborted) return reject(stopped());
+      if (document.visibilityState !== 'hidden') return resolve();
+      const onVis = () => {
+        if (document.visibilityState === 'hidden') return;
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(stopped());
+      };
+      const cleanup = () => {
+        document.removeEventListener('visibilitychange', onVis);
+        signal.removeEventListener('abort', onAbort);
+      };
+      document.addEventListener('visibilitychange', onVis);
+      signal.addEventListener('abort', onAbort, { once: true });
+    }),
+  now: () => Date.now(),
+};
+
+/**
+ * Polls a one-photo background-removal job until it settles. It doesn't poll while the tab is hidden, backs
+ * off (and honours 429 Retry-After), and gives up after JOB_WAIT.limitMs of visible waiting (cloud work may be
+ * paused until midnight UTC): the job carries on and the AI queue shows it.
+ */
+export async function waitForJob(
   jobId: string,
   signal: AbortSignal,
-): Promise<{ ok: true } | { ok: false; error: AiItemError | null }> {
+  deps: Partial<JobWaitDeps> = {},
+): Promise<JobWait> {
+  const d = { ...jobWaitDeps, ...deps };
+  let waited = 0;
+  let wait: number = JOB_WAIT.fastMs;
   for (let i = 0; ; i++) {
-    await new Promise((r, rej) => {
-      const t = setTimeout(r, i < 10 ? 2000 : 5000);
-      signal.addEventListener(
-        'abort',
-        () => {
-          clearTimeout(t);
-          rej(new DOMException('Stopped.', 'AbortError'));
-        },
-        {
-          once: true,
-        },
-      );
-    });
-    const d = await getJob(jobId, null, signal);
-    const item = d.items[0];
+    if (i >= JOB_WAIT.fastPolls) wait = Math.min(JOB_WAIT.maxMs, Math.round(wait * 1.5));
+    await d.sleep(wait, signal);
+    await d.visible(signal);
+    waited += wait;
+    if (waited >= JOB_WAIT.limitMs) return { ok: false, timeout: true };
+    let job: Awaited<ReturnType<typeof getJob>>;
+    try {
+      job = await d.get(jobId, null, signal);
+    } catch (e) {
+      if (e instanceof ApiFailure && (e.code === 'rate_limited' || e.code === 'network')) {
+        await d.sleep(Math.min(JOB_WAIT.maxMs, (e.retryAfter ?? 5) * 1000), signal);
+        continue;
+      }
+      throw e;
+    }
+    const item = job.items[0];
     if (item?.status === 'completed') return { ok: true };
     if (item?.status === 'failed' || item?.status === 'canceled') return { ok: false, error: item.error };
-    if (d.job.status === 'done' || d.job.status === 'canceled')
+    if (job.job.status === 'done' || job.job.status === 'canceled')
       return { ok: false, error: item?.error ?? null };
   }
 }
@@ -478,6 +544,13 @@ export function EditorAiPanel({
       const done = await waitForJob(res.job.id, c.signal);
       if (c.signal.aborted) return;
       void refreshAiStatus();
+      if ('timeout' in done) {
+        setBg({
+          s: 'error',
+          text: 'This is taking a while (cloud work may be paused). It carries on: see the AI queue for progress.',
+        });
+        return;
+      }
       if (!done.ok) {
         setBg({
           s: 'failed',

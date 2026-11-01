@@ -59,14 +59,31 @@ describe('device steps', () => {
     if (res.status === 'done') expect(res.changed).toBeGreaterThan(0);
   });
 
-  it('reloads and retries once after a conflict, then reports a failure', async () => {
+  it('fails the photo on a conflict instead of applying the steps again on top (client review #2)', async () => {
     const saveEdit = vi.fn(async () => {
       throw new ApiFailure('conflict', 409);
     });
     const d = deps({ saveEdit });
     const res = await runDeviceSteps(photo, { steps: ['hdr'] }, { owner: 'me', deps: d });
-    expect(saveEdit).toHaveBeenCalledTimes(2);
+    expect(saveEdit).toHaveBeenCalledTimes(1);
     expect(res).toEqual({ status: 'failed', error: 'conflict' });
+  });
+
+  it('leaves alone a photo edited since the job started, so HDR never stacks (client review #2)', async () => {
+    const d = deps();
+    const res = await runDeviceSteps(
+      photo,
+      { steps: ['hdr'] },
+      { owner: 'me', deps: d, since: '2026-10-31T23:00:00Z' }, // the photo's edit is from 1 Nov 00:00
+    );
+    expect(res).toEqual({ status: 'unchanged' });
+    expect(d.saveEdit).not.toHaveBeenCalled();
+    const ok = await runDeviceSteps(
+      photo,
+      { steps: ['hdr'] },
+      { owner: 'me', deps: deps(), since: '2026-11-01T01:00:00Z' },
+    );
+    expect(ok.status).toBe('done');
   });
 
   it('stops the whole job when someone else is signed in or the session ended', async () => {

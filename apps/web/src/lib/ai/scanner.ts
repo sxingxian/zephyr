@@ -3,6 +3,7 @@ import { ApiFailure } from '../api';
 import { originalPreviewUrl, originalThumbUrl } from '../edits';
 import { onSessionEnd, sessionUserId } from '../sessionGuard';
 import { facesPending, postFaces, postSignals, signalsPending } from './api';
+import { FacesStoppedError, ModelError } from './faceErrors';
 
 /**
  * The background scanner (phase 6). While the app is open and idle it measures, one photo at a time:
@@ -39,6 +40,31 @@ export interface ScanDeps {
   idle(signal: AbortSignal): Promise<void>;
   /** Shuts the workers down (stop). */
   stopWorkers(): void;
+  /** Shuts the face worker down (face grouping off): frees the models and the WebAssembly heap. */
+  stopFaceWorker(): void;
+  /** A feature was refused (off in Admin, not on the plan): re-read the AI status. */
+  statusChanged(): void;
+  /** Waits, unless aborted. */
+  sleep(ms: number, signal: AbortSignal): Promise<void>;
+}
+
+/** Retries after 429s: at most this many in a row, each waiting the server's Retry-After (capped). */
+const MAX_RATE_RETRIES = 6;
+const MAX_RETRY_WAIT_S = 120;
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(new DOMException('Stopped.', 'AbortError'));
+    const t = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new DOMException('Stopped.', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 const SIGNAL_BATCH = 25;
@@ -101,6 +127,20 @@ const defaultDeps: ScanDeps = {
     void import('./faces').then((m) => m.stopFaces());
     void import('./signals').then((m) => m.stopSignalsWorker());
   },
+  stopFaceWorker() {
+    void import('./faces').then((m) => m.stopFaces());
+  },
+  statusChanged() {
+    void import('../aiClient').then((m) => m.refreshAiStatus({ fresh: true }));
+  },
+  sleep: abortableSleep,
+};
+
+const IDLE: ScanProgress = {
+  phase: 'idle',
+  signals: { done: 0, remaining: null },
+  faces: { done: 0, remaining: null, total: null },
+  error: null,
 };
 
 export class Scanner {
@@ -109,19 +149,18 @@ export class Scanner {
   private paused = false;
   private resumeWait: (() => void) | null = null;
   private subs = new Set<(p: ScanProgress) => void>();
-  private snap: ScanProgress = {
-    phase: 'idle',
-    signals: { done: 0, remaining: null },
-    faces: { done: 0, remaining: null, total: null },
-    error: null,
-  };
+  private snap: ScanProgress = IDLE;
+  /** The face batch being posted right now (never aborted mid-request: the server may already be storing it). */
+  private facesPosting: Promise<unknown> | null = null;
 
   constructor(private deps: ScanDeps = defaultDeps) {}
 
   /** Starts (or re-targets) the scan for the signed-in member. */
   start(opts: ScanOptions): void {
     const changed = opts.signals !== this.opts.signals || opts.faces !== this.opts.faces;
+    const facesOff = this.opts.faces && !opts.faces;
     this.opts = { ...opts };
+    if (facesOff) this.deps.stopFaceWorker();
     if (this.ctrl && !changed) return;
     this.ctrl?.abort();
     const owner = this.deps.owner();
@@ -141,7 +180,19 @@ export class Scanner {
     this.paused = false;
     this.resumeWait?.();
     this.deps.stopWorkers();
+    // Forget the previous member's counts too (shared devices).
+    this.snap = IDLE;
     this.set({ phase: 'stopped' });
+  }
+  /**
+   * Before face data is deleted: stop finding faces at once, shut the face worker down, and wait for a face
+   * batch already on its way to the server to finish, so nothing lands after the delete. Signals carry on.
+   */
+  async stopFaces(): Promise<void> {
+    if (this.opts.faces) this.start({ signals: this.opts.signals, faces: false });
+    this.deps.stopFaceWorker();
+    this.set({ faces: { done: 0, remaining: null, total: null } });
+    await this.facesPosting?.catch(() => undefined);
   }
   pause(): void {
     if (!this.ctrl || this.paused) return;
@@ -166,7 +217,13 @@ export class Scanner {
   }
 
   private async gate(owner: string, signal: AbortSignal) {
-    while (this.paused && !signal.aborted) await new Promise<void>((r) => (this.resumeWait = r));
+    while (this.paused && !signal.aborted) {
+      // Ends on resume, and on abort (re-targeted or stopped while paused), so no run is left hanging.
+      await new Promise<void>((r) => {
+        this.resumeWait = r;
+        signal.addEventListener('abort', () => r(), { once: true });
+      });
+    }
     if (signal.aborted) throw new DOMException('Stopped.', 'AbortError');
     await this.deps.idle(signal);
     if (this.deps.owner() !== owner) throw new DOMException('Signed in as someone else.', 'AbortError');
@@ -178,9 +235,31 @@ export class Scanner {
       if (this.opts.faces) await this.facesPass(owner, signal);
       if (!signal.aborted) this.set({ phase: 'done' });
     } catch (e) {
-      if (signal.aborted || (e as Error).name === 'AbortError') return;
-      if (e instanceof ApiFailure && (e.code === 'unauthenticated' || e.code === 'session_changed')) {
+      if (signal.aborted || (e as Error).name === 'AbortError' || e instanceof FacesStoppedError) return;
+      if (
+        e instanceof ApiFailure &&
+        (e.code === 'unauthenticated' ||
+          e.code === 'session_changed' ||
+          e.code === 'account_pending_deletion')
+      ) {
         this.stop();
+        return;
+      }
+      if (e instanceof ApiFailure && (e.code === 'feature_off' || e.code === 'plan_required')) {
+        // Switched off in Admin, by the member on another device, or the plan lapsed: no more face work here.
+        this.opts = { ...this.opts, faces: false };
+        this.deps.stopFaceWorker();
+        this.deps.statusChanged();
+        this.set({ phase: 'idle', error: null });
+        return;
+      }
+      if (e instanceof ModelError) {
+        // Not this photo's fault: end the faces pass and try again on a later start (with back-off).
+        this.deps.stopFaceWorker();
+        this.set({
+          phase: 'error',
+          error: 'The face models couldn’t be loaded. Zephyr will try again later.',
+        });
         return;
       }
       this.set({ phase: 'error', error: (e as Error).message });
@@ -210,6 +289,7 @@ export class Scanner {
       batch: number;
     },
   ) {
+    type Page = Awaited<ReturnType<typeof o.page>>;
     const failed = new Set<string>();
     let done = 0;
     let cursor: string | null = null;
@@ -221,7 +301,8 @@ export class Scanner {
       );
     for (;;) {
       this.set({ phase: o.phase });
-      const page = await o.page(cursor);
+      const at: string | null = cursor;
+      const page: Page = await this.polite(() => o.page(at), signal);
       report(page.remaining, page.total);
       const todo = page.photos.filter((p) => !failed.has(p.id));
       if (!todo.length) {
@@ -233,7 +314,8 @@ export class Scanner {
       const flush = async () => {
         if (!items.length) return;
         const n = items.length;
-        await o.post(items.splice(0));
+        const batch = items.splice(0);
+        await this.polite(() => o.post(batch), signal);
         done += n;
         report(Math.max(0, page.remaining - done), page.total);
       };
@@ -242,7 +324,8 @@ export class Scanner {
         try {
           items.push(await o.one(p));
         } catch (e) {
-          if ((e as Error).name === 'AbortError') throw e;
+          if ((e as Error).name === 'AbortError' || e instanceof ModelError || e instanceof FacesStoppedError)
+            throw e;
           failed.add(p.id); // undecodable, or gone: skipped for this session
         }
         if (items.length >= o.batch) await flush();
@@ -251,6 +334,19 @@ export class Scanner {
       const allFailed = todo.every((p) => failed.has(p.id));
       if (allFailed && !page.nextCursor) return;
       cursor = allFailed ? page.nextCursor : null;
+    }
+  }
+
+  /** Runs a request, waiting out 429s (Retry-After, capped) a few times before giving up. */
+  private async polite<T>(call: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    for (let tries = 0; ; tries++) {
+      try {
+        return await call();
+      } catch (e) {
+        if (!(e instanceof ApiFailure && e.code === 'rate_limited') || tries >= MAX_RATE_RETRIES) throw e;
+        const wait = Math.min(e.retryAfter ?? 30, MAX_RETRY_WAIT_S) * 1000;
+        await this.deps.sleep(wait + Math.floor(Math.random() * 1000), signal);
+      }
     }
   }
 
@@ -269,7 +365,15 @@ export class Scanner {
       phase: 'faces',
       page: (cursor) => this.deps.facesPending(cursor, signal),
       one: async (p) => ({ id: p.id, faces: await this.deps.faces(p.id, signal) }),
-      post: (items) => this.deps.postFaces(items, owner, signal),
+      // Not aborted once sent: stopFaces() waits for it instead, so face data can't land after a delete.
+      post: (items) => {
+        if (signal.aborted) return Promise.reject(new DOMException('Stopped.', 'AbortError'));
+        const p = this.deps.postFaces(items, owner);
+        this.facesPosting = p;
+        return p.finally(() => {
+          if (this.facesPosting === p) this.facesPosting = null;
+        });
+      },
       batch: FACE_BATCH,
     });
   }

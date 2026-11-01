@@ -31,9 +31,12 @@ async function loadCleanup(signal: AbortSignal): Promise<CleanupResult> {
     cursor = page.nextCursor;
     if (!cursor) break;
   }
-  const { groupCleanup } = await import('../lib/ai/cleanup');
-  return groupCleanup(photos);
+  const { groupCleanupOffThread } = await import('../lib/ai/cleanupRun');
+  return groupCleanupOffThread(photos, signal);
 }
+
+/** Sets and blurry photos rendered at a time ("Show more" adds as many again). */
+export const CLEANUP_PAGE = { sets: 30, blurry: 120 } as const;
 
 /** Everything but each group's best photo is ticked for the Trash, and every blurry photo. */
 export function defaultTrash(r: CleanupResult): Set<string> {
@@ -89,6 +92,8 @@ export function CleanupPage() {
   /** Photos ticked for the Trash. */
   const [trash, setTrash] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState<string | null>(null);
+  /** How many sets (or blurry photos) are rendered: a big library is shown a page at a time. */
+  const [limit, setLimit] = useState(1);
   const state = status?.features.cleanup;
   const on = Boolean(status?.enabled && state === 'on');
 
@@ -117,10 +122,17 @@ export function CleanupPage() {
         ? result.bursts
         : []
     : [];
+  const visibleGroups = groups.slice(0, CLEANUP_PAGE.sets * limit);
+  const visibleBlurry = result ? result.blurry.slice(0, CLEANUP_PAGE.blurry * limit) : [];
+  const more =
+    tab === 'blurry'
+      ? (result?.blurry.length ?? 0) > visibleBlurry.length
+      : groups.length > visibleGroups.length;
+  // Only what's on screen can be moved to the Trash: never photos the member hasn't seen.
   const shown: CleanupPhoto[] = result
     ? tab === 'blurry'
-      ? result.blurry
-      : groups.flatMap((g) => g.photos)
+      ? visibleBlurry
+      : visibleGroups.flatMap((g) => g.photos)
     : [];
   const picked = shown.filter((p) => trash.has(p.id));
   const savings = picked.reduce((n, p) => n + p.sizeBytes, 0);
@@ -211,7 +223,10 @@ export function CleanupPage() {
           <Segmented
             label="Cleanup type"
             value={tab}
-            onChange={setTab}
+            onChange={(t) => {
+              setTab(t);
+              setLimit(1);
+            }}
             options={[
               { value: 'duplicates', label: `Duplicates · ${plural(result.duplicates.length, 'set')}` },
               { value: 'blurry', label: `Blurry · ${result.blurry.length}` },
@@ -243,7 +258,7 @@ export function CleanupPage() {
             <EmptyHint title="No blurry photos found" />
           ) : (
             <div className="ai-clean__grid">
-              {result.blurry.map((p) => (
+              {visibleBlurry.map((p) => (
                 <div key={p.id} className="ai-clean__cell">
                   <Tile
                     p={p}
@@ -268,7 +283,7 @@ export function CleanupPage() {
           <EmptyHint title={tab === 'duplicates' ? 'No duplicates found' : 'No similar bursts found'} />
         ) : (
           <div className="ai-clean__sets">
-            {groups.map((g) => {
+            {visibleGroups.map((g) => {
               const first = g.photos[0];
               return (
                 <article key={g.keep} className="ai-clean__set">
@@ -311,6 +326,11 @@ export function CleanupPage() {
               );
             })}
           </div>
+        )}
+        {more && (
+          <Button kind="ghost" onClick={() => setLimit((n) => n + 1)}>
+            Show more
+          </Button>
         )}
         <Note tone="neutral" icon="monitor">
           Duplicates and blurry photos are found on your devices from the previews. Nothing about them leaves

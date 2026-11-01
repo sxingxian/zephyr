@@ -2,7 +2,7 @@ import type { AiItemError, AiJobItem, AiJobPage, AiJobSummary } from '@zephyr/sh
 import { Button, Chip, Icon, Note, Spinner, useToast } from '@zephyr/ui';
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router';
-import { AiPausedNote, CloudPausedBanner, CreditStrip, plural } from '../components/ai/AiBits';
+import { AiPausedNote, CloudPausedBanner, ConfirmDialog, CreditStrip, plural } from '../components/ai/AiBits';
 import { Segmented } from '../components/LibraryBits';
 import { Shell } from '../components/Shell';
 import {
@@ -140,7 +140,12 @@ function CloudItems({ job, per, onChanged }: { job: AiJobSummary; per: number; o
               </td>
               <td className="aiq-act">
                 {it.status === 'failed' && it.retryable && (
-                  <Button size="sm" busy={busy === it.id} onClick={() => void retry(it.id)}>
+                  <Button
+                    size="sm"
+                    busy={busy === it.id}
+                    disabled={busy !== null}
+                    onClick={() => void retry(it.id)}
+                  >
                     Retry · {plural(per, 'credit')}
                   </Button>
                 )}
@@ -179,6 +184,7 @@ function JobCard({
 }) {
   const toast = useToast();
   const [busy, setBusy] = useState<string | null>(null);
+  const [confirmRetry, setConfirmRetry] = useState(false);
   const [showItems, setShowItems] = useState(job.kind === 'bg_removal' && job.status !== 'done');
   const c = job.counts;
   const cloud = job.kind === 'bg_removal';
@@ -278,10 +284,10 @@ function JobCard({
             <Button
               size="sm"
               icon="refresh"
-              busy={busy === 'retry'}
-              onClick={() => void run('retry', () => retryJob(job.id))}
+              disabled={busy !== null || confirmRetry}
+              onClick={() => setConfirmRetry(true)}
             >
-              Retry all failed
+              {`Retry all failed · ${plural(c.failed * per, 'credit')}`}
             </Button>
           )}
           {live && (
@@ -301,6 +307,25 @@ function JobCard({
           )}
         </div>
       </div>
+      <ConfirmDialog
+        open={confirmRetry}
+        title={`Retry ${plural(c.failed, 'failed photo')}?`}
+        confirm={`Retry · up to ${plural(c.failed * per, 'credit')}`}
+        onClose={() => setConfirmRetry(false)}
+        onConfirm={async () => {
+          setBusy('retry');
+          try {
+            await retryJob(job.id);
+            void refreshAiStatus();
+            onChanged();
+          } finally {
+            setBusy(null);
+          }
+        }}
+      >
+        Each photo is charged again ({plural(per, 'credit')} a photo). Photos that fail again are refunded,
+        and photos that can’t be retried (deleted ones) aren’t charged.
+      </ConfirmDialog>
       <Progress job={job} />
       <div className="aiq-counts">
         {counts.filter(Boolean).map((t) => (

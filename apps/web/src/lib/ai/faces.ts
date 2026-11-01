@@ -1,4 +1,5 @@
 import { FACE_LIMITS, type FaceInput } from '@zephyr/shared/client';
+import { FacesStoppedError, ModelError } from './faceErrors';
 import { embeddingToBase64, type FaceDetection } from './facesCore';
 
 export type { FaceDetection } from './facesCore';
@@ -14,21 +15,48 @@ let worker: Worker | null = null;
 let seq = 0;
 const waiting = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 
+/**
+ * A failed model download or integrity check is remembered for this page session, with a growing back-off
+ * (1 minute, doubling up to an hour), so a broken deploy or a proxy serving the wrong bytes never makes every
+ * photo download the 10 MB model again. Calls in the back-off window fail at once with ModelError.
+ */
+const BACKOFF_START_MS = 60_000;
+const BACKOFF_MAX_MS = 60 * 60_000;
+let blockedUntil = 0;
+let backoff = BACKOFF_START_MS;
+let now = () => Date.now();
+function modelFailed(message: string): ModelError {
+  blockedUntil = now() + backoff;
+  backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
+  return new ModelError(message);
+}
+/** Test hook: a clock, and forgetting the back-off. */
+export function _resetFacesForTest(clock?: () => number): void {
+  blockedUntil = 0;
+  backoff = BACKOFF_START_MS;
+  now = clock ?? (() => Date.now());
+}
+
+type Reply = { n: number; error?: string; model?: boolean; faces?: unknown; codes?: unknown };
 function getWorker(): Worker {
   if (worker) return worker;
   worker = new Worker(new URL('./faces.worker.ts', import.meta.url), { type: 'module', name: 'faces' });
-  worker.onmessage = (e: MessageEvent<{ n: number; error?: string; faces?: unknown; codes?: unknown }>) => {
+  worker.onmessage = (e: MessageEvent<Reply>) => {
     const w = waiting.get(e.data.n);
     if (!w) return;
     waiting.delete(e.data.n);
-    if (e.data.error) w.reject(new Error(e.data.error));
-    else w.resolve(e.data.faces ?? e.data.codes);
+    if (e.data.error) w.reject(e.data.model ? modelFailed(e.data.error) : new Error(e.data.error));
+    else {
+      backoff = BACKOFF_START_MS;
+      w.resolve(e.data.faces ?? e.data.codes);
+    }
   };
   worker.onerror = () => stopFaces();
   return worker;
 }
 
 async function ask<T>(msg: Record<string, unknown>, bitmap: ImageBitmap): Promise<T> {
+  if (now() < blockedUntil) throw new ModelError();
   // A copy for the worker: transferring would take the caller's bitmap away.
   const copy = await createImageBitmap(bitmap);
   return new Promise<T>((resolve, reject) => {
@@ -72,10 +100,14 @@ export async function facesForGrouping(bitmap: ImageBitmap): Promise<FaceInput[]
   }));
 }
 
-/** Stops the worker (session end, or after an error). Pending calls are rejected. */
+/**
+ * Stops the worker (session end, face grouping turned off, or after an error) and frees its models and
+ * WebAssembly heap. Pending calls are rejected with FacesStoppedError.
+ */
 export function stopFaces(): void {
   worker?.terminate();
   worker = null;
-  for (const w of waiting.values()) w.reject(new DOMException('Stopped.', 'AbortError'));
+  for (const w of waiting.values()) w.reject(new FacesStoppedError());
   waiting.clear();
 }
+export { FacesStoppedError, ModelError } from './faceErrors';

@@ -122,9 +122,18 @@
     - **Admin:** any change that could raise spend or turn something on needs a passkey sign-in in the last 10
       minutes, is audited with a before/after diff and emails every Owner; switching things off or lowering a cap
       saves at once, so a one-person team can always pull the kill switch.
-    - **Shared devices:** AI writes carry `X-Zephyr-Expected-User`; device-job leases belong to a sign-in session.
-      Masks are served to their owner only, privately cached but revalidated on every use (`no-cache` + ETag), so a
-      browser never shows a mask its member can no longer read.
+    - **Shared devices:** AI writes (and bulk photo actions) carry `X-Zephyr-Expected-User`, captured when the work
+      began. Device-job leases belong to a sign-in session and to one tab's random runner token; a Web Lock keeps a
+      second tab of the browser off the same job, and a photo edited after its job started is left alone, so
+      steps never stack. Masks are served to their owner only, privately cached but revalidated on every use
+      (`no-cache` + ETag), so a browser never shows a mask its member can no longer read. Sign-out, an account
+      switch or pending deletion stop the scanner, the face worker and device jobs, and forget the AI status,
+      the scanner's counts and decoded masks; a status request is never shared across members.
+    - **On the device:** "Turn off and delete" stops the face pass and waits for a face batch already sent before
+      deleting; turning faces off anywhere (or a 403 `feature_off` / `plan_required`) shuts the face worker
+      down. A model that fails to download or verify is remembered with a growing back-off, so it's never
+      re-downloaded per photo. 429s are waited out with their Retry-After. Spending actions show their credit
+      cost and ask first ("Retry all failed").
     - **Account deletion:** scheduling it deletes face data, cancels and refunds pending cloud work, and the scene
       backfill and the queue consumer skip the account.
 

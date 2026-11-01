@@ -46,12 +46,21 @@ export const patchPhoto = (id: string, body: PhotoPatchBody) =>
   api<PhotoItem | { photo: PhotoItem }>(LIBRARY_API.photo(id), { method: 'PATCH', body }).then(unwrapPhoto);
 
 const BULK_MAX = 500;
-/** POST /photos/bulk, split into requests of at most 500 ids. Returns the total affected. */
-export async function bulk(ids: string[], action: BulkBody['action'], albumId?: string): Promise<number> {
+/**
+ * POST /photos/bulk, split into requests of at most 500 ids. Returns the total affected. Every chunk names the
+ * member signed in when the action began (X-Zephyr-Expected-User), so a long multi-chunk action never carries
+ * on under someone who signed in meanwhile (409 session_changed).
+ */
+export async function bulk(
+  ids: string[],
+  action: BulkBody['action'],
+  albumId?: string,
+  owner: string | null = sessionUserId(),
+): Promise<number> {
   let affected = 0;
   for (let i = 0; i < ids.length; i += BULK_MAX) {
     const body: BulkBody = { ids: ids.slice(i, i + BULK_MAX), action, ...(albumId ? { albumId } : {}) };
-    const r = await api<BulkResult>(LIBRARY_API.photosBulk, { body });
+    const r = await api<BulkResult>(LIBRARY_API.photosBulk, { body, headers: ownerHeader(owner) });
     affected += r.affected;
   }
   return affected;

@@ -15,8 +15,9 @@ import type { AiProxy } from './proxy';
 
 /**
  * Runs a device job's steps on one photo (phase 6): auto-enhance, HDR & interior balance and colour match, in
- * that order, on the photo's proxy, then saves the result as a normal edit (PUT with the base version; on a
- * conflict it reloads the photo's edit once and starts again). Only sliders change: the crop, detail,
+ * that order, on the photo's proxy, then saves the result as a normal edit (PUT with the base version). A
+ * conflict (the photo was edited elsewhere meanwhile) fails the photo instead of applying the steps again on
+ * top of the other edit. Only sliders change: the crop, detail,
  * effects and cut-out the photo already has are kept. The thumbnails are then re-rendered in the background.
  *
  * Everything is done for `ctx.owner`, the member who started the job: if someone else is signed in by the
@@ -48,6 +49,12 @@ export interface RunContext {
   signal?: AbortSignal;
   /** The colour-match reference, loaded once per job (loadReference). Required when the steps include it. */
   reference?: Reference;
+  /**
+   * When the job was created (server time). A photo whose edit changed after that is left alone: either this
+   * job already processed it (a run whose progress report was lost) or the member edited it meanwhile; applying
+   * the steps again would stack HDR and contrast on top.
+   */
+  since?: string;
   deps?: Partial<RunDeps>;
 }
 export type RunResult =
@@ -158,27 +165,29 @@ export async function runDeviceSteps(
   const skinWanted = params.steps.includes('auto_enhance') && (params.skin ?? true);
   let faces: FaceBox[] | null = null;
   try {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      abortIf(signal);
-      if (d.owner() !== owner) throw new DOMException('Signed in as someone else.', 'AbortError');
-      const edit = await d.getEdit(photo.id, signal);
-      const base = normalizeRecipe(edit?.recipe);
-      const proxy = await d.loadProxy(photo, base, signal);
-      if (skinWanted && faces === null) faces = await d.faces(photo, signal);
-      abortIf(signal);
-      const next = await applySteps(proxy, base, params, faces ?? [], ctx.reference);
-      if (recipeJson(next) === recipeJson(base)) return { status: 'unchanged' };
-      try {
-        const saved = await d.saveEdit(photo.id, next, edit?.version ?? null, owner, signal);
-        d.saved(photo, saved, owner);
-        const { changedSliders } = await import('./enhance');
-        return { status: 'done', edit: saved, changed: changedSliders(base, next) };
-      } catch (e) {
-        if (e instanceof ApiFailure && e.code === 'conflict' && attempt === 0) continue; // edited elsewhere: once more
-        throw e;
-      }
+    abortIf(signal);
+    if (d.owner() !== owner) throw new DOMException('Signed in as someone else.', 'AbortError');
+    const edit = await d.getEdit(photo.id, signal);
+    if (ctx.since && edit?.updatedAt && Date.parse(edit.updatedAt) > Date.parse(ctx.since)) {
+      return { status: 'unchanged' }; // edited since the job started: never stack the steps twice
     }
-    return { status: 'failed', error: 'conflict' };
+    const base = normalizeRecipe(edit?.recipe);
+    const proxy = await d.loadProxy(photo, base, signal);
+    if (skinWanted && faces === null) faces = await d.faces(photo, signal);
+    abortIf(signal);
+    const next = await applySteps(proxy, base, params, faces ?? [], ctx.reference);
+    if (recipeJson(next) === recipeJson(base)) return { status: 'unchanged' };
+    try {
+      const saved = await d.saveEdit(photo.id, next, edit?.version ?? null, owner, signal);
+      d.saved(photo, saved, owner);
+      const { changedSliders } = await import('./enhance');
+      return { status: 'done', edit: saved, changed: changedSliders(base, next) };
+    } catch (e) {
+      // Edited elsewhere while this ran (another tab or device, or the member): fail this photo rather than
+      // re-applying the steps on top of that edit.
+      if (e instanceof ApiFailure && e.code === 'conflict') return { status: 'failed', error: 'conflict' };
+      throw e;
+    }
   } catch (e) {
     if (stopping(e)) throw e;
     if (e instanceof ApiFailure) return { status: 'failed', error: e.code };

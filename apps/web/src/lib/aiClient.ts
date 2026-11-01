@@ -21,7 +21,7 @@ import {
   type SceneSummary,
 } from '@zephyr/shared/client';
 import { useEffect, useSyncExternalStore } from 'react';
-import { api } from './api';
+import { ApiFailure, api } from './api';
 import { expectedUser } from './library';
 import { onSessionEnd, sessionUserId } from './sessionGuard';
 
@@ -38,6 +38,28 @@ const q = (params: Record<string, string | undefined | null>) => {
 };
 const write = <T>(path: string, method: 'POST' | 'PATCH' | 'DELETE', body?: unknown) =>
   api<T>(path, { method, body: method === 'DELETE' ? undefined : (body ?? {}), headers: expectedUser() });
+
+/**
+ * Face writes (rename, merge, move) answer 429 with a short Retry-After while another face request of the
+ * member holds the server's faces lock (a scan batch, say). Wait it out a couple of times before showing it.
+ */
+export async function politely<T>(
+  call: () => Promise<T>,
+  tries = 2,
+  sleep = (ms: number) => new Promise((r) => setTimeout(r, ms)),
+): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await call();
+    } catch (e) {
+      if (!(e instanceof ApiFailure && e.code === 'rate_limited') || i >= tries || (e.retryAfter ?? 60) > 15)
+        throw e;
+      await sleep((e.retryAfter ?? 5) * 1000);
+    }
+  }
+}
+const faceWrite = <T>(path: string, method: 'POST' | 'PATCH' | 'DELETE', body?: unknown) =>
+  politely(() => write<T>(path, method, body));
 
 // ---------------------------------------------------------------- status, settings, credits
 export const fetchAiStatus = (signal?: AbortSignal) => api<AiStatusResult>(AI_API.status, { signal });
@@ -56,8 +78,8 @@ export const createJob = (body: AiJobCreateBody) => write<AiJobCreateResult>(AI_
 export const cancelJob = (id: string) => write<{ ok: true; job: AiJobSummary }>(AI_API.job(id), 'DELETE');
 export const retryJob = (id: string, itemIds?: string[]) =>
   write<{ ok: true; job: AiJobSummary }>(AI_API.jobRetry(id), 'POST', itemIds ? { itemIds } : {});
-export const claimJob = (id: string, device: string) =>
-  write<DeviceClaimResult>(AI_API.jobClaim(id), 'POST', { device });
+export const claimJob = (id: string, device: string, runner?: string) =>
+  write<DeviceClaimResult>(AI_API.jobClaim(id), 'POST', runner ? { device, runner } : { device });
 export const postProgress = (id: string, body: DeviceProgressBody, owner: string) =>
   api<{ ok: true; job: AiJobSummary }>(AI_API.jobProgress(id), {
     method: 'POST',
@@ -80,15 +102,27 @@ export const fetchPeople = (hidden = false, signal?: AbortSignal) =>
 export const fetchPerson = (id: string, signal?: AbortSignal) =>
   api<{ ok: true; person: PersonSummary }>(AI_API.person(id), { signal });
 export const patchPerson = (id: string, body: PersonPatchBody) =>
-  write<{ ok: true; person: PersonSummary }>(AI_API.person(id), 'PATCH', body);
+  faceWrite<{ ok: true; person: PersonSummary }>(AI_API.person(id), 'PATCH', body);
 export const mergePeople = (id: string, from: string[]) =>
-  write<{ ok: true; person: PersonSummary }>(AI_API.personMerge(id), 'POST', { from });
+  faceWrite<{ ok: true; person: PersonSummary }>(AI_API.personMerge(id), 'POST', { from });
 export const personFaces = (id: string, body: PersonFacesBody) =>
-  write<{ ok: true; person: PersonSummary }>(AI_API.personFaces(id), 'POST', body);
+  faceWrite<{ ok: true; person: PersonSummary }>(AI_API.personFaces(id), 'POST', body);
 export const fetchSuggestions = (signal?: AbortSignal) =>
   api<{ ok: true; suggestions: FaceSuggestion[] }>(AI_API.suggestions, { signal });
-/** Turns face grouping off and deletes every face, person and name. */
-export const deleteFaceData = () => write<void>(AI_API.faces, 'DELETE');
+/** Turns face grouping off and deletes every face, person and name. Use turnOffFaceGrouping() from the UI. */
+export const deleteFaceData = () => faceWrite<void>(AI_API.faces, 'DELETE');
+
+/**
+ * "Turn off and delete": first stops this tab finding faces and waits for a face batch already on its way, so
+ * nothing lands after the delete; then deletes; then reads a fresh status (never a request that started before
+ * the delete), so the switch and the scanner see "off" straight away.
+ */
+export async function turnOffFaceGrouping(): Promise<void> {
+  const { scanner } = await import('./ai/scanner');
+  await scanner.stopFaces();
+  await deleteFaceData();
+  await refreshAiStatus({ fresh: true });
+}
 
 // ---------------------------------------------------------------- device label
 /** "Chrome on Mac", "Safari on iPhone"… shown on device jobs. Never more than DEVICE_LABEL_MAX characters. */
@@ -140,20 +174,31 @@ export function isAiStatus(x: unknown): x is AiStatus {
 }
 let current: AiStatus | null = null;
 let running = 0;
-let inflight: Promise<void> | null = null;
+/** The status request in flight, for one member: a request made for someone else is never shared. */
+let inflight: { owner: string; p: Promise<void> } | null = null;
+/** Requests are numbered; an older answer never overwrites a newer one. */
+let seqStarted = 0;
+let seqApplied = 0;
 let ownerOfStatus: string | null = null;
 const subs = new Set<() => void>();
 const emit = () => {
   for (const s of subs) s();
 };
 
-/** Re-reads the AI status (and the running-jobs count for the nav). Concurrent calls share one request. */
-export function refreshAiStatus(): Promise<void> {
+/**
+ * Re-reads the AI status (and the running-jobs count for the nav). Concurrent calls for the same member share
+ * one request; `fresh` always starts a new one (after a change that the shared request may predate).
+ */
+export function refreshAiStatus(opts: { fresh?: boolean } = {}): Promise<void> {
   const owner = sessionUserId();
   if (!owner) return Promise.resolve();
-  inflight ??= Promise.all([fetchAiStatus(), listJobs('running').catch(() => null)])
+  if (!opts.fresh && inflight?.owner === owner) return inflight.p;
+  const seq = ++seqStarted;
+  const p = Promise.all([fetchAiStatus(), listJobs('running').catch(() => null)])
     .then(([s, jobs]) => {
-      if (sessionUserId() !== owner || !isAiStatus(s)) return; // someone else signed in meanwhile, or not a status
+      // Someone else signed in meanwhile, not a status, or a newer answer already arrived.
+      if (sessionUserId() !== owner || !isAiStatus(s) || seq < seqApplied) return;
+      seqApplied = seq;
       const { ok: _ok, ...status } = s;
       current = status;
       ownerOfStatus = owner;
@@ -164,9 +209,10 @@ export function refreshAiStatus(): Promise<void> {
       // Keep the last known status; the next poll tries again.
     })
     .finally(() => {
-      inflight = null;
+      if (inflight?.p === p) inflight = null;
     });
-  return inflight;
+  inflight = { owner, p };
+  return p;
 }
 /** Sets the status from a response that carried it (settings PATCH). */
 export function setAiStatus(s: AiStatusResult | AiStatus): void {
@@ -177,6 +223,9 @@ export function setAiStatus(s: AiStatusResult | AiStatus): void {
   const { ok: _ok, ...status } = s as AiStatusResult;
   current = status;
   ownerOfStatus = sessionUserId();
+  // A status from a write is the newest there is: answers to requests started earlier are ignored.
+  seqApplied = seqStarted + 1;
+  seqStarted = seqApplied;
   emit();
 }
 export function setRunningJobs(n: number): void {
@@ -192,6 +241,8 @@ export function resetAiStatus(): void {
   current = null;
   running = 0;
   ownerOfStatus = null;
+  inflight = null;
+  seqApplied = seqStarted;
   emit();
 }
 onSessionEnd(() => resetAiStatus());

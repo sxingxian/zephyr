@@ -1,6 +1,7 @@
 import type { CleanupPhoto } from '@zephyr/shared/client';
 import { describe, expect, it } from 'vitest';
-import { groupCleanup, hamming, hashBits } from './cleanup';
+import { groupCleanup, hamming, hashBits, MAX_BURST_NEIGHBOURS } from './cleanup';
+import { groupCleanupOffThread } from './cleanupRun';
 
 let n = 0;
 const P = (phash: string, o: Partial<CleanupPhoto> = {}): CleanupPhoto => ({
@@ -66,5 +67,24 @@ describe('cleanup grouping', () => {
       P('5555555555555555', { takenAt: day, sharpness: 450 }),
     ]);
     expect(r.blurry.map((p) => p.sharpness)).toEqual([20]);
+  });
+
+  it('stays fast when thousands of photos share one time (a camera with no clock), client review #9', () => {
+    // Random-looking hashes so no duplicates; every photo at the same instant.
+    let x = 0x9e3779b97f4a7c15n;
+    const photos = Array.from({ length: 6000 }, () => {
+      x = (x * 6364136223846793005n + 1442695040888963407n) & 0xffffffffffffffffn;
+      return P(x.toString(16).padStart(16, '0'), { takenAt: '2001-01-01T00:00:00Z' });
+    });
+    const t0 = performance.now();
+    groupCleanup(photos);
+    expect(performance.now() - t0).toBeLessThan(3000);
+    expect(MAX_BURST_NEIGHBOURS).toBeLessThanOrEqual(64);
+  });
+
+  it('groups on the main thread when there are no workers (tests, old browsers)', async () => {
+    const base = 'a5c3f00f12345678';
+    const r = await groupCleanupOffThread([P(base), P(flip(base, 3))]);
+    expect(r.duplicates).toHaveLength(1);
   });
 });

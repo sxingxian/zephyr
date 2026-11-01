@@ -14,6 +14,9 @@ import { CLEANUP, type CleanupPhoto } from '@zephyr/shared/client';
  * Each group is ordered best first: sharpest, then largest file, then earliest. The best one is kept; the
  * others are offered for the Trash. Photos marked "Not duplicates" / "Keep" are left out.
  */
+/** Later photos each photo is compared with in the burst sweep (bounds the work for clock-less cameras). */
+export const MAX_BURST_NEIGHBOURS = 64;
+
 export interface CleanupGroup {
   /** Best first. */
   photos: CleanupPhoto[];
@@ -141,10 +144,13 @@ export function groupCleanup(photos: CleanupPhoto[]): CleanupResult {
     .map((p) => ({ p, t: Date.parse(p.takenAt as string) }))
     .filter((x) => Number.isFinite(x.t))
     .sort((a, b) => a.t - b.t || (a.p.id < b.p.id ? -1 : 1));
+  // Each photo is compared with at most MAX_BURST_NEIGHBOURS later ones: a camera without a clock can give
+  // thousands of photos the same time, which would otherwise be a quadratic sweep.
   const ufb = new UnionFind();
   for (let i = 0; i < timed.length; i++) {
     const a = timed[i] as { p: CleanupPhoto; t: number };
-    for (let j = i + 1; j < timed.length; j++) {
+    const end = Math.min(timed.length, i + 1 + MAX_BURST_NEIGHBOURS);
+    for (let j = i + 1; j < end; j++) {
       const b = timed[j] as { p: CleanupPhoto; t: number };
       if (b.t - a.t > CLEANUP.burstSeconds * 1000) break;
       if (hamming(hashes.get(a.p.id) as bigint, hashes.get(b.p.id) as bigint) <= CLEANUP.burstBits)

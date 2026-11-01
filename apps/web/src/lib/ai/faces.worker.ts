@@ -17,7 +17,18 @@ async function sha256(buf: ArrayBuffer): Promise<string> {
   return Array.from(d, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** A model that couldn't be downloaded or verified: the main thread backs off instead of retrying per photo. */
+class ModelLoadError extends Error {}
+
 async function loadModel(m: { file: string; sha256: string }): Promise<Uint8Array> {
+  try {
+    return await fetchModel(m);
+  } catch (e) {
+    throw new ModelLoadError(String((e as Error)?.message ?? e));
+  }
+}
+
+async function fetchModel(m: { file: string; sha256: string }): Promise<Uint8Array> {
   const url = MODEL_PATH + m.file;
   const cache = 'caches' in self ? await caches.open(MODEL_CACHE).catch(() => null) : null;
   const hit = await cache?.match(url);
@@ -71,7 +82,10 @@ function pixels(bmp: ImageBitmap): Rgba {
 self.onmessage = async (e: MessageEvent<Req>) => {
   const r = e.data;
   try {
-    const eng = await getEngine();
+    const eng = await getEngine().catch((err: unknown) => {
+      // onnxruntime or the detector itself couldn't start: as bad as a missing model.
+      throw err instanceof ModelLoadError ? err : new ModelLoadError(String((err as Error)?.message ?? err));
+    });
     const img = pixels(r.bitmap);
     r.bitmap.close();
     if (r.op === 'detect') {
@@ -84,6 +98,15 @@ self.onmessage = async (e: MessageEvent<Req>) => {
       );
     }
   } catch (err) {
-    (self as unknown as Worker).postMessage({ n: r.n, error: String((err as Error)?.message ?? err) });
+    try {
+      r.bitmap.close();
+    } catch {
+      // already closed
+    }
+    (self as unknown as Worker).postMessage({
+      n: r.n,
+      error: String((err as Error)?.message ?? err),
+      model: err instanceof ModelLoadError,
+    });
   }
 };

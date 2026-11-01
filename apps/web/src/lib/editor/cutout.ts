@@ -194,19 +194,24 @@ export interface MaskDeps {
   fetchMask(photoId: string, maskId: string, signal?: AbortSignal): Promise<Blob>;
   decode(blob: Blob): Promise<{ width: number; height: number; data: Uint8Array }>;
 }
-const defaultDeps: MaskDeps = {
+export const defaultMaskDeps: MaskDeps = {
   async fetchMask(photoId, maskId, signal) {
-    // Owner-only route; the mask id is unique, so the browser may cache it privately.
-    const res = await fetch(AI_API.mask(photoId, maskId), { credentials: 'same-origin', signal });
+    // Owner-only route, served `private, no-cache` with an ETag: the browser revalidates every time (one
+    // ownership check, usually a 304), so a signed-out or switched session never reads a cached mask.
+    const res = await fetch(AI_API.mask(photoId, maskId), {
+      credentials: 'same-origin',
+      cache: 'no-cache',
+      signal,
+    });
     if (!res.ok) throw new ApiFailure(res.status === 404 ? 'not_found' : 'server', res.status);
     return res.blob();
   },
   decode: decodeMaskPng,
 };
-let deps: MaskDeps = defaultDeps;
+let deps: MaskDeps = defaultMaskDeps;
 /** Tests swap the network and decoder. */
 export function setMaskDeps(d: Partial<MaskDeps> | null): void {
-  deps = d ? { ...defaultDeps, ...d } : defaultDeps;
+  deps = d ? { ...defaultMaskDeps, ...d } : defaultMaskDeps;
 }
 
 /** Loads (once) and decodes a photo's mask. Concurrent calls share one request. */

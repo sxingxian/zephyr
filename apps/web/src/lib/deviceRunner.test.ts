@@ -4,6 +4,7 @@ import { deviceLabel } from './aiClient';
 import { ApiFailure } from './api';
 import { DeviceRunner, type RunnerDeps } from './deviceRunner';
 
+const RUNNER = 'AbCdEfGhIjKlMnOpQrStUv';
 const PARAMS: DeviceJobParams = { steps: ['auto_enhance'], strength: 70, skin: true };
 const job = (id = 'j1', params: DeviceJobParams = PARAMS) =>
   ({ id, params }) as Pick<AiJobSummary, 'id' | 'params'>;
@@ -14,7 +15,7 @@ function deps(over: Partial<RunnerDeps> = {}) {
     progressCalls: [],
     owner: () => 'u1',
     claim: vi.fn(async (id: string) => ({
-      job: { id, params: PARAMS } as AiJobSummary,
+      job: { id, params: PARAMS, createdAt: '2026-11-01T00:00:00Z' } as AiJobSummary,
       remaining: ['a', 'b', 'c'],
     })),
     progress: vi.fn(async (_id: string, body: { done?: string[]; failed?: string[] }) => {
@@ -35,6 +36,11 @@ function deps(over: Partial<RunnerDeps> = {}) {
     device: () => 'Chrome on Mac',
     now: () => t,
     changed: vi.fn(),
+    runner: () => RUNNER,
+    exclusive: async (_id: string, fn: () => Promise<void>) => {
+      await fn();
+      return true;
+    },
     ...over,
   };
   return d;
@@ -48,7 +54,12 @@ describe('DeviceRunner', () => {
     const d = deps();
     const r = new DeviceRunner(d);
     await r.start(job());
-    expect(d.claim).toHaveBeenCalledWith('j1', 'Chrome on Mac');
+    expect(d.claim).toHaveBeenCalledWith('j1', 'Chrome on Mac', RUNNER);
+    // Every report carries this tab's runner token, and the photos are run with the job's start time.
+    expect(d.progressCalls.every((c) => (c as { runner?: string }).runner === RUNNER)).toBe(true);
+    expect((d.run as ReturnType<typeof vi.fn>).mock.calls[0]?.[2]).toMatchObject({
+      since: '2026-11-01T00:00:00Z',
+    });
     expect(d.run).toHaveBeenCalledTimes(3);
     // a (t=500) and b (t=1000) are held back by the throttle; the final flush carries everything left.
     const reported = d.progressCalls.flatMap((c) => c.done ?? []);
@@ -131,7 +142,7 @@ describe('DeviceRunner', () => {
     const r = new DeviceRunner(d);
     const p = r.start(job());
     await vi.advanceTimersByTimeAsync(31_000);
-    expect(d.progress).toHaveBeenCalledWith('j1', { done: [], failed: [] }, 'u1');
+    expect(d.progress).toHaveBeenCalledWith('j1', { done: [], failed: [], runner: RUNNER }, 'u1');
     release?.();
     await p;
   });
@@ -151,6 +162,87 @@ describe('DeviceRunner', () => {
     await r.start(job('j2', params));
     expect(d.reference).toHaveBeenCalledTimes(1);
     expect(d.run).toHaveBeenCalledTimes(3);
+  });
+
+  // ---- client review #2 and #6 -------------------------------------------------------------------------
+  it('doesn’t run a job another tab of this browser is running (Web Lock)', async () => {
+    const d = deps({ exclusive: async () => false });
+    const r = new DeviceRunner(d);
+    await r.start(job());
+    expect(d.claim).not.toHaveBeenCalled();
+    expect(d.run).not.toHaveBeenCalled();
+    expect(r.getSnapshot()[0]?.state).toBe('lost');
+  });
+
+  it('the heartbeat never posts for a stopped job or for someone else, and a lost lease stops the job', async () => {
+    let release: (() => void) | undefined;
+    let owner = 'u1';
+    const d = deps({
+      owner: () => owner,
+      claim: vi.fn(async (id: string) => ({
+        job: { id, params: PARAMS } as AiJobSummary,
+        remaining: ['a', 'b'],
+      })),
+      now: () => Date.now(),
+      run: vi.fn(
+        () =>
+          new Promise<{ status: string }>((res) => {
+            release = () => res({ status: 'done' });
+          }),
+      ),
+    });
+    const r = new DeviceRunner(d);
+    const p = r.start(job());
+    await vi.advanceTimersByTimeAsync(0);
+    owner = 'u2'; // someone else signed in while a slow photo ran
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(d.progress).not.toHaveBeenCalled();
+    owner = 'u1';
+    // The lease went elsewhere: the heartbeat's 409 aborts the job before the next photo.
+    (d.progress as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      throw new ApiFailure('conflict', 409);
+    });
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(d.progress).toHaveBeenCalledTimes(1);
+    release?.();
+    await p;
+    expect(d.run).toHaveBeenCalledTimes(1);
+    expect(r.getSnapshot()[0]?.state).toBe('lost');
+  });
+
+  it('keeps ids whose heartbeat report failed and sends them with the next one', async () => {
+    let release: (() => void) | undefined;
+    let n = 0;
+    let fail = true;
+    const d = deps({
+      claim: vi.fn(async (id: string) => ({
+        job: { id, params: PARAMS } as AiJobSummary,
+        remaining: ['a', 'b'],
+      })),
+      now: () => Date.now(),
+      progress: vi.fn(async (_id: string, body: { done?: string[]; failed?: string[] }) => {
+        if (fail) {
+          fail = false;
+          throw new ApiFailure('network', 0);
+        }
+        d.progressCalls.push(body);
+      }),
+      // 'a' finishes at once (its report is held back by the 2 s throttle); 'b' is slow.
+      run: vi.fn(() =>
+        n++ === 0
+          ? Promise.resolve({ status: 'done' })
+          : new Promise<{ status: string }>((res) => {
+              release = () => res({ status: 'done' });
+            }),
+      ),
+    });
+    const r = new DeviceRunner(d);
+    const p = r.start(job());
+    await vi.advanceTimersByTimeAsync(31_000); // heartbeat carries 'a' and fails
+    expect(d.progress).toHaveBeenCalledTimes(1);
+    release?.();
+    await p;
+    expect(d.progressCalls.flatMap((c) => c.done ?? []).sort()).toEqual(['a', 'b']);
   });
 
   it('stopAll (session end) aborts every job', async () => {
