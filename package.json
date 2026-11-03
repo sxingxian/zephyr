@@ -17,7 +17,7 @@
     "brand:export": "pnpm --filter @zephyr/brand export"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.6.3",
+    "@biomejs/biome": "2.6.4",
     "turbo": "2.11.10",
     "typescript": "6.0.3"
   }
