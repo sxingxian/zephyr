@@ -25,7 +25,7 @@
     "@astrojs/check": "^0.9.12",
     "@types/three": "^0.186.0",
     "typescript": "6.0.3",
-    "vitest": "^4.0.0",
+    "vitest": "^5.0.5",
     "wrangler": "^4.150.0",
     "@cloudflare/workers-types": "^5.20261020.0",
     "@zephyr/admin": "workspace:*"
