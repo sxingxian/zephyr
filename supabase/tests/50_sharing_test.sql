@@ -327,10 +327,10 @@ select pg_temp.ok(guest_gallery_info(pg_temp.h('m-tok-1'), pg_temp.h('n')) #>> '
 update public.profiles set plan_id = 'free' where id = pg_temp.i('mei');
 select pg_temp.ok((select v ->> 'downloads' = 'web' and v ->> 'favourites' = 'false' and v #>> '{brand,studioName}' = 'Zephyr' and v ->> 'state' = 'locked'
   from (select guest_gallery_info(pg_temp.h('m-tok-1'), pg_temp.h('n')) v) x)
-  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', false) -> 'watermark' = 'null'::jsonb
+  and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'grid', false) -> 'watermark' ->> 'key' like '%/b/watermark-%'
   and guest_media(pg_temp.i('g1'), pg_temp.i('p1'), 'full', true) ->> 'unavailable' = 'not_allowed'
   and get_gallery(pg_temp.i('mei'), pg_temp.i('g1')) #>> '{extras,watermark}' = 'true',
-  'after a downgrade the extras stop working but the gallery stays live, unchanged');
+  'after a downgrade the extras stop working (the watermark stays, phase 7) but the gallery stays live, unchanged');
 update public.profiles set plan_id = 'studio' where id = pg_temp.i('mei');
 
 -- ---- Favourites -------------------------------------------------------------------------------------------
