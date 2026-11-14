@@ -287,6 +287,115 @@ update public.profiles set deletion_requested_at = now() - interval '31 days', d
 select pg_temp.ok((select x ->> 'stripeSubscriptionId' from jsonb_array_elements(public.due_account_purges(100)) x where x ->> 'ownerId' = :yr) = 'sub_Year',
   'purge work carries the subscription to cancel');
 
+-- ---- Security review fixes ------------------------------------------------------------------------
+insert into auth.users (id, email, email_confirmed_at) values
+  ('b7000000-0000-0000-0000-000000000006', 'dup.bill@example.com', now()),
+  ('b7000000-0000-0000-0000-000000000007', 'grace.bill@example.com', now()),
+  ('b7000000-0000-0000-0000-000000000008', 'del.bill@example.com', now()),
+  ('b7000000-0000-0000-0000-000000000009', 'raise.bill@example.com', now()),
+  ('b7000000-0000-0000-0000-00000000000a', 'nomail.bill@example.com', now());
+\set dup '\'b7000000-0000-0000-0000-000000000006\''
+\set grace '\'b7000000-0000-0000-0000-000000000007\''
+\set del '\'b7000000-0000-0000-0000-000000000008\''
+\set rz '\'b7000000-0000-0000-0000-000000000009\''
+
+-- Two live subscriptions (two Checkouts paid): the second never replaces the first.
+select public.billing_customer_set(:dup, 'cus_Dup');
+select public.billing_apply(:dup, pg_temp.sub('sub_DupA', 'cus_Dup', 'active', 'price_ProM1', now() - interval '1 day', now() + interval '29 days'), now());
+select public.billing_apply(:dup, pg_temp.sub('sub_DupB', 'cus_Dup', 'active', 'price_StuM1', now(), now() + interval '30 days'), now() + interval '1 second') as dupr \gset
+select pg_temp.ok((:'dupr'::jsonb ->> 'duplicate')::boolean and :'dupr'::jsonb ->> 'storedSubscriptionId' = 'sub_DupA'
+  and (select plan_id from public.profiles where id = :dup) = 'pro'
+  and (select stripe_subscription_id from public.subscriptions where owner_id = :dup) = 'sub_DupA',
+  'a second live subscription is reported as a duplicate and changes nothing');
+select public.billing_apply(:dup, pg_temp.sub('sub_DupA', 'cus_Dup', 'canceled', 'price_ProM1', now() - interval '1 day', now() + interval '29 days'), now() + interval '2 seconds');
+select public.billing_apply(:dup, pg_temp.sub('sub_DupB', 'cus_Dup', 'active', 'price_StuM1', now(), now() + interval '30 days'), now() + interval '3 seconds');
+select pg_temp.ok((select plan_id from public.profiles where id = :dup) = 'studio'
+  and (select stripe_subscription_id from public.subscriptions where owner_id = :dup) = 'sub_DupB',
+  'once the stored subscription has ended, the newer one takes over');
+
+-- Open Checkouts and the return page's own look at Stripe.
+select public.billing_checkout_record(:dup, 'cs_test_duptab00001', 'subscription', 'zephyr_pro_monthly', 'checkout:k1');
+select public.billing_checkout_record(:dup, 'cs_test_duptab00002', 'subscription', 'zephyr_studio_monthly', 'checkout:k2');
+select public.billing_checkout_record(:dup, 'cs_test_duptop00001', 'topup', 'zephyr_topup_500', 'checkout:k3');
+select pg_temp.ok(public.billing_checkout_open(:dup, 'subscription', 'checkout:k2') = '["cs_test_duptab00001"]'::jsonb
+  and public.billing_checkout_open(:mei, 'subscription', 'checkout:k2') = '[]'::jsonb,
+  'the other open subscription Checkouts are listed, never the one this retry returns, never another member''s');
+select pg_temp.ok(public.billing_checkout_poll(:dup, 'cs_test_duptab00001') and not public.billing_checkout_poll(:dup, 'cs_test_duptab00001')
+  and not public.billing_checkout_poll(:mei, 'cs_test_duptab00002'), 'the return page asks Stripe at most once per 10 seconds, and only for its own session');
+update public.checkout_sessions set fetched_at = now() - interval '11 seconds' where id = 'cs_test_duptab00001';
+select pg_temp.ok(public.billing_checkout_poll(:dup, 'cs_test_duptab00001'), '10 seconds later it may ask again');
+
+-- A refunded top-up found by its session (no payment intent recorded).
+select public.billing_topup_grant(:dup, 'cs_test_duptop00001', null, 'zephyr_topup_500');
+select pg_temp.ok((public.billing_topup_refund_by_session('cs_test_duptop00001') ->> 'removed')::int = 500
+  and (public.billing_topup_refund_by_session('cs_test_duptop00001') ->> 'removed')::int = 0
+  and public.billing_topup_refund_by_session('cs_test_nosuch00001') is null, 'a refund by session removes the unused credits once');
+
+-- Past due keeps the plan for 21 days at most.
+select public.billing_customer_set(:grace, 'cus_Grace');
+select public.billing_apply(:grace, pg_temp.sub('sub_Grace', 'cus_Grace', 'past_due', 'price_ProM1', now() - interval '25 days', now() + interval '5 days'), now());
+select pg_temp.ok((select plan_id from public.profiles where id = :grace) = 'pro', 'newly past due keeps the plan');
+update public.subscriptions set past_due_since = now() - interval '22 days' where owner_id = :grace;
+select public.billing_past_due_expire(100) as pde \gset
+select pg_temp.ok((select count(*) from jsonb_array_elements(:'pde'::jsonb) x where x ->> 'ownerId' = :grace and x ->> 'email' = 'grace.bill@example.com') = 1
+  and (select plan_id from public.profiles where id = :grace) = 'free'
+  and jsonb_array_length(public.billing_past_due_expire(100)) = 0, 'past the grace period the daily job ends the plan, once');
+select pg_temp.ok((public._credit_period(:grace)).period_start = public._ai_period()
+  and (public.billing_subscription(:grace) ->> 'keepsPlan')::boolean = false, 'and credits go back to calendar months; the API may sell a new plan');
+select public.billing_apply(:grace, pg_temp.sub('sub_Grace', 'cus_Grace', 'past_due', 'price_ProM1', now() - interval '25 days', now() + interval '5 days'), now() + interval '1 second');
+select pg_temp.ok((select plan_id from public.profiles where id = :grace) = 'free', 'a later past_due event doesn''t bring the plan back');
+select public.billing_apply(:grace, pg_temp.sub('sub_Grace2', 'cus_Grace', 'active', 'price_ProM1', now(), now() + interval '30 days'), now() + interval '2 seconds');
+select pg_temp.ok((select plan_id from public.profiles where id = :grace) = 'pro'
+  and (select stripe_subscription_id from public.subscriptions where owner_id = :grace) = 'sub_Grace2', 'a new subscription replaces one past its grace');
+
+-- Pending deletion with a subscription that still renews: the cron asks Stripe again.
+select public.billing_customer_set(:del, 'cus_Del');
+select public.billing_apply(:del, pg_temp.sub('sub_Del', 'cus_Del', 'active', 'price_ProM1', now() - interval '1 day', now() + interval '29 days'), now());
+select public.request_account_deletion(:del);
+select pg_temp.ok((select count(*) from jsonb_array_elements(public.billing_deletion_cancels_due(100)) x
+                    where x ->> 'ownerId' = :del and x ->> 'stripeSubscriptionId' = 'sub_Del') = 1, 'pending deletion with a renewing subscription is listed');
+select public.billing_apply(:del, pg_temp.sub('sub_Del', 'cus_Del', 'active', 'price_ProM1', now() - interval '1 day', now() + interval '29 days',
+  '{"cancel_at_period_end": true}'), now() + interval '1 second');
+select pg_temp.ok((select count(*) from jsonb_array_elements(public.billing_deletion_cancels_due(100)) x where x ->> 'ownerId' = :del) = 0,
+  'once it stops renewing it isn''t');
+
+-- A rise is judged per subscriber; a stopped rise leaves subscribers grandfathered until a later rise for them.
+select public.admin_price_set(null, 'zephyr_studio_yearly', 'price_StuY1', 24900, null, true);
+select public.billing_customer_set(:rz, 'cus_Raise');
+select public.billing_apply(:rz, pg_temp.sub('sub_Raise', 'cus_Raise', 'active', 'price_StuY1', now() - interval '100 days', now() + interval '265 days'), now());
+select public.admin_price_set(:fin, 'zephyr_studio_yearly', 'price_StuY2', 29900, 'Costs', false) as y2 \gset
+select public.price_moves_due(500);
+select public.admin_price_change_stop(:fin, (:'y2'::jsonb ->> 'priceChangeId')::uuid);
+select pg_temp.ok((public.admin_price_preview('zephyr_studio_yearly', 27900) ->> 'raise')::boolean
+  and not (public.admin_price_preview('zephyr_studio_yearly', 19900) ->> 'raise')::boolean,
+  'a "cut" still above what a grandfathered subscriber pays is a rise; below it isn''t');
+select public.admin_price_set(:fin, 'zephyr_studio_yearly', 'price_StuY3', 27900, 'Simplify', false) as y3 \gset
+select pg_temp.ok((:'y3'::jsonb ->> 'raise')::boolean, 'and setting it says so (passkey and the Owners'' email)');
+select public.price_moves_due(500) as dy3 \gset
+select pg_temp.ok((select count(*) from jsonb_array_elements(:'dy3'::jsonb) x where x ->> 'ownerId' = :rz and x ->> 'toPriceId' = 'price_StuY3' and x ->> 'status' = 'pending') = 1,
+  'the grandfathered subscriber gets a notice for the new rise');
+select public.price_move_mark((select id from public.price_moves where owner_id = :rz and to_price_id = 'price_StuY3'), 'notified');
+update public.price_moves set move_at = now() + interval '1 day' where owner_id = :rz and to_price_id = 'price_StuY3';
+select public.price_move_mark((select id from public.price_moves where owner_id = :rz and to_price_id = 'price_StuY3'), 'moved');
+select public.admin_price_set(:fin, 'zephyr_studio_yearly', 'price_StuY4', 25900, 'Again', false);
+select pg_temp.ok((select status from public.price_changes where id = (:'y3'::jsonb ->> 'priceChangeId')::uuid) = 'moving'
+  and jsonb_array_length(public.admin_price_change_stop(:fin, (:'y3'::jsonb ->> 'priceChangeId')::uuid) -> 'reverts') = 1,
+  'a later price doesn''t close a change with applied moves; Stop can still revert them');
+
+-- A notice that never went out by the move date: the move is skipped, never applied.
+select public.price_moves_due(500);
+update public.price_moves set move_at = now() - interval '1 minute' where owner_id = :rz and to_price_id = 'price_StuY4' and status = 'pending';
+select public.price_moves_due(500) as dnm \gset
+select pg_temp.ok((select status = 'skipped' and skip_reason = 'no_email' from public.price_moves where owner_id = :rz and to_price_id = 'price_StuY4')
+  and (select count(*) from jsonb_array_elements(:'dnm'::jsonb) x where x ->> 'ownerId' = :rz and x ->> 'toPriceId' = 'price_StuY4') = 0,
+  'an unsent notice past its date skips the move');
+
+select pg_temp.ok(has_function_privilege('service_role', 'public.billing_checkout_open(uuid, text, text)', 'execute')
+  and has_function_privilege('service_role', 'public.billing_past_due_expire(integer)', 'execute')
+  and not has_function_privilege('authenticated', 'public.billing_topup_refund_by_session(text)', 'execute')
+  and not has_function_privilege('service_role', 'public._topup_refund(uuid)', 'execute')
+  and not has_function_privilege('service_role', 'public._key_floor(text)', 'execute'), 'new functions are for the API only; helpers for nobody');
+
 -- ---- Privileges -----------------------------------------------------------------------------------
 select pg_temp.ok(not exists (
   select 1 from unnest(array['billing_customers', 'billing_prices', 'subscriptions', 'billing_events', 'checkout_sessions',

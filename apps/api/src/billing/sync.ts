@@ -7,6 +7,7 @@ import {
   type BillingInterval,
   PAID_PLANS,
   type PaidPlanId,
+  PLAN_KEEPING_STATUSES,
   SUBSCRIPTION_LOOKUP_KEYS,
   type SubscriptionStatus,
   TOPUP_PACKS,
@@ -17,7 +18,7 @@ import { sendEmail } from '../email/resend';
 import type { Env } from '../env';
 import { logError } from '../http';
 import { billingDb, type SubscriptionSnapshot } from './db';
-import { idOf, type Stripe } from './stripe';
+import { idOf, isMissing, type Stripe } from './stripe';
 
 /** The event's object belongs to no owner we know, or to a different one than its customer: never applied. */
 export class OwnerMismatch extends Error {
@@ -139,11 +140,70 @@ export async function syncSubscription(
   const customerId = idOf(sub.customer);
   const owner = await resolveOwner(env, stripe, customerId, sub.metadata);
   if (knownOwner && knownOwner !== owner) throw new OwnerMismatch('owner_mismatch');
-  const out = await billingDb.apply(env, owner, snapshot(sub), syncedAt);
-  if (out && !out.stale && out.planBefore !== 'free' && out.planAfter === 'free') {
+  let out = await billingDb.apply(env, owner, snapshot(sub), syncedAt);
+  if (out?.duplicate && out.storedSubscriptionId) {
+    out = await resolveDuplicate(env, stripe, owner, sub, out.storedSubscriptionId, requestId);
+  }
+  if (out && !out.stale && !out.duplicate && out.planBefore !== 'free' && out.planAfter === 'free') {
     await notifyPlanEnded(env, stripe, out.email ?? null, customerId, requestId);
   }
   return owner;
+}
+
+const keepsPlan = (sub: Stripe.Subscription) =>
+  PLAN_KEEPING_STATUSES.includes(sub.status as SubscriptionStatus);
+
+/**
+ * A second live subscription for an owner whose stored one still keeps the plan (two Checkouts paid, e.g. two
+ * tabs). First the stored one is checked in Stripe: if it has in fact ended, that is applied and the newer one
+ * takes its place. Otherwise the newer one is canceled at once and its paid invoice refunded in full, so the
+ * member is never billed twice for one plan. Returns the final apply result.
+ */
+async function resolveDuplicate(
+  env: Env,
+  stripe: Stripe,
+  owner: string,
+  newer: Stripe.Subscription,
+  storedId: string,
+  requestId: string,
+): Promise<Awaited<ReturnType<typeof billingDb.apply>>> {
+  let stored: Stripe.Subscription | null = null;
+  const storedAt = new Date();
+  try {
+    stored = await stripe.subscriptions.retrieve(storedId, { expand: SUBSCRIPTION_EXPAND });
+  } catch (err) {
+    if (!isMissing(err)) throw err;
+  }
+  if (!stored || !keepsPlan(stored)) {
+    // The stored subscription ended and we hadn't heard yet: record that, then apply the newer one.
+    if (stored) await billingDb.apply(env, owner, snapshot(stored), storedAt);
+    return billingDb.apply(env, owner, snapshot(newer), new Date());
+  }
+  logError(requestId, 'billing_duplicate_subscription', new Error('duplicate'));
+  if (keepsPlan(newer) || newer.status === 'incomplete') {
+    await stripe.subscriptions.cancel(
+      newer.id,
+      { prorate: false, invoice_now: false },
+      { idempotencyKey: `dup-cancel:${newer.id}` },
+    );
+  }
+  await refundLatestInvoice(stripe, newer);
+  return { planBefore: 'free', planAfter: 'free', duplicate: true };
+}
+
+/** Refunds every paid payment of a subscription's latest invoice in full (a duplicate purchase). */
+async function refundLatestInvoice(stripe: Stripe, sub: Stripe.Subscription) {
+  const invoice = idOf(sub.latest_invoice as string | { id: string } | null);
+  if (!invoice) return;
+  const payments = await stripe.invoicePayments.list({ invoice, status: 'paid', limit: 10 });
+  for (const p of payments.data) {
+    const pi = idOf(p.payment?.payment_intent as string | { id: string } | null | undefined);
+    if (!pi) continue;
+    await stripe.refunds.create(
+      { payment_intent: pi, reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
+      { idempotencyKey: `dup-refund:${pi}` },
+    );
+  }
 }
 
 async function notifyPlanEnded(

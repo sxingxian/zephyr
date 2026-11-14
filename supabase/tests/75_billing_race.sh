@@ -4,22 +4,32 @@
 # - Seats: two invites racing for the last seat: exactly one is created.
 # - Webhooks: two applies of the same subscription racing keep the newest read, whichever commits first.
 # - Top-ups: two grants of one Checkout session racing grant once.
+# - Duplicates: two different live subscriptions racing for one member: one is stored, the other is a duplicate.
 set -euo pipefail
 read -r -a psql <<<"$PSQL_ARGS"
 P() { "${psql[@]}" -At "$@"; }
 owner=75000000-0000-0000-0000-000000000001
+owner2=75000000-0000-0000-0000-000000000002
 P <<SQL >/dev/null
 insert into auth.users (id, email, email_confirmed_at) values ('$owner', 'race75@example.com', now());
 update public.profiles set plan_id = 'studio' where id = '$owner';
 select public.team_invite_create('$owner', 'first75@example.com', 'editor', extensions.digest('r75-0', 'sha256'));
 select public.billing_customer_set('$owner', 'cus_Race75');
 select public.billing_checkout_record('$owner', 'cs_test_race75top01', 'topup', 'zephyr_topup_500');
+insert into auth.users (id, email, email_confirmed_at) values ('$owner2', 'race75b@example.com', now());
+select public.billing_customer_set('$owner2', 'cus_Race75b');
 create function public.race_invite(n text) returns text language sql as \$\$
   select coalesce(public.team_invite_create('$owner', n || '@example.com', 'viewer', extensions.digest('r75-' || n, 'sha256')) ->> 'error', 'ok') \$\$;
 create function public.race_apply(price text, synced timestamptz) returns text language sql as \$\$
   select coalesce(public.billing_apply('$owner', jsonb_build_object('stripe_subscription_id', 'sub_Race75', 'stripe_customer_id', 'cus_Race75',
     'status', 'active', 'stripe_price_id', price, 'item_id', 'si_Race75', 'current_period_start', now() - interval '1 day',
     'current_period_end', now() + interval '29 days', 'cancel_at_period_end', false), synced) ->> 'planAfter', 'null') \$\$;
+create function public.race_sub(id text) returns text language sql as \$\$
+  select case when r ->> 'duplicate' = 'true' then 'duplicate' else r ->> 'planAfter' end
+    from (select public.billing_apply('$owner2', jsonb_build_object('stripe_subscription_id', id, 'stripe_customer_id', 'cus_Race75b',
+      'status', 'active', 'stripe_price_id', (select stripe_price_id from public.billing_prices where lookup_key = 'zephyr_pro_monthly' and current),
+      'item_id', 'si_' || replace(id, 'sub_', ''), 'current_period_start', now() - interval '1 day', 'current_period_end', now() + interval '29 days',
+      'cancel_at_period_end', false), now()) as r) x \$\$;
 create function public.race_topup() returns text language sql as \$\$
   select public.billing_topup_grant('$owner', 'cs_test_race75top01', 'pi_Race75', 'zephyr_topup_500') ->> 'granted' \$\$;
 SQL
@@ -54,7 +64,13 @@ r="$(run_pair "public.race_topup()" "public.race_topup()")"
 [ "$(P -c "select count(*) from public.credit_topups where checkout_session_id = 'cs_test_race75top01'")" = 1 ] || fail "top-up rows after the race"
 echo "ok - two grants of one Checkout session racing grant once"
 
+r="$(run_pair "public.race_sub('sub_Race75a')" "public.race_sub('sub_Race75b')")"
+[ "$r" = "pro duplicate" ] || fail "two live subscriptions racing: got '$r', want 'pro duplicate'"
+[ "$(P -c "select stripe_subscription_id from public.subscriptions where owner_id = '$owner2'")" = sub_Race75a ] || fail "the first subscription should be stored"
+echo "ok - two live subscriptions racing: one is stored, the other is reported as a duplicate"
+
 P <<SQL >/dev/null
+drop function public.race_sub(text);
 drop function public.race_invite(text);
 drop function public.race_apply(text, timestamptz);
 drop function public.race_topup();

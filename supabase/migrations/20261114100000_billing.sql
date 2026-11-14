@@ -106,6 +106,11 @@ create table public.checkout_sessions (
   kind text not null check (kind in ('subscription', 'topup')),
   lookup_key text not null,
   state text not null default 'pending' check (state in ('pending', 'done', 'failed')),
+  -- The Checkout idempotency key: an idempotent retry returns this same session, so it's never expired by its
+  -- own retry (see billing_checkout_open).
+  idem_key text check (idem_key is null or length(idem_key) <= 200),
+  -- Last time the return page made the API ask Stripe itself (at most once per 10 s per session).
+  fetched_at timestamptz,
   created_at timestamptz not null default now(),
   finished_at timestamptz
 );
@@ -154,6 +159,9 @@ create table public.price_moves (
   status text not null default 'pending' check (status in ('pending', 'notified', 'moved', 'skipped', 'stopped')),
   moved_at timestamptz,
   reverted_at timestamptz,
+  -- Why a move was skipped: changed (plan, price or status moved on), superseded (a later price), no_email
+  -- (no notice could be sent before the move date: a rise is never applied without one).
+  skip_reason text check (skip_reason is null or skip_reason in ('changed', 'superseded', 'no_email')),
   created_at timestamptz not null default now(),
   unique (change_id, owner_id)
 );
@@ -191,12 +199,24 @@ $$;
 create function public._sub_keeps_plan(p_status text) returns boolean
 language sql immutable set search_path = '' as $$ select p_status in ('active', 'trialing', 'past_due') $$;
 
+-- How long a past_due subscription keeps its plan while Stripe retries the card (docs/phase-7.md). Stripe's
+-- dunning must end in "cancel the subscription"; this cap holds even if it doesn't.
+create function public._past_due_grace() returns interval
+language sql immutable set search_path = '' as $$ select interval '21 days' $$;
+
+-- Keeps the paid plan: active or trialing, or past_due for at most the grace period.
+create function public._sub_keeps(p_status text, p_past_due_since timestamptz) returns boolean
+language sql stable set search_path = '' as $$
+  select p_status in ('active', 'trialing')
+      or (p_status = 'past_due' and (p_past_due_since is null or p_past_due_since > now() - public._past_due_grace()));
+$$;
+
 -- The subscription that sets the member's plan right now (Stripe-sourced plan matching a plan-keeping
 -- subscription), or no row.
 create function public._live_subscription(p_owner uuid) returns setof public.subscriptions
 language sql stable set search_path = '' as $$
   select s.* from public.subscriptions s join public.profiles p on p.id = s.owner_id
-   where s.owner_id = p_owner and public._sub_keeps_plan(s.status) and p.plan_source = 'stripe' and p.plan_id = s.plan_id;
+   where s.owner_id = p_owner and public._sub_keeps(s.status, s.past_due_since) and p.plan_source = 'stripe' and p.plan_id = s.plan_id;
 $$;
 
 -- The credit period containing now(): (start, end), dates in UTC, end exclusive.
@@ -647,10 +667,34 @@ language sql stable security definer set search_path = '' as $$
   select c.owner_id from public.billing_customers c where c.stripe_customer_id = p_customer;
 $$;
 
-create function public.billing_checkout_record(p_owner uuid, p_session text, p_kind text, p_lookup_key text) returns void
+create function public.billing_checkout_record(p_owner uuid, p_session text, p_kind text, p_lookup_key text,
+  p_idem text default null) returns void
 language sql volatile security definer set search_path = '' as $$
-  insert into public.checkout_sessions (id, owner_id, kind, lookup_key) values (p_session, p_owner, p_kind, p_lookup_key)
+  insert into public.checkout_sessions (id, owner_id, kind, lookup_key, idem_key)
+  values (p_session, p_owner, p_kind, p_lookup_key, left(p_idem, 200))
   on conflict (id) do nothing;
+$$;
+
+-- The owner's other open Checkout sessions of a kind (pending, younger than a day), so the API can expire them
+-- before opening a new one: two paid subscription Checkouts would mean two subscriptions. Sessions created with
+-- p_idem are left alone (an idempotent retry returns that same session). [session id, …]
+create function public.billing_checkout_open(p_owner uuid, p_kind text, p_idem text) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select coalesce(jsonb_agg(c.id order by c.created_at), '[]'::jsonb)
+    from public.checkout_sessions c
+   where c.owner_id = p_owner and c.kind = p_kind and c.state = 'pending' and c.created_at > now() - interval '1 day'
+     and c.idem_key is distinct from p_idem;
+$$;
+
+-- The return page's own look at Stripe: true at most once per 10 seconds per session (and only its owner's).
+create function public.billing_checkout_poll(p_owner uuid, p_session text) returns boolean
+language plpgsql volatile security definer set search_path = '' as $$
+begin
+  update public.checkout_sessions set fetched_at = now()
+   where id = p_session and owner_id = p_owner and state = 'pending'
+     and (fetched_at is null or fetched_at <= now() - interval '10 seconds');
+  return found;
+end;
 $$;
 
 -- {state, kind, lookupKey, createdAt, plan, credits} for the session's owner only, or null.
@@ -701,6 +745,7 @@ declare
   b1 public.credit_balances;
   m0 integer;
   m1 integer;
+  since timestamptz;
 begin
   if p_sub is null or jsonb_typeof(p_sub) <> 'object' or p_synced_at is null then
     raise exception 'bad subscription' using errcode = 'invalid_parameter_value';
@@ -712,11 +757,21 @@ begin
     return jsonb_build_object('applied', false, 'ignored', 'customer_mismatch');
   end if;
   select * into cur from public.subscriptions where owner_id = p_owner;
-  if found then
+  -- When this subscription went past due (kept across reads of the same past_due subscription).
+  since := case when st = 'past_due' then
+             case when cur.owner_id is not null and cur.status = 'past_due' and cur.stripe_subscription_id = p_sub ->> 'stripe_subscription_id'
+                  then coalesce(cur.past_due_since, now()) else now() end end;
+  if cur.owner_id is not null then
     if cur.stripe_subscription_id = p_sub ->> 'stripe_subscription_id' and p_synced_at < cur.synced_at then
       return jsonb_build_object('applied', false, 'stale', true, 'planBefore', pr.plan_id, 'planAfter', pr.plan_id);
     end if;
-    if cur.stripe_subscription_id <> p_sub ->> 'stripe_subscription_id' and public._sub_keeps_plan(cur.status) and not public._sub_keeps_plan(st) then
+    if cur.stripe_subscription_id <> p_sub ->> 'stripe_subscription_id' and public._sub_keeps(cur.status, cur.past_due_since) then
+      -- A different subscription while the stored one still keeps the plan: an ended one is ignored; a second
+      -- live one (two Checkouts paid) never replaces the first. The API cancels and refunds the newer one.
+      if public._sub_keeps(st, since) then
+        return jsonb_build_object('applied', false, 'duplicate', true, 'planBefore', pr.plan_id, 'planAfter', pr.plan_id,
+                                  'storedSubscriptionId', cur.stripe_subscription_id);
+      end if;
       return jsonb_build_object('applied', false, 'ignored', 'older_subscription', 'planBefore', pr.plan_id, 'planAfter', pr.plan_id);
     end if;
   end if;
@@ -751,7 +806,7 @@ begin
     coalesce((p_sub ->> 'cancel_at_period_end')::boolean, false), p_sub ->> 'schedule_id', sched.stripe_price_id,
     coalesce(sched.plan_id, p_sub ->> 'scheduled_plan'), coalesce(sched.billing_interval, p_sub ->> 'scheduled_interval'),
     case when coalesce(sched.plan_id, p_sub ->> 'scheduled_plan') is not null then (p_sub ->> 'scheduled_at')::timestamptz end,
-    case when st = 'past_due' then now() end, coalesce((p_sub ->> 'payment_attempts')::integer, 0), p_synced_at, now())
+    since, coalesce((p_sub ->> 'payment_attempts')::integer, 0), p_synced_at, now())
   on conflict (owner_id) do update set
     stripe_subscription_id = excluded.stripe_subscription_id, stripe_customer_id = excluded.stripe_customer_id,
     status = excluded.status, plan_id = excluded.plan_id, billing_interval = excluded.billing_interval,
@@ -760,12 +815,10 @@ begin
     cancel_at_period_end = excluded.cancel_at_period_end, schedule_id = excluded.schedule_id,
     scheduled_price_id = excluded.scheduled_price_id, scheduled_plan = excluded.scheduled_plan,
     scheduled_interval = excluded.scheduled_interval, scheduled_at = excluded.scheduled_at,
-    past_due_since = case when excluded.status = 'past_due'
-                          then case when s.status = 'past_due' and s.stripe_subscription_id = excluded.stripe_subscription_id
-                                    then coalesce(s.past_due_since, now()) else now() end end,
+    past_due_since = excluded.past_due_since,
     payment_attempts = excluded.payment_attempts, synced_at = excluded.synced_at, updated_at = now();
 
-  plan_after := case when public._sub_keeps_plan(st) then price.plan_id else 'free' end;
+  plan_after := case when public._sub_keeps(st, since) then price.plan_id else 'free' end;
   if pr.plan_source = 'stripe' and pr.plan_id <> plan_after then
     update public.profiles set plan_id = plan_after where id = p_owner;
   else
@@ -806,7 +859,7 @@ language sql stable security definer set search_path = '' as $$
                             'syncedAt', s.synced_at,
                             'scheduleId', s.schedule_id, 'currentPeriodStart', s.current_period_start,
                             'currentPeriodEnd', s.current_period_end, 'cancelAtPeriodEnd', s.cancel_at_period_end,
-                            'keepsPlan', public._sub_keeps_plan(s.status))
+                            'keepsPlan', public._sub_keeps(s.status, s.past_due_since))
     from public.subscriptions s where s.owner_id = p_owner;
 $$;
 
@@ -881,11 +934,32 @@ $$;
 -- A refunded or disputed top-up: its unused credits are removed, once. {ownerId, removed} or null.
 create function public.billing_topup_refund(p_payment_intent text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
+declare t public.credit_topups;
+begin
+  select * into t from public.credit_topups where payment_intent_id = p_payment_intent;
+  if not found then return null; end if;
+  return public._topup_refund(t.id);
+end;
+$$;
+
+-- The same, found by its Checkout session (when the refund or dispute carries no payment intent we recorded).
+create function public.billing_topup_refund_by_session(p_session text) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare t public.credit_topups;
+begin
+  select * into t from public.credit_topups where checkout_session_id = p_session;
+  if not found then return null; end if;
+  return public._topup_refund(t.id);
+end;
+$$;
+
+create function public._topup_refund(p_id uuid) returns jsonb
+language plpgsql volatile set search_path = '' as $$
 declare
   t public.credit_topups;
   b public.credit_balances;
 begin
-  select * into t from public.credit_topups where payment_intent_id = p_payment_intent;
+  select * into t from public.credit_topups where id = p_id;
   if not found then return null; end if;
   perform public._credits_lock(t.owner_id);
   select * into t from public.credit_topups where id = t.id for update;
@@ -966,6 +1040,8 @@ declare
   old public.billing_prices;
   ch uuid;
   n integer;
+  floor_amount integer;
+  is_raise boolean;
   reason text := nullif(btrim(regexp_replace(coalesce(p_reason, ''), '[[:cntrl:]]', '', 'g')), '');
 begin
   if not coalesce(p_seed, false) and not public._staff_can(p_staff, array['owner', 'finance']) then
@@ -993,32 +1069,48 @@ begin
   if old.stripe_price_id = p_stripe_price_id or exists (select 1 from public.billing_prices where stripe_price_id = p_stripe_price_id) then
     return jsonb_build_object('error', 'unchanged');
   end if;
+  -- A rise for anyone: above the current price, or above what any plan-keeping subscriber on this key pays
+  -- (a subscriber left on an older, lower price by a stopped change).
+  floor_amount := public._key_floor(p_lookup_key);
+  is_raise := p_amount > least(old.amount, coalesce(floor_amount, old.amount));
   update public.billing_prices set current = false where stripe_price_id = old.stripe_price_id;
   insert into public.billing_prices (stripe_price_id, lookup_key, plan_id, billing_interval, credits, amount, active, current, created_by)
   values (p_stripe_price_id, p_lookup_key, old.plan_id, old.billing_interval, old.credits, p_amount, old.active, true, p_staff);
 
   if old.plan_id is not null then
     select count(*) into n from public.subscriptions s join public.billing_prices bp on bp.stripe_price_id = s.stripe_price_id
-     where bp.lookup_key = p_lookup_key and bp.amount <> p_amount and public._sub_keeps_plan(s.status);
-    -- Moves of earlier changes on this key that haven't happened are superseded by this one.
-    update public.price_moves m set status = 'skipped'
+     where bp.lookup_key = p_lookup_key and bp.amount <> p_amount and public._sub_keeps(s.status, s.past_due_since);
+    -- Moves of earlier changes on this key that haven't happened are superseded by this one. An earlier change
+    -- with moves applied but not yet renewed stays 'moving', so Stop can still put those back.
+    update public.price_moves m set status = 'skipped', skip_reason = 'superseded'
       from public.price_changes c
      where c.id = m.change_id and c.lookup_key = p_lookup_key and m.status in ('pending', 'notified');
-    update public.price_changes set status = 'done'
-     where lookup_key = p_lookup_key and status in ('notifying', 'moving');
+    update public.price_changes c
+       set status = case when exists (select 1 from public.price_moves m
+                                       where m.change_id = c.id and m.status = 'moved' and m.move_at > now())
+                         then 'moving' else 'done' end
+     where c.lookup_key = p_lookup_key and c.status in ('notifying', 'moving');
     if n > 0 then
       insert into public.price_changes (lookup_key, from_amount, to_amount, to_price_id, reason, created_by)
       values (p_lookup_key, old.amount, p_amount, p_stripe_price_id, reason, p_staff) returning id into ch;
     end if;
   end if;
   perform public._audit(p_staff, 'billing.price_set', p_lookup_key,
-    jsonb_build_object('from', old.amount, 'to', p_amount, 'reason', reason, 'priceChangeId', ch));
+    jsonb_build_object('from', old.amount, 'to', p_amount, 'reason', reason, 'priceChangeId', ch, 'raise', is_raise));
   return jsonb_build_object('lookupKey', p_lookup_key, 'previousAmount', old.amount, 'amount', p_amount,
-                            'raise', p_amount > old.amount, 'priceChangeId', ch);
+                            'raise', is_raise, 'priceChangeId', ch);
 end;
 $$;
 
--- AdminPricePreviewResult (without ok), or null for an unknown key.
+-- The lowest amount any plan-keeping subscriber pays on a lookup key (any of its prices), or null.
+create function public._key_floor(p_lookup_key text) returns integer
+language sql stable set search_path = '' as $$
+  select min(bp.amount) from public.subscriptions s join public.billing_prices bp on bp.stripe_price_id = s.stripe_price_id
+   where bp.lookup_key = p_lookup_key and public._sub_keeps(s.status, s.past_due_since);
+$$;
+
+-- AdminPricePreviewResult (without ok), or null for an unknown key. raise: above the current price or above what
+-- any plan-keeping subscriber on the key pays (needs a passkey and emails the Owners).
 create function public.admin_price_preview(p_lookup_key text, p_amount integer) returns jsonb
 language sql stable security definer set search_path = '' as $$
   select jsonb_build_object(
@@ -1026,10 +1118,10 @@ language sql stable security definer set search_path = '' as $$
     'subscribers', count(s.owner_id) filter (where bp.amount <> p_amount),
     'firstMoveAt', min(public._move_at(s, bp.amount, p_amount, now())) filter (where bp.amount <> p_amount),
     'lastMoveAt', max(public._move_at(s, bp.amount, p_amount, now())) filter (where bp.amount <> p_amount),
-    'raise', p_amount > cur.amount)
+    'raise', p_amount > least(cur.amount, coalesce(min(bp.amount) filter (where s.owner_id is not null), cur.amount)))
   from public.billing_prices cur
   left join public.billing_prices bp on bp.lookup_key = cur.lookup_key
-  left join public.subscriptions s on s.stripe_price_id = bp.stripe_price_id and public._sub_keeps_plan(s.status)
+  left join public.subscriptions s on s.stripe_price_id = bp.stripe_price_id and public._sub_keeps(s.status, s.past_due_since)
   where cur.lookup_key = p_lookup_key and cur.current
   group by cur.amount;
 $$;
@@ -1096,12 +1188,16 @@ declare
   r record;
   ch uuid;
 begin
+  -- A notice that never went out by the move date (no address, or sending kept failing): never moved. A rise
+  -- is never applied without a notice.
+  update public.price_moves set status = 'skipped', skip_reason = 'no_email'
+   where status = 'pending' and move_at <= now();
   -- Subscription changed plan, price, status or id since the move was planned.
-  update public.price_moves m set status = 'skipped'
+  update public.price_moves m set status = 'skipped', skip_reason = 'changed'
    where m.status in ('pending', 'notified')
      and not exists (select 1 from public.subscriptions s
                       where s.owner_id = m.owner_id and s.stripe_subscription_id = m.stripe_subscription_id
-                        and s.stripe_price_id = m.from_price_id and public._sub_keeps_plan(s.status));
+                        and s.stripe_price_id = m.from_price_id and public._sub_keeps(s.status, s.past_due_since));
   -- A missed move (the cron didn't run in the window): the notice still stands; move at the next renewal.
   update public.price_moves m set move_at = public._renewal_on_or_after(s, now())
     from public.subscriptions s
@@ -1113,7 +1209,7 @@ begin
       from public.subscriptions s
       join public.billing_prices bp on bp.stripe_price_id = s.stripe_price_id
       join public.billing_prices nowp on nowp.lookup_key = bp.lookup_key and nowp.current
-     where public._sub_keeps_plan(s.status) and bp.amount <> nowp.amount and s.schedule_id is null
+     where public._sub_keeps(s.status, s.past_due_since) and bp.amount <> nowp.amount and s.schedule_id is null
        and not exists (select 1 from public.price_moves m where m.owner_id = s.owner_id
                          and (m.status in ('pending', 'notified')
                               or (m.status = 'stopped' and m.to_price_id = nowp.stripe_price_id)
@@ -1170,7 +1266,7 @@ begin
   elsif p_status = 'moved' and m.status = 'notified' then
     update public.price_moves set status = 'moved', moved_at = now() where id = p_id returning * into m;
   elsif p_status = 'skipped' and m.status in ('pending', 'notified') then
-    update public.price_moves set status = 'skipped' where id = p_id returning * into m;
+    update public.price_moves set status = 'skipped', skip_reason = 'changed' where id = p_id returning * into m;
   elsif p_status = 'reverted' and m.status = 'moved' then
     update public.price_moves set status = 'stopped', reverted_at = now() where id = p_id returning * into m;
   elsif p_status not in ('notified', 'moved', 'skipped', 'reverted') then
@@ -1190,13 +1286,13 @@ language sql stable security definer set search_path = '' as $$
                         where s.status in ('active', 'trialing', 'past_due')), 0)::bigint,
       'paying', (select count(*) from public.subscriptions s where s.status in ('active', 'past_due')),
       'pastDue', (select count(*) from public.subscriptions s where s.status = 'past_due'),
-      'cancelling', (select count(*) from public.subscriptions s where s.cancel_at_period_end and public._sub_keeps_plan(s.status)),
+      'cancelling', (select count(*) from public.subscriptions s where s.cancel_at_period_end and public._sub_keeps(s.status, s.past_due_since)),
       'topUpCreditsSold30d', (select coalesce(sum(t.credits), 0) from public.credit_topups t
                                where t.created_at > now() - interval '30 days' and t.refunded_at is null)),
     'prices', coalesce((select jsonb_agg(jsonb_build_object(
         'lookupKey', p.lookup_key, 'plan', p.plan_id, 'interval', p.billing_interval, 'credits', p.credits,
         'amount', p.amount, 'active', p.active,
-        'subscribers', (select count(*) from public.subscriptions s where s.stripe_price_id = p.stripe_price_id and public._sub_keeps_plan(s.status)),
+        'subscribers', (select count(*) from public.subscriptions s where s.stripe_price_id = p.stripe_price_id and public._sub_keeps(s.status, s.past_due_since)),
         'updatedAt', p.created_at) order by p.plan_id nulls last, p.billing_interval, p.credits)
       from public.billing_prices p where p.current), '[]'::jsonb),
     'changes', coalesce((select jsonb_agg(jsonb_build_object(
@@ -1222,6 +1318,46 @@ language sql stable security definer set search_path = '' as $$
     'events', coalesce((select jsonb_agg(jsonb_build_object('id', e.id, 'type', e.type, 'at', e.received_at,
         'status', case when e.status = 'received' then 'failed' else e.status end, 'error', e.error) order by e.received_at desc)
       from (select * from public.billing_events order by received_at desc limit 50) e), '[]'::jsonb)) end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- Daily billing cron helpers
+-- ---------------------------------------------------------------------------------------------
+-- Past due beyond the grace period with no word from Stripe: the plan ends (Stripe's dunning should have
+-- canceled by now). [{ownerId, email}] of plans ended, for the plan-ended email.
+create function public.billing_past_due_expire(p_limit integer) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare
+  r record;
+  out jsonb := '[]'::jsonb;
+begin
+  for r in select s.owner_id, s.plan_id from public.subscriptions s join public.profiles p on p.id = s.owner_id
+            where s.status = 'past_due' and s.past_due_since <= now() - public._past_due_grace()
+              and p.plan_source = 'stripe' and p.plan_id = s.plan_id
+            order by s.past_due_since limit least(greatest(coalesce(p_limit, 100), 1), 500) loop
+    perform public._lock_billing(r.owner_id);
+    update public.profiles set plan_id = 'free'
+     where id = r.owner_id and plan_source = 'stripe' and plan_id = r.plan_id;
+    if found then
+      perform public._audit(null, 'billing.plan_changed', r.owner_id::text,
+        jsonb_build_object('from', r.plan_id, 'to', 'free', 'status', 'past_due', 'reason', 'past_due_grace'));
+      out := out || jsonb_build_array(jsonb_build_object('ownerId', r.owner_id,
+               'email', (select u.email from auth.users u where u.id = r.owner_id)));
+    end if;
+  end loop;
+  return out;
+end;
+$$;
+
+-- Accounts pending deletion whose plan-keeping subscription still renews (setting cancel_at_period_end failed
+-- or hasn't been seen yet): the cron asks Stripe again. [{ownerId, stripeSubscriptionId}]
+create function public.billing_deletion_cancels_due(p_limit integer) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select coalesce(jsonb_agg(jsonb_build_object('ownerId', x.owner_id, 'stripeSubscriptionId', x.stripe_subscription_id)), '[]'::jsonb)
+    from (select s.owner_id, s.stripe_subscription_id from public.subscriptions s join public.profiles p on p.id = s.owner_id
+           where p.deletion_due is not null and p.deleted_at is null and not s.cancel_at_period_end
+             and public._sub_keeps_plan(s.status)
+           order by p.deletion_due limit least(greatest(coalesce(p_limit, 100), 1), 500)) x;
 $$;
 
 -- ---------------------------------------------------------------------------------------------
@@ -1287,6 +1423,8 @@ revoke execute on all functions in schema public from public, anon, authenticate
 revoke execute on function
   public._lock_billing(uuid),
   public._sub_keeps_plan(text),
+  public._past_due_grace(),
+  public._sub_keeps(text, timestamptz),
   public._live_subscription(uuid),
   public._credit_period(uuid),
   public._plan_monthly_credits(text),
@@ -1301,14 +1439,21 @@ revoke execute on function
   public._renewal_on_or_after(public.subscriptions, timestamptz),
   public._move_at(public.subscriptions, integer, integer, timestamptz),
   public._staff_can(uuid, text[]),
-  public._move_json(public.price_moves)
+  public._move_json(public.price_moves),
+  public._key_floor(text),
+  public._topup_refund(uuid)
 from service_role;
 grant execute on function
   public.billing_prices_current(),
   public.billing_customer_get(uuid),
   public.billing_customer_set(uuid, text),
   public.billing_owner_by_customer(text),
-  public.billing_checkout_record(uuid, text, text, text),
+  public.billing_checkout_record(uuid, text, text, text, text),
+  public.billing_checkout_open(uuid, text, text),
+  public.billing_checkout_poll(uuid, text),
+  public.billing_topup_refund_by_session(text),
+  public.billing_past_due_expire(integer),
+  public.billing_deletion_cancels_due(integer),
   public.billing_checkout_status(uuid, text),
   public.billing_checkout_mark(text, text),
   public.billing_apply(uuid, jsonb, timestamptz),

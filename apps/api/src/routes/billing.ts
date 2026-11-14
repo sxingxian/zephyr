@@ -65,8 +65,17 @@ function upstream(c: Ctx, where: string, err: unknown) {
   if (isStripeError(err)) return unavailable(c);
   return c.json(fail('server'), 500);
 }
+/** Keeps the paid plan now (the database also caps past_due at its grace period). */
 const keeping = (s: StoredSubscription | null): s is StoredSubscription =>
-  !!s && PLAN_KEEPING_STATUSES.includes(s.status);
+  !!s && (s.keepsPlan ?? PLAN_KEEPING_STATUSES.includes(s.status));
+
+/** Our stored customer and Stripe's disagree (a lost race): no Checkout on a customer we don't own. */
+class CustomerConflict extends Error {
+  constructor() {
+    super('customer_conflict');
+    this.name = 'CustomerConflict';
+  }
+}
 const priceFor = (prices: CurrentPrice[], key: string) => prices.find((p) => p.lookupKey === key) ?? null;
 
 async function statusResult(c: Ctx): Promise<BillingStatusResult | null> {
@@ -94,15 +103,42 @@ async function ensureCustomer(c: Ctx, stripe: Stripe): Promise<string> {
     { email: c.get('session').email, metadata: { owner_id: owner } },
     { idempotencyKey: `customer:${owner}` },
   );
+  // Insert-only: the answer is whatever is stored for this owner (a parallel request may have won), or null
+  // when this customer id already belongs to someone else.
+  let stored: unknown;
   try {
-    await billingDb.setCustomer(c.env, owner, customer.id);
+    stored = await billingDb.setCustomer(c.env, owner, customer.id);
   } catch (err) {
-    // A parallel request may have stored it first (insert-only): use whatever is stored.
-    const stored = await billingDb.customer(c.env, owner);
-    if (stored) return stored;
-    throw err;
+    stored = await billingDb.customer(c.env, owner);
+    if (!stored) throw err;
   }
-  return customer.id;
+  if (typeof stored !== 'string' || !/^cus_[A-Za-z0-9]+$/.test(stored)) throw new CustomerConflict();
+  return stored;
+}
+
+/**
+ * Expires the owner's other open subscription Checkouts, so two tabs can't end in two paid subscriptions.
+ * Returns true when one had already completed (then the caller answers 409: the member has a plan now).
+ */
+async function expireOtherCheckouts(c: Ctx, stripe: Stripe, owner: string, idem: string): Promise<boolean> {
+  let completed = false;
+  for (const id of await billingDb.checkoutOpen(c.env, owner, 'subscription', idem)) {
+    try {
+      await stripe.checkout.sessions.expire(id, {}, { idempotencyKey: `expire:${id}` });
+      await billingDb.checkoutMark(c.env, id, 'failed');
+    } catch (err) {
+      // Not open any more: see what happened to it.
+      if (!isStripeError(err)) throw err;
+      const session = await stripe.checkout.sessions.retrieve(id);
+      if (session.status === 'complete') {
+        await applyCheckoutSession(c.env, stripe, session, c.get('requestId'));
+        completed = true;
+      } else if (session.status === 'expired') {
+        await billingDb.checkoutMark(c.env, id, 'failed');
+      } else throw err;
+    }
+  }
+  return completed;
 }
 
 billingRoutes.post('/checkout', async (c) => {
@@ -131,6 +167,11 @@ billingRoutes.post('/checkout', async (c) => {
     // 10-minute windows; top-ups: 1 minute, so buying a second pack soon after is a new session.
     const windowSec = body.kind === 'subscription' ? 600 : 60;
     const bucket = Math.floor(Date.now() / 1000 / windowSec);
+    const idem = `checkout:${owner}:${body.kind}:${lookupKey}:${bucket}`;
+    if (body.kind === 'subscription') {
+      if (await expireOtherCheckouts(c, stripe, owner, idem)) return c.json(fail('conflict'), 409);
+      if (keeping(await billingDb.subscription(c.env, owner))) return c.json(fail('conflict'), 409);
+    }
     // Derived from the window, so the idempotent retry sends identical parameters; always ≥ 30 min ahead.
     const expiresAt = (bucket + 1) * windowSec + 31 * 60;
     const metadata = { owner_id: owner, kind: body.kind, lookup_key: lookupKey };
@@ -148,13 +189,12 @@ billingRoutes.post('/checkout', async (c) => {
         ? { subscription_data: { metadata: { owner_id: owner } } }
         : { payment_intent_data: { metadata } }),
     };
-    const session = await stripe.checkout.sessions.create(params, {
-      idempotencyKey: `checkout:${owner}:${body.kind}:${lookupKey}:${bucket}`,
-    });
+    const session = await stripe.checkout.sessions.create(params, { idempotencyKey: idem });
     if (!session.url) return unavailable(c);
-    await billingDb.checkoutRecord(c.env, owner, session.id, body.kind, lookupKey);
+    await billingDb.checkoutRecord(c.env, owner, session.id, body.kind, lookupKey, idem);
     return c.json({ ok: true, url: session.url }, 201);
   } catch (err) {
+    if (err instanceof CustomerConflict) return c.json(fail('conflict'), 409);
     return upstream(c, 'billing_checkout', err);
   }
 });
@@ -168,7 +208,13 @@ billingRoutes.get('/checkout/:id', async (c) => {
     if (!row) return c.json(fail('not_found'), 404);
     const age = row.createdAt ? Date.now() - new Date(row.createdAt).getTime() : 0;
     const stripe = stripeClient(c.env);
-    if (row.state === 'pending' && stripe && age >= CHECKOUT_SELF_FETCH_AFTER_MS) {
+    if (
+      row.state === 'pending' &&
+      stripe &&
+      age >= CHECKOUT_SELF_FETCH_AFTER_MS &&
+      // At most once per 10 s per session, however fast the page (or a script) polls.
+      (await billingDb.checkoutPoll(c.env, owner, id.data))
+    ) {
       // The webhook is slow: apply the session through the same path the webhook uses.
       try {
         const session = await stripe.checkout.sessions.retrieve(id.data);
@@ -202,10 +248,10 @@ billingRoutes.post('/portal', async (c) => {
   try {
     const customer = await billingDb.customer(c.env, ownerOf(c));
     if (!customer) return c.json(fail('conflict'), 409);
-    const session = await stripe.billingPortal.sessions.create({
-      customer,
-      return_url: `${appUrl(c)}/settings/billing`,
-    });
+    const session = await stripe.billingPortal.sessions.create(
+      { customer, return_url: `${appUrl(c)}/settings/billing` },
+      { idempotencyKey: `portal:${ownerOf(c)}:${Math.floor(Date.now() / 60_000)}` },
+    );
     return c.json({ ok: true, url: session.url }, 201);
   } catch (err) {
     return upstream(c, 'billing_portal', err);
@@ -332,6 +378,93 @@ billingRoutes.post('/change/preview', async (c) => {
   }
 });
 
+/** The price a schedule moves to next (a scheduled downgrade), or null. */
+async function scheduledTarget(
+  stripe: Stripe,
+  scheduleId: string,
+): Promise<{ price: string; interval: BillingInterval } | null> {
+  const schedule = await stripe.subscriptionSchedules.retrieve(scheduleId, {
+    expand: ['phases.items.price'],
+  });
+  if (schedule.status !== 'active' && schedule.status !== 'not_started') return null;
+  const now = Math.floor(Date.now() / 1000);
+  const next = schedule.phases.find((p) => p.start_date > now);
+  const p = next?.items[0]?.price;
+  if (!p) return null;
+  const price = typeof p === 'string' ? p : p.id;
+  const interval =
+    typeof p !== 'string' && 'recurring' in p && p.recurring?.interval === 'year' ? 'year' : 'month';
+  return { price, interval };
+}
+
+/** Puts the subscription on a schedule: the current price until the period end, then `next` for an interval. */
+async function scheduleChange(
+  stripe: Stripe,
+  sub: Stripe.Subscription,
+  item: Stripe.SubscriptionItem,
+  currentPrice: string,
+  scheduleId: string | null,
+  next: { price: string; interval: BillingInterval; key: string; scheduleKey: string },
+) {
+  let schedule: Stripe.SubscriptionSchedule | null = null;
+  if (scheduleId) {
+    schedule = await stripe.subscriptionSchedules.retrieve(scheduleId);
+    if (schedule.status !== 'active' && schedule.status !== 'not_started') schedule = null;
+  }
+  if (!schedule) {
+    schedule = await stripe.subscriptionSchedules.create(
+      { from_subscription: sub.id },
+      { idempotencyKey: next.scheduleKey },
+    );
+  }
+  const start =
+    schedule.current_phase?.start_date ?? schedule.phases[0]?.start_date ?? item.current_period_start;
+  await stripe.subscriptionSchedules.update(
+    schedule.id,
+    {
+      end_behavior: 'release',
+      phases: [
+        {
+          items: [{ price: currentPrice, quantity: 1 }],
+          start_date: start,
+          end_date: item.current_period_end,
+          proration_behavior: 'none',
+        },
+        {
+          items: [{ price: next.price, quantity: 1 }],
+          duration: { interval: next.interval, interval_count: 1 },
+          proration_behavior: 'none',
+        },
+      ],
+    },
+    { idempotencyKey: next.key },
+  );
+}
+
+/** An upgrade that didn't go through: the downgrade the member had scheduled goes back as it was. */
+async function restoreSchedule(
+  c: Ctx,
+  stripe: Stripe,
+  owner: string,
+  sub: Stripe.Subscription,
+  item: Stripe.SubscriptionItem,
+  currentPrice: string,
+  pending: { price: string; interval: BillingInterval },
+  minute: number,
+) {
+  try {
+    await scheduleChange(stripe, sub, item, currentPrice, null, {
+      ...pending,
+      key: `restore:${owner}:${sub.id}:${pending.price}:${minute}`,
+      scheduleKey: `restore-schedule:${owner}:${sub.id}:${minute}`,
+    });
+  } catch (err) {
+    // Stripe may refuse a schedule while an update waits for payment; the member sees no scheduled change and
+    // can schedule it again. Logged as an alert.
+    logError(c.get('requestId'), 'billing_schedule_restore', err);
+  }
+}
+
 billingRoutes.post('/change', async (c) => {
   const body = await readBody(c, planChangeSchema);
   if (!body) return c.json(fail('invalid'), 400);
@@ -343,59 +476,47 @@ billingRoutes.post('/change', async (c) => {
     const minute = Math.floor(Date.now() / 60_000);
     const scheduleId = idOf(sub.schedule);
     let actionUrl: string | null = null;
+    const currentPrice = typeof item.price === 'string' ? item.price : item.price.id;
     if (kind === 'upgrade') {
-      // A subscription managed by a schedule can't be updated directly: drop the scheduled downgrade first.
-      if (scheduleId) await stripe.subscriptionSchedules.release(scheduleId);
-      const updated = await stripe.subscriptions.update(
-        sub.id,
-        {
-          items: [{ id: item.id, price: target.stripePriceId }],
-          proration_behavior: 'always_invoice',
-          // Nothing changes unless the proration is paid: an unpaid upgrade never unlocks the higher plan.
-          payment_behavior: 'pending_if_incomplete',
-          expand: ['latest_invoice'],
-        },
-        { idempotencyKey: `change:${owner}:${sub.id}:${target.lookupKey}:${minute}` },
-      );
+      // A subscription managed by a schedule can't be updated directly: drop the scheduled downgrade first, and
+      // put it back if the upgrade doesn't go through (failed, or waiting for payment), so an unpaid upgrade
+      // never silently cancels the member's downgrade.
+      const pending = scheduleId ? await scheduledTarget(stripe, scheduleId) : null;
+      if (scheduleId)
+        await stripe.subscriptionSchedules.release(
+          scheduleId,
+          {},
+          { idempotencyKey: `release:${scheduleId}` },
+        );
+      let updated: Stripe.Subscription;
+      try {
+        updated = await stripe.subscriptions.update(
+          sub.id,
+          {
+            items: [{ id: item.id, price: target.stripePriceId }],
+            proration_behavior: 'always_invoice',
+            // Nothing changes unless the proration is paid: an unpaid upgrade never unlocks the higher plan.
+            payment_behavior: 'pending_if_incomplete',
+            expand: ['latest_invoice'],
+          },
+          { idempotencyKey: `change:${owner}:${sub.id}:${target.lookupKey}:${minute}` },
+        );
+      } catch (err) {
+        if (pending) await restoreSchedule(c, stripe, owner, sub, item, currentPrice, pending, minute);
+        throw err;
+      }
       if (updated.pending_update) {
         const inv = updated.latest_invoice;
         actionUrl = inv && typeof inv !== 'string' ? (inv.hosted_invoice_url ?? null) : null;
+        if (pending) await restoreSchedule(c, stripe, owner, sub, item, currentPrice, pending, minute);
       }
     } else {
-      const currentPrice = typeof item.price === 'string' ? item.price : item.price.id;
-      let schedule: Stripe.SubscriptionSchedule | null = null;
-      if (scheduleId) {
-        schedule = await stripe.subscriptionSchedules.retrieve(scheduleId);
-        if (schedule.status !== 'active' && schedule.status !== 'not_started') schedule = null;
-      }
-      if (!schedule) {
-        schedule = await stripe.subscriptionSchedules.create(
-          { from_subscription: sub.id },
-          { idempotencyKey: `schedule:${owner}:${sub.id}:${minute}` },
-        );
-      }
-      const start =
-        schedule.current_phase?.start_date ?? schedule.phases[0]?.start_date ?? item.current_period_start;
-      await stripe.subscriptionSchedules.update(
-        schedule.id,
-        {
-          end_behavior: 'release',
-          phases: [
-            {
-              items: [{ price: currentPrice, quantity: 1 }],
-              start_date: start,
-              end_date: item.current_period_end,
-              proration_behavior: 'none',
-            },
-            {
-              items: [{ price: target.stripePriceId, quantity: 1 }],
-              duration: { interval: to.interval, interval_count: 1 },
-              proration_behavior: 'none',
-            },
-          ],
-        },
-        { idempotencyKey: `change:${owner}:${sub.id}:${target.lookupKey}:${minute}` },
-      );
+      await scheduleChange(stripe, sub, item, currentPrice, scheduleId, {
+        price: target.stripePriceId,
+        interval: to.interval,
+        key: `change:${owner}:${sub.id}:${target.lookupKey}:${minute}`,
+        scheduleKey: `schedule:${owner}:${sub.id}:${minute}`,
+      });
     }
     await syncSubscription(c.env, stripe, sub.id, requestId, owner);
     const status = await statusResult(c);
@@ -417,7 +538,7 @@ billingRoutes.delete('/change', async (c) => {
     const sub = await stripe.subscriptions.retrieve(stored.stripeSubscriptionId);
     const scheduleId = idOf(sub.schedule);
     if (!scheduleId) return c.json(fail('conflict'), 409);
-    await stripe.subscriptionSchedules.release(scheduleId);
+    await stripe.subscriptionSchedules.release(scheduleId, {}, { idempotencyKey: `release:${scheduleId}` });
     await syncSubscription(c.env, stripe, sub.id, c.get('requestId'), owner);
     const status = await statusResult(c);
     return status ? c.json(status) : c.json(fail('server'), 500);

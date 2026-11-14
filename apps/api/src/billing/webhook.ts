@@ -80,9 +80,17 @@ export async function dispatch(
     case 'charge.dispute.created': {
       const o = event.data.object as Stripe.Charge | Stripe.Dispute;
       const pi = idOf(o.payment_intent);
+      if (!pi) return { status: 'ignored', owner: null };
       // Only top-up payment intents have a bucket; anything else is a no-op in the database.
-      if (pi) await billingDb.topupRefund(env, pi);
-      return { status: pi ? 'processed' : 'ignored', owner: null };
+      let out = await billingDb.topupRefund(env, pi);
+      if (!out) {
+        // We may not have recorded the payment intent (Managed Payments): find the Checkout session it paid.
+        const sessions = await stripe.checkout.sessions.list({ payment_intent: pi, limit: 1 });
+        const session = sessions.data[0];
+        if (session && session.mode === 'payment')
+          out = await billingDb.topupRefundBySession(env, session.id);
+      }
+      return { status: out ? 'processed' : 'ignored', owner: out?.ownerId ?? null };
     }
   }
   if (SUBSCRIPTION_EVENTS.has(event.type)) {
@@ -100,6 +108,31 @@ export async function dispatch(
   return { status: 'ignored', owner: null };
 }
 
+/** The request body as text, or null once it passes `max` bytes (the rest is never read). */
+export async function readCapped(req: Request, max: number): Promise<string | null> {
+  if (!req.body) return '';
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(size);
+  let at = 0;
+  for (const ch of chunks) {
+    buf.set(ch, at);
+    at += ch.byteLength;
+  }
+  return new TextDecoder().decode(buf);
+}
+
 export async function handleWebhook(c: Context<HonoEnv>) {
   const requestId = c.get('requestId');
   const secret = c.env.STRIPE_WEBHOOK_SECRET;
@@ -110,9 +143,9 @@ export async function handleWebhook(c: Context<HonoEnv>) {
   if (declared > WEBHOOK_MAX_BYTES) return c.json(fail('too_large'), 413);
   const signature = c.req.header('Stripe-Signature');
   if (!signature) return c.json(fail('invalid'), 400);
-  const buf = await c.req.arrayBuffer();
-  if (buf.byteLength > WEBHOOK_MAX_BYTES) return c.json(fail('too_large'), 413);
-  const raw = new TextDecoder().decode(buf);
+  // Content-Length can be absent (chunked) or wrong: count while reading and stop at the cap.
+  const raw = await readCapped(c.req.raw, WEBHOOK_MAX_BYTES);
+  if (raw === null) return c.json(fail('too_large'), 413);
 
   let event: Stripe.Event;
   try {
