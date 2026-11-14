@@ -2,6 +2,8 @@
  * Zod-free entry for browser bundles: constants and types only. The landing page, app and admin import
  * from '@zephyr/shared/client' so they don't ship the validation library.
  */
+
+export * from './admin-types';
 export * from './ai-types';
 export * from './api-types';
 export * from './billing-types';

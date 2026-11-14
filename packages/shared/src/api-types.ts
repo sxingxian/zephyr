@@ -87,6 +87,9 @@ export type ApiErrorCode =
   | 'role_forbidden' // phase 7 (403): the member's role in this library doesn't allow it (see ROLE_CAN)
   | 'library_read_only' // phase 7 (403): the library is over its plan's storage: view, download, Trash and delete only
   | 'billing_unavailable' // phase 7 (503): Stripe isn't configured or didn't answer; nothing was charged
+  | 'account_suspended' // phase 8 (403): staff suspended this account; the session is ended
+  | 'read_only_mode' // phase 8 (503): read-only mode is on (set in Admin, or by itself when the photo store stops answering)
+  | 'last_owner' // phase 8 (409): the last Owner can't be removed or demoted
   | 'server';
 
 export interface ApiError {
