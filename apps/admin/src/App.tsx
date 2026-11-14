@@ -1,5 +1,5 @@
 import { Spinner, ToastProvider } from '@zephyr/ui';
-import { type ReactNode, useCallback } from 'react';
+import { lazy, type ReactNode, Suspense, useCallback } from 'react';
 import { createBrowserRouter, Navigate, Outlet, type RouteObject, useNavigate } from 'react-router';
 import { AdminSessionProvider, useAdminSession } from './lib/session';
 import { AiControls } from './routes/AiControls';
@@ -8,6 +8,18 @@ import { Billing } from './routes/Billing';
 import { Enrol } from './routes/Enrol';
 import { SignIn } from './routes/SignIn';
 import { Signups } from './routes/Signups';
+import { StaffInvite } from './routes/StaffInvite';
+
+// Phase 8 pages load on first visit, so sign-in and the older pages stay small.
+const Ads = lazy(() => import('./routes/Ads').then((m) => ({ default: m.Ads })));
+const Audit = lazy(() => import('./routes/Audit').then((m) => ({ default: m.Audit })));
+const Limits = lazy(() => import('./routes/Limits').then((m) => ({ default: m.Limits })));
+const Retention = lazy(() => import('./routes/Retention').then((m) => ({ default: m.Retention })));
+const Safety = lazy(() => import('./routes/Safety').then((m) => ({ default: m.Safety })));
+const Settings = lazy(() => import('./routes/Settings').then((m) => ({ default: m.Settings })));
+const Staff = lazy(() => import('./routes/Staff').then((m) => ({ default: m.Staff })));
+const Storage = lazy(() => import('./routes/Storage').then((m) => ({ default: m.Storage })));
+const Users = lazy(() => import('./routes/Users').then((m) => ({ default: m.Users })));
 
 function Root() {
   const nav = useNavigate();
@@ -35,7 +47,7 @@ function RequireStaff({ children }: { children: ReactNode }) {
   if (staff === undefined) return <Loading />;
   if (!staff) return <Navigate to="/sign-in" replace />;
   if (enrolOnly) return <Navigate to="/enrol" replace />;
-  return <>{children}</>;
+  return <Suspense fallback={<Loading />}>{children}</Suspense>;
 }
 
 function SignedOutOnly({ children }: { children: ReactNode }) {
@@ -98,6 +110,80 @@ export const routes: RouteObject[] = [
           </RequireStaff>
         ),
       },
+      {
+        path: '/users',
+        element: (
+          <RequireStaff>
+            <Users />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/safety',
+        element: (
+          <RequireStaff>
+            <Safety />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/limits',
+        element: (
+          <RequireStaff>
+            <Limits />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/ads',
+        element: (
+          <RequireStaff>
+            <Ads />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/storage',
+        element: (
+          <RequireStaff>
+            <Storage />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/retention',
+        element: (
+          <RequireStaff>
+            <Retention />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/audit',
+        element: (
+          <RequireStaff>
+            <Audit />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/staff',
+        element: (
+          <RequireStaff>
+            <Staff />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/settings',
+        element: (
+          <RequireStaff>
+            <Settings />
+          </RequireStaff>
+        ),
+      },
+      // Public: the staff invite link (token in the fragment). It never needs a session.
+      { path: '/invite', element: <StaffInvite /> },
       { path: '*', element: <Navigate to="/signups" replace /> },
     ],
   },

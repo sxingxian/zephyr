@@ -20,7 +20,7 @@ export function setUnauthenticatedHandler(fn: Listener | null): void {
 }
 
 export interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   /** Don't trigger the global sign-in redirect on 401 (used by the session probe itself). */
   quiet401?: boolean;
@@ -46,6 +46,9 @@ const KNOWN: ApiErrorCode[] = [
   'billing_unavailable',
   'not_found',
   'conflict',
+  'last_owner',
+  'read_only_mode',
+  'account_suspended',
   'server',
 ];
 
@@ -136,7 +139,43 @@ export function errorMessage(err: unknown): string {
       return 'Your session ended. Sign in again.';
     case 'forbidden':
       return 'You don’t have access to that.';
+    case 'last_owner':
+      return 'There must always be at least one Owner. Make someone else an Owner first.';
+    case 'not_found':
+      return 'That no longer exists. Reload to see the latest.';
+    case 'conflict':
+      return 'Someone else changed this. Reload to see the latest.';
     default:
       return 'Something went wrong on our side. Try again in a minute.';
   }
+}
+
+/**
+ * Non-JSON request to our own API: a binary upload (PUT with a body) or a download (GET returning a Blob).
+ * Errors are mapped exactly like `api`.
+ */
+export async function apiRaw(
+  path: string,
+  opts: { method?: 'GET' | 'PUT'; body?: Blob; contentType?: string; signal?: AbortSignal } = {},
+): Promise<Response> {
+  const method = opts.method ?? 'GET';
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method,
+      credentials: 'same-origin',
+      headers: opts.contentType ? { 'content-type': opts.contentType } : undefined,
+      body: method === 'GET' ? undefined : opts.body,
+      signal: opts.signal,
+      cache: 'no-store',
+    });
+  } catch (e) {
+    if ((e as Error).name === 'AbortError') throw e;
+    throw new ApiFailure('network', 0);
+  }
+  if (res.ok) return res;
+  const body: unknown = await res.json().catch(() => null);
+  const failure = toFailure(res.status, body, res.headers.get('retry-after'));
+  if (failure.code === 'unauthenticated') onUnauthenticated?.();
+  throw failure;
 }
