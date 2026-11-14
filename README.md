@@ -10,8 +10,9 @@ AI photo editing and private passcode galleries, by Midnight Poetry Studio.
 | Admin                | zephyr.midnightpoetry.studio/admin | `apps/admin` (React + Vite)             |
 | Database and sign-in | Supabase                           | `supabase/`                             |
 
-Status: **phase 6**: Zephyr AI (on-device auto-enhance, HDR, colour match, cleanup and opt-in face grouping; cloud
-background removal and scene tags with credits and daily spend caps; Admin › Zephyr AI) on top of shared galleries,
+Status: **phase 7**: billing (Stripe Checkout with Managed Payments, in-app upgrades and downgrades, top-up credits,
+prices set in Admin › Plans & billing) and Studio team libraries (Owner, Editor and Viewer roles), on top of Zephyr AI
+(on-device features; cloud background removal and scene tags with credits and spend caps), shared galleries,
 the editor, photo library, accounts, invites and the invite-only landing page. See [docs/roadmap.md](docs/roadmap.md) and the phase docs in [docs/](docs/).
 
 ## Layout

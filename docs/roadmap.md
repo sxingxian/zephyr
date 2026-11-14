@@ -8,8 +8,8 @@
 | 4     | Editor: WebGL adjustments, recipes, copy/paste, batch, RAW decoding (Wasm)                                                                                                                       | Done   |
 | 5     | Sharing: passcode galleries, guest view, rate limits, expiry and revoke, CSAM scanning route                                                                                                     | Done   |
 | 6     | Zephyr AI: on-device features, cloud background removal (after the bake-off), AI Gateway, spend caps                                                                                             | Done   |
-| 7     | Billing: Stripe Checkout, Billing, Customer Portal, webhooks, credits and top-ups                                                                                                                | Next   |
-| 8     | Admin portal: users, safety, AI controls, plan limits, ads, audit, roles; Cloudflare Access on /admin; storage provider switch (R2, another S3-compatible cloud service, or on-premises storage) |        |
+| 7     | Billing and teams: Stripe Checkout with Managed Payments, in-app plan changes, Customer Portal, webhooks, top-ups, admin-set prices; Studio team libraries (Owner, Editor, Viewer)               | Done   |
+| 8     | Admin portal: users, safety, AI controls, plan limits, ads, audit, roles; Cloudflare Access on /admin; storage provider switch (R2, another S3-compatible cloud service, or on-premises storage) | Next   |
 
 ## Phase 8 note: switching storage provider
 

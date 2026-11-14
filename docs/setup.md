@@ -118,6 +118,23 @@ Nothing here is committed; each value goes into Cloudflare, Supabase, Resend or 
 8. Deploy order: the API (`zephyr-api`, which also runs the 15-minute clean-up job and the zephyr-ai queue), then the landing Worker (custom domain `zephyr.midnightpoetry.studio`,
    includes /admin), then the app Worker (custom domain `zephyrapp.midnightpoetry.studio`).
 
+## 3.7 Stripe (phase 7, billing)
+
+Do this in **test mode** first and answer "Build step 0" in [phase-7.md](phase-7.md) before going live.
+
+1. Activate **Managed Payments** on the account (Singapore seller) and set payouts to a **USD bank account**.
+2. Create a **restricted key** with the permissions listed in phase-7.md, Build step 0.
+3. From the repo root, run `STRIPE_SECRET_KEY=rk_test_… SUPABASE_URL=… SUPABASE_SECRET_KEY=… node scripts/stripe-setup.mjs --test --put-secret`.
+   With the Supabase values it also swaps the database's placeholder prices for the real Stripe ids. It creates the
+   products, the seven prices with their lookup keys, the portal configuration and the webhook endpoint
+   (`https://zephyrapp.midnightpoetry.studio/api/v1/stripe/webhook`), and pipes the signing secret into
+   `wrangler secret put STRIPE_WEBHOOK_SECRET`. It never prints keys.
+4. `wrangler secret put STRIPE_SECRET_KEY` (the restricted key) on `zephyr-api`.
+5. **Billing › Revenue recovery:** set the final action after all retries to **Cancel the subscription** (Zephyr ends
+   the plan 21 days after a failed payment either way).
+6. Check the product tax codes are accepted by Managed Payments.
+7. Repeat with `--live` and live keys once test mode passes.
+
 ## 4. GitHub (Settings › Environments › production)
 
 - Secrets: `CLOUDFLARE_API_TOKEN`, `SUPABASE_ACCESS_TOKEN`, `SUPABASE_DB_PASSWORD`.
