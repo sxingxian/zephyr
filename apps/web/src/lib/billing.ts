@@ -12,6 +12,7 @@ import {
   type PlanChangeResult,
   type PublicPricingResult,
   TEAM_API,
+  TEAM_REMOVE_REPLACE_LINKS_PARAM,
   type TeamInviteBody,
   type TeamInvitePreviewResult,
   type TeamMemberPatch,
@@ -144,7 +145,14 @@ export const revokeTeamInvite = (id: string) => write<TeamResult>(TEAM_API.invit
 export const resendTeamInvite = (id: string) => write<TeamResult>(TEAM_API.invite(id), 'POST', {});
 export const setTeammateRole = (memberId: string, body: TeamMemberPatch) =>
   write<TeamResult>(TEAM_API.member(memberId), 'PATCH', body);
-export const removeTeammate = (memberId: string) => write<TeamResult>(TEAM_API.member(memberId), 'DELETE');
+/** Phase 8: `replaceLinks` also replaces the links of every live gallery in the library (the old ones stop). */
+export const removeTeammate = (memberId: string, replaceLinks = false) =>
+  write<TeamResult>(
+    replaceLinks
+      ? `${TEAM_API.member(memberId)}?${TEAM_REMOVE_REPLACE_LINKS_PARAM}=1`
+      : TEAM_API.member(memberId),
+    'DELETE',
+  );
 export const previewTeamInvite = (token: string) =>
   api<TeamInvitePreviewResult>(TEAM_API.invitePreview, { body: { token }, quiet401: true });
 export const acceptTeamInvite = (token: string) =>

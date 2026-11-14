@@ -14,6 +14,7 @@ import {
   api,
   setPendingDeletionHandler,
   setSessionChangedHandler,
+  setSuspendedHandler,
   setUnauthenticatedHandler,
 } from './api';
 import { browser, endSession, onOtherTabSession, setSessionUserId } from './sessionGuard';
@@ -95,6 +96,17 @@ export function SessionProvider({
     });
     return () => setSessionChangedHandler(null);
   }, []);
+
+  // Phase 8: any call answering 403 account_suspended (sign-in included). The server ended the session;
+  // stop everything bound to it here and reload on the suspended screen, so no photo data stays in memory.
+  useEffect(() => {
+    setSuspendedHandler(() => {
+      setUser(null);
+      // Already there (the session probe on that page can answer the same): no reload loop.
+      if (window.location.pathname !== '/suspended') browser.assign('/suspended');
+    });
+    return () => setSuspendedHandler(null);
+  }, [setUser]);
 
   // Any call answering 403 account_pending_deletion: re-read the session, which then routes to Restore.
   useEffect(() => {

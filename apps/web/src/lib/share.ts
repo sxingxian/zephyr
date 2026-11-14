@@ -6,6 +6,7 @@ import {
   type GalleryCreated,
   type GalleryDetail,
   type GalleryEvent,
+  type GalleryLinkResult,
   type GalleryPatchBody,
   type GalleryPhotoItem,
   type GalleryPhotosBody,
@@ -13,6 +14,7 @@ import {
   type GallerySummary,
   type GuestSelection,
   MAX_LINK_DAYS_SYSTEM,
+  MEMBER8_API,
   type Page,
   PLANS,
   type PlanId,
@@ -36,6 +38,16 @@ export const createGallery = (body: GalleryCreateBody) =>
 /** The gallery's full guest link (owner only). Passcodes are never retrievable; only the link is. */
 export const getGalleryLink = (id: string, signal?: AbortSignal) =>
   api<{ ok: true; url: string }>(SHARE_API.galleryLink(id), { signal }).then((r) => r.url);
+/**
+ * Phase 8: a new link for a gallery whose link reached someone it shouldn't have. The old link stops at once;
+ * the passcode, favourites and activity stay. The new link is returned once (copy it again later as usual).
+ */
+export const replaceGalleryLink = (id: string) =>
+  api<GalleryLinkResult>(MEMBER8_API.galleryLinkReplace(id), {
+    method: 'POST',
+    body: {},
+    headers: expectedUser(),
+  }).then((r) => r.link);
 export const getGallery = (id: string, signal?: AbortSignal) =>
   api<{ ok: true; gallery: GalleryDetail }>(SHARE_API.gallery(id), { signal }).then((r) => r.gallery);
 export const patchGallery = (id: string, body: GalleryPatchBody) =>

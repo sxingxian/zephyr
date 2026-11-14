@@ -11,8 +11,9 @@
     "binding": "ASSETS",
     "html_handling": "drop-trailing-slash",
     "not_found_handling": "single-page-application",
-    // Only API calls and the guest gallery page run the Worker script; everything else is a static file.
-    "run_worker_first": ["/api/*", "/g/*", "/g"]
+    // Phase 8: the Worker runs first for every request so HTML pages get their CSP from it (the AdSense
+    // variant only while AdSense is on). Static files are passed straight to ASSETS untouched; see worker/index.ts.
+    "run_worker_first": true
   },
   "services": [{ "binding": "API", "service": "zephyr-api" }],
   "observability": { "enabled": true, "logs": { "invocation_logs": false } }

@@ -3,8 +3,10 @@ import { Button, Mascot, Note, useToast } from '@zephyr/ui';
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { AlbumPicker } from '../components/AlbumPicker';
+import { AdSlot, useAdsReady } from '../components/ads/Ads';
 import { useAiBatch } from '../components/ai/useAiBatch';
 import { useEditActions } from '../components/editor/LibraryEdit';
+import { RetentionBanner } from '../components/LibraryBanner';
 import {
   type BarAction,
   SearchBox,
@@ -207,6 +209,9 @@ export function LibraryPage({ view }: { view: 'library' | 'favourites' }) {
   const { actions, pickerEl } = useLibraryActions(list, sel);
   const title = view === 'favourites' ? 'Favourites' : 'Library';
   const plain = view === 'library' && filter === 'library' && !q;
+  // Phase 8: a Free member's own library grid carries ads (the slots stay empty on the viewer and editor).
+  const adsReady = useAdsReady('library');
+  const renderAd = useCallback((slot: number) => <AdSlot placement="library" slot={slot} layout="row" />, []);
 
   useShareWithViewer({
     items: list.items,
@@ -261,11 +266,13 @@ export function LibraryPage({ view }: { view: 'library' | 'favourites' }) {
         onOpen={open}
         focusId={returnId}
         label={`${title} photos`}
+        renderAd={view === 'library' && adsReady ? renderAd : undefined}
       />
     );
 
   return (
     <Shell title={title} search={<SearchBox value={search} onChange={setSearch} />}>
+      {view === 'library' && <RetentionBanner />}
       <div className="lib-toolbar">
         {view === 'library' && (
           <Segmented

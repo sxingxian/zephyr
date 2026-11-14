@@ -472,7 +472,7 @@ describe('removing a teammate', () => {
     mockApi((url) => (url === '/api/v1/team' ? json(200, { ok: true, team: team(2) }) : undefined));
     renderAt('/settings/team');
     fireEvent.click(await screen.findByRole('button', { name: 'Remove Aisha M. from the team' }));
-    const note = (await screen.findByText(/could open 2 live gallery links/)).closest(
+    const note = (await screen.findByText(/could open the links of 2 live galleries/)).closest(
       '[role="dialog"], dialog',
     );
     const link = [...(note?.querySelectorAll('a') ?? [])].find((a) => a.textContent === 'Shared galleries');

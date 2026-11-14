@@ -1,9 +1,9 @@
 import { ROLE_CAN, TEAM_NAME_MAX, type Team, type TeamMember, type TeamRole } from '@zephyr/shared/client';
-import { Button, Chip, Field, Icon, Note, Spinner, useToast } from '@zephyr/ui';
+import { Button, Chip, Field, Icon, Note, Spinner, Switch, useToast } from '@zephyr/ui';
 import { type FormEvent, useEffect, useId, useState } from 'react';
 import { Link } from 'react-router';
 import { Avatar } from '../components/Avatar';
-import { ConfirmDialog } from '../components/ai/AiBits';
+import { ConfirmDialog, plural } from '../components/ai/AiBits';
 import { SettingsNav } from '../components/SettingsNav';
 import { Shell } from '../components/Shell';
 import { ApiFailure, errorMessage } from '../lib/api';
@@ -253,6 +253,12 @@ function OwnerTeam() {
   const [role, setRole] = useState<TeamRole>('editor');
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<TeamMember | null>(null);
+  // Phase 8: replace the links a removed teammate could open (on by default when there are any).
+  const [replaceLinks, setReplaceLinks] = useState(false);
+  const startRemove = (m: TeamMember | null) => {
+    setRemoving(m);
+    setReplaceLinks(Boolean(m && m.liveGalleries > 0));
+  };
   const [renaming, setRenaming] = useState<string | null>(null);
   const formId = useId();
 
@@ -376,7 +382,7 @@ function OwnerTeam() {
               onRole={(r) =>
                 void run(`role:${m.userId}`, () => setTeammateRole(m.userId, { role: r }), 'Role updated.')
               }
-              onRemove={() => setRemoving(m)}
+              onRemove={() => startRemove(m)}
             />
           ))}
           {team.invites.map((i) => (
@@ -472,26 +478,47 @@ function OwnerTeam() {
       <ConfirmDialog
         open={removing !== null}
         title={`Remove ${removing?.displayName || removing?.email || 'this teammate'}?`}
-        confirm="Remove from team"
+        confirm={
+          removing && removing.liveGalleries > 0 && replaceLinks
+            ? `Remove and replace ${plural(removing.liveGalleries, 'link')}`
+            : 'Remove from team'
+        }
         danger
         onClose={() => setRemoving(null)}
         onConfirm={async () => {
           if (!removing) return;
-          setTeam((await removeTeammate(removing.userId)).team);
-          toast.show('Removed from the team.', 'good');
+          const replace = removing.liveGalleries > 0 && replaceLinks;
+          setTeam((await removeTeammate(removing.userId, replace)).team);
+          toast.show(
+            replace
+              ? 'Removed from the team. The gallery links are replaced; share the new ones from Shared galleries.'
+              : 'Removed from the team.',
+            'good',
+          );
         }}
       >
         <p>They lose access to your library straight away. Edits they made stay in your library.</p>
         {removing && removing.liveGalleries > 0 && (
-          <Note tone="warn" icon="alert">
-            {`${removing.displayName || 'They'} could open ${
-              removing.liveGalleries === 1
-                ? '1 live gallery link'
-                : `${removing.liveGalleries} live gallery links`
-            } and may have copied ${removing.liveGalleries === 1 ? 'it' : 'them'}. Removing them doesn’t change the links. `}
-            In <Link to="/shared">Shared galleries</Link>, set a new passcode or end any gallery you’re
-            concerned about.
-          </Note>
+          <>
+            <Note tone="warn" icon="alert">
+              {`${removing.displayName || 'They'} could open the links of ${
+                removing.liveGalleries === 1 ? '1 live gallery' : `${removing.liveGalleries} live galleries`
+              }. Removing them doesn’t change those links.`}
+            </Note>
+            <Switch
+              checked={replaceLinks}
+              onChange={setReplaceLinks}
+              label={`Replace the links of ${
+                removing.liveGalleries === 1 ? 'that gallery' : `those ${removing.liveGalleries} galleries`
+              } now`}
+              hint={
+                <>
+                  The old links stop working; you’ll share the new ones from{' '}
+                  <Link to="/shared">Shared galleries</Link>. Passcodes stay the same.
+                </>
+              }
+            />
+          </>
         )}
       </ConfirmDialog>
     </>

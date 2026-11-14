@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ADSENSE_SOURCES, APP_HEADERS, APP_HEADERS_FILE, appCsp } from '../worker/appHeaders.js';
 import { GUEST_HEADERS } from '../worker/guestHeaders.js';
 
 const dist = fileURLToPath(new URL('../dist', import.meta.url));
@@ -27,25 +28,14 @@ for (const file of pages) {
   if (handler) throw new Error(`Inline event handler in ${file}: ${handler[0]}`);
 }
 
-const TURNSTILE = 'https://challenges.cloudflare.com';
-const csp = [
-  "default-src 'self'",
-  // 'wasm-unsafe-eval' lets hash-wasm compile its SHA-256 WebAssembly (upload fingerprinting). It allows
-  // WebAssembly compilation only, not JavaScript eval; the worker script itself is 'self'.
-  `script-src 'self' 'wasm-unsafe-eval' ${TURNSTILE} ${[...hashes].join(' ')}`.trim(),
-  "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob:",
-  "font-src 'self'",
-  "connect-src 'self'",
-  `frame-src ${TURNSTILE}`,
-  "worker-src 'self'",
-  "manifest-src 'self'",
-  "object-src 'none'",
-  "base-uri 'none'",
-  "form-action 'self'",
-  "frame-ancestors 'none'",
-  'upgrade-insecure-requests',
-].join('; ');
+// Phase 8: the app Worker serves every HTML response with one of two policies, both built in
+// worker/appHeaders.js: the default (written below) and, only while AdSense is on in Admin, a variant that
+// adds Google's ad and consent hosts to four directives. Both are checked here before anything ships.
+const hashList = [...hashes];
+const csp = appCsp(hashList);
+const adsenseCsp = appCsp(hashList, { adsense: true });
+checkPolicies(csp, adsenseCsp);
+writeFileSync(join(dist, APP_HEADERS_FILE.slice(1)), `${JSON.stringify({ hashes: hashList })}\n`);
 
 // The guest page (served for /g/* by the Worker, which sets these same headers) replaces the app's policy.
 const guestBlock = (path) =>
@@ -59,14 +49,9 @@ const guestBlock = (path) =>
 
 const headers = `/*
   Content-Security-Policy: ${csp}
-  Strict-Transport-Security: max-age=63072000; includeSubDomains
-  X-Content-Type-Options: nosniff
-  X-Frame-Options: DENY
-  Referrer-Policy: strict-origin-when-cross-origin
-  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), browsing-topics=(), publickey-credentials-get=(self), publickey-credentials-create=(self)
-  Cross-Origin-Opener-Policy: same-origin
-  Cross-Origin-Resource-Policy: same-origin
-  X-Robots-Tag: noindex
+${Object.entries(APP_HEADERS)
+  .map(([k, v]) => `  ${k}: ${v}`)
+  .join('\n')}
   Cache-Control: no-cache
 
 /assets/*
@@ -82,4 +67,54 @@ const headers = `/*
   Cache-Control: no-cache
 ${guestBlock('/guest')}${guestBlock('/guest.html')}`;
 writeFileSync(join(dist, '_headers'), headers);
-console.log(`_headers written · ${pages.length} page(s) · ${hashes.size} inline script hash(es)`);
+
+function directivesOf(policy) {
+  return new Map(
+    policy.split(';').map((d) => {
+      const [k, ...v] = d.trim().split(/\s+/);
+      return [k, v];
+    }),
+  );
+}
+function checkPolicies(strict, widened) {
+  const a = directivesOf(strict);
+  const b = directivesOf(widened);
+  const fail = (m) => {
+    throw new Error(`CSP check failed: ${m}`);
+  };
+  for (const [name, p] of [
+    ['default', a],
+    ['AdSense', b],
+  ]) {
+    const script = p.get('script-src') ?? [];
+    if (script.some((s) => s === "'unsafe-inline'" || s === "'unsafe-eval'" || s === '*' || s === 'https:'))
+      fail(`${name} script-src allows inline, eval or any host`);
+    if (script.some((s) => s.includes('*'))) fail(`${name} script-src has a wildcard host`);
+    for (const d of ['object-src', 'base-uri', 'frame-ancestors'])
+      if ((p.get(d) ?? []).join(' ') !== "'none'") fail(`${name} ${d} must be 'none'`);
+    if ((p.get('default-src') ?? []).join(' ') !== "'self'") fail(`${name} default-src must be 'self'`);
+  }
+  // The default policy names no Google host at all, and only Turnstile as a third party.
+  if (/google|doubleclick|gstatic|adtrafficquality/.test(strict))
+    fail('the default policy names a Google host');
+  const thirdParty = [...a.values()].flat().filter((s) => /^https:\/\//.test(s));
+  if (thirdParty.some((s) => s !== 'https://challenges.cloudflare.com'))
+    fail('the default policy allows a third party other than Turnstile');
+  // The AdSense variant differs only by adding the listed Google hosts to the four listed directives.
+  if ([...a.keys()].join() !== [...b.keys()].join()) fail('the two policies have different directives');
+  for (const [d, base] of a) {
+    const wide = b.get(d) ?? [];
+    const added = wide.filter((s) => !base.includes(s));
+    if (base.some((s) => !wide.includes(s))) fail(`the AdSense policy drops a source from ${d}`);
+    const allowed = ADSENSE_SOURCES[d] ?? [];
+    if (added.some((s) => !allowed.includes(s))) fail(`the AdSense policy adds an unexpected source to ${d}`);
+    if (allowed.length && added.length !== allowed.length)
+      fail(`the AdSense policy is missing hosts in ${d}`);
+  }
+  for (const list of Object.values(ADSENSE_SOURCES))
+    if (list.some((s) => !/^https:\/\/[a-z0-9.-]+$/.test(s)))
+      fail('AdSense sources must be exact https hosts');
+}
+console.log(
+  `_headers written · ${pages.length} page(s) · ${hashes.size} inline script hash(es) · CSP variants checked (default, AdSense)`,
+);

@@ -2399,3 +2399,151 @@ a.nav-item:hover {
 .meter__bar--good > span {
   background: var(--good);
 }
+
+/* ---------- Phase 8: ads (Free plan, own library) ---------- */
+.sidebar__ad:empty {
+  display: none;
+}
+.sidebar__ad {
+  margin-bottom: 12px;
+}
+.sponsored {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--surf);
+  min-width: 0;
+}
+.sponsored__main {
+  display: flex;
+  flex-direction: column;
+  color: inherit;
+  text-decoration: none;
+  min-width: 0;
+}
+.sponsored--row,
+.sponsored--row .sponsored__main {
+  flex-direction: row;
+}
+.sponsored--row {
+  max-width: 640px;
+  height: 100%;
+}
+.sponsored__media {
+  display: block;
+  aspect-ratio: 1200 / 628;
+  background: var(--bg2);
+  overflow: hidden;
+}
+.sponsored--row .sponsored__media {
+  aspect-ratio: auto;
+  width: 160px;
+  flex-shrink: 0;
+}
+.sponsored__media img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.sponsored__text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px 14px 4px;
+  min-width: 0;
+}
+.sponsored__label,
+.adsense__label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.sponsored__advertiser {
+  font-size: 12.5px;
+  color: var(--ink2);
+}
+.sponsored__headline {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.sponsored__body {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.sponsored__main:hover .sponsored__headline {
+  text-decoration: underline;
+}
+.sponsored__main:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: -2px;
+  border-radius: 16px;
+}
+.sponsored__upsell,
+.adsense__upsell {
+  font-size: 12px;
+  text-decoration: none;
+  color: var(--accInk);
+}
+.sponsored__upsell {
+  padding: 4px 14px 12px;
+}
+.sponsored--row .sponsored__upsell {
+  position: absolute;
+  right: 14px;
+  bottom: 10px;
+  padding: 0;
+}
+.adsense {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px dashed var(--line2);
+  border-radius: 16px;
+  background: var(--surf2);
+  min-width: 0;
+}
+.adsense__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.adsense__unit {
+  display: block;
+  min-height: 100px;
+}
+.pgrid__ad {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  display: flex;
+  align-items: stretch;
+}
+.pgrid__ad > .adsense {
+  flex: 1;
+  max-width: 728px;
+  overflow: hidden;
+}
+.aiq-list > .sponsored,
+.aiq-list > .adsense {
+  max-width: 640px;
+}
+@media (max-width: 860px) {
+  .sponsored--row .sponsored__media {
+    width: 112px;
+  }
+  .pgrid__ad {
+    padding: 8px 0;
+  }
+}

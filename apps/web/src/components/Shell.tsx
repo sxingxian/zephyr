@@ -6,9 +6,11 @@ import { useActiveLibrary, useCan } from '../lib/libraryContext';
 import { initials, useSession } from '../lib/session';
 import { formatOf, useUsage } from '../lib/usage';
 import { Avatar } from './Avatar';
+import { AdSlot } from './ads/Ads';
 import { CreditsMeter } from './ai/AiBits';
 import { LibraryBanner } from './LibraryBanner';
 import { LibrarySwitcher, PhoneLibrarySwitcher } from './LibrarySwitcher';
+import { StatusBanner } from './StatusBanner';
 import '../billing.css';
 import { useUploadPicker } from './Uploads';
 
@@ -129,6 +131,9 @@ function Sidebar() {
         )}
       </div>
       <div className="sidebar__spacer" />
+      <div className="sidebar__ad">
+        <AdSlot placement="sidebar" />
+      </div>
       <div className="sidebar__plan">
         <div className="sidebar__plan-row">
           <Link to="/settings/billing" className="sidebar__plan-link">
@@ -248,6 +253,7 @@ export function Shell({
       <div className="shell__main">
         <Topbar title={title} actions={actions} search={search} />
         <main id="main" className="shell__content">
+          <StatusBanner />
           {banner && <LibraryBanner />}
           {children}
         </main>

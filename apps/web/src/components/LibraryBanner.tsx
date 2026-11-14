@@ -2,7 +2,9 @@ import { Button, Icon, type IconName } from '@zephyr/ui';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router';
 import { PLAN_NAME } from '../lib/billing';
+import { shortDate } from '../lib/format';
 import { switchLibrary, useActiveLibrary, useLibraries } from '../lib/libraryContext';
+import { useSession } from '../lib/session';
 import { formatBytes, useUsage } from '../lib/usage';
 
 /** Full-width notice at the top of a page (read-only library, Viewer, payment due). */
@@ -93,4 +95,49 @@ export function LibraryBanner() {
     );
   }
   return null;
+}
+
+/** Phase 8: `/me` (the session user) carries the last retention batch of the member's own library. */
+export interface RetentionNotice {
+  trashedAt: string;
+  photos: number;
+  restoreBy: string;
+}
+export function retentionOf(user: unknown): RetentionNotice | null {
+  const r = (user as { retention?: RetentionNotice | null } | null | undefined)?.retention;
+  if (!r || typeof r.photos !== 'number' || r.photos <= 0 || typeof r.restoreBy !== 'string') return null;
+  const by = new Date(r.restoreBy).getTime();
+  return Number.isNaN(by) || by <= Date.now() ? null : r;
+}
+
+/**
+ * Phase 8: after a year over the Free storage, the oldest photos beyond it went to Trash (30 days to restore).
+ * Shown on the member's own library only.
+ */
+export function RetentionBanner() {
+  const { user } = useSession();
+  const lib = useActiveLibrary();
+  const r = lib.self ? retentionOf(user) : null;
+  if (!r) return null;
+  const n = r.photos.toLocaleString('en-GB');
+  return (
+    <Banner
+      tone="warn"
+      icon="trash"
+      title={`${n} of your oldest photo${r.photos === 1 ? ' was' : 's were'} moved to Trash`}
+      actions={
+        <>
+          <Link to="/trash" className="z-btn z-btn--secondary z-btn--sm">
+            <span>Open Trash</span>
+          </Link>
+          <Link to="/plans" className="z-btn z-btn--primary z-btn--sm">
+            <span>Upgrade to Pro</span>
+          </Link>
+        </>
+      }
+    >
+      Your library stayed over the Free plan’s storage for a year after your paid plan ended. Restore anything
+      by {shortDate(r.restoreBy)}, or upgrade to keep everything.
+    </Banner>
+  );
 }

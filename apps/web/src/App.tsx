@@ -1,12 +1,14 @@
 import { Spinner, ToastProvider, useToast } from '@zephyr/ui';
 import { lazy, Suspense, useCallback, useEffect, useRef } from 'react';
 import { createBrowserRouter, Outlet, type RouteObject, useLocation, useNavigate } from 'react-router';
+import { AdsBoot } from './components/ads/Ads';
 import { AiHost } from './components/ai/AiHost';
 import { EditTray } from './components/editor/EditTray';
 import { PublicOnly, RequireAuth } from './components/Guards';
 import { LibraryHost } from './components/LibraryHost';
 import { ShareTray } from './components/share/ShareTray';
 import { UploadProvider } from './components/Uploads';
+import { useAppStatusPolling } from './lib/appStatus';
 import { refreshLibraries, takeLibraryNotice, useCan } from './lib/libraryContext';
 import { safeReturnPath } from './lib/returnPath';
 import { SessionProvider, useSession } from './lib/session';
@@ -23,6 +25,7 @@ import { SharingSettings } from './routes/SharingSettings';
 import { SignIn } from './routes/SignIn';
 import { SignInCode } from './routes/SignInCode';
 import { SignUp } from './routes/SignUp';
+import { SuspendedPage } from './routes/Suspended';
 import { TrashPage } from './routes/Trash';
 import { WelcomePasskey } from './routes/WelcomePasskey';
 import './lib/editor';
@@ -67,6 +70,8 @@ function LibraryBoot() {
 }
 
 function Root() {
+  // Phase 8: read-only mode and the maintenance notice, for everyone (no session needed).
+  useAppStatusPolling();
   const nav = useNavigate();
   const loc = useLocation();
   // A 401 from any call: back to sign-in, remembering where the visitor was.
@@ -78,6 +83,7 @@ function Root() {
     <SessionProvider onUnauthenticated={onUnauthenticated}>
       <ToastProvider>
         <LibraryBoot />
+        <AdsBoot />
         <Uploads>
           <Outlet />
         </Uploads>
@@ -150,6 +156,8 @@ export const routes: RouteObject[] = [
       { path: '/shared/:galleryId', element: auth(<GalleryPage />) },
       { path: '/shared/:galleryId/:tab', element: auth(<GalleryPage />) },
       { path: '/account-deleted', element: <AccountDeleted /> },
+      // Phase 8: a suspended account (from any call, sign-in included). No session by then.
+      { path: '/suspended', element: <SuspendedPage /> },
       { path: '/sign-in', element: pub(<SignIn />) },
       { path: '/sign-in/code', element: pub(<SignInCode />) },
       { path: '/sign-up', element: pub(<SignUp />) },
