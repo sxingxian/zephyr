@@ -1,14 +1,27 @@
 import { handleAiBatch } from './ai/consumer';
 import { runAiCron } from './ai/cron';
 import { app } from './app';
+import { BILLING_CRON, runBillingCron } from './billing/cron';
 import type { AiMessage, Env } from './env';
 import { logError } from './http';
 import { runCleanup } from './jobs';
 
 export default {
   fetch: app.fetch,
-  /** Cron Trigger (wrangler.jsonc): the library clean-up jobs and Zephyr AI's queue upkeep, every 15 minutes. */
-  scheduled(_controller, env, ctx) {
+  /**
+   * Cron Triggers (wrangler.jsonc): the library clean-up jobs and Zephyr AI's queue upkeep every 15 minutes;
+   * billing's price moves once a day (phase 7).
+   */
+  scheduled(controller, env, ctx) {
+    if (controller.cron === BILLING_CRON) {
+      ctx.waitUntil(
+        runBillingCron(env).then(
+          () => undefined,
+          (err) => logError('cron', 'billing', err),
+        ),
+      );
+      return;
+    }
     ctx.waitUntil(
       runCleanup(env).then(
         () => undefined,

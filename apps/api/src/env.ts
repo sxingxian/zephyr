@@ -82,6 +82,16 @@ export interface Env {
   AI_GATEWAY_TOKEN?: string;
   RUNWARE_API_KEY?: string;
   FAL_KEY?: string;
+
+  // ---- Phase 7: billing (Stripe, Managed Payments) ----
+  /** Restricted Stripe key (docs/phase-7.md, Build step 0). Unset: billing answers 503 billing_unavailable. */
+  STRIPE_SECRET_KEY?: string;
+  /** Signing secret of the webhook endpoint (whsec_…). */
+  STRIPE_WEBHOOK_SECRET?: string;
+  /** Pinned Stripe API version; defaults to the installed SDK's version. */
+  STRIPE_API_VERSION?: string;
+  /** Per-member billing and team writes (20 a minute). */
+  BILLING_LIMITER: RateLimit;
 }
 
 /** The slice of the Workers AI binding the API uses. */

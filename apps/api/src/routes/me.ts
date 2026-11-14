@@ -11,9 +11,10 @@ import { Hono, type MiddlewareHandler } from 'hono';
 import { gotrue } from '../auth/gotrue';
 import { appendCookies, clearCookies, recentlyAuthenticated } from '../auth/session';
 import { ceremonyMatches } from '../auth/webauthn';
+import { cancelForDeletion, undoCancelForDeletion } from '../billing/deletion';
 import { notifyAccountDeletion, notifyPasskeyChange } from '../email/notify';
 import { list } from '../env';
-import { burstOk, fail, guardWrite, logError, rateLimited, readBody } from '../http';
+import { background, burstOk, fail, guardWrite, logError, rateLimited, readBody } from '../http';
 import { rpc, UpstreamError } from '../supabase';
 import type { HonoEnv } from '../types';
 import { getProfile, requireMember, sessionUser, toPasskey } from './session-helpers';
@@ -148,8 +149,19 @@ meRoutes.post('/delete', requireRecentAuth, async (c) => {
   if (!body) return c.json(fail('invalid'), 400);
   const s = c.get('session');
   try {
-    const purgeAt = await rpc<string | null>(c.env, 'request_account_deletion', { p_owner: s.userId });
+    // Phase 7: the answer may also carry the Stripe subscription id (renewal stops while deletion is pending).
+    const scheduled = await rpc<string | { purgeAt?: string; stripeSubscriptionId?: string | null } | null>(
+      c.env,
+      'request_account_deletion',
+      { p_owner: s.userId },
+    );
+    const purgeAt = typeof scheduled === 'string' ? scheduled : (scheduled?.purgeAt ?? null);
     if (!purgeAt) return c.json(fail('forbidden'), 403);
+    await background(c, () =>
+      cancelForDeletion(c.env, s.userId, scheduled).catch((err) =>
+        logError(c.get('requestId'), 'deletion_billing_cancel', err),
+      ),
+    );
     try {
       await gotrue.logoutEverywhere(c.env, s.accessToken);
     } catch (err) {
@@ -169,8 +181,17 @@ meRoutes.post('/delete', requireRecentAuth, async (c) => {
 meRoutes.post('/restore', async (c) => {
   const s = c.get('session');
   try {
-    const restored = await rpc<boolean | null>(c.env, 'restore_account', { p_owner: s.userId });
+    const restoredRes = await rpc<
+      boolean | { restored?: boolean; stripeSubscriptionId?: string | null } | null
+    >(c.env, 'restore_account', { p_owner: s.userId });
+    const restored =
+      typeof restoredRes === 'object' && restoredRes ? restoredRes.restored === true : restoredRes;
     if (!restored) return c.json(fail('conflict'), 409);
+    await background(c, () =>
+      undoCancelForDeletion(c.env, s.userId, restoredRes).catch((err) =>
+        logError(c.get('requestId'), 'restore_billing_resume', err),
+      ),
+    );
     const profile = await getProfile(c.env, s.userId);
     if (!profile) return c.json(fail('server'), 500);
     return c.json({ ok: true, user: await sessionUser(c, s, profile) } satisfies SessionResponse);

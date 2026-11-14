@@ -5,6 +5,7 @@ import { adminRoutes } from './routes/admin';
 import { aiRoutes } from './routes/ai';
 import { albumRoutes } from './routes/albums';
 import { appAuthRoutes } from './routes/app-auth';
+import { billingRoutes, pricingRoutes, stripeWebhookRoutes } from './routes/billing';
 import { brandingRoutes } from './routes/branding';
 import { galleryRoutes } from './routes/galleries';
 import { guestRoutes } from './routes/guest';
@@ -70,6 +71,11 @@ app.route('/api/v1/ai', aiRoutes);
 // Sharing (phase 5): members' galleries, and guests (the link token is the capability).
 app.route('/api/v1/galleries', galleryRoutes);
 app.route('/api/v1/g', guestRoutes);
+// Billing (phase 7): the member's own plan, public prices, and Stripe's webhook (signature-authenticated,
+// outside the Origin/JSON/session middleware; it carries no cookies).
+app.route('/api/v1/billing', billingRoutes);
+app.route('/api/v1/public/pricing', pricingRoutes);
+app.route('/api/v1/stripe', stripeWebhookRoutes);
 // Admin console (zephyr.midnightpoetry.studio/admin, behind Cloudflare Access).
 app.route('/admin/api', adminRoutes);
 

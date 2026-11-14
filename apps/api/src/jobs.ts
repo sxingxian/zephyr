@@ -4,6 +4,7 @@
  * to repeat. One audit row per run that did something, with counts only.
  */
 import { gotrue } from './auth/gotrue';
+import { cancelForPurge } from './billing/deletion';
 import { sendEmail } from './email/resend';
 import { galleryExpiringEmail, safetyReportEmail } from './email/share-templates';
 import type { Env } from './env';
@@ -66,6 +67,8 @@ interface DueAccount {
   /** Phase 5: guest renditions and branding in zephyr-shared. */
   sharedPrefix?: string;
   uploads: { r2Key: string; r2UploadId: string }[];
+  /** Phase 7: the subscription to cancel before the account goes (when the database gives it). */
+  stripeSubscriptionId?: string | null;
 }
 
 async function abortMultipart(env: Env, key: string, uploadId: string) {
@@ -149,6 +152,9 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
           if (res.deleted > 0) await rpc(env, 'account_purge_progress', { p_owner: a.ownerId });
           continue;
         }
+        // Phase 7: never delete an account Stripe would keep billing. Throws if Stripe can't be reached,
+        // so the account waits for the next run.
+        await cancelForPurge(env, a.ownerId, a);
         await gotrue.adminDeleteUser(env, a.ownerId);
         counts.accountsPurged += 1;
       } catch (err) {
