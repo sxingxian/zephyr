@@ -1,3 +1,4 @@
+import { type StaffAction, staffCan } from '@zephyr/shared/client';
 import { Button, Chip, Icon, type IconName, Wordmark } from '@zephyr/ui';
 import type { ReactNode } from 'react';
 import { NavLink, useNavigate } from 'react-router';
@@ -5,29 +6,34 @@ import { ROLE_LABEL, useAdminSession } from '../lib/session';
 import { Avatar } from './Avatar';
 
 type Role = NonNullable<ReturnType<typeof useAdminSession>['staff']>['role'];
-const NAV: {
+/** Nav items. Each one is shown only to roles that may view it; the API answers 403 to everyone else. */
+export const NAV: {
   label: string;
   icon: IconName;
-  to?: string;
+  to: string;
   end?: boolean;
-  phase?: number;
-  /** Only these roles see the item (the API enforces the same). */
+  /** STAFF_CAN action that lets a role view the page. */
+  can?: StaffAction;
+  /** Older pages gated by an explicit role list. */
   roles?: Role[];
 }[] = [
-  { label: 'Overview', icon: 'home', phase: 8 },
-  { label: 'Users', icon: 'people', phase: 8 },
+  { label: 'Users', icon: 'people', to: '/users', can: 'usersView' },
   { label: 'Sign-ups & invites', icon: 'mail', to: '/signups' },
-  { label: 'Safety & reports', icon: 'shield', phase: 5 },
+  { label: 'Safety & reports', icon: 'shield', to: '/safety', can: 'safetyView' },
   { label: 'AI jobs', icon: 'cpu', to: '/ai/jobs' },
   { label: 'Zephyr AI', icon: 'breeze', to: '/ai', end: true },
   { label: 'Plans & billing', icon: 'card', to: '/billing', roles: ['owner', 'admin', 'finance'] },
-  { label: 'Plan limits', icon: 'sliders', phase: 8 },
-  { label: 'Ads', icon: 'megaphone', phase: 8 },
-  { label: 'Galleries', icon: 'link', phase: 5 },
-  { label: 'Audit log', icon: 'file', phase: 8 },
-  { label: 'Team & roles', icon: 'key', phase: 8 },
-  { label: 'System settings', icon: 'settings', phase: 8 },
+  { label: 'Plan limits', icon: 'sliders', to: '/limits', can: 'limitsView' },
+  { label: 'Ads', icon: 'megaphone', to: '/ads', can: 'ads' },
+  { label: 'Storage', icon: 'database', to: '/storage', can: 'storage' },
+  { label: 'Retention', icon: 'clock', to: '/retention', can: 'retention' },
+  { label: 'Audit log', icon: 'file', to: '/audit', can: 'auditView' },
+  { label: 'Staff & roles', icon: 'key', to: '/staff', can: 'staff' },
+  { label: 'System settings', icon: 'settings', to: '/settings', can: 'settings' },
 ];
+
+export const navFor = (role: Role | undefined) =>
+  NAV.filter((n) => role && (n.can ? staffCan(role, n.can) : !n.roles || n.roles.includes(role)));
 
 const initials = (s: string) =>
   s
@@ -69,20 +75,12 @@ export function AdminShell({
           Production
         </div>
         <div className="anav__items">
-          {NAV.filter((n) => !n.roles || (staff && n.roles.includes(staff.role))).map((n) =>
-            n.to ? (
-              <NavLink key={n.label} to={n.to} end={n.end} className="anav__item">
-                <Icon name={n.icon} size={18} />
-                <span>{n.label}</span>
-              </NavLink>
-            ) : (
-              <span key={n.label} className="anav__item anav__item--off" aria-disabled="true">
-                <Icon name={n.icon} size={18} />
-                <span>{n.label}</span>
-                <span className="anav__phase">Phase {n.phase}</span>
-              </span>
-            ),
-          )}
+          {navFor(staff?.role).map((n) => (
+            <NavLink key={n.label} to={n.to} end={n.end} className="anav__item">
+              <Icon name={n.icon} size={18} />
+              <span>{n.label}</span>
+            </NavLink>
+          ))}
         </div>
         {staff && (
           <div className="anav__me">

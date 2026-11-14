@@ -1,7 +1,7 @@
 import { ADMIN_API, type AdminSessionResponse, type PasskeyOptions } from '@zephyr/shared/client';
 import { Button, CodeInput, Field, Note } from '@zephyr/ui';
 import { type FormEvent, useState } from 'react';
-import { Link, useNavigate } from 'react-router';
+import { Link, useLocation, useNavigate } from 'react-router';
 import { AuthFrame } from '../components/AuthFrame';
 import { ApiFailure, api, errorMessage } from '../lib/api';
 import { createPasskey, isCancelled, passkeysSupported } from '../lib/passkey';
@@ -15,8 +15,13 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
  */
 export function Enrol() {
   const nav = useNavigate();
+  const location = useLocation();
   const { staff, enrolOnly, setSession } = useAdminSession();
-  const [email, setEmail] = useState('');
+  // Prefilled after accepting a staff invite (/invite passes the invited address in router state, never the URL).
+  const [email, setEmail] = useState(() => {
+    const s = location.state as { email?: unknown } | null;
+    return typeof s?.email === 'string' ? s.email : '';
+  });
   const [sentTo, setSentTo] = useState<string | null>(null);
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
