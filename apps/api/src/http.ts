@@ -5,6 +5,7 @@ import type { z } from 'zod';
 import { hashIp, hmac, toPgBytea } from './crypto';
 import type { Env } from './env';
 import { networkKey } from './ip';
+import { StoreError } from './storage/types';
 import { rpc, UpstreamError } from './supabase';
 import type { HonoEnv } from './types';
 
@@ -21,9 +22,11 @@ export function logError(requestId: string, where: string, err: unknown) {
   const detail =
     err instanceof UpstreamError
       ? `${err.where} ${err.status}${err.code ? ` ${err.code}` : ''}`
-      : err instanceof Error
-        ? err.name
-        : 'unknown';
+      : err instanceof StoreError
+        ? `store ${err.code}${err.status ? ` ${err.status}` : ''}`
+        : err instanceof Error
+          ? err.name
+          : 'unknown';
   console.error(JSON.stringify({ level: 'error', requestId, where, detail }));
 }
 

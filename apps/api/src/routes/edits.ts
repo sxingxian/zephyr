@@ -14,7 +14,9 @@ import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { background, fail, logError, rateLimited, readBody } from '../http';
 import { actorOf, ownerOf, requireRole, requireWritable } from '../library/context';
 import { imageInfo } from '../library/files';
-import { contentLength, deleteKeys, expectedUser, newEditKey, readExact, UUID } from '../library/storage';
+import { contentLength, expectedUser, newEditKey, readExact, UUID } from '../library/storage';
+import { deleteEverywhere } from '../storage';
+import { photoStore, storeIdOf } from '../storage/config';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 
@@ -41,13 +43,16 @@ const editWriteLimit: MiddlewareHandler<HonoEnv> = async (c, next) => {
 const writesOnly: MiddlewareHandler<HonoEnv> = async (c, next) =>
   c.req.method === 'GET' || c.req.method === 'HEAD' ? next() : expectedUser(c, next);
 
-/** Deletes R2 objects after the response (waitUntil); failures are left to the orphan sweep. */
+/**
+ * Deletes objects after the response (waitUntil); failures are left to the orphan sweep. The database hands
+ * back keys without a store, so they go on every store (a photo mid-move has a copy on both).
+ */
 async function dropLater(c: Ctx, keys: string[], where: string) {
   if (!keys.length) return;
   const requestId = c.get('requestId');
   await background(c, async () => {
     try {
-      await deleteKeys(c.env.PHOTOS, keys);
+      await deleteEverywhere(c.env, keys);
     } catch (err) {
       logError(requestId, where, err);
     }
@@ -133,7 +138,10 @@ editRoutes.put('/:id/edit/variants/:kind', requireRole('edit'), requireWritable,
     if (len < 1) return c.json(fail('invalid'), 400);
     // Checked before anything is written: a stale render (common after quick edits) or a repeat of one
     // already stored (a retry, a second tab) never touches R2.
-    const check = await rpc<{ status: 'current' | 'exists' | 'stale' } | null>(c.env, 'edit_variant_check', {
+    const check = await rpc<{
+      status: 'current' | 'exists' | 'stale';
+      storeId?: string | null;
+    } | null>(c.env, 'edit_variant_check', {
       p_owner: owner,
       p_photo: id,
       p_version: version,
@@ -158,10 +166,9 @@ editRoutes.put('/:id/edit/variants/:kind', requireRole('edit'), requireWritable,
     // only if it turns out not to be the recorded key.
     let outcomeUnknown = false;
     try {
-      await c.env.PHOTOS.put(key, bytes, {
-        httpMetadata: { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' },
-      });
-      const head = await c.env.PHOTOS.head(key);
+      const store = photoStore(c.env, storeIdOf(check));
+      await store.put(key, bytes, { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' });
+      const head = await store.head(key);
       if (!head) return c.json(fail('server'), 500);
       outcomeUnknown = true;
       const res = await rpc<{

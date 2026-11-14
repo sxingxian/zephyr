@@ -10,7 +10,8 @@ import { safetyMatchEmail } from '../email/share-templates';
 import type { Env } from '../env';
 import { background, fail, logError } from '../http';
 import { contentDisposition } from '../library/files';
-import { fetchCached, nonce, stores } from '../library/objects';
+import { fetchCached, nonce, stores } from '../storage';
+import { photoStore, storeIdOf } from '../storage/config';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 import { guestDownloadName } from './names';
@@ -74,7 +75,8 @@ interface MediaPlan {
   unavailable?: 'pending' | 'not_allowed';
   /** pending because the account is past its storage allowance (the member is told in Settings). */
   storageFull?: boolean;
-  source: { key: string; editVersion: number };
+  /** `storeId` (phase 8): the photo's store, for library keys; gallery renders (`u/<o>/g/…`) are always on R2. */
+  source: { key: string; editVersion: number; storeId?: string | null };
   watermark: {
     key: string;
     version: number;
@@ -149,8 +151,11 @@ async function makeRendition(
   size: RenditionSize,
   m: MediaPlan,
 ): Promise<string> {
-  const { photos, shared } = stores(c.env);
-  const src = await photos.get(m.source.key);
+  const { galleryRenders, shared } = stores(c.env);
+  const source = /^u\/[^/]+\/g\//.test(m.source.key)
+    ? galleryRenders
+    : photoStore(c.env, storeIdOf(m.source));
+  const src = await source.get(m.source.key);
   if (!src) throw new Unavailable(404, 'not_found');
   const long = outLongEdge(m, size);
   let bytes: Uint8Array;

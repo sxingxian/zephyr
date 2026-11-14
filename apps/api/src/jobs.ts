@@ -9,7 +9,6 @@ import { sendEmail } from './email/resend';
 import { galleryExpiringEmail, safetyReportEmail } from './email/share-templates';
 import type { Env } from './env';
 import { logError } from './http';
-import { deleteAll, deleteUnder, stores } from './library/objects';
 import {
   deleteKeys,
   deletePrefix,
@@ -20,6 +19,9 @@ import {
   photoKey,
   stagingKey,
 } from './library/storage';
+import { deleteAll, deleteUnder, stores } from './storage';
+import { allStores, photoStore, storeIdOf } from './storage/config';
+import type { ObjectStore } from './storage/types';
 import { rpc } from './supabase';
 
 export const JOB_LIMITS = {
@@ -59,6 +61,7 @@ interface ExpiredUpload {
   r2Key: string;
   r2UploadId: string | null;
   keys: string[];
+  storeId?: string | null;
 }
 interface DueAccount {
   ownerId: string;
@@ -66,17 +69,27 @@ interface DueAccount {
   stagingPrefix: string;
   /** Phase 5: guest renditions and branding in zephyr-shared. */
   sharedPrefix?: string;
-  uploads: { r2Key: string; r2UploadId: string }[];
+  uploads: { r2Key: string; r2UploadId: string; storeId?: string | null }[];
   /** Phase 7: the subscription to cancel before the account goes (when the database gives it). */
   stripeSubscriptionId?: string | null;
 }
 
-async function abortMultipart(env: Env, key: string, uploadId: string) {
+async function abortMultipart(env: Env, storeId: string, key: string, uploadId: string) {
   try {
-    await env.PHOTOS.resumeMultipartUpload(key, uploadId).abort();
+    await photoStore(env, storeId).abortMultipart(key, uploadId);
   } catch {
     /* already aborted or completed */
   }
+}
+
+/** Groups rows by their store ('r2' when the database row has none). */
+function byStore<T extends { storeId?: string | null }>(rows: T[]): Map<string, T[]> {
+  const out = new Map<string, T[]>();
+  for (const r of rows) {
+    const id = storeIdOf(r);
+    out.set(id, [...(out.get(id) ?? []), r]);
+  }
+  return out;
 }
 
 export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupCounts> {
@@ -104,11 +117,11 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
       p_limit: JOB_LIMITS.expiredUploads,
     });
     counts.uploadsAborted = due.length;
-    if (due.length) {
-      for (const u of due) if (u.r2UploadId) await abortMultipart(env, u.r2Key, u.r2UploadId);
+    for (const u of due) if (u.r2UploadId) await abortMultipart(env, storeIdOf(u), u.r2Key, u.r2UploadId);
+    for (const [id, group] of byStore(due)) {
       counts.objectsDeleted += await deleteKeys(
-        env.PHOTOS,
-        due.flatMap((u) => u.keys),
+        photoStore(env, id),
+        group.flatMap((u) => u.keys),
       );
     }
   } catch (err) {
@@ -117,16 +130,21 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
 
   // 2. Trash past its 30 days (and anything left purging): delete objects, then rows and usage.
   try {
+    // Each photo's keys on its own store; a store that fails leaves only its photos for the next run.
     const due = await rpc<PurgeItem[]>(env, 'due_photo_purges', { p_limit: JOB_LIMITS.photoPurges });
-    if (due.length) {
-      counts.objectsDeleted += await deleteKeys(
-        env.PHOTOS,
-        due.flatMap((p) => p.keys),
-      );
-      counts.photosPurged = await rpc<number>(env, 'confirm_photo_purges', {
-        p_ids: due.map((p) => p.photoId),
-      });
+    const done: string[] = [];
+    for (const [id, group] of byStore(due)) {
+      try {
+        counts.objectsDeleted += await deleteKeys(
+          photoStore(env, id),
+          group.flatMap((p) => p.keys),
+        );
+        done.push(...group.map((p) => p.photoId));
+      } catch (err) {
+        logError(requestId, 'job_photo_purge_store', err);
+      }
     }
+    if (done.length) counts.photosPurged = await rpc<number>(env, 'confirm_photo_purges', { p_ids: done });
   } catch (err) {
     logError(requestId, 'job_photo_purges', err);
   }
@@ -136,16 +154,24 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
     const due = await rpc<DueAccount[]>(env, 'due_account_purges', { p_limit: JOB_LIMITS.accountPurges });
     for (const a of due) {
       try {
-        for (const u of a.uploads) await abortMultipart(env, u.r2Key, u.r2UploadId);
-        const photos = await deletePrefix(env.PHOTOS, a.prefix, JOB_LIMITS.pagesPerAccount);
-        const staged = await deletePrefix(env.PHOTOS, a.stagingPrefix, JOB_LIMITS.pagesPerAccount);
-        const shared = a.sharedPrefix
-          ? await deleteUnder(stores(env).shared, a.sharedPrefix, JOB_LIMITS.pagesPerAccount)
-          : { deleted: 0, complete: true };
-        const res = {
-          deleted: photos.deleted + staged.deleted + shared.deleted,
-          complete: photos.complete && staged.complete && shared.complete,
-        };
+        for (const u of a.uploads) await abortMultipart(env, storeIdOf(u), u.r2Key, u.r2UploadId);
+        // Phase 8: the owner's prefixes on every configured store, so nothing is left on a store the
+        // library moved away from. A store that can't be built (missing secret) keeps the account waiting.
+        const { stores: all, broken } = allStores(env);
+        const res = { deleted: 0, complete: broken.length === 0 };
+        if (broken.length) logError(requestId, 'job_account_purge_store', new Error('store_unavailable'));
+        for (const store of all) {
+          for (const prefix of [a.prefix, a.stagingPrefix]) {
+            const r = await deletePrefix(store, prefix, JOB_LIMITS.pagesPerAccount);
+            res.deleted += r.deleted;
+            res.complete &&= r.complete;
+          }
+        }
+        if (a.sharedPrefix) {
+          const r = await deleteUnder(stores(env).shared, a.sharedPrefix, JOB_LIMITS.pagesPerAccount);
+          res.deleted += r.deleted;
+          res.complete &&= r.complete;
+        }
         counts.objectsDeleted += res.deleted;
         if (!res.complete) {
           // More objects than one run allows: progress, not a failure, so no hour's backoff.
@@ -230,6 +256,7 @@ interface PendingPublish {
   ownerId: string;
   thumbBytes: number;
   previewBytes: number;
+  storeId?: string | null;
 }
 
 /**
@@ -244,22 +271,21 @@ export async function retryPublishes(env: Env): Promise<{ published: number; los
   let published = 0;
   let lost = 0;
   for (const p of due) {
+    const store = photoStore(env, storeIdOf(p));
     const outcome: Record<'thumb' | 'preview', 'ok' | 'lost' | 'wait'> = { thumb: 'ok', preview: 'ok' };
     for (const kind of ['thumb', 'preview'] as const) {
       const counted = kind === 'thumb' ? p.thumbBytes : p.previewBytes;
       if (counted <= 0) continue;
-      const staged = await env.PHOTOS.get(stagingKey(p.ownerId, p.photoId, kind));
-      if (staged && 'body' in staged && staged.size === counted) {
-        const bytes = new Uint8Array(await staged.arrayBuffer());
-        const type = staged.httpMetadata?.contentType === 'image/jpeg' ? 'image/jpeg' : 'image/webp';
-        await env.PHOTOS.put(photoKey(p.ownerId, p.photoId, kind), bytes, {
-          httpMetadata: { contentType: type },
-        });
+      const staged = await store.get(stagingKey(p.ownerId, p.photoId, kind));
+      if (staged && staged.size === counted) {
+        const bytes = await staged.bytes();
+        const type = staged.contentType === 'image/jpeg' ? 'image/jpeg' : 'image/webp';
+        await store.put(photoKey(p.ownerId, p.photoId, kind), bytes, { contentType: type });
         published += 1;
         continue;
       }
-      if (staged && 'body' in staged) await staged.body.cancel().catch(() => undefined);
-      const final = await env.PHOTOS.head(photoKey(p.ownerId, p.photoId, kind));
+      if (staged) await staged.body.cancel().catch(() => undefined);
+      const final = await store.head(photoKey(p.ownerId, p.photoId, kind));
       if (final && final.size === counted) continue;
       outcome[kind] = staged ? 'wait' : 'lost';
     }
@@ -271,7 +297,7 @@ export async function retryPublishes(env: Env): Promise<{ published: number; los
       p_lost_preview: outcome.preview === 'lost',
     });
     lost += Number(outcome.thumb === 'lost') + Number(outcome.preview === 'lost');
-    await deleteKeys(env.PHOTOS, [
+    await deleteKeys(store, [
       stagingKey(p.ownerId, p.photoId, 'thumb'),
       stagingKey(p.ownerId, p.photoId, 'preview'),
     ]);
@@ -289,7 +315,12 @@ interface PhotoRowState {
   editPreviewKey?: string | null;
   /** Phase 6: the masks the photo's rows record (the only `m/` keys that count). */
   maskKeys?: string[];
+  /** Phase 8: the store the photo lives on ('r2' until sweep_photo_rows returns it). */
+  storeId?: string | null;
 }
+
+/** Migration states during which a photo can have a copy on a store other than its own. */
+const MOVING = new Set(['copying', 'paused', 'verifying', 'holding', 'rolling_back', 'failed']);
 
 /**
  * Deletes photo objects (`u/`) nothing accounts for: keys whose photo row is gone or belongs to someone
@@ -301,16 +332,39 @@ interface PhotoRowState {
  * empties it after 2 days).
  */
 export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> {
-  const cursor = await rpc<string | null>(env, 'get_job_state', { p_key: 'orphan_sweep_cursor' });
-  const listed = await env.PHOTOS.list({
-    prefix: 'u/',
-    limit: JOB_LIMITS.sweepPage,
-    ...(cursor ? { cursor } : {}),
-  });
+  // Phase 8: one page per configured store per run, each with its own cursor. A copy on a store other than
+  // its photo's is left alone while a migration is moving photos (old copies are deleted only after the
+  // verify-plus-hold, by the migration); with no migration under way it's a leftover and goes too.
+  let moving = true;
+  try {
+    const status = await rpc<{ migration: { state: string } | null } | null>(env, 'storage_status');
+    moving = !!status?.migration && MOVING.has(status.migration.state);
+  } catch (err) {
+    logError('cron', 'job_sweep_status', err);
+  }
+  const { stores: all } = allStores(env);
+  let deleted = 0;
+  for (const store of all) {
+    try {
+      deleted += await sweepStore(env, store, moving, now);
+    } catch (err) {
+      logError('cron', 'job_orphan_sweep_store', err);
+    }
+  }
+  return deleted;
+}
+
+const cursorKey = (storeId: string) =>
+  storeId === 'r2' ? 'orphan_sweep_cursor' : `orphan_sweep_cursor:${storeId}`;
+
+async function sweepStore(env: Env, store: ObjectStore, moving: boolean, now: number): Promise<number> {
+  const key = cursorKey(store.id);
+  const cursor = await rpc<string | null>(env, 'get_job_state', { p_key: key });
+  const listed = await store.list('u/', { limit: JOB_LIMITS.sweepPage, cursor });
   const parsed = listed.objects.map((o) => ({
     key: o.key,
     k: parseKey(o.key),
-    uploaded: o.uploaded instanceof Date ? o.uploaded.getTime() : now,
+    uploaded: o.uploaded instanceof Date && o.uploaded.getTime() > 0 ? o.uploaded.getTime() : now,
   }));
   const ids = [...new Set(parsed.flatMap((p) => (p.k ? [p.k.photo] : [])))];
   const rows = ids.length ? await rpc<PhotoRowState[]>(env, 'sweep_photo_rows', { p_ids: ids }) : [];
@@ -320,6 +374,11 @@ export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> 
     if (!k) return isNonCanonicalPhotoKey(key) ? [key] : [];
     const row = byId.get(k.photo);
     if (!row || row.ownerId !== k.owner) return [key];
+    if (storeIdOf(row) !== store.id) {
+      // A copy away from the photo's store: the migration owns it while photos are moving. Gallery renders
+      // (`u/<owner>/g/…`) don't parse as photo keys, so they never get here.
+      return !moving && now - uploaded > LIBRARY_LIMITS.editGraceMs ? [key] : [];
+    }
     if (k.kind === 'edit') {
       // Every PUT writes its own key, so a key that isn't the recorded one is never going to be: once it's
       // older than any PUT can take between its write and its record, it goes.
@@ -333,14 +392,13 @@ export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> 
     }
     return [];
   });
-  if (orphans.length) await deleteKeys(env.PHOTOS, orphans);
-  const next = listed.truncated ? (listed.cursor ?? null) : null;
+  if (orphans.length) await deleteKeys(store, orphans);
   try {
-    await rpc(env, 'set_job_state', { p_key: 'orphan_sweep_cursor', p_value: next });
+    await rpc(env, 'set_job_state', { p_key: key, p_value: listed.cursor });
   } catch (err) {
     // Never freeze on a cursor that can't be stored (e.g. too long): start over from the top next run.
     logError('cron', 'job_sweep_cursor', err);
-    await rpc(env, 'set_job_state', { p_key: 'orphan_sweep_cursor', p_value: null });
+    await rpc(env, 'set_job_state', { p_key: key, p_value: null });
   }
   return orphans.length;
 }
@@ -453,19 +511,21 @@ export async function drainShareDeletions(env: Env, requestId = 'cron'): Promise
   });
   if (!due.length) return 0;
   const s = stores(env);
+  // 'photos' queue rows are gallery renders (`u/<owner>/g/…`), which always stay on R2.
+  const target = { shared: s.shared, photos: s.galleryRenders };
   const done: number[] = [];
   let deleted = 0;
   for (const bucket of ['shared', 'photos'] as const) {
     const keys = due.filter((d) => d.bucket === bucket && !d.prefix);
     if (keys.length) {
       deleted += await deleteAll(
-        s[bucket],
+        target[bucket],
         keys.map((d) => d.key),
       );
       done.push(...keys.map((d) => d.id));
     }
     for (const d of due.filter((x) => x.bucket === bucket && x.prefix)) {
-      const r = await deleteUnder(s[bucket], d.key, 2);
+      const r = await deleteUnder(target[bucket], d.key, 2);
       deleted += r.deleted;
       if (r.complete) done.push(d.id);
     }

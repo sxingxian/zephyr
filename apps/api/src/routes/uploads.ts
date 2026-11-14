@@ -31,11 +31,13 @@ import {
   stagingKey,
   UUID,
 } from '../library/storage';
+import { photoStore } from '../storage/config';
+import type { ObjectStore } from '../storage/types';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 import { requireMember } from './session-helpers';
 
-/** /api/v1/uploads/*: resumable uploads through the Worker into R2 multipart (docs/phase-3.md). */
+/** /api/v1/uploads/*: resumable uploads through the Worker into the photo store's multipart upload (docs/phase-3.md). */
 export const uploadRoutes = new Hono<HonoEnv>();
 uploadRoutes.use('*', libraryGuard(LIBRARY_LIMITS.uploadCreateBodyBytes));
 uploadRoutes.use('*', requireMember);
@@ -57,6 +59,8 @@ interface UploadRow {
   variants: Partial<Record<VariantKind, number>>;
   expiresAt: string;
   expired: boolean;
+  /** Phase 8: the store this upload writes to (fixed at create time, so a switch never splits it). */
+  storeId?: string | null;
 }
 type Ctx = Context<HonoEnv>;
 
@@ -73,6 +77,7 @@ async function loadUpload(c: Ctx, id: string): Promise<UploadRow | Response> {
 }
 
 const keysOf = (c: Ctx, up: UploadRow) => photoKeys(ownerOf(c), up.photoId);
+const storeOf = (c: Ctx, up: { storeId?: string | null }) => photoStore(c.env, up.storeId);
 
 /**
  * Discards an upload: claims it in the database first (rows and reservation go under the storage lock),
@@ -81,21 +86,23 @@ const keysOf = (c: Ctx, up: UploadRow) => photoKeys(ownerOf(c), up.photoId);
  * removed by the orphan sweep. False if there was nothing to claim.
  */
 async function discardUpload(c: Ctx, uploadId: string): Promise<boolean> {
-  const claim = await rpc<{ r2Key: string; r2UploadId: string | null; keys: string[] } | null>(
-    c.env,
-    'abort_upload',
-    { p_owner: ownerOf(c), p_upload: uploadId },
-  );
+  const claim = await rpc<{
+    r2Key: string;
+    r2UploadId: string | null;
+    keys: string[];
+    storeId?: string | null;
+  } | null>(c.env, 'abort_upload', { p_owner: ownerOf(c), p_upload: uploadId });
   if (!claim) return false;
   try {
+    const store = storeOf(c, claim);
     if (claim.r2UploadId) {
       try {
-        await c.env.PHOTOS.resumeMultipartUpload(claim.r2Key, claim.r2UploadId).abort();
+        await store.abortMultipart(claim.r2Key, claim.r2UploadId);
       } catch {
         /* already aborted or completed; the original key is deleted below either way */
       }
     }
-    await deleteKeys(c.env.PHOTOS, claim.keys);
+    await deleteKeys(store, claim.keys);
   } catch (err) {
     logError(c.get('requestId'), 'upload_discard_r2', err);
   }
@@ -202,29 +209,24 @@ uploadRoutes.put('/:id/parts/:n', async (c) => {
       body = rest;
     }
 
+    const store = storeOf(c, up);
     let r2UploadId = up.r2UploadId;
     if (!r2UploadId) {
-      const mp = await c.env.PHOTOS.createMultipartUpload(up.r2Key, {
-        httpMetadata: { contentType: FILE_TYPES[up.fileType].mime },
-      });
+      const created = await store.createMultipart(up.r2Key, FILE_TYPES[up.fileType].mime);
       r2UploadId = await rpc<string | null>(c.env, 'set_upload_r2', {
         p_owner: ownerOf(c),
         p_upload: up.uploadId,
-        p_r2_upload_id: mp.uploadId,
+        p_r2_upload_id: created,
       });
       // A parallel part created the upload first: use theirs and drop ours.
-      if (r2UploadId !== mp.uploadId) await mp.abort().catch(() => undefined);
+      if (r2UploadId !== created) await store.abortMultipart(up.r2Key, created).catch(() => undefined);
       if (!r2UploadId) return c.json(fail('upload_expired'), 410);
     }
 
     const limited = exactLength(body, expected);
     let etag: string;
     try {
-      const part = await c.env.PHOTOS.resumeMultipartUpload(up.r2Key, r2UploadId).uploadPart(
-        n,
-        limited.stream,
-      );
-      etag = part.etag;
+      etag = await store.uploadPart(up.r2Key, r2UploadId, n, limited.stream, expected);
     } catch (err) {
       if (limited.state.error) {
         return limited.state.error.tooLong ? c.json(fail('too_large'), 413) : c.json(fail('invalid'), 400);
@@ -264,9 +266,8 @@ uploadRoutes.put('/:id/variants/:kind', async (c) => {
     if (info.width > limits.maxEdge || info.height > limits.maxEdge) return c.json(fail('invalid'), 400);
     // Staged, never the photo's own key: only a completion that wins the claim publishes it.
     const staged = stagingKey(ownerOf(c), up.photoId, kind);
-    await c.env.PHOTOS.put(staged, bytes, {
-      httpMetadata: { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' },
-    });
+    const store = storeOf(c, up);
+    await store.put(staged, bytes, { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' });
     const recorded = await rpc<boolean | null>(c.env, 'record_variant', {
       p_owner: ownerOf(c),
       p_upload: up.uploadId,
@@ -279,7 +280,7 @@ uploadRoutes.put('/:id/variants/:kind', async (c) => {
       const requestId = c.get('requestId');
       await background(c, async () => {
         try {
-          await c.env.PHOTOS.delete(staged);
+          await store.delete([staged]);
         } catch (err) {
           logError(requestId, 'upload_variant_unstage', err);
         }
@@ -295,15 +296,18 @@ uploadRoutes.put('/:id/variants/:kind', async (c) => {
 
 /** A staged variant, re-checked (size cap, JPEG/WEBP header, dimensions); null if absent or invalid. */
 async function readStaged(
-  c: Ctx,
+  store: ObjectStore,
   key: string,
   kind: VariantKind,
 ): Promise<{ bytes: Uint8Array; type: 'image/jpeg' | 'image/webp' } | null> {
-  const obj = await c.env.PHOTOS.get(key);
-  if (!obj || !('body' in obj)) return null;
+  const obj = await store.get(key);
+  if (!obj) return null;
   const limits = VARIANT_LIMITS[kind];
-  if (obj.size > limits.maxBytes) return null;
-  const bytes = new Uint8Array(await obj.arrayBuffer());
+  if (obj.size > limits.maxBytes) {
+    await obj.body.cancel().catch(() => undefined);
+    return null;
+  }
+  const bytes = await obj.bytes();
   const info = imageInfo(bytes);
   if (
     !info ||
@@ -333,15 +337,16 @@ uploadRoutes.post('/:id/complete', async (c) => {
     const parts = Object.entries(up.parts)
       .map(([n, etag]) => ({ partNumber: Number(n), etag }))
       .sort((a, b) => a.partNumber - b.partNumber);
+    const store = storeOf(c, up);
     let completed = true;
     try {
-      await c.env.PHOTOS.resumeMultipartUpload(up.r2Key, up.r2UploadId).complete(parts);
+      await store.completeMultipart(up.r2Key, up.r2UploadId, parts);
     } catch (err) {
       // Possibly completed by an earlier attempt that died before the database step: the HEAD decides.
       completed = false;
       logError(c.get('requestId'), 'upload_complete_r2', err);
     }
-    const head = await c.env.PHOTOS.head(up.r2Key);
+    const head = await store.head(up.r2Key);
     if (!head) {
       return completed ? c.json(fail('server'), 500) : c.json(fail('server'), 502);
     }
@@ -352,8 +357,8 @@ uploadRoutes.post('/:id/complete', async (c) => {
     // Measure the staged variants ourselves: their real sizes are what gets counted.
     const owner = ownerOf(c);
     const variants = {
-      thumb: await readStaged(c, stagingKey(owner, up.photoId, 'thumb'), 'thumb'),
-      preview: await readStaged(c, stagingKey(owner, up.photoId, 'preview'), 'preview'),
+      thumb: await readStaged(store, stagingKey(owner, up.photoId, 'thumb'), 'thumb'),
+      preview: await readStaged(store, stagingKey(owner, up.photoId, 'preview'), 'preview'),
     };
     const res = await rpc<CompleteResult | null>(c.env, 'complete_upload', {
       p_owner: owner,
@@ -372,9 +377,7 @@ uploadRoutes.post('/:id/complete', async (c) => {
             for (const kind of ['thumb', 'preview'] as const) {
               const v = variants[kind];
               if (v) {
-                await c.env.PHOTOS.put(photoKey(owner, up.photoId, kind), v.bytes, {
-                  httpMetadata: { contentType: v.type },
-                });
+                await store.put(photoKey(owner, up.photoId, kind), v.bytes, { contentType: v.type });
               }
             }
             await rpc(c.env, 'finish_publish', {
@@ -383,7 +386,7 @@ uploadRoutes.post('/:id/complete', async (c) => {
               p_lost_thumb: false,
               p_lost_preview: false,
             });
-            await deleteKeys(c.env.PHOTOS, [
+            await deleteKeys(store, [
               stagingKey(owner, up.photoId, 'thumb'),
               stagingKey(owner, up.photoId, 'preview'),
             ]);
@@ -406,7 +409,7 @@ uploadRoutes.post('/:id/complete', async (c) => {
         return c.json({ ok: true, photo: res.photo } satisfies UploadCompleteResult);
       case 'duplicate': {
         // The same file finished first elsewhere: this copy's objects go; answer with the kept one.
-        await deleteKeys(c.env.PHOTOS, keysOf(c, up));
+        await deleteKeys(store, keysOf(c, up));
         const kept = await rpc<PhotoDetail | null>(c.env, 'get_photo', {
           p_owner: ownerOf(c),
           p_id: res.photoId,
