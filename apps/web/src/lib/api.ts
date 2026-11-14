@@ -1,4 +1,5 @@
 import type { ApiError, ApiErrorCode } from '@zephyr/shared/client';
+import { markReadOnly } from './appStatus';
 import { fallbackToOwnLibrary, libraryHeaders } from './libraryContext';
 
 /** A failed API call, carrying the contract's error code. */
@@ -26,6 +27,11 @@ let onPendingDeletion: Listener | null = null;
 export function setPendingDeletionHandler(fn: Listener | null): void {
   onPendingDeletion = fn;
 }
+let onSuspended: Listener | null = null;
+/** Phase 8: the session layer registers this to end the session and show the suspended screen. */
+export function setSuspendedHandler(fn: Listener | null): void {
+  onSuspended = fn;
+}
 let onSessionChanged: Listener | null = null;
 /** The session layer registers this to stop and reload when the cookie turns out to belong to someone else. */
 export function setSessionChangedHandler(fn: Listener | null): void {
@@ -40,6 +46,8 @@ export function notifyFailure(failure: ApiFailure, quiet401?: boolean): void {
   if (failure.code === 'account_pending_deletion') onPendingDeletion?.();
   if (failure.code === 'session_changed') onSessionChanged?.();
   if (failure.code === 'library_unavailable') void fallbackToOwnLibrary();
+  if (failure.code === 'account_suspended') onSuspended?.();
+  if (failure.code === 'read_only_mode') markReadOnly();
 }
 
 export interface RequestOptions {
@@ -87,6 +95,9 @@ const KNOWN: ApiErrorCode[] = [
   'role_forbidden',
   'library_read_only',
   'billing_unavailable',
+  'account_suspended',
+  'read_only_mode',
+  'last_owner',
   'server',
 ];
 
@@ -216,6 +227,10 @@ export function errorMessage(err: unknown): string {
       return 'This library is read-only because it’s over its plan’s storage. Free up space or renew the plan.';
     case 'billing_unavailable':
       return 'Billing isn’t available right now. Nothing was charged. Try again in a few minutes.';
+    case 'account_suspended':
+      return 'This account is suspended. Contact support if you think this is a mistake.';
+    case 'read_only_mode':
+      return 'Zephyr is read-only for a little while, so uploads and edits are paused. Your photos are safe; try again later.';
     default:
       return 'Something went wrong on our side. Try again in a minute.';
   }

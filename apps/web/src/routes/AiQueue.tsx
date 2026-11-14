@@ -1,7 +1,8 @@
 import type { AiItemError, AiJobItem, AiJobPage, AiJobSummary } from '@zephyr/shared/client';
 import { Button, Chip, Icon, Note, Spinner, useToast } from '@zephyr/ui';
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router';
+import { AdSlot } from '../components/ads/Ads';
 import { AiPausedNote, CloudPausedBanner, ConfirmDialog, CreditStrip, plural } from '../components/ai/AiBits';
 import { Segmented } from '../components/LibraryBits';
 import { Shell } from '../components/Shell';
@@ -492,14 +493,17 @@ function AiQueueContent() {
         </EmptyHint>
       ) : (
         <div className="aiq-list">
-          {page.jobs.map((j) => (
-            <JobCard
-              key={j.id}
-              job={j}
-              local={local.find((l) => l.id === j.id)}
-              per={status?.credits.bgCreditsPerPhoto ?? 1}
-              onChanged={() => void load()}
-            />
+          {page.jobs.map((j, i) => (
+            <Fragment key={j.id}>
+              <JobCard
+                job={j}
+                local={local.find((l) => l.id === j.id)}
+                per={status?.credits.bgCreditsPerPhoto ?? 1}
+                onChanged={() => void load()}
+              />
+              {/* Phase 8: Free plan, own library: one sponsored slot after the first batch. */}
+              {i === 0 && <AdSlot placement="batch" layout="row" />}
+            </Fragment>
           ))}
           {page.nextCursor && (
             <Button kind="ghost" busy={more} onClick={loadMore}>

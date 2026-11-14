@@ -60,6 +60,10 @@ export const browser = {
   assign(path: string): void {
     window.location.assign(path);
   },
+  /** Reloads the current page (phase 8: drops a loaded AdSense script after a plan upgrade). */
+  reload(): void {
+    window.location.reload();
+  },
 };
 
 // ------------------------------------------------------------ other tabs

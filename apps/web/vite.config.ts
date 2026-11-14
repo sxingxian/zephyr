@@ -83,10 +83,20 @@ export default defineConfig(({ mode, command }) => {
             'assets/ort.*',
             'assets/faces.worker-*',
           ],
-          navigateFallback: '/index.html',
-          // /g/* is the guest gallery: always from the network, never the member app shell.
-          navigateFallbackDenylist: [/^\/api\//, /^\/g(\/|$)/],
-          runtimeCaching: [],
+          // Phase 8: pages come from the network first (the app Worker sets their CSP, which changes with the
+          // AdSense setting), with the precached shell as the offline fallback. A cached page must never keep
+          // an old, wider policy after AdSense is turned off.
+          navigateFallback: null,
+          runtimeCaching: [
+            {
+              urlPattern: ({ request, url }) =>
+                request.mode === 'navigate' && !/^\/(api|g)(\/|$)/.test(url.pathname),
+              handler: 'NetworkOnly',
+              options: {
+                precacheFallback: { fallbackURL: '/index.html' },
+              },
+            },
+          ],
           cleanupOutdatedCaches: true,
           clientsClaim: true,
         },

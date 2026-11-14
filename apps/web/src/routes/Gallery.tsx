@@ -15,7 +15,14 @@ import { Button, Card, Chip, Dialog, Field, Icon, type IconName, Note, useToast 
 import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, NavLink, useParams } from 'react-router';
 import { Shell } from '../components/Shell';
-import { copyText, PasscodeReveal, photosLabel, ShNote, StatusChip } from '../components/share/ShareBits';
+import {
+  CopyButton,
+  copyText,
+  PasscodeReveal,
+  photosLabel,
+  ShNote,
+  StatusChip,
+} from '../components/share/ShareBits';
 import {
   DownloadChoice,
   ExtrasSwitches,
@@ -40,6 +47,7 @@ import {
   newPasscode,
   patchGallery,
   removePasscode,
+  replaceGalleryLink,
   revokeGallery,
   sharingLimits,
 } from '../lib/share';
@@ -62,7 +70,9 @@ export function GalleryPage() {
   const [g, setG] = useState<GalleryDetail | null>(null);
   const [missing, setMissing] = useState<string | null>(null);
   const [passcode, setPasscode] = useState<string | null>(null);
-  const [confirm, setConfirm] = useState<null | 'revoke' | 'newcode' | 'nocode'>(null);
+  const [confirm, setConfirm] = useState<null | 'revoke' | 'newcode' | 'nocode' | 'replace'>(null);
+  // Phase 8: the replaced link, shown once in the dialog.
+  const [newLink, setNewLink] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const toast = useToast();
 
@@ -119,6 +129,13 @@ export function GalleryPage() {
       const ok = await copyText(url);
       if (ok) toast.show('Link copied. Send the passcode separately.', 'good');
       else toast.show('Couldn’t copy. Your browser blocked the clipboard.', 'bad');
+    });
+  const doReplace = () =>
+    run('replace', async () => {
+      const link = await replaceGalleryLink(galleryId);
+      setConfirm(null);
+      setNewLink(link);
+      await load();
     });
   const doRevoke = () =>
     run('revoke', async () => {
@@ -241,6 +258,7 @@ export function GalleryPage() {
               onNewCode={() => setConfirm('newcode')}
               onNoCode={() => setConfirm('nocode')}
               onRevoke={() => setConfirm('revoke')}
+              onReplace={() => setConfirm('replace')}
             />
           )}
         </div>
@@ -306,6 +324,56 @@ export function GalleryPage() {
           Without a passcode, anyone who gets the link can see these photos. Fine for a family album; keep it
           on for client work.
         </ShNote>
+      </Dialog>
+      <Dialog
+        open={confirm === 'replace'}
+        onClose={() => !busy && setConfirm(null)}
+        title={`Replace the link for “${g.name}”?`}
+        footer={
+          <>
+            <Button kind="ghost" onClick={() => setConfirm(null)} disabled={Boolean(busy)}>
+              Cancel
+            </Button>
+            <Button kind="primary" icon="refresh" busy={busy === 'replace'} onClick={doReplace}>
+              Replace link
+            </Button>
+          </>
+        }
+      >
+        <p className="sh-p">Use this if the link reached someone it shouldn’t have.</p>
+        <ul className="sh-bullets">
+          <li>The current link stops working at once, for everyone.</li>
+          <li>Guests need the new link; the passcode stays the same.</li>
+          <li>Favourites and activity are kept.</li>
+        </ul>
+      </Dialog>
+      <Dialog
+        open={Boolean(newLink)}
+        onClose={() => setNewLink(null)}
+        title="Your new link"
+        footer={
+          <Button kind="primary" onClick={() => setNewLink(null)}>
+            Done
+          </Button>
+        }
+      >
+        {newLink && (
+          <div className="stack sh-form">
+            <Field
+              label="Private link"
+              value={newLink}
+              readOnly
+              mono
+              size="md"
+              onFocus={(e) => e.currentTarget.select()}
+              trailing={<CopyButton text={newLink} what="Link" />}
+            />
+            <ShNote icon="info">
+              The old link no longer works. Send this one to your guests
+              {g.passcode ? '; the passcode is unchanged.' : '.'}
+            </ShNote>
+          </div>
+        )}
       </Dialog>
       <Dialog
         open={Boolean(passcode)}
@@ -817,12 +885,14 @@ function SettingsTab({
   onNewCode,
   onNoCode,
   onRevoke,
+  onReplace,
 }: {
   g: GalleryDetail;
   onSaved: (g: GalleryDetail) => void;
   onNewCode: () => void;
   onNoCode: () => void;
   onRevoke: () => void;
+  onReplace: () => void;
 }) {
   const toast = useToast();
   const usage = useUsage();
@@ -945,6 +1015,15 @@ function SettingsTab({
               Add a passcode
             </Button>
           )}
+        </SettingRow>
+        <SettingRow
+          icon="link"
+          title="Replace the link"
+          sub="If the link reached someone it shouldn’t have. The current link stops working at once; the passcode stays."
+        >
+          <Button size="sm" icon="refresh" onClick={onReplace}>
+            Replace link…
+          </Button>
         </SettingRow>
         <SettingRow
           icon="ban"

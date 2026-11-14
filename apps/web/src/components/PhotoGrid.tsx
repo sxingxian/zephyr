@@ -5,6 +5,7 @@ import {
   type KeyboardEvent,
   type MouseEvent,
   type PointerEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -19,7 +20,12 @@ import { type GridLayout, gridMove, type Selection } from '../lib/selection';
 
 type Row =
   | { kind: 'head'; key: string; label: string; count: number; first: number }
-  | { kind: 'tiles'; key: string; indexes: number[] };
+  | { kind: 'tiles'; key: string; indexes: number[] }
+  | { kind: 'ad'; key: string; slot: number };
+
+/** Phase 8: a Free member's library grid shows an ad after the first 24 tiles, then every 48. */
+export const AD_FIRST = 24;
+export const AD_EVERY = 48;
 
 interface Metrics {
   cols: number;
@@ -48,8 +54,12 @@ export function buildRows(
   sort: PhotoListQuery['sort'],
   cols: number,
   grouped = true,
+  ads = false,
 ): Row[] {
   const rows: Row[] = [];
+  let tiles = 0;
+  let nextAd = AD_FIRST;
+  let slot = 0;
   const keyAt = (k: number) => {
     const p = items[k];
     return p ? dayKey(sortTime(p, sort)) : '';
@@ -65,6 +75,13 @@ export function buildRows(
       const indexes: number[] = [];
       for (let x = k; x < Math.min(j, k + cols); x++) indexes.push(x);
       rows.push({ kind: 'tiles', key: `t:${k}`, indexes });
+      tiles += indexes.length;
+      // Only between rows: never after the last tile.
+      if (ads && tiles >= nextAd && tiles < items.length) {
+        rows.push({ kind: 'ad', key: `a:${slot}`, slot });
+        slot++;
+        nextAd += AD_EVERY;
+      }
     }
     i = j;
   }
@@ -98,6 +115,8 @@ export interface PhotoGridProps {
   /** Photo to focus when coming back from the viewer. */
   focusId?: string | null;
   label: string;
+  /** Phase 8: renders the ad in an ad row (rows are only added when this is given). */
+  renderAd?: (slot: number) => ReactNode;
 }
 
 /** Virtualised photo grid grouped by day, with sticky day headers, selection and keyboard support. */
@@ -113,6 +132,7 @@ export function PhotoGrid({
   grouped = true,
   focusId,
   label,
+  renderAd,
 }: PhotoGridProps) {
   const wrap = useRef<HTMLElement>(null);
   const phone = usePhone();
@@ -144,7 +164,12 @@ export function PhotoGrid({
   }, []);
 
   const m = metricsFor(width || 900, phone);
-  const rows = useMemo(() => buildRows(items, sort, m.cols, grouped), [items, sort, m.cols, grouped]);
+  const withAds = Boolean(renderAd) && !trash;
+  const rows = useMemo(
+    () => buildRows(items, sort, m.cols, grouped, withAds),
+    [items, sort, m.cols, grouped, withAds],
+  );
+  const adH = m.phone ? 132 : 156;
   const layout: GridLayout = useMemo(
     () => rows.flatMap((r) => (r.kind === 'tiles' ? [r.indexes] : [])),
     [rows],
@@ -157,8 +182,11 @@ export function PhotoGrid({
     return map;
   }, [rows]);
   const size = useCallback(
-    (i: number) => (rows[i]?.kind === 'head' ? m.headH : m.tileH + m.gap),
-    [rows, m.headH, m.tileH, m.gap],
+    (i: number) => {
+      const k = rows[i]?.kind;
+      return k === 'head' ? m.headH : k === 'ad' ? adH + m.gap : m.tileH + m.gap;
+    },
+    [rows, m.headH, m.tileH, m.gap, adH],
   );
   const starts = useMemo(() => {
     const s: number[] = [];
@@ -323,6 +351,13 @@ export function PhotoGrid({
           const r = rows[vr.index];
           const y = vr.start - margin;
           if (!r) return null;
+          if (r.kind === 'ad') {
+            return (
+              <div key={r.key} className="pgrid__ad" style={{ transform: `translateY(${y}px)`, height: adH }}>
+                {renderAd?.(r.slot)}
+              </div>
+            );
+          }
           if (r.kind === 'head') {
             const all = ids.slice(r.first, r.first + r.count);
             const allOn = all.every((id) => selection.selected.has(id));

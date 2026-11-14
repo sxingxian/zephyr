@@ -9,6 +9,7 @@ import {
 } from '@zephyr/shared/client';
 import { useEffect, useSyncExternalStore } from 'react';
 import { api } from './api';
+import { isAppReadOnly, useAppReadOnly } from './appStatus';
 import { browser, endSession, onSessionEnd, sessionUserId } from './sessionGuard';
 
 /**
@@ -173,17 +174,19 @@ export function useActiveLibrary(): ActiveLibrary {
   const libs = useLibraries();
   return currentLibrary(libs);
 }
-/** May the member do this in the open library? (Read-only state blocks writes that add data.) */
+const WRITES: readonly LibraryAction[] = ['upload', 'edit', 'ai', 'galleries'];
+/**
+ * May the member do this in the open library? A read-only library (over its plan's storage) and Zephyr's
+ * read-only mode (phase 8, set in Admin or by itself during a storage incident) block writes that add data.
+ */
 export function canInLibrary(lib: ActiveLibrary, action: LibraryAction): boolean {
   if (!roleCan(lib.role, action)) return false;
-  if (
-    lib.state === 'read_only' &&
-    (action === 'upload' || action === 'edit' || action === 'ai' || action === 'galleries')
-  )
-    return false;
+  if ((lib.state === 'read_only' || isAppReadOnly()) && WRITES.includes(action)) return false;
   return true;
 }
 export function useCan(action: LibraryAction): boolean {
+  // Subscribes to read-only mode so write entry points disappear and come back with it.
+  useAppReadOnly();
   return canInLibrary(useActiveLibrary(), action);
 }
 

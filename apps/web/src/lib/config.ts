@@ -10,3 +10,6 @@ export { TURNSTILE_ACTIONS } from '@zephyr/shared/client';
 
 export const LANDING_URL = 'https://zephyr.midnightpoetry.studio';
 export const REQUEST_INVITE_URL = `${LANDING_URL}/#request-invite`;
+
+/** Phase 8: where a suspended member writes to (shown on the suspended screen). */
+export const SUPPORT_EMAIL = 'support@midnightpoetry.studio';
