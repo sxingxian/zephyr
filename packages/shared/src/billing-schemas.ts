@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   BILLING_INTERVALS,
+  isSafeLabel,
   LOOKUP_KEYS,
   PAID_PLANS,
   PRICE_BOUNDS,
@@ -46,7 +47,9 @@ const email = z
 
 export const teamInviteSchema = z.object({ email, role: z.enum(TEAM_ROLES) }).strict();
 export const teamMemberPatchSchema = z.object({ role: z.enum(TEAM_ROLES) }).strict();
-export const teamNamePatchSchema = z.object({ name: text(TEAM_NAME_MAX) }).strict();
+export const teamNamePatchSchema = z
+  .object({ name: text(TEAM_NAME_MAX).refine(isSafeLabel, "letters, numbers, spaces and . , ' & - only") })
+  .strict();
 /** Team invite tokens: 32 random bytes, base64url (43 chars). */
 export const teamInviteTokenSchema = z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict();
 /** X-Zephyr-Library header value. */

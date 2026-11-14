@@ -149,7 +149,9 @@ describe('team (owner)', () => {
     const link = mail?.text.match(/https:\/\/\S+\/team\/accept#token=([A-Za-z0-9_-]{43})/);
     expect(link).toBeTruthy();
     expect(mail?.text).toContain('Create my account');
-    expect(mail?.subject).toContain('Tan Studio');
+    // A fixed subject: owner-chosen text never goes in it.
+    expect(mail?.subject).toBe('You’re invited to join a team on Zephyr');
+    expect(mail?.text).toContain('Tan Studio');
     // The raw token is never sent to the database.
     expect(JSON.stringify(world.calls.filter((c) => c.url.includes('/rpc/')))).not.toContain(link?.[1]);
     expect(billingLimiter.keys).toContain(`team:${MEI.id}`);
@@ -251,6 +253,20 @@ describe('team (owner)', () => {
     expect(r.status).toBe(200);
     expect(rpcCalls('team_set_name')[0]?.p_name).toBe('Tan  Studio');
   });
+
+  it('refuses team names that read as links or addresses', async () => {
+    world.rpc.team_set_name = () => null;
+    const j = await signedIn(MEI);
+    for (const name of ['Win at evil.com', 'www Studio www.x', 'mail me@x', 'http://x', 'Tan <b>', 'A/B']) {
+      const r = await call(TEAM_API.team, { jar: j, method: 'PATCH', body: { name } });
+      expect(r.status, name).toBe(400);
+    }
+    expect(rpcCalls('team_set_name')).toHaveLength(0);
+    for (const name of ['Tân & Sons Studio', 'St. John’s'.replace('’', "'"), 'Studio 54 - Co.']) {
+      const r = await call(TEAM_API.team, { jar: j, method: 'PATCH', body: { name } });
+      expect(r.status, name).toBe(200);
+    }
+  });
 });
 
 describe('invite links', () => {
@@ -296,20 +312,31 @@ describe('invite links', () => {
 });
 
 describe('team invite email', () => {
-  it('escapes names and keeps the token link intact', () => {
-    const m = teamInviteEmail({
-      teamName: '<b>Tan</b> Studio',
-      inviterName: 'Mei "Lin"',
-      role: 'viewer',
-      link: 'https://zephyrapp.midnightpoetry.studio/team/accept#token=abc',
-      expiresAt: '2026-11-21T00:00:00Z',
-      needsAccount: false,
-    });
-    expect(m.html).not.toContain('<b>Tan</b>');
-    expect(m.html).toContain('&lt;b&gt;Tan&lt;/b&gt;');
-    expect(m.html).toContain('Mei &quot;Lin&quot;');
+  const base = {
+    role: 'viewer' as const,
+    link: 'https://zephyrapp.midnightpoetry.studio/team/accept#token=abc',
+    expiresAt: '2026-11-21T00:00:00Z',
+    needsAccount: false,
+  };
+  it('has a fixed subject and shows names that pass the strict pattern', () => {
+    const m = teamInviteEmail({ ...base, teamName: "Tan & Sons' Studio", inviterName: 'Mei Lin' });
+    expect(m.subject).toBe('You’re invited to join a team on Zephyr');
+    expect(m.text).toContain("Mei Lin invited you to join Tan & Sons' Studio");
+    expect(m.html).toContain('Tan &amp; Sons&#39; Studio');
     expect(m.text).toContain('#token=abc');
     expect(m.text).toContain('browse and download');
     expect(m.html).toContain('21 November 2026');
+  });
+  it('falls back to generic wording for names with links, addresses or markup', () => {
+    const m = teamInviteEmail({
+      ...base,
+      teamName: 'Claim your prize at evil.com',
+      inviterName: 'Support <b>@</b> bank',
+    });
+    expect(m.subject).toBe('You’re invited to join a team on Zephyr');
+    expect(m.text).toContain('You’re invited to join a Studio team on Zephyr');
+    expect(m.html).not.toContain('evil.com');
+    expect(m.html).not.toContain('bank');
+    expect(m.text).not.toContain('evil.com');
   });
 });

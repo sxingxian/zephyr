@@ -38,6 +38,7 @@ import {
   dollarsToCents,
   formatCents,
   isOpenChange,
+  needsAttention,
   priceError,
   priceKind,
   priceName,
@@ -117,7 +118,20 @@ function changeText(c: AdminPriceChange, name: string): string {
         ? `${n(c.counts.pending)} subscriber${c.counts.pending === 1 ? '' : 's'} will be emailed in the next daily run.`
         : 'No existing subscribers to move.',
   ];
-  return `${name}: ${formatCents(c.from)} → ${formatCents(c.to)}. ${parts.join(' ')}`;
+  if (c.counts.reverting > 0)
+    parts.push(
+      `${n(c.counts.reverting)} subscriber${c.counts.reverting === 1 ? ' is' : 's are'} being put back on the old price (retried daily).`,
+    );
+  if (c.counts.revertFailed > 0)
+    parts.push(
+      `${n(c.counts.revertFailed)} renewed at the new price before the stop could put them back: check them in Stripe.`,
+    );
+  const head =
+    c.status === 'stopped'
+      ? `${name}: the change to ${formatCents(c.to)} was stopped.`
+      : `${name}: ${formatCents(c.from)} → ${formatCents(c.to)}.`;
+  if (c.status === 'stopped') return `${head} ${parts.slice(2).join(' ')}`;
+  return `${head} ${parts.join(' ')}`;
 }
 
 function PriceDialog({
@@ -409,7 +423,7 @@ function Body({
   const [packBusy, setPackBusy] = useState<string | null>(null);
   const [packErr, setPackErr] = useState<string | null>(null);
   const canAct = editable && data.configured;
-  const open = data.changes.filter(isOpenChange);
+  const open = data.changes.filter((c) => isOpenChange(c) || needsAttention(c));
   const changing = new Set(open.map((c) => c.lookupKey));
   const rowByKey = new Map(data.prices.map((p) => [p.lookupKey, p]));
   const nameOf = (key: string) => {
@@ -579,7 +593,7 @@ function Body({
           <div key={c.id} className="bl-change" role="status">
             <Icon name="clock" size={16} />
             <span className="bl-change__text">{changeText(c, nameOf(c.lookupKey))}</span>
-            {canAct && (
+            {canAct && isOpenChange(c) && (
               <Button
                 size="sm"
                 onClick={() => setStopping(c)}

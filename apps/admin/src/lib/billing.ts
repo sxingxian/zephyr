@@ -61,6 +61,9 @@ export function billedLabel(r: Pick<AdminPriceRow, 'interval' | 'credits'>): str
 
 /** Changes still in progress (subscribers can still be stopped). */
 export const isOpenChange = (c: AdminPriceChange) => c.status === 'notifying' || c.status === 'moving';
+/** A stopped change with moves still being put back, or ones the renewal reached first: shown until resolved. */
+export const needsAttention = (c: AdminPriceChange) =>
+  c.status === 'stopped' && (c.counts.reverting > 0 || c.counts.revertFailed > 0);
 
 export const shortDate = (iso: string) =>
   new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });

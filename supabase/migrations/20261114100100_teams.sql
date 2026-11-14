@@ -10,9 +10,19 @@
 -- ---------------------------------------------------------------------------------------------
 -- Tables
 -- ---------------------------------------------------------------------------------------------
+-- A team name goes into invite emails sent to any address, so it's held to a strict pattern: letters, numbers,
+-- spaces and . , ' & - only, and nothing that reads as an address or a link (no "@", "://", "www.", or a dot
+-- followed by a letter, as in a domain). public._safe_label is the same rule (the API mirrors it in SAFE_LABEL).
+create function public._safe_label(p text) returns boolean
+language sql immutable set search_path = '' as $$
+  select p is not null and length(p) between 1 and 60
+     and p ~ '^[[:alpha:][:digit:] .,''&-]+$'
+     and p !~* '(www\.|://|\.[[:alpha:]])';
+$$;
+
 create table public.teams (
   owner_id uuid primary key references auth.users (id) on delete cascade,
-  name text not null check (length(name) between 1 and 60),
+  name text not null check (public._safe_label(name)),
   updated_at timestamptz not null default now()
 );
 alter table public.teams enable row level security;
@@ -247,7 +257,7 @@ create function public.team_set_name(p_owner uuid, p_name text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare n text := nullif(btrim(regexp_replace(coalesce(p_name, ''), '[[:cntrl:]]', '', 'g')), '');
 begin
-  if n is null or length(n) > 60 then return jsonb_build_object('error', 'invalid'); end if;
+  if n is null or not public._safe_label(n) then return jsonb_build_object('error', 'invalid'); end if;
   if not exists (select 1 from public.profiles where id = p_owner and deleted_at is null) then return null; end if;
   insert into public.teams (owner_id, name) values (p_owner, n)
   on conflict (owner_id) do update set name = excluded.name, updated_at = now();
@@ -462,7 +472,8 @@ declare
 begin
   for t in select ti.owner_id, ti.role, ti.invite_id from public.team_invites ti join public.invites i on i.id = ti.invite_id
             where lower(i.email::text) = lower(new.email) and i.accepted_at is null and i.revoked_at is null and i.expires_at > now()
-            order by i.created_at loop
+            -- One lock order everywhere (by owner id): two accounts confirming at once can't deadlock.
+            order by ti.owner_id loop
     perform public._lock_team(t.owner_id);
     -- Read again under the team lock: the owner may have revoked it (or the team stopped being usable) meanwhile.
     select * into live from public.invites
@@ -573,6 +584,7 @@ revoke execute on all functions in schema public from public, anon, authenticate
 revoke execute on function
   public._lock_team(uuid),
   public._lock_team_member(uuid),
+  public._safe_label(text),
   public._owner_name(uuid),
   public._self_name(uuid),
   public._team_name(uuid),

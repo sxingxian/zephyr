@@ -105,7 +105,8 @@ create table public.checkout_sessions (
   owner_id uuid not null references auth.users (id) on delete cascade,
   kind text not null check (kind in ('subscription', 'topup')),
   lookup_key text not null,
-  state text not null default 'pending' check (state in ('pending', 'done', 'failed')),
+  -- refunded: paid, but it was a second live subscription (two tabs): canceled and refunded in full.
+  state text not null default 'pending' check (state in ('pending', 'done', 'failed', 'refunded')),
   -- The Checkout idempotency key: an idempotent retry returns this same session, so it's never expired by its
   -- own retry (see billing_checkout_open).
   idem_key text check (idem_key is null or length(idem_key) <= 200),
@@ -126,7 +127,10 @@ create table public.credit_topups (
   expires_at timestamptz not null,
   checkout_session_id text not null unique,
   payment_intent_id text unique check (payment_intent_id is null or payment_intent_id ~ '^pi_[A-Za-z0-9]{1,250}$'),
+  -- Fully refunded or disputed. A partial refund removes credits in proportion (refund_removed tracks how many
+  -- credits refunds have already removed), never more than are left.
   refunded_at timestamptz,
+  refund_removed integer not null default 0 check (refund_removed >= 0),
   created_at timestamptz not null default now()
 );
 create index credit_topups_owner on public.credit_topups (owner_id, expires_at) where remaining > 0;
@@ -156,7 +160,12 @@ create table public.price_moves (
   to_price_id text not null,
   notice_at timestamptz,
   move_at timestamptz not null,
-  status text not null default 'pending' check (status in ('pending', 'notified', 'moved', 'skipped', 'stopped')),
+  -- pending → notified (notice sent) → moving (claimed by the cron for the Stripe swap) → moved.
+  -- Stop: pending/notified → stopped; moved (not yet renewed) → revert_pending → stopped (reverted_at set), or
+  -- revert_failed when the renewal came first. A claimed move finished after Stop goes to revert_pending.
+  status text not null default 'pending'
+    check (status in ('pending', 'notified', 'moving', 'moved', 'skipped', 'stopped', 'revert_pending', 'revert_failed')),
+  claimed_at timestamptz,
   moved_at timestamptz,
   reverted_at timestamptz,
   -- Why a move was skipped: changed (plan, price or status moved on), superseded (a later price), no_email
@@ -165,7 +174,8 @@ create table public.price_moves (
   created_at timestamptz not null default now(),
   unique (change_id, owner_id)
 );
-create index price_moves_open on public.price_moves (status, move_at) where status in ('pending', 'notified', 'moved');
+create index price_moves_open on public.price_moves (status, move_at)
+  where status in ('pending', 'notified', 'moving', 'moved', 'revert_pending');
 create index price_moves_owner on public.price_moves (owner_id, created_at desc);
 alter table public.price_moves enable row level security;
 
@@ -426,7 +436,8 @@ begin
             where ct.id::text in (select jsonb_object_keys(drawn)) and (drawn ->> ct.id::text)::integer > 0
             order by ct.expires_at desc, ct.id for update of ct loop
     exit when left_ <= 0;
-    give := least(t.d, left_, t.credits - t.remaining);
+    -- Never above what refunds left of the top-up (credits a refund removed don't come back).
+    give := least(t.d, left_, t.credits - t.refund_removed - t.remaining);
     if give <= 0 then continue; end if;
     if t.refunded_at is null and t.expires_at > now() then
       update public.credit_topups set remaining = remaining + give where id = t.id;
@@ -706,14 +717,15 @@ language sql stable security definer set search_path = '' as $$
     from public.checkout_sessions c where c.id = p_session and c.owner_id = p_owner;
 $$;
 
--- Marks a session done or failed (a done session stays done). {ownerId, kind, lookupKey, state} or null.
+-- Marks a session done, failed or refunded. A refunded session stays refunded; a done one only becomes refunded
+-- (the duplicate was found after it was marked done). {ownerId, kind, lookupKey, state} or null.
 create function public.billing_checkout_mark(p_session text, p_state text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare c public.checkout_sessions;
 begin
-  if p_state not in ('done', 'failed') then raise exception 'bad state' using errcode = 'invalid_parameter_value'; end if;
+  if p_state not in ('done', 'failed', 'refunded') then raise exception 'bad state' using errcode = 'invalid_parameter_value'; end if;
   update public.checkout_sessions set state = p_state, finished_at = now()
-   where id = p_session and state <> 'done' returning * into c;
+   where id = p_session and state <> 'refunded' and (state <> 'done' or p_state = 'refunded') returning * into c;
   if not found then select * into c from public.checkout_sessions where id = p_session; end if;
   if not found then return null; end if;
   return jsonb_build_object('ownerId', c.owner_id, 'kind', c.kind, 'lookupKey', c.lookup_key, 'state', c.state);
@@ -931,46 +943,62 @@ begin
 end;
 $$;
 
--- A refunded or disputed top-up: its unused credits are removed, once. {ownerId, removed} or null.
-create function public.billing_topup_refund(p_payment_intent text) returns jsonb
+-- A refunded or disputed top-up. p_refunded / p_amount: the charge's refunded total so far and its amount (cents;
+-- a dispute passes its amount twice, a full refund). Credits removed = credits × refunded ÷ amount, rounded up,
+-- less what earlier refunds already removed, and never more than are left: credits already spent are never
+-- clawed back. Without amounts the refund counts as full. {ownerId, removed} or null.
+create function public.billing_topup_refund(p_payment_intent text, p_refunded integer default null,
+  p_amount integer default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare t public.credit_topups;
 begin
   select * into t from public.credit_topups where payment_intent_id = p_payment_intent;
   if not found then return null; end if;
-  return public._topup_refund(t.id);
+  return public._topup_refund(t.id, p_refunded, p_amount);
 end;
 $$;
 
 -- The same, found by its Checkout session (when the refund or dispute carries no payment intent we recorded).
-create function public.billing_topup_refund_by_session(p_session text) returns jsonb
+create function public.billing_topup_refund_by_session(p_session text, p_refunded integer default null,
+  p_amount integer default null) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare t public.credit_topups;
 begin
   select * into t from public.credit_topups where checkout_session_id = p_session;
   if not found then return null; end if;
-  return public._topup_refund(t.id);
+  return public._topup_refund(t.id, p_refunded, p_amount);
 end;
 $$;
 
-create function public._topup_refund(p_id uuid) returns jsonb
+create function public._topup_refund(p_id uuid, p_refunded integer, p_amount integer) returns jsonb
 language plpgsql volatile set search_path = '' as $$
 declare
   t public.credit_topups;
   b public.credit_balances;
+  full_refund boolean := p_amount is null or p_amount <= 0 or p_refunded is null or p_refunded >= p_amount;
+  target integer;
+  n integer;
 begin
   select * into t from public.credit_topups where id = p_id;
   if not found then return null; end if;
   perform public._credits_lock(t.owner_id);
   select * into t from public.credit_topups where id = t.id for update;
   if t.refunded_at is not null then return jsonb_build_object('ownerId', t.owner_id, 'removed', 0); end if;
+  -- Refunded totals are cumulative, so a repeated or out-of-order event never removes credits twice.
+  target := case when full_refund then t.credits
+                 else least(t.credits, ceil(t.credits::numeric * greatest(p_refunded, 0) / p_amount)::integer) end;
+  n := least(t.remaining, greatest(target - t.refund_removed, 0));
   b := public._credits_roll(t.owner_id);
-  if t.remaining > 0 then
+  if n > 0 then
     insert into public.credit_ledger (owner_id, delta, reason, label, period_start)
-    values (t.owner_id, -t.remaining, 'top_up_refund', 'Top-up refunded', b.period_start);
+    values (t.owner_id, -n, 'top_up_refund', case when full_refund then 'Top-up refunded' else 'Top-up partly refunded' end,
+            b.period_start);
   end if;
-  update public.credit_topups set remaining = 0, refunded_at = now() where id = t.id;
-  return jsonb_build_object('ownerId', t.owner_id, 'removed', t.remaining);
+  update public.credit_topups
+     set remaining = remaining - n, refund_removed = refund_removed + n,
+         refunded_at = case when full_refund then now() else null end
+   where id = t.id;
+  return jsonb_build_object('ownerId', t.owner_id, 'removed', n);
 end;
 $$;
 
@@ -1087,7 +1115,8 @@ begin
      where c.id = m.change_id and c.lookup_key = p_lookup_key and m.status in ('pending', 'notified');
     update public.price_changes c
        set status = case when exists (select 1 from public.price_moves m
-                                       where m.change_id = c.id and m.status = 'moved' and m.move_at > now())
+                                       where m.change_id = c.id
+                                         and (m.status = 'moving' or (m.status = 'moved' and m.move_at > now())))
                          then 'moving' else 'done' end
      where c.lookup_key = p_lookup_key and c.status in ('notifying', 'moving');
     if n > 0 then
@@ -1149,13 +1178,52 @@ begin
   select * into c from public.price_changes where id = p_id for update;
   if not found or c.status in ('done', 'stopped') then return jsonb_build_object('error', 'not_found'); end if;
   update public.price_changes set status = 'stopped', stopped_at = now() where id = p_id;
+  -- Moves the cron has claimed (moving) are left alone here: when the cron finishes one, price_move_mark sees the
+  -- change stopped and sends it to revert_pending, so it's put back too.
   update public.price_moves set status = 'stopped' where change_id = p_id and status in ('pending', 'notified');
+  -- Applied but not yet renewed: to be put back. They wait in revert_pending until a revert succeeds (the API
+  -- tries now; the daily cron retries), or the renewal comes first (revert_failed).
+  update public.price_moves set status = 'revert_pending'
+   where change_id = p_id and status = 'moved' and move_at > now();
   perform public._audit(p_staff, 'billing.price_change_stopped', c.lookup_key, jsonb_build_object('priceChangeId', p_id));
   return jsonb_build_object('lookupKey', c.lookup_key, 'reverts', coalesce((
     select jsonb_agg(jsonb_build_object('moveId', m.id, 'ownerId', m.owner_id, 'stripeSubscriptionId', m.stripe_subscription_id,
                                         'itemId', s.item_id, 'fromPriceId', m.from_price_id, 'toPriceId', m.to_price_id))
       from public.price_moves m left join public.subscriptions s on s.stripe_subscription_id = m.stripe_subscription_id
-     where m.change_id = p_id and m.status = 'moved' and m.move_at > now()), '[]'::jsonb));
+     where m.change_id = p_id and m.status = 'revert_pending'), '[]'::jsonb));
+end;
+$$;
+
+-- Reverts still owed (Stop's Stripe call failed): those whose renewal has come are marked revert_failed (the
+-- subscriber renewed at the new price; an alert for the team), the rest are returned for the cron to try again.
+-- {failed: <count newly failed>, reverts: [{moveId, ownerId, stripeSubscriptionId, fromPriceId, toPriceId}]}
+create function public.price_move_reverts_due(p_limit integer) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare n integer;
+begin
+  update public.price_moves set status = 'revert_failed' where status = 'revert_pending' and move_at <= now();
+  get diagnostics n = row_count;
+  return jsonb_build_object('failed', n, 'reverts', coalesce((
+    select jsonb_agg(jsonb_build_object('moveId', m.id, 'ownerId', m.owner_id, 'stripeSubscriptionId', m.stripe_subscription_id,
+                                        'fromPriceId', m.from_price_id, 'toPriceId', m.to_price_id) order by m.move_at)
+      from (select * from public.price_moves where status = 'revert_pending' order by move_at
+             limit least(greatest(coalesce(p_limit, 100), 1), 500)) m), '[]'::jsonb));
+end;
+$$;
+
+-- The cron claims a notified move (under its row lock) before the Stripe swap, so Stop can't race it. A claim
+-- older than an hour (a worker that died mid-swap) can be taken again: the swap is idempotent. The move, or null.
+create function public.price_move_claim(p_id uuid) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare m public.price_moves;
+begin
+  update public.price_moves set status = 'moving', claimed_at = now()
+   where id = p_id
+     and (status = 'notified' or (status = 'moving' and claimed_at < now() - interval '1 hour'))
+     and exists (select 1 from public.price_changes c where c.id = change_id and c.status <> 'stopped')
+  returning * into m;
+  if not found then return null; end if;
+  return public._move_json(m);
 end;
 $$;
 
@@ -1211,7 +1279,7 @@ begin
       join public.billing_prices nowp on nowp.lookup_key = bp.lookup_key and nowp.current
      where public._sub_keeps(s.status, s.past_due_since) and bp.amount <> nowp.amount and s.schedule_id is null
        and not exists (select 1 from public.price_moves m where m.owner_id = s.owner_id
-                         and (m.status in ('pending', 'notified')
+                         and (m.status in ('pending', 'notified', 'moving', 'revert_pending')
                               or (m.status = 'stopped' and m.to_price_id = nowp.stripe_price_id)
                               or (m.status = 'moved' and m.to_price_id = nowp.stripe_price_id and m.move_at > now())))
      order by s.current_period_end limit lim
@@ -1232,15 +1300,18 @@ begin
 
   update public.price_changes c set status = case
       when exists (select 1 from public.price_moves m where m.change_id = c.id and m.status = 'pending') then 'notifying'
-      when exists (select 1 from public.price_moves m where m.change_id = c.id and (m.status = 'notified' or (m.status = 'moved' and m.move_at > now()))) then 'moving'
+      when exists (select 1 from public.price_moves m where m.change_id = c.id
+                     and (m.status in ('notified', 'moving') or (m.status = 'moved' and m.move_at > now()))) then 'moving'
       else 'done' end
    where c.status in ('notifying', 'moving');
 
   return coalesce((select jsonb_agg(public._move_json(m) order by m.status = 'notified', m.move_at)
                      from ((select * from public.price_moves where status = 'pending' order by move_at limit lim)
                            union all
-                           (select * from public.price_moves where status = 'notified' and move_at <= now() + interval '48 hours'
-                              and notice_at is not null order by move_at limit lim)) m), '[]'::jsonb);
+                           (select * from public.price_moves
+                             where (status = 'notified' or (status = 'moving' and claimed_at < now() - interval '1 hour'))
+                               and move_at <= now() + interval '48 hours' and notice_at is not null
+                             order by move_at limit lim)) m), '[]'::jsonb);
 end;
 $$;
 
@@ -1263,13 +1334,24 @@ begin
     update public.price_moves set status = 'notified', notice_at = now(),
            move_at = case when s.owner_id is not null then public._move_at(s, fa, ta, now()) else move_at end
      where id = p_id returning * into m;
-  elsif p_status = 'moved' and m.status = 'notified' then
-    update public.price_moves set status = 'moved', moved_at = now() where id = p_id returning * into m;
-  elsif p_status = 'skipped' and m.status in ('pending', 'notified') then
+  elsif p_status = 'notified' and m.status = 'moving' then
+    -- The swap didn't happen (a transient Stripe error): release the claim for the next run.
+    update public.price_moves set status = 'notified', claimed_at = null where id = p_id returning * into m;
+  elsif p_status = 'moved' and m.status in ('notified', 'moving') then
+    -- Stopped while the cron was swapping: Stripe now has the new price, so it goes straight to revert_pending
+    -- (the caller reverts it; the cron retries if that fails).
+    update public.price_moves
+       set status = case when exists (select 1 from public.price_changes c where c.id = m.change_id and c.status = 'stopped')
+                         then 'revert_pending' else 'moved' end,
+           moved_at = now()
+     where id = p_id returning * into m;
+  elsif p_status = 'skipped' and m.status in ('pending', 'notified', 'moving') then
     update public.price_moves set status = 'skipped', skip_reason = 'changed' where id = p_id returning * into m;
-  elsif p_status = 'reverted' and m.status = 'moved' then
+  elsif p_status = 'reverted' and m.status in ('moved', 'revert_pending') then
     update public.price_moves set status = 'stopped', reverted_at = now() where id = p_id returning * into m;
-  elsif p_status not in ('notified', 'moved', 'skipped', 'reverted') then
+  elsif p_status = 'revert_failed' and m.status = 'revert_pending' then
+    update public.price_moves set status = 'revert_failed' where id = p_id returning * into m;
+  elsif p_status not in ('notified', 'moved', 'skipped', 'reverted', 'revert_failed') then
     raise exception 'bad status' using errcode = 'invalid_parameter_value';
   end if;
   return public._move_json(m);
@@ -1303,10 +1385,13 @@ language sql stable security definer set search_path = '' as $$
         'reason', c.reason,
         'counts', jsonb_build_object(
           'pending', (select count(*) from public.price_moves m where m.change_id = c.id and m.status = 'pending'),
-          'notified', (select count(*) from public.price_moves m where m.change_id = c.id and m.status = 'notified'),
+          'notified', (select count(*) from public.price_moves m where m.change_id = c.id and m.status in ('notified', 'moving')),
           'moved', (select count(*) from public.price_moves m where m.change_id = c.id and m.status = 'moved'),
-          'skipped', (select count(*) from public.price_moves m where m.change_id = c.id and m.status in ('skipped', 'stopped'))),
-        'lastMoveAt', (select max(m.move_at) from public.price_moves m where m.change_id = c.id and m.status in ('pending', 'notified', 'moved')))
+          'skipped', (select count(*) from public.price_moves m where m.change_id = c.id and m.status in ('skipped', 'stopped')),
+          'reverting', (select count(*) from public.price_moves m where m.change_id = c.id and m.status = 'revert_pending'),
+          'revertFailed', (select count(*) from public.price_moves m where m.change_id = c.id and m.status = 'revert_failed')),
+        'lastMoveAt', (select max(m.move_at) from public.price_moves m where m.change_id = c.id
+                         and m.status in ('pending', 'notified', 'moving', 'moved', 'revert_pending')))
         order by c.created_at desc)
       from (select * from public.price_changes order by created_at desc limit 20) c), '[]'::jsonb),
     'paymentDue', coalesce((select jsonb_agg(jsonb_build_object(
@@ -1336,6 +1421,12 @@ begin
               and p.plan_source = 'stripe' and p.plan_id = s.plan_id
             order by s.past_due_since limit least(greatest(coalesce(p_limit, 100), 1), 500) loop
     perform public._lock_billing(r.owner_id);
+    -- Read again under the lock: a card retry may have succeeded (billing_apply recorded active) since the select.
+    if not exists (select 1 from public.subscriptions s
+                    where s.owner_id = r.owner_id and s.status = 'past_due'
+                      and s.past_due_since <= now() - public._past_due_grace()) then
+      continue;
+    end if;
     update public.profiles set plan_id = 'free'
      where id = r.owner_id and plan_source = 'stripe' and plan_id = r.plan_id;
     if found then
@@ -1441,7 +1532,7 @@ revoke execute on function
   public._staff_can(uuid, text[]),
   public._move_json(public.price_moves),
   public._key_floor(text),
-  public._topup_refund(uuid)
+  public._topup_refund(uuid, integer, integer)
 from service_role;
 grant execute on function
   public.billing_prices_current(),
@@ -1451,7 +1542,7 @@ grant execute on function
   public.billing_checkout_record(uuid, text, text, text, text),
   public.billing_checkout_open(uuid, text, text),
   public.billing_checkout_poll(uuid, text),
-  public.billing_topup_refund_by_session(text),
+  public.billing_topup_refund_by_session(text, integer, integer),
   public.billing_past_due_expire(integer),
   public.billing_deletion_cancels_due(integer),
   public.billing_checkout_status(uuid, text),
@@ -1460,7 +1551,7 @@ grant execute on function
   public.billing_subscription(uuid),
   public.billing_status(uuid),
   public.billing_topup_grant(uuid, text, text, text),
-  public.billing_topup_refund(text),
+  public.billing_topup_refund(text, integer, integer),
   public.billing_event_begin(text, text, timestamptz),
   public.billing_event_finish(text, text, text, uuid),
   public.admin_price_set(uuid, text, text, integer, text, boolean),
@@ -1469,5 +1560,7 @@ grant execute on function
   public.admin_price_change_stop(uuid, uuid),
   public.price_moves_due(integer),
   public.price_move_mark(uuid, text),
+  public.price_move_claim(uuid),
+  public.price_move_reverts_due(integer),
   public.admin_billing_overview(uuid)
 to service_role;

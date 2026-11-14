@@ -7,6 +7,7 @@ import type { Context } from 'hono';
 import { fail, logError } from '../http';
 import type { HonoEnv } from '../types';
 import { billingDb } from './db';
+import { settlePendingDowngrade } from './schedule';
 import { idOf, isMissing, type Stripe, stripeClient, verifyWebhook } from './stripe';
 import { applyCheckoutSession, OwnerMismatch, syncSubscription } from './sync';
 
@@ -81,14 +82,20 @@ export async function dispatch(
       const o = event.data.object as Stripe.Charge | Stripe.Dispute;
       const pi = idOf(o.payment_intent);
       if (!pi) return { status: 'ignored', owner: null };
+      // A refund removes credits in proportion to the charge's refunded total so far (cumulative, so repeats are
+      // harmless); a dispute counts as a full refund.
+      const [refunded, amount] =
+        event.type === 'charge.refunded'
+          ? [(o as Stripe.Charge).amount_refunded, (o as Stripe.Charge).amount]
+          : [null, null];
       // Only top-up payment intents have a bucket; anything else is a no-op in the database.
-      let out = await billingDb.topupRefund(env, pi);
+      let out = await billingDb.topupRefund(env, pi, refunded, amount);
       if (!out) {
         // We may not have recorded the payment intent (Managed Payments): find the Checkout session it paid.
         const sessions = await stripe.checkout.sessions.list({ payment_intent: pi, limit: 1 });
         const session = sessions.data[0];
         if (session && session.mode === 'payment')
-          out = await billingDb.topupRefundBySession(env, session.id);
+          out = await billingDb.topupRefundBySession(env, session.id, refunded, amount);
       }
       return { status: out ? 'processed' : 'ignored', owner: out?.ownerId ?? null };
     }
@@ -97,7 +104,21 @@ export async function dispatch(
     const sub = subscriptionOf(event);
     if (!sub) return { status: 'ignored', owner: null };
     try {
-      const owner = await syncSubscription(env, stripe, sub, requestId);
+      if (
+        event.type === 'customer.subscription.pending_update_applied' ||
+        event.type === 'customer.subscription.pending_update_expired'
+      ) {
+        // An upgrade that waited for payment ended: put back the noted downgrade if it expired unpaid.
+        await settlePendingDowngrade(
+          env,
+          stripe,
+          sub,
+          event.type.endsWith('expired') ? 'expired' : 'applied',
+          event.id,
+          requestId,
+        );
+      }
+      const { owner } = await syncSubscription(env, stripe, sub, requestId);
       return { status: 'processed', owner };
     } catch (err) {
       // A subscription Stripe no longer has: nothing to apply.

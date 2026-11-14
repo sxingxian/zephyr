@@ -9,13 +9,13 @@ import { planEndedEmail, priceNoticeEmail } from '../email/billing-templates';
 import { sendEmail } from '../email/resend';
 import type { Env } from '../env';
 import { logError } from '../http';
-import { billingDb, type DueMove } from './db';
+import { billingDb, type DueMove, type RevertMove } from './db';
 import { cancelForDeletion } from './deletion';
 import { isMissing, type Stripe, stripeClient } from './stripe';
 import { syncSubscription } from './sync';
 
 export const BILLING_CRON = '10 2 * * *';
-export const BILLING_CRON_LIMITS = { moves: 200, pastDue: 200, deletions: 100 } as const;
+export const BILLING_CRON_LIMITS = { moves: 200, pastDue: 200, deletions: 100, reverts: 100 } as const;
 /** Moves are applied this long before the renewal, so the renewal invoice uses the new price. */
 export const MOVE_LEAD_MS = 48 * 3600 * 1000;
 
@@ -28,6 +28,59 @@ export interface BillingCronCounts {
   unsent: number;
   plansEnded: number;
   deletionCancels: number;
+  /** Stopped moves put back on their old price (Stop's own try failed, or the swap finished after Stop). */
+  reverted: number;
+  /** Stopped moves the renewal reached before a revert succeeded (an alert: billed at the new price). */
+  revertFailed: number;
+}
+
+/**
+ * Puts a stopped move back on its old price (no proration). 'moot' when there is nothing to put back: the
+ * subscription is gone, already on the old price, or moved on to another price by the member's own change.
+ * Throws on a Stripe error, so the move stays revert_pending and the next run tries again.
+ */
+export async function revertMove(stripe: Stripe, r: RevertMove): Promise<'reverted' | 'moot'> {
+  let sub: Stripe.Subscription;
+  try {
+    sub = await stripe.subscriptions.retrieve(r.stripeSubscriptionId);
+  } catch (err) {
+    if (isMissing(err)) return 'moot';
+    throw err;
+  }
+  if (!PLAN_KEEPING_STATUSES.includes(sub.status as SubscriptionStatus)) return 'moot';
+  const item = sub.items.data[0];
+  if (!item || sub.items.data.length !== 1) return 'moot';
+  const current = typeof item.price === 'string' ? item.price : item.price.id;
+  if (current === r.fromPriceId) return 'moot';
+  if (r.toPriceId && current !== r.toPriceId) return 'moot';
+  await stripe.subscriptions.update(
+    r.stripeSubscriptionId,
+    { items: [{ id: item.id, price: r.fromPriceId }], proration_behavior: 'none' },
+    { idempotencyKey: `revert:${r.moveId}` },
+  );
+  return 'reverted';
+}
+
+/** Reverts one move and records it. False when Stripe failed (the move stays revert_pending). */
+export async function revertAndMark(
+  env: Env,
+  stripe: Stripe,
+  r: RevertMove,
+  requestId: string,
+): Promise<boolean> {
+  try {
+    const out = await revertMove(stripe, r);
+    await billingDb.moveMark(env, r.moveId, 'reverted');
+    if (out === 'reverted') {
+      await syncSubscription(env, stripe, r.stripeSubscriptionId, requestId).catch((err) =>
+        logError(requestId, 'price_revert_sync', err),
+      );
+    }
+    return true;
+  } catch (err) {
+    logError(requestId, 'price_revert', err);
+    return false;
+  }
 }
 
 /** Puts a subscription's item on `price` without proration. Returns false when the item isn't on `from`. */
@@ -94,12 +147,15 @@ export async function runBillingCron(
     unsent: 0,
     plansEnded: 0,
     deletionCancels: 0,
+    reverted: 0,
+    revertFailed: 0,
   };
   // Past-due plans end without Stripe (the database's own cap), so this runs even when Stripe isn't set up.
   await endPastDuePlans(env, requestId, counts);
   const stripe = stripeClient(env);
   if (!stripe) return counts;
   await retryDeletionCancels(env, requestId, counts);
+  await retryReverts(env, stripe, requestId, counts);
   let due: DueMove[];
   try {
     due = await billingDb.movesDue(env, BILLING_CRON_LIMITS.moves);
@@ -119,9 +175,30 @@ export async function runBillingCron(
         continue;
       }
       if (new Date(m.moveAt).getTime() - now > MOVE_LEAD_MS) continue;
-      const r = await swapPrice(stripe, m.stripeSubscriptionId, m.fromPriceId, m.toPriceId, `move:${m.id}`);
+      // Claimed under the move's row lock first, so a Stop meanwhile can't be lost: Stop leaves claimed moves
+      // alone, and marking one moved after Stop sends it to revert_pending.
+      if (!(await billingDb.moveClaim(env, m.id))) continue;
+      let r: Awaited<ReturnType<typeof swapPrice>>;
+      try {
+        r = await swapPrice(stripe, m.stripeSubscriptionId, m.fromPriceId, m.toPriceId, `move:${m.id}`);
+      } catch (err) {
+        // Not swapped: release the claim for the next run.
+        await billingDb.moveMark(env, m.id, 'notified').catch(() => undefined);
+        throw err;
+      }
       if (r === 'swapped') {
-        await billingDb.moveMark(env, m.id, 'moved');
+        const after = await billingDb.moveMark(env, m.id, 'moved');
+        if (after?.status === 'revert_pending') {
+          // Stopped while we swapped: put it back now (the next run retries if this fails).
+          const back = {
+            moveId: m.id,
+            stripeSubscriptionId: m.stripeSubscriptionId,
+            fromPriceId: m.fromPriceId,
+          };
+          if (await revertAndMark(env, stripe, { ...back, toPriceId: m.toPriceId }, requestId))
+            counts.reverted += 1;
+          continue;
+        }
         counts.moved += 1;
         await syncSubscription(env, stripe, m.stripeSubscriptionId, requestId, m.ownerId).catch((err) =>
           logError(requestId, 'price_move_sync', err),
@@ -153,6 +230,23 @@ async function endPastDuePlans(env: Env, requestId: string, counts: BillingCronC
     }
   } catch (err) {
     logError(requestId, 'billing_past_due_expire', err);
+  }
+}
+
+/** Reverts Stop still owes. Any that the renewal reached first are counted and alerted (billed at the new price). */
+async function retryReverts(env: Env, stripe: Stripe, requestId: string, counts: BillingCronCounts) {
+  try {
+    const due = await billingDb.revertsDue(env, BILLING_CRON_LIMITS.reverts);
+    if (due.failed > 0) {
+      counts.revertFailed += due.failed;
+      logError(requestId, 'price_revert_failed', new Error(String(due.failed)));
+    }
+    for (const r of due.reverts) {
+      if (await revertAndMark(env, stripe, r, requestId)) counts.reverted += 1;
+      else counts.failed += 1;
+    }
+  } catch (err) {
+    logError(requestId, 'price_move_reverts_due', err);
   }
 }
 

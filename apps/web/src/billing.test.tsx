@@ -227,6 +227,21 @@ describe('plans', () => {
   });
 });
 
+describe('checkout return', () => {
+  it('says a duplicate purchase was refunded, never welcomes it', async () => {
+    mockApi((url) =>
+      url.startsWith('/api/v1/billing/checkout/')
+        ? json(200, { ok: true, state: 'refunded', kind: 'subscription', plan: 'pro' })
+        : undefined,
+    );
+    renderAt('/billing/return?session_id=cs_test_dupdupdup12345');
+    expect(
+      await screen.findByText('You already have a plan, so this purchase was refunded.', { exact: false }),
+    ).toBeTruthy();
+    expect(screen.queryByText(/You’re on/)).toBeNull();
+  });
+});
+
 describe('upgrade dialog', () => {
   it('shows the preview, then opens the Stripe invoice when the card needs confirming', async () => {
     const to = vi.spyOn(leave, 'to').mockImplementation(() => {});

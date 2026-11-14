@@ -57,7 +57,7 @@ const DATA: AdminBillingResult = {
       createdAt: '2026-11-10T00:00:00Z',
       createdBy: 'Farah K.',
       reason: 'Costs',
-      counts: { pending: 10, notified: 300, moved: 12, skipped: 0 },
+      counts: { pending: 10, notified: 300, moved: 12, skipped: 0, reverting: 0, revertFailed: 0 },
       lastMoveAt: '2027-11-10T00:00:00Z',
     },
   ],
@@ -262,6 +262,22 @@ describe('Plans & billing', () => {
     expect(writes('/price-changes/')).toHaveLength(0);
     await act(async () => screen.getByRole('button', { name: 'Stop the change', hidden: true }).click());
     await waitFor(() => expect(writes('/price-changes/chg1')[0]?.method).toBe('DELETE'), { timeout: 4000 });
+  });
+
+  it('shows stopped moves still being put back, and ones that renewed first', async () => {
+    const change = DATA.changes[0] as AdminBillingResult['changes'][number];
+    mock('finance', undefined, {
+      ...DATA,
+      changes: [
+        { ...change, status: 'stopped', counts: { ...change.counts, reverting: 2, revertFailed: 1 } },
+      ],
+    });
+    renderAt('/billing');
+    expect(
+      await screen.findByText(/2 subscribers are being put back on the old price/, {}, { timeout: 4000 }),
+    ).toBeTruthy();
+    expect(screen.getByText(/1 renewed at the new price before the stop could put them back/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Stop the change/ })).toBeNull();
   });
 
   it('is read-only for Admins', async () => {

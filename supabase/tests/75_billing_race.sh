@@ -5,11 +5,13 @@
 # - Webhooks: two applies of the same subscription racing keep the newest read, whichever commits first.
 # - Top-ups: two grants of one Checkout session racing grant once.
 # - Duplicates: two different live subscriptions racing for one member: one is stored, the other is a duplicate.
+# - Past due: the daily expiry racing a card retry that succeeded never ends the plan of a member who just paid.
 set -euo pipefail
 read -r -a psql <<<"$PSQL_ARGS"
 P() { "${psql[@]}" -At "$@"; }
 owner=75000000-0000-0000-0000-000000000001
 owner2=75000000-0000-0000-0000-000000000002
+owner3=75000000-0000-0000-0000-000000000003
 P <<SQL >/dev/null
 insert into auth.users (id, email, email_confirmed_at) values ('$owner', 'race75@example.com', now());
 update public.profiles set plan_id = 'studio' where id = '$owner';
@@ -30,6 +32,22 @@ create function public.race_sub(id text) returns text language sql as \$\$
       'status', 'active', 'stripe_price_id', (select stripe_price_id from public.billing_prices where lookup_key = 'zephyr_pro_monthly' and current),
       'item_id', 'si_' || replace(id, 'sub_', ''), 'current_period_start', now() - interval '1 day', 'current_period_end', now() + interval '29 days',
       'cancel_at_period_end', false), now()) as r) x \$\$;
+insert into auth.users (id, email, email_confirmed_at) values ('$owner3', 'race75c@example.com', now());
+select public.billing_customer_set('$owner3', 'cus_Race75c');
+select public.billing_apply('$owner3', jsonb_build_object('stripe_subscription_id', 'sub_Race75c', 'stripe_customer_id', 'cus_Race75c',
+  'status', 'past_due', 'stripe_price_id', (select stripe_price_id from public.billing_prices where lookup_key = 'zephyr_pro_monthly' and current),
+  'item_id', 'si_Race75c', 'current_period_start', now() - interval '25 days', 'current_period_end', now() + interval '5 days',
+  'cancel_at_period_end', false), now());
+update public.subscriptions set past_due_since = now() - interval '22 days' where owner_id = '$owner3';
+-- The card retry succeeded: billing_apply records active under the billing lock (simulated directly here).
+create function public.race_recover() returns text language plpgsql as \$\$
+begin
+  perform public._lock_billing('$owner3');
+  update public.subscriptions set status = 'active', past_due_since = null where owner_id = '$owner3';
+  return 'recovered';
+end \$\$;
+create function public.race_expire() returns text language sql as \$\$
+  select jsonb_array_length(public.billing_past_due_expire(100))::text \$\$;
 create function public.race_topup() returns text language sql as \$\$
   select public.billing_topup_grant('$owner', 'cs_test_race75top01', 'pi_Race75', 'zephyr_topup_500') ->> 'granted' \$\$;
 SQL
@@ -69,7 +87,15 @@ r="$(run_pair "public.race_sub('sub_Race75a')" "public.race_sub('sub_Race75b')")
 [ "$(P -c "select stripe_subscription_id from public.subscriptions where owner_id = '$owner2'")" = sub_Race75a ] || fail "the first subscription should be stored"
 echo "ok - two live subscriptions racing: one is stored, the other is reported as a duplicate"
 
+[ "$(P -c "select plan_id from public.profiles where id = '$owner3'")" = pro ] || fail "past-due member should start on Pro"
+r="$(run_pair "public.race_recover()" "public.race_expire()")"
+[ "$r" = "recovered 0" ] || fail "past-due expiry racing a recovery: got '$r', want 'recovered 0'"
+[ "$(P -c "select plan_id from public.profiles where id = '$owner3'")" = pro ] || fail "the member who just paid must keep Pro"
+echo "ok - the past-due expiry racing a successful card retry keeps the plan"
+
 P <<SQL >/dev/null
+drop function public.race_recover();
+drop function public.race_expire();
 drop function public.race_sub(text);
 drop function public.race_invite(text);
 drop function public.race_apply(text, timestamptz);

@@ -73,6 +73,7 @@ export function BillingReturnPage() {
 
   const done = res?.state === 'done';
   const failed = res?.state === 'failed';
+  const refunded = res?.state === 'refunded';
   let body: React.ReactNode;
   if (gone) {
     body = (
@@ -96,6 +97,20 @@ export function BillingReturnPage() {
         <div className="bl-return__actions">
           <Link to="/plans" className="z-btn z-btn--primary z-btn--md">
             <span>Back to plans</span>
+          </Link>
+        </div>
+      </>
+    );
+  } else if (refunded) {
+    body = (
+      <>
+        <h2 className="bl-return__title">You already have a plan</h2>
+        <p className="bl-return__text">
+          You already have a plan, so this purchase was refunded. Your plan hasn’t changed.
+        </p>
+        <div className="bl-return__actions">
+          <Link to="/settings/billing" className="z-btn z-btn--primary z-btn--md">
+            <span>Plan &amp; billing</span>
           </Link>
         </div>
       </>
@@ -152,7 +167,7 @@ export function BillingReturnPage() {
     <Shell title="Plans">
       <section className="bl-return" aria-live="polite">
         <Mascot
-          pose={done ? 'hop' : failed || gone ? 'ponder' : 'guard'}
+          pose={done ? 'hop' : failed || gone || refunded ? 'ponder' : 'guard'}
           width={140}
           tile={{ background: 'var(--m-mist)', height: 150 }}
           className="bl-return__art"

@@ -31,6 +31,25 @@ select pg_temp.ok(public.team_get(:mei) ->> 'name' = 'Mei Lin''s Studio' and (pu
   and (public.team_get(:mei) ->> 'used')::int = 1 and (public.team_get(:mei) ->> 'available')::boolean, 'a Studio team starts with 3 seats, 1 used');
 select pg_temp.ok(public.team_set_name(:mei, '  Tan Studio ') ->> 'name' = 'Tan Studio', 'the owner names the team');
 select pg_temp.ok(public.team_set_name(:mei, '') ->> 'error' = 'invalid', 'an empty name is refused');
+-- Team names go into invite emails sent to any address: no links, addresses or markup.
+select pg_temp.ok(public.team_set_name(:mei, 'Claim it at evil.com') ->> 'error' = 'invalid'
+  and public.team_set_name(:mei, 'www Studio') ->> 'name' = 'www Studio'
+  and public.team_set_name(:mei, 'Go www.evil') ->> 'error' = 'invalid'
+  and public.team_set_name(:mei, 'mail me@evil') ->> 'error' = 'invalid'
+  and public.team_set_name(:mei, 'http://evil') ->> 'error' = 'invalid'
+  and public.team_set_name(:mei, 'Tan <b>') ->> 'error' = 'invalid',
+  'team names that read as links or addresses are refused');
+select pg_temp.ok(public.team_set_name(:mei, 'St. John''s & Sons - Co.') ->> 'name' = 'St. John''s & Sons - Co.'
+  and public._safe_label('Tân Studio 54'), 'letters (any script), numbers, spaces and . , '' & - are fine');
+select pg_temp.ok(public.team_set_name(:mei, 'Tan Studio') ->> 'name' = 'Tan Studio', 'back to Tan Studio');
+do $$ begin
+  begin
+    update public.teams set name = 'x.com' where owner_id = 'c8000000-0000-0000-0000-000000000001';
+    if not found then raise exception 'FAILED: no team row to test'; end if;
+    raise exception 'FAILED: the table accepted a link-like team name';
+  exception when check_violation then raise notice 'ok - the table itself refuses link-like team names';
+  end;
+end $$;
 select pg_temp.ok(public.team_invite_create(:free, 'x@example.com', 'editor', pg_temp.h('t-free')) ->> 'error' = 'plan_required'
   and not (public.team_get(:free) ->> 'available')::boolean, 'a Free member can''t invite (the Team page shows the upsell)');
 select pg_temp.ok(public.team_invite_create(:mei, 'mei.team@example.com', 'editor', pg_temp.h('t-self')) ->> 'error' = 'already_member',

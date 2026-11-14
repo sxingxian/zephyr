@@ -10,9 +10,10 @@ import {
   TOPUP_PACKS,
 } from '@zephyr/shared';
 import type { Context, Hono, MiddlewareHandler } from 'hono';
+import { revertAndMark } from '../billing/cron';
 import { billingDb, type StopResult } from '../billing/db';
-import { isMissing, isStripeError, type Stripe, stripeClient } from '../billing/stripe';
-import { planOfPrice, syncSubscription } from '../billing/sync';
+import { isStripeError, type Stripe, stripeClient } from '../billing/stripe';
+import { planOfPrice } from '../billing/sync';
 import { priceChangeOwnersEmail } from '../email/billing-templates';
 import { sendEmail } from '../email/resend';
 import { background, fail, logError, readBody } from '../http';
@@ -92,31 +93,6 @@ async function productFor(
   const found = await stripe.prices.list({ lookup_keys: [lookupKey], limit: 1 });
   const p = found.data[0];
   return p ? (typeof p.product === 'string' ? p.product : p.product.id) : null;
-}
-
-/** Puts a stopped move back on its old price (no proration), unless the subscription has moved on since. */
-async function revertMove(
-  stripe: Stripe,
-  r: { moveId: string; stripeSubscriptionId: string; fromPriceId: string; toPriceId?: string },
-): Promise<boolean> {
-  try {
-    const sub = await stripe.subscriptions.retrieve(r.stripeSubscriptionId);
-    const item = sub.items.data[0];
-    if (!item || sub.items.data.length !== 1) return false;
-    const current = typeof item.price === 'string' ? item.price : item.price.id;
-    if (current === r.fromPriceId) return true;
-    if (r.toPriceId && current !== r.toPriceId) return false;
-    // A plan change since the move (planOfPrice differs) is the member's own choice: leave it.
-    await stripe.subscriptions.update(
-      r.stripeSubscriptionId,
-      { items: [{ id: item.id, price: r.fromPriceId }], proration_behavior: 'none' },
-      { idempotencyKey: `revert:${r.moveId}` },
-    );
-    return true;
-  } catch (err) {
-    if (isMissing(err)) return false;
-    throw err;
-  }
 }
 
 /**
@@ -271,19 +247,10 @@ export function registerAdminBillingRoutes(router: Hono<HonoEnv>, requireStaff: 
           fail(out.error === 'forbidden' ? 'forbidden' : 'conflict'),
           out.error === 'forbidden' ? 403 : 409,
         );
+      // Each move waits in revert_pending until its revert succeeds: what fails here, the daily cron retries.
       let unreverted = 0;
       for (const r of out.reverts ?? []) {
-        try {
-          if (await revertMove(stripe, r)) {
-            await rpc(c.env, 'price_move_mark', { p_id: r.moveId, p_status: 'reverted' });
-            await syncSubscription(c.env, stripe, r.stripeSubscriptionId, c.get('requestId')).catch((err) =>
-              logError(c.get('requestId'), 'price_revert_sync', err),
-            );
-          } else unreverted += 1;
-        } catch (err) {
-          unreverted += 1;
-          logError(c.get('requestId'), 'price_revert', err);
-        }
+        if (!(await revertAndMark(c.env, stripe, r, c.get('requestId')))) unreverted += 1;
       }
       if (unreverted) logError(c.get('requestId'), 'price_revert_incomplete', new Error(`${unreverted}`));
       await tellOwners(c, {

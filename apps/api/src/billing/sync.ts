@@ -18,7 +18,7 @@ import { sendEmail } from '../email/resend';
 import type { Env } from '../env';
 import { logError } from '../http';
 import { billingDb, type SubscriptionSnapshot } from './db';
-import { idOf, isMissing, type Stripe } from './stripe';
+import { idOf, isMissing, isStripeError, type Stripe } from './stripe';
 
 /** The event's object belongs to no owner we know, or to a different one than its customer: never applied. */
 export class OwnerMismatch extends Error {
@@ -127,14 +127,23 @@ export async function resolveOwner(
   return owner;
 }
 
-/** Re-reads a subscription from Stripe and applies it. Returns the owner. */
+/** Subscription metadata flag: a second live subscription we canceled and refunded (two Checkouts paid). */
+export const DUPLICATE_FLAG = 'zephyr_duplicate';
+
+export interface SyncResult {
+  owner: string;
+  /** The subscription was a duplicate purchase: canceled and refunded (its Checkout shows "refunded"). */
+  duplicate: boolean;
+}
+
+/** Re-reads a subscription from Stripe and applies it. */
 export async function syncSubscription(
   env: Env,
   stripe: Stripe,
   subscriptionId: string,
   requestId: string,
   knownOwner?: string,
-): Promise<string> {
+): Promise<SyncResult> {
   const syncedAt = new Date();
   const sub = await stripe.subscriptions.retrieve(subscriptionId, { expand: SUBSCRIPTION_EXPAND });
   const customerId = idOf(sub.customer);
@@ -142,12 +151,17 @@ export async function syncSubscription(
   if (knownOwner && knownOwner !== owner) throw new OwnerMismatch('owner_mismatch');
   let out = await billingDb.apply(env, owner, snapshot(sub), syncedAt);
   if (out?.duplicate && out.storedSubscriptionId) {
-    out = await resolveDuplicate(env, stripe, owner, sub, out.storedSubscriptionId, requestId);
+    out = await resolveDuplicate(env, stripe, owner, sub, syncedAt, out.storedSubscriptionId, requestId);
+  } else if (out?.ignored === 'older_subscription' && sub.metadata?.[DUPLICATE_FLAG] === '1') {
+    // A duplicate we flagged earlier, now ended: finish its refund if an earlier try failed (idempotent keys:
+    // a refund already made is never repeated).
+    await settleDuplicate(stripe, sub);
+    out = { planBefore: 'free', planAfter: 'free', duplicate: true };
   }
   if (out && !out.stale && !out.duplicate && out.planBefore !== 'free' && out.planAfter === 'free') {
     await notifyPlanEnded(env, stripe, out.email ?? null, customerId, requestId);
   }
-  return owner;
+  return { owner, duplicate: Boolean(out?.duplicate) };
 }
 
 const keepsPlan = (sub: Stripe.Subscription) =>
@@ -164,6 +178,7 @@ async function resolveDuplicate(
   stripe: Stripe,
   owner: string,
   newer: Stripe.Subscription,
+  newerSyncedAt: Date,
   storedId: string,
   requestId: string,
 ): Promise<Awaited<ReturnType<typeof billingDb.apply>>> {
@@ -177,18 +192,35 @@ async function resolveDuplicate(
   if (!stored || !keepsPlan(stored)) {
     // The stored subscription ended and we hadn't heard yet: record that, then apply the newer one.
     if (stored) await billingDb.apply(env, owner, snapshot(stored), storedAt);
-    return billingDb.apply(env, owner, snapshot(newer), new Date());
+    // The newer read keeps the time it was taken: a read made since then must still win.
+    return billingDb.apply(env, owner, snapshot(newer), newerSyncedAt);
   }
   logError(requestId, 'billing_duplicate_subscription', new Error('duplicate'));
-  if (keepsPlan(newer) || newer.status === 'incomplete') {
-    await stripe.subscriptions.cancel(
+  if (newer.metadata?.[DUPLICATE_FLAG] !== '1' && (keepsPlan(newer) || newer.status === 'incomplete')) {
+    // Flagged first (Stripe won't update a canceled subscription), so a retry after the cancel still refunds.
+    await stripe.subscriptions.update(
       newer.id,
-      { prorate: false, invoice_now: false },
-      { idempotencyKey: `dup-cancel:${newer.id}` },
+      { metadata: { [DUPLICATE_FLAG]: '1' } },
+      { idempotencyKey: `dup-flag:${newer.id}` },
     );
   }
-  await refundLatestInvoice(stripe, newer);
+  await settleDuplicate(stripe, newer);
   return { planBefore: 'free', planAfter: 'free', duplicate: true };
+}
+
+/**
+ * Refund first, then cancel: if the refund fails, the webhook answers 500 and Stripe's retry still finds a live
+ * duplicate and finishes. If the cancel fails after the refund, the retry's refund is a no-op (same keys).
+ */
+async function settleDuplicate(stripe: Stripe, sub: Stripe.Subscription) {
+  await refundLatestInvoice(stripe, sub);
+  if (keepsPlan(sub) || sub.status === 'incomplete') {
+    await stripe.subscriptions.cancel(
+      sub.id,
+      { prorate: false, invoice_now: false },
+      { idempotencyKey: `dup-cancel:${sub.id}` },
+    );
+  }
 }
 
 /** Refunds every paid payment of a subscription's latest invoice in full (a duplicate purchase). */
@@ -199,10 +231,15 @@ async function refundLatestInvoice(stripe: Stripe, sub: Stripe.Subscription) {
   for (const p of payments.data) {
     const pi = idOf(p.payment?.payment_intent as string | { id: string } | null | undefined);
     if (!pi) continue;
-    await stripe.refunds.create(
-      { payment_intent: pi, reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
-      { idempotencyKey: `dup-refund:${pi}` },
-    );
+    try {
+      await stripe.refunds.create(
+        { payment_intent: pi, reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
+        { idempotencyKey: `dup-refund:${pi}` },
+      );
+    } catch (err) {
+      // Refunded already (an earlier try, after the 24 h idempotency window): done, not a failure to retry.
+      if (!(isStripeError(err) && err.code === 'charge_already_refunded')) throw err;
+    }
   }
 }
 
@@ -239,8 +276,10 @@ export async function applyCheckoutSession(
   }
   if (session.mode === 'subscription') {
     const subId = idOf(session.subscription);
-    if (subId) await syncSubscription(env, stripe, subId, requestId, owner);
-    if (session.status === 'complete') await billingDb.checkoutMark(env, session.id, 'done');
+    const r = subId ? await syncSubscription(env, stripe, subId, requestId, owner) : null;
+    // A duplicate purchase never shows "Welcome": the return page says it was refunded.
+    if (r?.duplicate) await billingDb.checkoutMark(env, session.id, 'refunded');
+    else if (session.status === 'complete') await billingDb.checkoutMark(env, session.id, 'done');
     return owner;
   }
   if (session.mode === 'payment') {

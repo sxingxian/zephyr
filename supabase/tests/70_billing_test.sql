@@ -381,6 +381,10 @@ select public.admin_price_set(:fin, 'zephyr_studio_yearly', 'price_StuY4', 25900
 select pg_temp.ok((select status from public.price_changes where id = (:'y3'::jsonb ->> 'priceChangeId')::uuid) = 'moving'
   and jsonb_array_length(public.admin_price_change_stop(:fin, (:'y3'::jsonb ->> 'priceChangeId')::uuid) -> 'reverts') = 1,
   'a later price doesn''t close a change with applied moves; Stop can still revert them');
+select pg_temp.ok((select status from public.price_moves where owner_id = :rz and to_price_id = 'price_StuY3') = 'revert_pending'
+  and (select count(*) from jsonb_array_elements(public.price_moves_due(500)) x where x ->> 'ownerId' = :rz and x ->> 'toPriceId' = 'price_StuY4') = 0,
+  'while a revert is owed the subscriber gets no new move');
+select public.price_move_mark((select id from public.price_moves where owner_id = :rz and to_price_id = 'price_StuY3'), 'reverted');
 
 -- A notice that never went out by the move date: the move is skipped, never applied.
 select public.price_moves_due(500);
@@ -390,10 +394,94 @@ select pg_temp.ok((select status = 'skipped' and skip_reason = 'no_email' from p
   and (select count(*) from jsonb_array_elements(:'dnm'::jsonb) x where x ->> 'ownerId' = :rz and x ->> 'toPriceId' = 'price_StuY4') = 0,
   'an unsent notice past its date skips the move');
 
+-- ---- Round-2 review fixes ------------------------------------------------------------------------
+insert into auth.users (id, email, email_confirmed_at) values
+  ('b7000000-0000-0000-0000-00000000000b', 'mv.bill@example.com', now()),
+  ('b7000000-0000-0000-0000-00000000000c', 'part.bill@example.com', now());
+\set mv '\'b7000000-0000-0000-0000-00000000000b\''
+\set part '\'b7000000-0000-0000-0000-00000000000c\''
+
+-- A Checkout that bought a duplicate shows refunded, never done.
+select public.billing_checkout_record(:dup, 'cs_test_dupref00001', 'subscription', 'zephyr_pro_monthly', 'checkout:r1');
+select public.billing_checkout_mark('cs_test_dupref00001', 'done');
+select pg_temp.ok(public.billing_checkout_mark('cs_test_dupref00001', 'refunded') ->> 'state' = 'refunded',
+  'a duplicate purchase is marked refunded, even after done');
+select pg_temp.ok(public.billing_checkout_mark('cs_test_dupref00001', 'done') ->> 'state' = 'refunded'
+  and public.billing_checkout_mark('cs_test_dupref00001', 'failed') ->> 'state' = 'refunded', 'and stays refunded');
+select pg_temp.ok(public.billing_checkout_status(:dup, 'cs_test_dupref00001') ->> 'state' = 'refunded', 'the return page sees refunded');
+
+-- Partial refunds remove credits in proportion, cumulatively, never more than are left.
+select public.billing_checkout_record(:part, 'cs_test_parttop0001', 'topup', 'zephyr_topup_1000');
+select public.billing_topup_grant(:part, 'cs_test_parttop0001', 'pi_Part1', 'zephyr_topup_1000');
+select pg_temp.ok((public.billing_topup_refund('pi_Part1', 250, 1000) ->> 'removed')::int = 250,
+  'a quarter refunded removes a quarter of the credits');
+select pg_temp.ok((public.billing_topup_refund('pi_Part1', 250, 1000) ->> 'removed')::int = 0, 'once (refund totals are cumulative)');
+select pg_temp.ok((select remaining = 750 and refunded_at is null from public.credit_topups where payment_intent_id = 'pi_Part1'),
+  'a partial refund leaves the rest');
+select pg_temp.ok((public.billing_topup_refund('pi_Part1', 333, 1000) ->> 'removed')::int = 83,
+  'more refunded removes the difference, rounded up (ceil(1000 × 333 ÷ 1000) = 333, less 250)');
+update public.credit_topups set remaining = 100 where payment_intent_id = 'pi_Part1';
+select pg_temp.ok((public.billing_topup_refund('pi_Part1', 1000, 1000) ->> 'removed')::int = 100,
+  'a full refund removes what is left (spent credits are never clawed back)');
+select pg_temp.ok((select remaining = 0 and refunded_at is not null from public.credit_topups where payment_intent_id = 'pi_Part1'),
+  'and marks the top-up refunded');
+select pg_temp.ok((public.billing_topup_refund('pi_Part1', 1000, 1000) ->> 'removed')::int = 0, 'once');
+select pg_temp.ok((select count(*) from public.credit_ledger where owner_id = :part and reason = 'top_up_refund'
+                     and label = 'Top-up partly refunded') = 2, 'partial refunds are labelled as such');
+
+-- Price moves: claimed before the swap, Stop leaves claimed moves alone, a move finished after Stop is put back,
+-- and reverts that keep failing until the renewal are marked failed.
+select public.admin_price_set(null, 'zephyr_pro_yearly', 'price_ProY1', 9900, null, true);
+select public.billing_customer_set(:mv, 'cus_Mv');
+select public.billing_apply(:mv, pg_temp.sub('sub_Mv', 'cus_Mv', 'active', 'price_ProY1', now() - interval '360 days', now() + interval '3 days'), now());
+select public.admin_price_set(:fin, 'zephyr_pro_yearly', 'price_ProY2', 10900, 'Costs', false) as mvc \gset
+select public.price_moves_due(500);
+select id as mvm from public.price_moves where owner_id = :mv and to_price_id = 'price_ProY2' \gset
+select public.price_move_mark(:'mvm', 'notified');
+update public.price_moves set move_at = now() + interval '1 day' where id = :'mvm';
+select pg_temp.ok(public.price_move_claim(:'mvm') ->> 'status' = 'moving', 'a notified move is claimed');
+select pg_temp.ok(public.price_move_claim(:'mvm') is null, 'only once');
+select pg_temp.ok(public.price_move_mark(:'mvm', 'notified') ->> 'status' = 'notified', 'a failed swap releases the claim');
+select pg_temp.ok(public.price_move_claim(:'mvm') ->> 'status' = 'moving', 'for the next run');
+update public.price_moves set claimed_at = now() - interval '2 hours' where id = :'mvm';
+select pg_temp.ok(public.price_move_claim(:'mvm') ->> 'status' = 'moving', 'a claim older than an hour (a dead worker) can be taken again');
+select pg_temp.ok((select count(*) from jsonb_array_elements(public.price_moves_due(500)) x where (x ->> 'id')::uuid = :'mvm') = 0,
+  'a fresh claim isn''t offered by the sweep');
+update public.price_moves set claimed_at = now() - interval '2 hours' where id = :'mvm';
+select pg_temp.ok((select count(*) from jsonb_array_elements(public.price_moves_due(500)) x
+                    where (x ->> 'id')::uuid = :'mvm' and x ->> 'status' = 'moving') = 1, 'and the sweep offers it again');
+update public.price_moves set claimed_at = now() where id = :'mvm';
+select pg_temp.ok(jsonb_array_length(public.admin_price_change_stop(:fin, (:'mvc'::jsonb ->> 'priceChangeId')::uuid) -> 'reverts') = 0,
+  'Stop has nothing to revert yet');
+select pg_temp.ok((select status from public.price_moves where id = :'mvm') = 'moving', 'Stop leaves a claimed move to the cron');
+select pg_temp.ok(public.price_move_claim(:'mvm') is null, 'a stopped change''s moves can''t be claimed');
+select pg_temp.ok(public.price_move_mark(:'mvm', 'moved') ->> 'status' = 'revert_pending',
+  'a move the cron finishes after Stop goes straight to revert_pending');
+select public.price_move_reverts_due(100) as rd \gset
+select pg_temp.ok((:'rd'::jsonb ->> 'failed')::int = 0
+  and (select count(*) from jsonb_array_elements(:'rd'::jsonb -> 'reverts') x
+        where (x ->> 'moveId')::uuid = :'mvm' and x ->> 'fromPriceId' = 'price_ProY1' and x ->> 'toPriceId' = 'price_ProY2') = 1,
+  'the cron is given the revert to retry');
+select pg_temp.ok((select (c -> 'counts' ->> 'reverting')::int from jsonb_array_elements(public.admin_billing_overview(:fin) -> 'changes') c
+                    where (c ->> 'id')::uuid = (:'mvc'::jsonb ->> 'priceChangeId')::uuid) = 1, 'the admin overview shows it as reverting');
+update public.price_moves set move_at = now() - interval '1 minute' where id = :'mvm';
+select public.price_move_reverts_due(100) as rd2 \gset
+select pg_temp.ok((:'rd2'::jsonb ->> 'failed')::int = 1 and jsonb_array_length(:'rd2'::jsonb -> 'reverts') = 0
+  and (select status from public.price_moves where id = :'mvm') = 'revert_failed'
+  and (select (c -> 'counts' ->> 'revertFailed')::int from jsonb_array_elements(public.admin_billing_overview(:fin) -> 'changes') c
+        where (c ->> 'id')::uuid = (:'mvc'::jsonb ->> 'priceChangeId')::uuid) = 1,
+  'a revert the renewal reached first is marked failed and counted for the team');
+select pg_temp.ok(public.price_move_mark(:'mvm', 'reverted') ->> 'status' = 'revert_failed', 'a failed revert isn''t silently marked done');
+
+select pg_temp.ok(has_function_privilege('service_role', 'public.price_move_claim(uuid)', 'execute')
+  and has_function_privilege('service_role', 'public.price_move_reverts_due(integer)', 'execute')
+  and has_function_privilege('service_role', 'public.billing_topup_refund(text, integer, integer)', 'execute')
+  and not has_function_privilege('authenticated', 'public.price_move_claim(uuid)', 'execute'), 'the new move functions are for the API only');
+
 select pg_temp.ok(has_function_privilege('service_role', 'public.billing_checkout_open(uuid, text, text)', 'execute')
   and has_function_privilege('service_role', 'public.billing_past_due_expire(integer)', 'execute')
-  and not has_function_privilege('authenticated', 'public.billing_topup_refund_by_session(text)', 'execute')
-  and not has_function_privilege('service_role', 'public._topup_refund(uuid)', 'execute')
+  and not has_function_privilege('authenticated', 'public.billing_topup_refund_by_session(text, integer, integer)', 'execute')
+  and not has_function_privilege('service_role', 'public._topup_refund(uuid, integer, integer)', 'execute')
   and not has_function_privilege('service_role', 'public._key_floor(text)', 'execute'), 'new functions are for the API only; helpers for nobody');
 
 -- ---- Privileges -----------------------------------------------------------------------------------

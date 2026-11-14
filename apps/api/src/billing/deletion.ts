@@ -36,7 +36,9 @@ export async function cancelForDeletion(env: Env, owner: string, fromDb?: unknow
   try {
     const sub = await stripe.subscriptions.retrieve(id);
     if (sub.status === 'canceled' || sub.status === 'incomplete_expired' || sub.cancel_at_period_end) return;
-    const day = new Date().toISOString().slice(0, 10);
+    // A fresh key per request: a deletion requested, restored and requested again on one day must reach Stripe
+    // again (a day-based key would replay the first answer). cancel_at_period_end is idempotent on its own.
+    const nonce = crypto.randomUUID();
     const schedule = idOf(sub.schedule);
     if (schedule) {
       await stripe.subscriptionSchedules.release(schedule, {}, { idempotencyKey: `release:${schedule}` });
@@ -44,7 +46,7 @@ export async function cancelForDeletion(env: Env, owner: string, fromDb?: unknow
     await stripe.subscriptions.update(
       id,
       { cancel_at_period_end: true, metadata: { [FLAG]: '1' } },
-      { idempotencyKey: `deletion-cancel:${id}:${day}` },
+      { idempotencyKey: `deletion-cancel:${id}:${nonce}` },
     );
   } catch (err) {
     if (!isMissing(err)) throw err;
@@ -63,7 +65,7 @@ export async function undoCancelForDeletion(env: Env, owner: string, fromDb?: un
     await stripe.subscriptions.update(
       id,
       { cancel_at_period_end: false, metadata: { [FLAG]: '' } },
-      { idempotencyKey: `deletion-resume:${id}:${new Date().toISOString().slice(0, 10)}` },
+      { idempotencyKey: `deletion-resume:${id}:${crypto.randomUUID()}` },
     );
   } catch (err) {
     if (!isMissing(err)) throw err;

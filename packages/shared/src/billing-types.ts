@@ -120,6 +120,14 @@ export const MAX_TEAM_LIBRARIES = 10;
 
 // ---------------------------------------------------------------- team (owner's view)
 export const TEAM_NAME_MAX = 60;
+/**
+ * Team names (and any name shown in a team invite email) go to addresses the owner chooses, so they're held to a
+ * strict pattern: letters, numbers, spaces and . , ' & - only, and nothing that reads as an address or a link
+ * (no "@", "://", "www.", or a dot followed by a letter, as in a domain). Mirrors public._safe_label.
+ */
+export const SAFE_LABEL = /^[\p{L}\p{N} .,'&-]{1,60}$/u;
+const LINK_LIKE = /(www\.|:\/\/|\.\p{L})/iu;
+export const isSafeLabel = (s: string): boolean => SAFE_LABEL.test(s) && !LINK_LIKE.test(s);
 export const TEAM_INVITE_DAYS = 7;
 export interface TeamMember {
   userId: string;
@@ -271,8 +279,11 @@ export type CheckoutBody =
   | { kind: 'topup'; pack: TopUpLookupKey };
 export interface CheckoutStatusResult {
   ok: true;
-  /** pending: Stripe hasn't confirmed yet (keep polling, ≤ 60 s) · done: applied · failed: payment not completed. */
-  state: 'pending' | 'done' | 'failed';
+  /**
+   * pending: Stripe hasn't confirmed yet (keep polling, ≤ 60 s) · done: applied · failed: payment not completed ·
+   * refunded: a second plan bought while one was already live (e.g. two tabs): canceled and refunded in full.
+   */
+  state: 'pending' | 'done' | 'failed' | 'refunded';
   kind: 'subscription' | 'topup';
   plan?: PlanId;
   credits?: number;
@@ -355,7 +366,17 @@ export interface AdminPriceChange {
   createdAt: string;
   createdBy: string;
   reason: string;
-  counts: { pending: number; notified: number; moved: number; skipped: number };
+  counts: {
+    pending: number;
+    /** Notice sent (includes moves the cron is swapping right now). */
+    notified: number;
+    moved: number;
+    skipped: number;
+    /** Stopped after they were applied: waiting to be put back on the old price (the daily cron retries). */
+    reverting: number;
+    /** Stopped, but the renewal came before the revert succeeded: billed at the new price. Needs a person. */
+    revertFailed: number;
+  };
   /** The last move date across subscribers. */
   lastMoveAt: string | null;
 }

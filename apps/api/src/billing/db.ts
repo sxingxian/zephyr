@@ -76,6 +76,8 @@ export interface ApplyResult {
    */
   duplicate?: boolean;
   storedSubscriptionId?: string;
+  /** Not applied: an ended subscription that never replaces a live one, or another customer's. */
+  ignored?: 'older_subscription' | 'customer_mismatch';
   email?: string | null;
 }
 
@@ -90,9 +92,18 @@ export interface DueMove {
   fromAmount: number;
   toAmount: number;
   moveAt: string;
-  status: 'pending' | 'notified';
+  /** moving: a claim older than an hour (a worker died mid-swap); it can be claimed again. */
+  status: 'pending' | 'notified' | 'moving';
   plan: PaidPlanId | null;
   interval: BillingInterval | null;
+}
+
+/** A move to put back on its old price (Stop, or a claimed move finished after Stop). */
+export interface RevertMove {
+  moveId: string;
+  stripeSubscriptionId: string;
+  fromPriceId: string;
+  toPriceId?: string;
 }
 
 /** admin_price_change_stop → moves applied in Stripe but not yet renewed, to put back. */
@@ -101,7 +112,7 @@ export interface StopResult {
   lookupKey?: string;
   from?: number;
   to?: number;
-  reverts?: { moveId: string; stripeSubscriptionId: string; fromPriceId: string; toPriceId?: string }[];
+  reverts?: RevertMove[];
 }
 
 export const billingDb = {
@@ -140,13 +151,13 @@ export const billingDb = {
     true,
   checkoutStatus: (env: Env, owner: string, session: string) =>
     rpc<{
-      state: 'pending' | 'done' | 'failed';
+      state: 'pending' | 'done' | 'failed' | 'refunded';
       kind: 'subscription' | 'topup';
       plan?: PlanId;
       credits?: number;
       createdAt?: string;
     } | null>(env, 'billing_checkout_status', { p_owner: owner, p_session: session }),
-  checkoutMark: (env: Env, session: string, state: 'done' | 'failed') =>
+  checkoutMark: (env: Env, session: string, state: 'done' | 'failed' | 'refunded') =>
     rpc<unknown>(env, 'billing_checkout_mark', { p_session: session, p_state: state }),
   apply: (env: Env, owner: string, sub: SubscriptionSnapshot, syncedAt: Date) =>
     rpc<ApplyResult | null>(env, 'billing_apply', {
@@ -167,13 +178,18 @@ export const billingDb = {
       p_payment_intent: paymentIntent,
       p_lookup_key: lookupKey,
     }),
-  topupRefund: (env: Env, paymentIntent: string) =>
+  /** `refunded` / `amount`: the charge's refunded total so far and its amount (credits come off in proportion). */
+  topupRefund: (env: Env, paymentIntent: string, refunded: number | null, amount: number | null) =>
     rpc<{ ownerId: string; removed: number } | null>(env, 'billing_topup_refund', {
       p_payment_intent: paymentIntent,
+      p_refunded: refunded,
+      p_amount: amount,
     }),
-  topupRefundBySession: (env: Env, session: string) =>
+  topupRefundBySession: (env: Env, session: string, refunded: number | null, amount: number | null) =>
     rpc<{ ownerId: string; removed: number } | null>(env, 'billing_topup_refund_by_session', {
       p_session: session,
+      p_refunded: refunded,
+      p_amount: amount,
     }),
   /** Plans ended because past_due outlasted the grace period: [{ownerId, email}]. */
   pastDueExpire: async (env: Env, limit: number) =>
@@ -203,6 +219,15 @@ export const billingDb = {
     rpc<unknown>(env, 'billing_event_finish', { p_id: id, p_status: status, p_error: error, p_owner: owner }),
   movesDue: async (env: Env, limit: number) =>
     (await rpc<DueMove[] | null>(env, 'price_moves_due', { p_limit: limit })) ?? [],
-  moveMark: (env: Env, id: string, status: 'notified' | 'moved' | 'skipped' | 'reverted') =>
-    rpc<unknown>(env, 'price_move_mark', { p_id: id, p_status: status }),
+  /** `notified` also releases a claim (the swap didn't happen). `moved` answers status revert_pending when the
+   * change was stopped while the swap ran: the caller puts it back. */
+  moveMark: (env: Env, id: string, status: 'notified' | 'moved' | 'skipped' | 'reverted' | 'revert_failed') =>
+    rpc<{ status?: string } | null>(env, 'price_move_mark', { p_id: id, p_status: status }),
+  /** Claims a notified move for the Stripe swap (null: stopped, already moved, or claimed by another run). */
+  moveClaim: (env: Env, id: string) => rpc<DueMove | null>(env, 'price_move_claim', { p_id: id }),
+  /** Reverts Stop still owes; those past their renewal are marked failed (counted). */
+  revertsDue: async (env: Env, limit: number) =>
+    (await rpc<{ failed: number; reverts: RevertMove[] } | null>(env, 'price_move_reverts_due', {
+      p_limit: limit,
+    })) ?? { failed: 0, reverts: [] },
 };

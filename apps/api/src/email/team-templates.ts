@@ -1,4 +1,4 @@
-import type { TeamRole } from '@zephyr/shared';
+import { isSafeLabel, type TeamRole } from '@zephyr/shared';
 import { escapeHtml, oneLine } from './escape';
 
 export interface TeamInviteEmail {
@@ -25,11 +25,23 @@ const ROLE_LINE: Record<TeamRole, string> = {
   viewer: 'As a Viewer you can browse and download photos from the team library.',
 };
 
-/** Team invite (phase 7): subject, HTML and plain text. Every member-provided value is escaped. */
+/** The subject never carries owner-chosen text: invites go to any address the owner types. */
+export const TEAM_INVITE_SUBJECT = 'You’re invited to join a team on Zephyr';
+
+/** A name only if it passes the strict pattern (SAFE_LABEL); otherwise null and generic wording is used. */
+const safeName = (s: string | null) => {
+  const v = s ? oneLine(s).trim() : '';
+  return v && isSafeLabel(v) ? v : null;
+};
+
+/**
+ * Team invite (phase 7): subject, HTML and plain text. The subject is fixed; the team and inviter names appear
+ * in the body only if they pass the strict name pattern (no links or addresses), and are escaped.
+ */
 export function teamInviteEmail(e: TeamInviteEmail): { subject: string; html: string; text: string } {
-  const team = oneLine(e.teamName).slice(0, 60) || 'a Studio team';
-  const who = e.inviterName ? oneLine(e.inviterName).slice(0, 80) : null;
-  const subject = who ? `${who} invited you to ${team} on Zephyr` : `You’re invited to ${team} on Zephyr`;
+  const team = safeName(e.teamName) ?? 'a Studio team on Zephyr';
+  const who = safeName(e.inviterName);
+  const subject = TEAM_INVITE_SUBJECT;
   const lead = who ? `${who} invited you to join ${team}` : `You’re invited to join ${team}`;
   const role = ROLE_LINE[e.role];
   const cta = e.needsAccount ? 'Create my account' : 'Join the team';
