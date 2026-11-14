@@ -14,6 +14,7 @@ import { errorMessage } from '../lib/api';
 import { emitLibrary } from '../lib/bus';
 import { cameraName, exposure, longDateTime, relativeDateTime, shortDateTime } from '../lib/format';
 import { bulk, editKey, getPhoto, originalUrl, patchPhoto, previewUrl, thumbUrl } from '../lib/library';
+import { useCan } from '../lib/libraryContext';
 import { formatBytes, refreshUsage } from '../lib/usage';
 import { AlbumPicker } from './AlbumPicker';
 import { useViewerHost } from './LibraryBits';
@@ -122,8 +123,11 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
     [items, nav, loc.state, list],
   );
 
+  // Phase 7: a Viewer in a team library browses and downloads only; read-only libraries can't be edited.
+  const canEdit = useCan('edit');
+  const canTrash = useCan('trash');
   const openEditor = () => {
-    if (!photo) return;
+    if (!photo || !canEdit) return;
     const bg = (loc.state as { bg?: string } | null)?.bg ?? '/';
     setReturnId(photo.id);
     nav(`/edit/${encodeURIComponent(photo.id)}`, { state: { bg, fromViewer: true } });
@@ -242,25 +246,29 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
           </div>
           <span className="viewer__spacer" />
           <div className="viewer__actions">
-            <button
-              type="button"
-              className="vbtn"
-              aria-label={photo?.favourite ? 'Remove from Favourites' : 'Favourite'}
-              aria-pressed={photo?.favourite ?? false}
-              onClick={favourite}
-              disabled={!photo || busy === 'fav'}
-            >
-              <Icon name="heart" size={19} className={photo?.favourite ? 'is-filled' : undefined} />
-            </button>
-            <button
-              type="button"
-              className="vbtn"
-              aria-label="Add to album"
-              onClick={() => setPicker(true)}
-              disabled={!photo}
-            >
-              <Icon name="folder" size={19} />
-            </button>
+            {canEdit && (
+              <>
+                <button
+                  type="button"
+                  className="vbtn"
+                  aria-label={photo?.favourite ? 'Remove from Favourites' : 'Favourite'}
+                  aria-pressed={photo?.favourite ?? false}
+                  onClick={favourite}
+                  disabled={!photo || busy === 'fav'}
+                >
+                  <Icon name="heart" size={19} className={photo?.favourite ? 'is-filled' : undefined} />
+                </button>
+                <button
+                  type="button"
+                  className="vbtn"
+                  aria-label="Add to album"
+                  onClick={() => setPicker(true)}
+                  disabled={!photo}
+                >
+                  <Icon name="folder" size={19} />
+                </button>
+              </>
+            )}
             {photo ? (
               <a
                 className="vbtn"
@@ -283,27 +291,31 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
             >
               <Icon name="info" size={19} />
             </button>
+            {canTrash && (
+              <button
+                type="button"
+                className="vbtn"
+                aria-label="Move to Trash"
+                onClick={trash}
+                disabled={!photo || busy === 'trash'}
+              >
+                <Icon name="trash" size={19} />
+              </button>
+            )}
+          </div>
+          {canEdit && (
             <button
               type="button"
-              className="vbtn"
-              aria-label="Move to Trash"
-              onClick={trash}
-              disabled={!photo || busy === 'trash'}
+              className="viewer__edit"
+              onClick={openEditor}
+              disabled={!photo?.hasPreview}
+              aria-keyshortcuts="e"
+              title={photo && !photo.hasPreview ? 'This file has no preview to edit' : 'Edit (E)'}
             >
-              <Icon name="trash" size={19} />
+              <Icon name="sliders" size={16} />
+              Edit
             </button>
-          </div>
-          <button
-            type="button"
-            className="viewer__edit"
-            onClick={openEditor}
-            disabled={!photo?.hasPreview}
-            aria-keyshortcuts="e"
-            title={photo && !photo.hasPreview ? 'This file has no preview to edit' : 'Edit (E)'}
-          >
-            <Icon name="sliders" size={16} />
-            Edit
-          </button>
+          )}
         </header>
         <div className="viewer__stage" onPointerDown={onPointerDown} onPointerUp={onPointerUp}>
           {index > 0 && (
@@ -396,31 +408,45 @@ export function Viewer({ photoId, fromGrid }: { photoId: string; fromGrid: boole
           </div>
         )}
         <nav className="viewer__tabs" aria-label="Photo actions">
-          <button type="button" onClick={openEditor} disabled={!photo?.hasPreview}>
-            <Icon name="sliders" size={22} />
-            Edit
-          </button>
-          <button
-            type="button"
-            onClick={favourite}
-            disabled={!photo}
-            aria-pressed={photo?.favourite ?? false}
-          >
-            <Icon name="heart" size={22} className={photo?.favourite ? 'is-filled' : undefined} />
-            Favourite
-          </button>
+          {canEdit && (
+            <>
+              <button type="button" onClick={openEditor} disabled={!photo?.hasPreview}>
+                <Icon name="sliders" size={22} />
+                Edit
+              </button>
+              <button
+                type="button"
+                onClick={favourite}
+                disabled={!photo}
+                aria-pressed={photo?.favourite ?? false}
+              >
+                <Icon name="heart" size={22} className={photo?.favourite ? 'is-filled' : undefined} />
+                Favourite
+              </button>
+            </>
+          )}
           <button type="button" onClick={toggleInfo} aria-pressed={info}>
             <Icon name="info" size={22} />
             Info
           </button>
-          <button type="button" onClick={() => setPicker(true)} disabled={!photo}>
-            <Icon name="folder" size={22} />
-            Album
-          </button>
-          <button type="button" onClick={trash} disabled={!photo}>
-            <Icon name="trash" size={22} />
-            Delete
-          </button>
+          {canEdit && (
+            <button type="button" onClick={() => setPicker(true)} disabled={!photo}>
+              <Icon name="folder" size={22} />
+              Album
+            </button>
+          )}
+          {canTrash && (
+            <button type="button" onClick={trash} disabled={!photo}>
+              <Icon name="trash" size={22} />
+              Delete
+            </button>
+          )}
+          {!canEdit && photo && (
+            <a href={originalUrl(photo.id)} download={photo.filename}>
+              <Icon name="download" size={22} />
+              Download
+            </a>
+          )}
         </nav>
       </div>
       {info && (

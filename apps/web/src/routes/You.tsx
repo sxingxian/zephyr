@@ -47,7 +47,9 @@ export function You() {
           </div>
           <StorageMeter />
           <CreditsMeter />
-          <p className="z-hint">Plan upgrades and credit top-ups are coming soon.</p>
+          <Link to="/settings/billing" className="z-btn z-btn--secondary z-btn--md z-btn--full">
+            <span>Plan &amp; billing</span>
+          </Link>
         </section>
         {aiOn && (
           <Group title="Zephyr AI">
@@ -105,6 +107,13 @@ export function You() {
           </Link>
         </Group>
         <Group title="People">
+          <Link to="/settings/team" className="you-row">
+            <span className="you-row__icon">
+              <Icon name="people" size={17} />
+            </span>
+            <span className="you-row__label">Team</span>
+            <Icon name="chevR" size={16} />
+          </Link>
           <Link to="/settings/invites" className="you-row">
             <span className="you-row__icon">
               <Icon name="mail" size={17} />

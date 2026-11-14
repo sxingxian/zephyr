@@ -7,6 +7,7 @@ import { Shell } from '../components/Shell';
 import { errorMessage } from '../lib/api';
 import { emitLibrary } from '../lib/bus';
 import { allPhotoIds, bulk, emptyTrash } from '../lib/library';
+import { useCan } from '../lib/libraryContext';
 import { usePhotoList } from '../lib/photos';
 import { useSelection } from '../lib/selection';
 import { formatBytes, refreshUsage, useUsage } from '../lib/usage';
@@ -83,14 +84,23 @@ export function TrashPage() {
       void refreshUsage();
     });
 
+  // Phase 7: editors restore; only the library's owner deletes for good.
+  const canRestore = useCan('trash');
+  const canPurge = useCan('purge');
   const actions: BarAction[] = [
-    { icon: 'undo', label: 'Restore', onClick: () => restore(ids), busy: busy === 'restore' },
-    {
-      icon: 'trash',
-      label: 'Delete forever',
-      onClick: () => setConfirm({ kind: 'forever', ids }),
-      danger: true,
-    },
+    ...(canRestore
+      ? [{ icon: 'undo' as const, label: 'Restore', onClick: () => restore(ids), busy: busy === 'restore' }]
+      : []),
+    ...(canPurge
+      ? [
+          {
+            icon: 'trash' as const,
+            label: 'Delete forever',
+            onClick: () => setConfirm({ kind: 'forever', ids }),
+            danger: true,
+          },
+        ]
+      : []),
   ];
   const count = list.hasMore ? null : list.items.length;
   const stats = [
@@ -112,27 +122,33 @@ export function TrashPage() {
           <span>They still count towards your storage until then.{stats ? ` ${stats}` : ''}</span>
         </div>
         <div className="trash-banner__actions">
-          <Button
-            size="sm"
-            icon="undo"
-            onClick={restoreAll}
-            busy={busy === 'restoreAll'}
-            disabled={!hasItems || busy !== null}
-          >
-            Restore all
-          </Button>
-          <Button
-            size="sm"
-            kind="danger"
-            icon="trash"
-            onClick={() => setConfirm({ kind: 'empty' })}
-            disabled={!hasItems || busy !== null}
-          >
-            Empty Trash
-          </Button>
+          {canRestore && (
+            <Button
+              size="sm"
+              icon="undo"
+              onClick={restoreAll}
+              busy={busy === 'restoreAll'}
+              disabled={!hasItems || busy !== null}
+            >
+              Restore all
+            </Button>
+          )}
+          {canPurge && (
+            <Button
+              size="sm"
+              kind="danger"
+              icon="trash"
+              onClick={() => setConfirm({ kind: 'empty' })}
+              disabled={!hasItems || busy !== null}
+            >
+              Empty Trash
+            </Button>
+          )}
         </div>
       </div>
-      {sel.count > 0 && <SelectionBar count={sel.count} actions={actions} onClear={sel.clear} />}
+      {sel.count > 0 && actions.length > 0 && (
+        <SelectionBar count={sel.count} actions={actions} onClear={sel.clear} />
+      )}
       {list.error && (
         <Note tone="bad" icon="alert" role="alert">
           {list.error}

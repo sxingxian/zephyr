@@ -20,6 +20,7 @@ import {
 } from '../lib/aiClient';
 import { errorMessage } from '../lib/api';
 import { allPhotoIds } from '../lib/library';
+import { useCan } from '../lib/libraryContext';
 import { usePhotoList } from '../lib/photos';
 import { useSelection } from '../lib/selection';
 import { useScanner } from '../lib/useScanner';
@@ -71,6 +72,7 @@ function ScanBar() {
 }
 
 function PeopleIntro({ onTurnOn }: { onTurnOn: () => void }) {
+  const owner = useCan('aiSettings');
   const points: [Parameters<typeof Icon>[0]['name'], string, string][] = [
     [
       'monitor',
@@ -110,9 +112,13 @@ function PeopleIntro({ onTurnOn }: { onTurnOn: () => void }) {
           </li>
         ))}
       </ul>
-      <Button kind="primary" size="lg" icon="people" onClick={onTurnOn}>
-        Turn on face grouping
-      </Button>
+      {owner ? (
+        <Button kind="primary" size="lg" icon="people" onClick={onTurnOn}>
+          Turn on face grouping
+        </Button>
+      ) : (
+        <span className="z-hint">Only the library’s owner can turn on face grouping.</span>
+      )}
     </section>
   );
 }

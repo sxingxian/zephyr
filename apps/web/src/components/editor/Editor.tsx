@@ -45,7 +45,7 @@ import {
   patchRecipe,
   saveEdit,
 } from '../../lib/edits';
-import { getPhoto } from '../../lib/library';
+import { getPhoto, thumbUrl } from '../../lib/library';
 import { sessionUserId } from '../../lib/sessionGuard';
 import { uploads } from '../../lib/uploads';
 import { type AiToast, EditorAiPanel } from '../ai/EditorAi';
@@ -968,7 +968,7 @@ export function Editor({ photoId }: { photoId: string }) {
                 >
                   {p.hasThumb ? (
                     <img
-                      src={`/api/v1/photos/${encodeURIComponent(p.id)}/thumb${p.edit?.rendered ? `?e=${p.edit.version}` : ''}`}
+                      src={thumbUrl(p.id, p.edit?.rendered ? p.edit.version : null)}
                       alt=""
                       loading="lazy"
                     />

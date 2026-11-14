@@ -2,10 +2,14 @@ import { Button, Chip, Icon, type IconName, Wordmark } from '@zephyr/ui';
 import { type ReactNode, useLayoutEffect, useRef } from 'react';
 import { Link, NavLink, useLocation } from 'react-router';
 import { useAiStatus, useRunningJobs } from '../lib/aiClient';
+import { useActiveLibrary, useCan } from '../lib/libraryContext';
 import { initials, useSession } from '../lib/session';
 import { formatOf, useUsage } from '../lib/usage';
 import { Avatar } from './Avatar';
 import { CreditsMeter } from './ai/AiBits';
+import { LibraryBanner } from './LibraryBanner';
+import { LibrarySwitcher, PhoneLibrarySwitcher } from './LibrarySwitcher';
+import '../billing.css';
 import { useUploadPicker } from './Uploads';
 
 interface NavDef {
@@ -82,7 +86,9 @@ function Sidebar() {
   const usage = useUsage();
   const ai = useAiStatus();
   const running = useRunningJobs();
-  const plan = user?.plan ?? 'free';
+  const lib = useActiveLibrary();
+  // A team library shows its owner's plan (Studio); the member's own plan is on Plan & billing.
+  const plan = lib.self ? (user?.plan ?? 'free') : (lib.summary?.plan ?? 'studio');
   // Zephyr AI pages show unless an admin switched Zephyr AI off for everyone.
   const aiOn = !ai || ai.enabled;
   return (
@@ -90,6 +96,7 @@ function Sidebar() {
       <Link to="/" className="sidebar__brand" aria-label="Zephyr library">
         <Wordmark size={21} />
       </Link>
+      <LibrarySwitcher />
       <div className="sidebar__group">
         {LIBRARY.filter((d) => aiOn || !d.ai).map((d) => (
           <Item key={d.label} d={d} count={d.count && usage ? usage.photoCount : undefined} />
@@ -121,7 +128,9 @@ function Sidebar() {
       <div className="sidebar__spacer" />
       <div className="sidebar__plan">
         <div className="sidebar__plan-row">
-          <Chip tone={plan === 'free' ? 'neutral' : 'ink'}>{PLAN_LABEL[plan]}</Chip>
+          <Link to="/settings/billing" className="sidebar__plan-link">
+            <Chip tone={plan === 'free' ? 'neutral' : 'ink'}>{PLAN_LABEL[plan]}</Chip>
+          </Link>
           <Link to="/settings/security" aria-label="Settings" className="sidebar__settings">
             <Icon name="settings" size={17} />
           </Link>
@@ -136,15 +145,19 @@ function Sidebar() {
 function Topbar({ title, actions, search }: { title: string; actions?: ReactNode; search?: ReactNode }) {
   const { user } = useSession();
   const pick = useUploadPicker();
+  const canUpload = useCan('upload');
   return (
     <header className="topbar">
+      <PhoneLibrarySwitcher />
       <h1 className="topbar__title">{title}</h1>
       {search && <div className="topbar__search">{search}</div>}
       <div className="topbar__spacer" />
       {actions}
-      <Button kind="primary" icon="upload" className="topbar__upload" onClick={pick}>
-        Upload
-      </Button>
+      {canUpload && (
+        <Button kind="primary" icon="upload" className="topbar__upload" onClick={pick}>
+          Upload
+        </Button>
+      )}
       {user && (
         <Link to="/settings/security" className="topbar__avatar" aria-label="Account and security">
           <Avatar text={initials(user)} seed={user.id} size={34} />
@@ -156,6 +169,7 @@ function Topbar({ title, actions, search }: { title: string; actions?: ReactNode
 
 function TabBar() {
   const pick = useUploadPicker();
+  const canUpload = useCan('upload');
   const { pathname } = useLocation();
   const inAlbums = /^\/(albums|favourites|trash)(\/|$)/.test(pathname);
   const tab = (to: string | undefined, icon: IconName, label: string, active?: boolean) =>
@@ -180,7 +194,13 @@ function TabBar() {
       {tab('/', 'library', 'Library')}
       {tab('/albums', 'folder', 'Albums', inAlbums)}
       <span className="tabbar__upload-wrap">
-        <button type="button" className="tabbar__upload" aria-label="Upload photos" onClick={pick}>
+        <button
+          type="button"
+          className="tabbar__upload"
+          aria-label={canUpload ? 'Upload photos' : 'Uploading isn’t available in this library'}
+          onClick={pick}
+          disabled={!canUpload}
+        >
           <Icon name="plus" size={24} />
         </button>
       </span>
@@ -204,6 +224,9 @@ export function Shell({
   children: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const { pathname } = useLocation();
+  // Library notices (read-only, Viewer) on library pages; settings and plans have their own.
+  const banner = !/^\/(settings|plans|billing|you)(\/|$)/.test(pathname);
   // Expose the top bar's height so sticky toolbars and day headers sit just below it.
   useLayoutEffect(() => {
     const el = ref.current;
@@ -222,6 +245,7 @@ export function Shell({
       <div className="shell__main">
         <Topbar title={title} actions={actions} search={search} />
         <main id="main" className="shell__content">
+          {banner && <LibraryBanner />}
           {children}
         </main>
       </div>

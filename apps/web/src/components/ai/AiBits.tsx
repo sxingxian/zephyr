@@ -102,7 +102,10 @@ export function UpgradeHint({ what, icon = 'lock' }: { what: string; icon?: Icon
       </span>
       <div>
         <strong>{what} comes with Pro and Studio.</strong>
-        <span className="z-muted"> Upgrades arrive with billing; your plan stays as it is for now.</span>
+        <span className="z-muted">
+          {' '}
+          <Link to="/plans">See plans</Link>
+        </span>
       </div>
       <Chip tone="ink" size="sm">
         Pro

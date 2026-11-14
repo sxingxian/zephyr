@@ -1,6 +1,7 @@
 import type { CreditEntry, CreditHistoryPage } from '@zephyr/shared/client';
 import { Button, Chip, Note, Spinner, useToast } from '@zephyr/ui';
 import { type ReactNode, useEffect, useState } from 'react';
+import { Link } from 'react-router';
 import {
   AiPausedNote,
   CloudPausedBanner,
@@ -19,6 +20,7 @@ import {
   useAiStatus,
 } from '../lib/aiClient';
 import { errorMessage } from '../lib/api';
+import { useCan } from '../lib/libraryContext';
 import { useSession } from '../lib/session';
 import '../ai.css';
 
@@ -77,6 +79,7 @@ function Toggle({
 
 function Credits() {
   const { user } = useSession();
+  const canBuy = useCan('billing');
   const [page, setPage] = useState<CreditHistoryPage | null>(null);
   const [entries, setEntries] = useState<CreditEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -150,10 +153,19 @@ function Credits() {
             })}
             ; {b.rollover ? 'unused credits carry over.' : 'unused credits don’t carry over.'}
           </span>
-          <Button size="sm" disabled>
-            Buy more credits
-          </Button>
-          <span className="z-hint">Top-ups arrive with billing</span>
+          {canBuy ? (
+            <Link to="/settings/billing" className="z-btn z-btn--secondary z-btn--sm">
+              <span>Buy more credits</span>
+            </Link>
+          ) : (
+            <span className="z-hint">The library’s owner buys more credits.</span>
+          )}
+          {(b.topUps?.length ?? 0) > 0 && (
+            <span className="z-hint">
+              Plus {b.topUps.reduce((n, t) => n + t.credits, 0).toLocaleString('en')} top-up credits, used
+              after the month’s.
+            </span>
+          )}
           <h3 className="ai-credits-card__h3">History</h3>
           {entries.length === 0 ? (
             <span className="z-muted">No credit changes yet.</span>
@@ -210,6 +222,8 @@ export function AiSettingsPage() {
 
   const f = status?.features;
   const faceOn = Boolean(status?.member.faceGrouping);
+  // Phase 7: in a team library only its owner changes these (face data is the owner's to consent to).
+  const owner = useCan('aiSettings');
   return (
     <Shell title="Settings">
       <div className="settings">
@@ -227,6 +241,11 @@ export function AiSettingsPage() {
                   <h2 id="ai-set-h" className="sh-h2">
                     Zephyr AI
                   </h2>
+                  {!owner && (
+                    <Note tone="neutral" icon="lock">
+                      Only the library’s owner can change these settings.
+                    </Note>
+                  )}
                   {f?.face_grouping === 'off_plan' ? (
                     <UpgradeHint what="Face grouping" icon="people" />
                   ) : (
@@ -243,11 +262,11 @@ export function AiSettingsPage() {
                         <Toggle
                           label="Face grouping"
                           checked={faceOn}
-                          disabled={busy !== null || f?.face_grouping === 'off_admin'}
+                          disabled={!owner || busy !== null || f?.face_grouping === 'off_admin'}
                           onChange={(v) => (v ? setConsent(true) : setConfirmOff(true))}
                         />
                       </Row>
-                      {faceOn && (
+                      {faceOn && owner && (
                         <Row
                           title="Delete face data"
                           hint="Turns face grouping off and deletes every face code and name now. Photos aren’t affected."
@@ -266,7 +285,7 @@ export function AiSettingsPage() {
                     <Toggle
                       label="Scene tags"
                       checked={status.member.sceneTags}
-                      disabled={busy !== null || f?.scene_tags === 'off_admin'}
+                      disabled={!owner || busy !== null || f?.scene_tags === 'off_admin'}
                       onChange={(v) =>
                         void patch(
                           'scene',
@@ -284,7 +303,7 @@ export function AiSettingsPage() {
                       <Toggle
                         label="Find duplicates and blurry photos"
                         checked={status.member.cleanup}
-                        disabled={busy !== null || f?.cleanup === 'off_admin'}
+                        disabled={!owner || busy !== null || f?.cleanup === 'off_admin'}
                         onChange={(v) =>
                           void patch('cleanup', { cleanup: v }, v ? 'Cleanup is on.' : 'Cleanup is off.')
                         }
