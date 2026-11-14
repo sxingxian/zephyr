@@ -14,6 +14,7 @@ import { ceremonyMatches } from '../auth/webauthn';
 import { notifyAccountDeletion, notifyPasskeyChange } from '../email/notify';
 import { list } from '../env';
 import { burstOk, fail, guardWrite, logError, rateLimited, readBody } from '../http';
+import { libraryContext, ownerOf } from '../library/context';
 import { rpc, UpstreamError } from '../supabase';
 import type { HonoEnv } from '../types';
 import { getProfile, requireMember, sessionUser, toPasskey } from './session-helpers';
@@ -126,10 +127,11 @@ meRoutes.delete('/passkeys/:id', requireRecentAuth, async (c) => {
   }
 });
 
-meRoutes.get('/usage', async (c) => {
+// Phase 7: the open library's storage (the sidebar meter of a team library shows the owner's usage).
+meRoutes.get('/usage', libraryContext, async (c) => {
   try {
     const usage = await rpc<Omit<Usage, 'ok'> | null>(c.env, 'get_usage', {
-      p_owner: c.get('session').userId,
+      p_owner: ownerOf(c),
     });
     if (!usage) return c.json(fail('not_found'), 404);
     return c.json({ ok: true, ...usage } satisfies Usage);

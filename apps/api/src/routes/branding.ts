@@ -10,6 +10,7 @@ import { brandingSchema } from '@zephyr/shared';
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { list } from '../env';
 import { background, fail, guardWrite, logError, rateLimited, readBody } from '../http';
+import { actorOf, libraryContext, ownerOf, requireRole } from '../library/context';
 import { nonce, stores } from '../library/objects';
 import { expectedUser, readExact } from '../library/storage';
 import { mediaHeaders } from '../share/media';
@@ -19,7 +20,6 @@ import { requireMember } from './session-helpers';
 
 export const brandingRoutes = new Hono<HonoEnv>();
 type Ctx = Context<HonoEnv>;
-const ownerOf = (c: Ctx) => c.get('session').userId;
 
 export const BRANDING_LIMITS = {
   maxUploadBytes: 2 * 1024 * 1024,
@@ -39,10 +39,11 @@ const guard: MiddlewareHandler<HonoEnv> = async (c, next) => {
   if (!UPLOAD_TYPES.has(type)) return c.json(fail('invalid'), 415);
   await next();
 };
-brandingRoutes.use('*', guard, requireMember);
+// Phase 7: the open library's branding (a Studio team shares the owner's); galleries rights (Owner, Editor).
+brandingRoutes.use('*', guard, requireMember, libraryContext, requireRole('galleries'));
 brandingRoutes.use('*', async (c, next) => {
   if (c.req.method === 'GET' || c.req.method === 'HEAD') return next();
-  if (!(await c.env.SHARE_LIMITER.limit({ key: `share:${ownerOf(c)}` })).success) return rateLimited(c, 60);
+  if (!(await c.env.SHARE_LIMITER.limit({ key: `share:${actorOf(c)}` })).success) return rateLimited(c, 60);
   return expectedUser(c, next);
 });
 

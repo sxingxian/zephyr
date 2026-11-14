@@ -10,7 +10,7 @@
  *   GET                   /api/v1/galleries/:id/renders        (render queue)
  *   PUT                   /api/v1/galleries/:id/renders/:photoId?v=   (full-size JPEG from the device)
  *   GET                   /api/v1/galleries/:id/preview(/photos)  and  /preview/m/:photoId/:size
- * Every route needs a member session and only ever passes the session's user as the owner. Writes need
+ * Every route needs a member session and only ever passes the open library's owner (libraryContext). Writes need
  * the expected user (shared devices) and count against SHARE_LIMITER.
  */
 import {
@@ -25,6 +25,7 @@ import {
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { toPgBytea } from '../crypto';
 import { background, fail, logError, rateLimited, readBody } from '../http';
+import { actorOf, libraryContext, ownerOf, requireRole, requireWritable } from '../library/context';
 import { imageInfo } from '../library/files';
 import { nonce, stores } from '../library/objects';
 import {
@@ -52,7 +53,6 @@ import { requireMember } from './session-helpers';
 
 export const galleryRoutes = new Hono<HonoEnv>();
 type Ctx = Context<HonoEnv>;
-const ownerOf = (c: Ctx) => c.get('session').userId;
 const notFound = (c: Ctx) => c.json(fail('not_found'), 404);
 const isRead = (c: Ctx) => c.req.method === 'GET' || c.req.method === 'HEAD';
 
@@ -61,9 +61,12 @@ const MAX_RENDER_BYTES = 64 * 1024 * 1024;
 const MAX_RENDER_EDGE = 20000;
 
 galleryRoutes.use('*', libraryGuard(128 * 1024), requireMember);
+// Phase 7: the open library's galleries. Owners and Editors only (ROLE_CAN galleries): a Viewer can't see
+// share links, guests' activity or favourites, which would let them share or profile clients.
+galleryRoutes.use('*', libraryContext, requireRole('galleries'));
 galleryRoutes.use('*', async (c, next) => (isRead(c) ? next() : expectedUser(c, next)));
 const shareLimit: MiddlewareHandler<HonoEnv> = async (c, next) => {
-  if (!(await c.env.SHARE_LIMITER.limit({ key: `share:${ownerOf(c)}` })).success) return rateLimited(c, 60);
+  if (!(await c.env.SHARE_LIMITER.limit({ key: `share:${actorOf(c)}` })).success) return rateLimited(c, 60);
   await next();
 };
 galleryRoutes.use('*', async (c, next) =>
@@ -112,7 +115,8 @@ galleryRoutes.get('/', async (c) => {
   }
 });
 
-galleryRoutes.post('/', async (c) => {
+// No new galleries while the library is read-only (live ones stay up until they expire).
+galleryRoutes.post('/', requireWritable, async (c) => {
   const body = await readBody(c, galleryCreateSchema);
   if (!body) return c.json(fail('invalid'), 400);
   try {
@@ -163,6 +167,10 @@ galleryRoutes.get('/:id', async (c) => {
 galleryRoutes.patch('/:id', async (c) => {
   const body = await readBody(c, galleryPatchSchema);
   if (!body) return c.json(fail('invalid'), 400);
+  // No extensions while read-only: any new expiry date is refused (shortening can wait until it's back under).
+  if (body.expiresOn !== undefined && c.get('library').state === 'read_only') {
+    return c.json(fail('library_read_only'), 403);
+  }
   try {
     const res = await rpc<{ gallery: GalleryDetail } | { error: GalleryError } | null>(
       c.env,

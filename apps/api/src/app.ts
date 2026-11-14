@@ -13,6 +13,7 @@ import { meRoutes } from './routes/me';
 import { photoRoutes } from './routes/photos';
 import { publicRoutes } from './routes/public';
 import { recipeRoutes } from './routes/recipes';
+import { librariesRoutes, teamRoutes } from './routes/team';
 import { trashRoutes } from './routes/trash';
 import { uploadRoutes } from './routes/uploads';
 import type { HonoEnv } from './types';
@@ -67,6 +68,9 @@ app.route('/api/v1/trash', trashRoutes);
 app.route('/api/v1/recipes', recipeRoutes);
 // Zephyr AI (phase 6).
 app.route('/api/v1/ai', aiRoutes);
+// Studio teams (phase 7): the library switcher and the owner's team.
+app.route('/api/v1/libraries', librariesRoutes);
+app.route('/api/v1/team', teamRoutes);
 // Sharing (phase 5): members' galleries, and guests (the link token is the capability).
 app.route('/api/v1/galleries', galleryRoutes);
 app.route('/api/v1/g', guestRoutes);

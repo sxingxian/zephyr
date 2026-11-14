@@ -36,19 +36,20 @@ import { enqueue } from '../ai/consumer';
 import { hmac } from '../crypto';
 import { list } from '../env';
 import { fail, guardWrite, logError, rateLimited, readBody } from '../http';
+import { actorOf, libraryContext, ownerOf, requireRole, requireWritable } from '../library/context';
 import { expectedUser, UUID } from '../library/storage';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 import { requireMember } from './session-helpers';
 
 /**
- * /api/v1/ai/*: Zephyr AI for members (docs/phase-6.md, API). Everything is scoped to the session's member
- * by the database functions, which take the owner id from here, never from the request.
+ * /api/v1/ai/*: Zephyr AI for members (docs/phase-6.md, API). Everything is scoped to the open library's
+ * owner (libraryContext, phase 7) by the database functions, which take the owner id from here, never from
+ * the request. Credits, plan and face-grouping consent are the library owner's; rate limits are per member.
  */
 export const aiRoutes = new Hono<HonoEnv>();
 
 type Ctx = Context<HonoEnv>;
-const ownerOf = (c: Ctx) => c.get('session').userId;
 
 /** Bodies are small except the faces batch (20 photos × 30 faces × ~700 bytes). */
 const FACES_BODY_BYTES = 640 * 1024;
@@ -58,19 +59,19 @@ const jsonGuard = guardWrite((env) => list(env.APP_ORIGINS), JSON_BODY_BYTES);
 aiRoutes.use('*', async (c, next) =>
   c.req.path.endsWith('/ai/faces') ? facesGuard(c, next) : jsonGuard(c, next),
 );
-aiRoutes.use('*', requireMember);
+aiRoutes.use('*', requireMember, libraryContext);
 /** Writes: the shared-device check (X-Zephyr-Expected-User) and the per-member AI write limit. */
 const writes: MiddlewareHandler<HonoEnv> = async (c, next) => {
   if (c.req.method === 'GET' || c.req.method === 'HEAD') {
     // Reads have their own, roomier limit: the people list and cleanup pages are the heavier queries.
-    if (!(await c.env.AI_READ_LIMITER.limit({ key: `ai-read:${ownerOf(c)}` })).success)
+    if (!(await c.env.AI_READ_LIMITER.limit({ key: `ai-read:${actorOf(c)}` })).success)
       return rateLimited(c, 60);
     return next();
   }
-  if (!(await c.env.AI_LIMITER.limit({ key: `ai:${ownerOf(c)}` })).success) return rateLimited(c, 60);
+  if (!(await c.env.AI_LIMITER.limit({ key: `ai:${actorOf(c)}` })).success) return rateLimited(c, 60);
   // Face batches are matched in Postgres against all of the member's people: kept to 10 a minute.
   if (c.req.method === 'POST' && c.req.path.endsWith('/ai/faces')) {
-    if (!(await c.env.FACES_LIMITER.limit({ key: `faces:${ownerOf(c)}` })).success) return rateLimited(c, 60);
+    if (!(await c.env.FACES_LIMITER.limit({ key: `faces:${actorOf(c)}` })).success) return rateLimited(c, 60);
   }
   return expectedUser(c, next);
 };
@@ -121,7 +122,7 @@ aiRoutes.get('/', async (c) => {
   }
 });
 
-aiRoutes.patch('/settings', async (c) => {
+aiRoutes.patch('/settings', requireRole('aiSettings'), async (c) => {
   const body = await readBody(c, aiMemberSettingsSchema);
   if (!body) return c.json(fail('invalid'), 400);
   try {
@@ -141,7 +142,7 @@ aiRoutes.patch('/settings', async (c) => {
   }
 });
 
-aiRoutes.get('/credits', async (c) => {
+aiRoutes.get('/credits', requireRole('ai'), async (c) => {
   const cursor = c.req.query('cursor');
   if (cursor && cursor.length > 200) return c.json(fail('invalid'), 400);
   try {
@@ -183,7 +184,7 @@ async function enqueueItems(c: Ctx, items: string[] | undefined) {
   }
 }
 
-aiRoutes.get('/jobs', async (c) => {
+aiRoutes.get('/jobs', requireRole('ai'), async (c) => {
   const q = jobListQuerySchema.safeParse({
     state: c.req.query('state') || undefined,
     cursor: c.req.query('cursor') || undefined,
@@ -202,7 +203,7 @@ aiRoutes.get('/jobs', async (c) => {
   }
 });
 
-aiRoutes.post('/jobs', async (c) => {
+aiRoutes.post('/jobs', requireRole('ai'), requireWritable, async (c) => {
   const body = await readBody(c, aiJobCreateSchema);
   if (!body) return c.json(fail('invalid'), 400);
   try {
@@ -255,7 +256,7 @@ aiRoutes.post('/jobs', async (c) => {
   }
 });
 
-aiRoutes.get('/jobs/:id', async (c) => {
+aiRoutes.get('/jobs/:id', requireRole('ai'), async (c) => {
   const id = c.req.param('id');
   const cursor = c.req.query('cursor');
   if (!UUID.test(id) || (cursor !== undefined && !/^\d{1,6}$/.test(cursor)))
@@ -274,7 +275,7 @@ aiRoutes.get('/jobs/:id', async (c) => {
   }
 });
 
-aiRoutes.delete('/jobs/:id', async (c) => {
+aiRoutes.delete('/jobs/:id', requireRole('ai'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   try {
@@ -290,7 +291,7 @@ aiRoutes.delete('/jobs/:id', async (c) => {
   }
 });
 
-aiRoutes.post('/jobs/:id/retry', async (c) => {
+aiRoutes.post('/jobs/:id/retry', requireRole('ai'), requireWritable, async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const body = await readBody(c, aiJobRetrySchema);
@@ -323,7 +324,7 @@ aiRoutes.post('/jobs/:id/retry', async (c) => {
   }
 });
 
-aiRoutes.post('/jobs/:id/claim', async (c) => {
+aiRoutes.post('/jobs/:id/claim', requireRole('ai'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const body = await readBody(c, deviceClaimSchema);
@@ -350,7 +351,7 @@ aiRoutes.post('/jobs/:id/claim', async (c) => {
   }
 });
 
-aiRoutes.post('/jobs/:id/progress', async (c) => {
+aiRoutes.post('/jobs/:id/progress', requireRole('ai'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const body = await readBody(c, deviceProgressSchema);
@@ -372,7 +373,7 @@ aiRoutes.post('/jobs/:id/progress', async (c) => {
   }
 });
 
-aiRoutes.post('/jobs/:id/pause', async (c) => {
+aiRoutes.post('/jobs/:id/pause', requireRole('ai'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   try {
@@ -394,7 +395,7 @@ const cursorOf = (c: Ctx) => {
   return v && v.length <= 200 ? v : null;
 };
 
-aiRoutes.get('/signals/pending', async (c) => {
+aiRoutes.get('/signals/pending', requireRole('ai'), async (c) => {
   try {
     const out = await rpc<Omit<SignalsPendingPage, 'ok'>>(c.env, 'ai_signals_pending', {
       p_owner: ownerOf(c),
@@ -407,7 +408,7 @@ aiRoutes.get('/signals/pending', async (c) => {
   }
 });
 
-aiRoutes.post('/signals', async (c) => {
+aiRoutes.post('/signals', requireRole('ai'), async (c) => {
   const body = await readBody(c, aiSignalsSchema);
   if (!body) return c.json(fail('invalid'), 400);
   try {
@@ -422,7 +423,7 @@ aiRoutes.post('/signals', async (c) => {
   }
 });
 
-aiRoutes.get('/cleanup', async (c) => {
+aiRoutes.get('/cleanup', requireRole('ai'), async (c) => {
   try {
     const out = await rpc<Omit<CleanupPage, 'ok'> & { error?: string }>(c.env, 'ai_cleanup_page', {
       p_owner: ownerOf(c),
@@ -435,7 +436,7 @@ aiRoutes.get('/cleanup', async (c) => {
   }
 });
 
-aiRoutes.post('/cleanup/ignore', async (c) => {
+aiRoutes.post('/cleanup/ignore', requireRole('ai'), async (c) => {
   const body = await readBody(c, cleanupIgnoreSchema);
   if (!body) return c.json(fail('invalid'), 400);
   try {
@@ -457,7 +458,7 @@ aiRoutes.get('/scenes', async (c) => {
 });
 
 // ---- faces and people ------------------------------------------------------------------------------------
-aiRoutes.get('/faces/pending', async (c) => {
+aiRoutes.get('/faces/pending', requireRole('ai'), async (c) => {
   try {
     const out = await rpc<Omit<FacesPendingPage, 'ok'> & { error?: string }>(c.env, 'ai_faces_pending', {
       p_owner: ownerOf(c),
@@ -499,7 +500,7 @@ export function embeddingLiteral(b64: string): string | null {
   return `[${v.map((x) => (x / norm).toPrecision(7)).join(',')}]`;
 }
 
-aiRoutes.post('/faces', async (c) => {
+aiRoutes.post('/faces', requireRole('ai'), async (c) => {
   const body = await readBody(c, facesSchema);
   if (!body) return c.json(fail('invalid'), 400);
   const items = body.photos.map((p) => ({
@@ -523,7 +524,7 @@ aiRoutes.post('/faces', async (c) => {
   }
 });
 
-aiRoutes.delete('/faces', async (c) => {
+aiRoutes.delete('/faces', requireRole('aiSettings'), async (c) => {
   try {
     await rpc(c.env, 'ai_faces_delete_all', { p_owner: ownerOf(c) });
     return c.body(null, 204);
@@ -578,7 +579,7 @@ aiRoutes.get('/people/:id', async (c) => {
   }
 });
 
-aiRoutes.patch('/people/:id', async (c) => {
+aiRoutes.patch('/people/:id', requireRole('edit'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const body = await readBody(c, personPatchSchema);
@@ -593,7 +594,7 @@ aiRoutes.patch('/people/:id', async (c) => {
   }
 });
 
-aiRoutes.post('/people/:id/merge', async (c) => {
+aiRoutes.post('/people/:id/merge', requireRole('edit'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const body = await readBody(c, personMergeSchema);
@@ -612,7 +613,7 @@ aiRoutes.post('/people/:id/merge', async (c) => {
   }
 });
 
-aiRoutes.post('/people/:id/faces', async (c) => {
+aiRoutes.post('/people/:id/faces', requireRole('edit'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const body = await readBody(c, personFacesSchema);

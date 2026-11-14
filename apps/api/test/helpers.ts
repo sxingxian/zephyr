@@ -50,6 +50,9 @@ export const workersAi = {
 export const aiLimiter = { ok: true, keys: [] as string[] };
 export const facesLimiter = { ok: true, keys: [] as string[] };
 export const aiReadLimiter = { ok: true, keys: [] as string[] };
+/** Phase 7 per-member limiters. */
+export const billingLimiter = { ok: true, keys: [] as string[] };
+export const teamInviteLimiter = { ok: true, keys: [] as string[] };
 export const MEDIA_HOST = 'media.test';
 export const MEDIA_SECRET = 'media-host-secret';
 
@@ -121,6 +124,8 @@ export const env: Env = {
   AI_LIMITER: fakeLimiter(aiLimiter),
   FACES_LIMITER: fakeLimiter(facesLimiter),
   AI_READ_LIMITER: fakeLimiter(aiReadLimiter),
+  BILLING_LIMITER: fakeLimiter(billingLimiter),
+  TEAM_INVITE_LIMITER: fakeLimiter(teamInviteLimiter),
   AI_GATEWAY_ACCOUNT_ID: 'acct123',
   AI_GATEWAY_ID: 'zephyr-test',
   AI_GATEWAY_TOKEN: 'gateway-token',
@@ -223,6 +228,11 @@ export interface World {
   media: { blocked: Set<string>; down: boolean; fetched: string[] };
   /** Phase 6: answers for other hosts (AI providers); undefined falls through to "unexpected fetch". */
   external?: (call: Call, init?: RequestInit) => Response | Promise<Response> | undefined;
+  /** Phase 7: team libraries for the default library_access: owner id → member id → role. */
+  teams?: Record<string, Record<string, 'editor' | 'viewer'>>;
+  /** Phase 7: the state and plan library_access reports. */
+  libraryState?: 'active' | 'read_only';
+  libraryPlan?: 'free' | 'pro' | 'studio';
 }
 export const world: World = {} as World;
 
@@ -264,6 +274,9 @@ export function resetWorld() {
     globalLogouts: [],
     media: { blocked: new Set(), down: false, fetched: [] },
     external: undefined,
+    teams: {},
+    libraryState: 'active',
+    libraryPlan: 'free',
   } satisfies World);
   aiQueue.sent.length = 0;
   aiQueue.fail = false;
@@ -276,6 +289,10 @@ export function resetWorld() {
   facesLimiter.keys.length = 0;
   aiReadLimiter.ok = true;
   aiReadLimiter.keys.length = 0;
+  for (const l of [billingLimiter, teamInviteLimiter]) {
+    l.ok = true;
+    l.keys.length = 0;
+  }
   shared.reset();
   images.reset();
   for (const l of [shareLimiter, guestLimiter, mediaLimiter]) {
@@ -364,6 +381,15 @@ const defaultRpc: Record<string, (a: Record<string, unknown>) => unknown> = {
           deleted: false,
         }
       : null;
+  },
+  // Phase 7: a member's own library is always theirs; team libraries are added per test.
+  library_access: (a) => {
+    const member = String(a.p_member);
+    const owner = String(a.p_owner);
+    const team = world.teams?.[owner]?.[member];
+    if (member === owner)
+      return { role: 'owner', plan: world.libraryPlan ?? 'free', state: world.libraryState ?? 'active' };
+    return team ? { role: team, plan: 'studio', state: world.libraryState ?? 'active' } : null;
   },
   update_display_name: (a) => {
     const u = byId(String(a.p_user_id));

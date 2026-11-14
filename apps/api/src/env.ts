@@ -75,6 +75,12 @@ export interface Env {
   FACES_LIMITER: RateLimit;
   /** Phase 6: Zephyr AI reads per member (300 a minute). */
   AI_READ_LIMITER: RateLimit;
+
+  // ---- Phase 7: billing and teams ----
+  /** Per-member billing and team writes (20 a minute). */
+  BILLING_LIMITER: RateLimit;
+  /** Per-member team invite sends (5 a minute; plus 20 an hour in Postgres). */
+  TEAM_INVITE_LIMITER: RateLimit;
   /** Cloudflare account id and gateway id of the AI Gateway every cloud AI call goes through. */
   AI_GATEWAY_ACCOUNT_ID?: string;
   AI_GATEWAY_ID?: string;

@@ -1,5 +1,6 @@
 import type { ActiveSession } from './auth/session';
 import type { Env } from './env';
+import type { LibraryContext } from './library/context';
 
 export interface SessionProfile {
   isStaff: boolean;
@@ -26,5 +27,7 @@ export type Variables = {
   profile: SessionProfile;
   staff: StaffContext;
   accessEmail: string;
+  /** Phase 7: the library a library-scoped request acts on (libraryContext). */
+  library: LibraryContext;
 };
 export type HonoEnv = { Bindings: Env; Variables: Variables };

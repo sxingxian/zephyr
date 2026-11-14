@@ -1,16 +1,19 @@
 import {
+  type BulkAction,
   type BulkResult,
   bulkSchema,
   FILE_TYPES,
   type FileTypeId,
+  type LibraryAction,
   type Page,
   type PhotoDetail,
   type PhotoItem,
   photoListQuerySchema,
   photoPatchSchema,
 } from '@zephyr/shared';
-import { type Context, Hono } from 'hono';
+import { Hono } from 'hono';
 import { fail, logError, readBody } from '../http';
+import { libraryContext, ownerOf, requireRole, roleAllows } from '../library/context';
 import { contentDisposition, downloadName, parseRange } from '../library/files';
 import {
   expectedUser,
@@ -29,10 +32,7 @@ import { requireMember } from './session-helpers';
 /** /api/v1/photos/*: the member's library, photo details and files. */
 export const photoRoutes = new Hono<HonoEnv>();
 photoRoutes.use('*', libraryGuard(LIBRARY_LIMITS.jsonBodyBytes));
-photoRoutes.use('*', requireMember);
-
-type Ctx = Context<HonoEnv>;
-const ownerOf = (c: Ctx) => c.get('session').userId;
+photoRoutes.use('*', requireMember, libraryContext);
 
 photoRoutes.get('/', async (c) => {
   const parsed = photoListQuerySchema.safeParse(c.req.query());
@@ -60,10 +60,22 @@ photoRoutes.get('/', async (c) => {
   }
 });
 
+/** What each bulk action needs (ROLE_CAN): Trash for trash/restore, Owner for delete forever, else edit. */
+const BULK_ACTION_ROLE: Record<BulkAction, LibraryAction> = {
+  favourite: 'edit',
+  unfavourite: 'edit',
+  trash: 'trash',
+  restore: 'trash',
+  delete_forever: 'purge',
+  add_to_album: 'edit',
+  remove_from_album: 'edit',
+};
+
 // Bulk actions name the member they were started for (multi-chunk trash/restore from Cleanup and Trash).
 photoRoutes.post('/bulk', expectedUser, async (c) => {
   const body = await readBody(c, bulkSchema);
   if (!body) return c.json(fail('invalid'), 400);
+  if (!roleAllows(c, BULK_ACTION_ROLE[body.action])) return c.json(fail('role_forbidden'), 403);
   try {
     const res = await rpc<{ affected?: number; purge?: PurgeItem[]; error?: string } | null>(
       c.env,
@@ -105,7 +117,7 @@ photoRoutes.get('/:id', async (c) => {
   }
 });
 
-photoRoutes.patch('/:id', async (c) => {
+photoRoutes.patch('/:id', requireRole('edit'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const body = await readBody(c, photoPatchSchema);
@@ -205,6 +217,7 @@ photoRoutes.get('/:id/masks/:mask', async (c) => {
   }
 });
 
+// Every role may view and download (ROLE_CAN view/download), so the media routes need no extra gate.
 photoRoutes.get('/:id/:kind', async (c) => {
   const id = c.req.param('id');
   const kind = c.req.param('kind');

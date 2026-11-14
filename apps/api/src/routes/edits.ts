@@ -12,6 +12,7 @@ import {
 } from '@zephyr/shared';
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { background, fail, logError, rateLimited, readBody } from '../http';
+import { actorOf, ownerOf, requireRole, requireWritable } from '../library/context';
 import { imageInfo } from '../library/files';
 import { contentLength, deleteKeys, expectedUser, newEditKey, readExact, UUID } from '../library/storage';
 import { rpc } from '../supabase';
@@ -27,7 +28,6 @@ import type { HonoEnv } from '../types';
 export const editRoutes = new Hono<HonoEnv>();
 
 type Ctx = Context<HonoEnv>;
-const ownerOf = (c: Ctx) => c.get('session').userId;
 
 /** Bulk merges retried after a concurrent change before giving up on those photos. */
 const BULK_ATTEMPTS = 3;
@@ -35,7 +35,7 @@ const BULK_ATTEMPTS = 3;
 /** Per-member limit on edit writes (the EDIT_LIMITER binding: 600 a minute). */
 const editWriteLimit: MiddlewareHandler<HonoEnv> = async (c, next) => {
   if (c.req.method === 'GET' || c.req.method === 'HEAD') return next();
-  if (!(await c.env.EDIT_LIMITER.limit({ key: `edit:${ownerOf(c)}` })).success) return rateLimited(c, 60);
+  if (!(await c.env.EDIT_LIMITER.limit({ key: `edit:${actorOf(c)}` })).success) return rateLimited(c, 60);
   await next();
 };
 const writesOnly: MiddlewareHandler<HonoEnv> = async (c, next) =>
@@ -73,7 +73,7 @@ editRoutes.get('/:id/edit', async (c) => {
   }
 });
 
-editRoutes.put('/:id/edit', async (c) => {
+editRoutes.put('/:id/edit', requireRole('edit'), requireWritable, async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const body = await readBody(c, editSaveSchema);
@@ -94,7 +94,8 @@ editRoutes.put('/:id/edit', async (c) => {
   }
 });
 
-editRoutes.delete('/:id/edit', async (c) => {
+// Reverting stays open in a read-only library: it only removes rendered variants.
+editRoutes.delete('/:id/edit', requireRole('edit'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   try {
@@ -114,7 +115,7 @@ editRoutes.delete('/:id/edit', async (c) => {
 // ---- edited variants -------------------------------------------------------------------------------------
 editRoutes.use('/:id/edit/variants/:kind', expectedUser);
 
-editRoutes.put('/:id/edit/variants/:kind', async (c) => {
+editRoutes.put('/:id/edit/variants/:kind', requireRole('edit'), requireWritable, async (c) => {
   const id = c.req.param('id');
   const kind = c.req.param('kind');
   if (!UUID.test(id) || (kind !== 'thumb' && kind !== 'preview')) return c.json(fail('not_found'), 404);
@@ -125,7 +126,7 @@ editRoutes.put('/:id/edit/variants/:kind', async (c) => {
   const owner = ownerOf(c);
   try {
     // Same per-member ceiling as upload parts and variants.
-    if (!(await c.env.UPLOAD_LIMITER.limit({ key: `put:${owner}` })).success) return rateLimited(c, 60);
+    if (!(await c.env.UPLOAD_LIMITER.limit({ key: `put:${actorOf(c)}` })).success) return rateLimited(c, 60);
     const len = contentLength(c.req.header('Content-Length'));
     if (len === null) return c.json(fail('invalid'), 411);
     if (len > limits.maxBytes) return c.json(fail('too_large'), 413);
@@ -218,9 +219,12 @@ editRoutes.use('/edits/bulk', expectedUser, editWriteLimit);
  * mergeRecipe, done here: read each photo's current edit, merge, then write back only where the edit is
  * still at the version that was read (a concurrent save is re-read and merged again).
  */
-editRoutes.post('/edits/bulk', async (c) => {
+editRoutes.post('/edits/bulk', requireRole('edit'), async (c) => {
   const body = await readBody(c, editBulkSchema);
   if (!body) return c.json(fail('invalid'), 400);
+  // A bulk revert (recipe null) stays open in a read-only library; pasting or applying is an edit save.
+  if (body.recipe !== null && c.get('library').state === 'read_only')
+    return c.json(fail('library_read_only'), 403);
   const owner = ownerOf(c);
   const ids = [...new Set(body.ids.map((i) => i.toLowerCase()))];
   try {

@@ -1,6 +1,7 @@
 import { recipeCreateSchema, recipePatchSchema, type SavedRecipe } from '@zephyr/shared';
-import { type Context, Hono, type MiddlewareHandler } from 'hono';
+import { Hono, type MiddlewareHandler } from 'hono';
 import { fail, logError, rateLimited, readBody } from '../http';
+import { actorOf, libraryContext, ownerOf, requireRole } from '../library/context';
 import { expectedUser, LIBRARY_LIMITS, libraryGuard, UUID } from '../library/storage';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
@@ -12,14 +13,11 @@ import { requireMember } from './session-helpers';
  */
 export const recipeRoutes = new Hono<HonoEnv>();
 recipeRoutes.use('*', libraryGuard(LIBRARY_LIMITS.jsonBodyBytes));
-recipeRoutes.use('*', requireMember);
-
-type Ctx = Context<HonoEnv>;
-const ownerOf = (c: Ctx) => c.get('session').userId;
+recipeRoutes.use('*', requireMember, libraryContext);
 
 const writes: MiddlewareHandler<HonoEnv> = async (c, next) => {
   if (c.req.method === 'GET' || c.req.method === 'HEAD') return next();
-  if (!(await c.env.EDIT_LIMITER.limit({ key: `edit:${ownerOf(c)}` })).success) return rateLimited(c, 60);
+  if (!(await c.env.EDIT_LIMITER.limit({ key: `edit:${actorOf(c)}` })).success) return rateLimited(c, 60);
   return expectedUser(c, next);
 };
 recipeRoutes.use('*', writes);
@@ -34,7 +32,7 @@ recipeRoutes.get('/', async (c) => {
   }
 });
 
-recipeRoutes.post('/', async (c) => {
+recipeRoutes.post('/', requireRole('edit'), async (c) => {
   const body = await readBody(c, recipeCreateSchema);
   if (!body) return c.json(fail('invalid'), 400);
   try {
@@ -52,7 +50,7 @@ recipeRoutes.post('/', async (c) => {
   }
 });
 
-recipeRoutes.patch('/:id', async (c) => {
+recipeRoutes.patch('/:id', requireRole('edit'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const body = await readBody(c, recipePatchSchema);
@@ -77,7 +75,7 @@ recipeRoutes.patch('/:id', async (c) => {
   }
 });
 
-recipeRoutes.delete('/:id', async (c) => {
+recipeRoutes.delete('/:id', requireRole('edit'), async (c) => {
   const id = c.req.param('id');
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   try {

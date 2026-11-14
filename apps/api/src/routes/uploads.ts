@@ -14,6 +14,7 @@ import {
 } from '@zephyr/shared';
 import { type Context, Hono } from 'hono';
 import { background, fail, limitHit, logError, rateLimited, readBody } from '../http';
+import { actorOf, libraryContext, ownerOf, requireRole, requireWritable } from '../library/context';
 import { fileTypeFromName, imageInfo, SIGNATURE_BYTES, signatureMatches } from '../library/files';
 import {
   contentLength,
@@ -38,6 +39,8 @@ import { requireMember } from './session-helpers';
 export const uploadRoutes = new Hono<HonoEnv>();
 uploadRoutes.use('*', libraryGuard(LIBRARY_LIMITS.uploadCreateBodyBytes));
 uploadRoutes.use('*', requireMember);
+// Phase 7: uploads go into the open library (an Editor uploads into the Studio owner's library and storage).
+uploadRoutes.use('*', libraryContext, requireRole('upload'));
 // Shared devices: see expectedUser (X-Zephyr-Expected-User → 409 session_changed).
 uploadRoutes.use('*', expectedUser);
 
@@ -61,7 +64,7 @@ type Ctx = Context<HonoEnv>;
 async function loadUpload(c: Ctx, id: string): Promise<UploadRow | Response> {
   if (!UUID.test(id)) return c.json(fail('not_found'), 404);
   const up = await rpc<UploadRow | null>(c.env, 'get_upload', {
-    p_owner: c.get('session').userId,
+    p_owner: ownerOf(c),
     p_upload: id,
   });
   if (!up) return c.json(fail('not_found'), 404);
@@ -69,7 +72,6 @@ async function loadUpload(c: Ctx, id: string): Promise<UploadRow | Response> {
   return up;
 }
 
-const ownerOf = (c: Ctx) => c.get('session').userId;
 const keysOf = (c: Ctx, up: UploadRow) => photoKeys(ownerOf(c), up.photoId);
 
 /**
@@ -101,14 +103,16 @@ async function discardUpload(c: Ctx, uploadId: string): Promise<boolean> {
 }
 
 /** Per-member limit on part and variant PUTs (the UPLOAD_LIMITER binding). */
-const putAllowed = async (c: Ctx) => (await c.env.UPLOAD_LIMITER.limit({ key: `put:${ownerOf(c)}` })).success;
+const putAllowed = async (c: Ctx) => (await c.env.UPLOAD_LIMITER.limit({ key: `put:${actorOf(c)}` })).success;
 
-uploadRoutes.post('/', async (c) => {
+// New uploads are refused while the library is read-only; ones already started may finish (the storage
+// reservation was made at create time).
+uploadRoutes.post('/', requireWritable, async (c) => {
   const body = await readBody(c, uploadCreateSchema);
   if (!body) return c.json(fail('invalid'), 400);
   const owner = ownerOf(c);
   try {
-    const key = await memberHash(c.env, owner);
+    const key = await memberHash(c.env, actorOf(c));
     if (!(await limitHit(c.env, 'upload_create', key, LIBRARY_LIMITS.uploadCreatesPerHour, 3600))) {
       return rateLimited(c, 3600);
     }
