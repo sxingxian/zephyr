@@ -4,6 +4,7 @@
  */
 export * from './ai-types';
 export * from './api-types';
+export * from './billing-types';
 export * from './edit-types';
 export * from './invite-constants';
 export * from './library-types';

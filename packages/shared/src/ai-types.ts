@@ -116,10 +116,15 @@ export interface AiMemberSettings {
 }
 
 export interface CreditBalance {
+  /** Spendable now: this period's credits plus unexpired top-up credits. */
   balance: number;
+  /** Phase 7: this period's plan credits (spent first). */
+  monthlyBalance: number;
+  /** Phase 7: unexpired top-up credits, soonest expiry first (spent after the month's credits). */
+  topUps: { credits: number; expiresAt: string }[];
   /** Credits the plan grants each month. */
   monthly: number;
-  /** Credit periods are calendar months in UTC until billing (phase 7) brings subscription periods. */
+  /** Free: calendar months (UTC). Paid: the subscription's billing month (yearly plans: monthly slices from the renewal date). */
   periodStart: string; // YYYY-MM-DD
   periodEnd: string; // YYYY-MM-DD, exclusive
   /** Unused credits carry into the next period (plan_limits.credits_rollover). */
@@ -161,6 +166,12 @@ export const CREDIT_REASONS = [
   'job_refund',
   'admin_adjust',
   'top_up',
+  /** Phase 7: an upgrade mid-period adds the difference in monthly credits. */
+  'plan_change',
+  /** Phase 7: unused top-up credits after TOPUP_VALID_MONTHS. */
+  'top_up_expiry',
+  /** Phase 7: a refunded or disputed top-up removes its unused credits. */
+  'top_up_refund',
 ] as const;
 export type CreditReason = (typeof CREDIT_REASONS)[number];
 export interface CreditEntry {

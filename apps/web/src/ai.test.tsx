@@ -61,6 +61,8 @@ function status(over: Partial<AiStatus> = {}): AiStatus {
     member: { faceGrouping: true, faceConsentAt: '2026-11-01T00:00:00Z', sceneTags: true, cleanup: true },
     credits: {
       balance: 640,
+      monthlyBalance: 640,
+      topUps: [],
       monthly: 1000,
       periodStart: '2026-11-01',
       periodEnd: '2026-12-01',

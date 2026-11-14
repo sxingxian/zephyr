@@ -83,6 +83,10 @@ export type ApiErrorCode =
   | 'asset_in_use' // branding (409): the image is drawn by the watermark of a live gallery
   | 'insufficient_credits' // phase 6 (402): not enough cloud credits; see `needed` and `balance`
   | 'feature_off' // phase 6 (403): this Zephyr AI feature is switched off in Admin, or by the member
+  | 'library_unavailable' // phase 7 (403): X-Zephyr-Library names a library this member can't open (removed, suspended, Studio lapsed)
+  | 'role_forbidden' // phase 7 (403): the member's role in this library doesn't allow it (see ROLE_CAN)
+  | 'library_read_only' // phase 7 (403): the library is over its plan's storage: view, download, Trash and delete only
+  | 'billing_unavailable' // phase 7 (503): Stripe isn't configured or didn't answer; nothing was charged
   | 'server';
 
 export interface ApiError {

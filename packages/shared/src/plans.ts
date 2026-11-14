@@ -1,7 +1,8 @@
 /**
  * Starting plan limits. The live values are rows in the versioned `plan_limits` table, edited in
  * Admin › Plan limits (Option 1). These defaults seed the database and render the landing pricing
- * section at build time. Prices in brackets are placeholders until Stripe Prices exist.
+ * section at build time. Prices here are build-time fallbacks only: live prices are set in Admin › Plans & billing (phase 7) and
+ * served by BILLING_API.pricing.
  */
 export type PlanId = 'free' | 'pro' | 'studio';
 
@@ -37,7 +38,7 @@ export interface Plan {
 
 /** Hard ceiling set by the GPU queue; Admin can't raise batch size past it. */
 export const SYSTEM_MAX_BATCH = 2000;
-export const CREDIT_TOP_UP = { credits: 500, price: '[$5]' } as const;
+export const CREDIT_TOP_UP = { credits: 500, price: '$5' } as const;
 
 export const PLANS: readonly Plan[] = [
   {
@@ -68,8 +69,8 @@ export const PLANS: readonly Plan[] = [
   {
     id: 'pro',
     name: 'Pro',
-    priceMonthly: '[$9.99]',
-    priceYearly: '[$99]',
+    priceMonthly: '$9.99',
+    priceYearly: '$99',
     blurb: 'For photographers who deliver to clients every week.',
     limits: {
       storageGb: 250,
@@ -93,8 +94,8 @@ export const PLANS: readonly Plan[] = [
   {
     id: 'studio',
     name: 'Studio',
-    priceMonthly: '[$24.99]',
-    priceYearly: '[$249]',
+    priceMonthly: '$24.99',
+    priceYearly: '$249',
     blurb: 'For small teams and studios with client proofing.',
     limits: {
       storageGb: 1000,

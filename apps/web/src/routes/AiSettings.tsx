@@ -31,6 +31,9 @@ const REASON: Record<CreditEntry['reason'], string> = {
   job_refund: 'Refund',
   admin_adjust: 'Adjustment by Zephyr',
   top_up: 'Credit top-up',
+  plan_change: 'Plan upgrade',
+  top_up_expiry: 'Top-up credits expired',
+  top_up_refund: 'Top-up refunded',
 };
 const PLAN = { free: 'Free', pro: 'Pro', studio: 'Studio' } as const;
 
