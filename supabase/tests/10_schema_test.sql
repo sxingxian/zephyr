@@ -37,38 +37,30 @@ do $$ begin
   end;
 end $$;
 
--- ---- Two-person approval ------------------------------------------------------------------------
+-- ---- Plan-limits versions (phase 8: the two-person rule became passkey + Owner emails) ---------
 insert into auth.users (id, email) values ('00000000-0000-0000-0000-0000000000a1', 'owner@zephyr.test');
 do $$ begin
   begin
-    insert into public.plan_limit_versions (version, status, reason, created_by, approved_by)
-    values (2, 'approved', 'Self-approved', '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a1');
-    raise exception 'FAILED: self-approval accepted';
-  exception when check_violation then raise notice 'ok - a plan-limits change cannot be approved by its author';
+    insert into public.plan_limit_versions (version, status, reason) values (2, 'scheduled', 'No date');
+    raise exception 'FAILED: scheduled without a date accepted';
+  exception when check_violation then raise notice 'ok - a scheduled version needs an effective date';
   end;
   begin
-    insert into public.plan_limit_versions (version, status, reason) values (2, 'approved', 'No author, no approver');
-    raise exception 'FAILED: approval without people accepted';
-  exception when check_violation then raise notice 'ok - an approved version needs a named author and approver';
-  end;
-  begin
-    insert into public.plan_limit_versions (version, status, reason, approved_by)
-    values (2, 'active', 'Approver only', '00000000-0000-0000-0000-0000000000a2');
-    raise exception 'FAILED: missing author accepted';
-  exception when check_violation then raise notice 'ok - an active version needs a named author';
+    insert into public.plan_limit_versions (version, status, reason) values (2, 'pending', 'Unknown status');
+    raise exception 'FAILED: unknown status accepted';
+  exception when check_violation then raise notice 'ok - unknown version status rejected';
   end;
 end $$;
 insert into public.plan_limit_versions (version, status, reason, created_by)
   values (3, 'draft', 'Raise Pro storage', '00000000-0000-0000-0000-0000000000a1');
 do $$ begin
   begin
-    update public.plan_limit_versions set status = 'approved' where version = 3;
-    raise exception 'FAILED: draft approved without an approver';
-  exception when check_violation then raise notice 'ok - a draft cannot be approved without an approver';
+    insert into public.plan_limit_versions (version, status, reason) values (4, 'draft', 'Second draft');
+    raise exception 'FAILED: two drafts accepted';
+  exception when unique_violation then raise notice 'ok - one draft at a time';
   end;
 end $$;
-update public.plan_limit_versions set status = 'approved', approved_by = '00000000-0000-0000-0000-0000000000a2' where version = 3;
-select pg_temp.ok((select status = 'approved' from public.plan_limit_versions where version = 3), 'a second person can approve a draft');
+delete from public.plan_limit_versions where version = 3;
 
 -- ---- audit_log is append-only -------------------------------------------------------------------
 insert into public.audit_log (actor, action, target) values (null, 'test.event', 'x');
