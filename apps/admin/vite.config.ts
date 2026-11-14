@@ -8,5 +8,6 @@ export default defineConfig({
   plugins: [react()],
   build: { sourcemap: false, target: 'es2022', outDir: 'dist' },
   server: { port: 5174, proxy: { '/admin/api': 'http://localhost:8788' } },
-  test: { environment: 'jsdom', globals: true, include: ['src/**/*.test.{ts,tsx}'] },
+  // Page tests wait up to 5 s for lazy routes on busy CI runners, so the per-test limit sits above that.
+  test: { environment: 'jsdom', globals: true, include: ['src/**/*.test.{ts,tsx}'], testTimeout: 15000 },
 });
