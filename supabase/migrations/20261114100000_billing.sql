@@ -1201,6 +1201,9 @@ begin
   values (p_stripe_price_id, p_lookup_key, old.plan_id, old.billing_interval, old.credits, p_amount, old.active, true, p_staff);
 
   if old.plan_id is not null then
+    -- Lock order as in Stop, claim, mark and the sweep: this key's open change rows first, then their moves.
+    perform 1 from public.price_changes c
+     where c.lookup_key = p_lookup_key and c.status in ('notifying', 'moving') order by c.id for update;
     select count(*) into n from public.subscriptions s join public.billing_prices bp on bp.stripe_price_id = s.stripe_price_id
      where bp.lookup_key = p_lookup_key and bp.amount <> p_amount and public._sub_keeps(s.status, s.past_due_since);
     -- Moves of earlier changes on this key that haven't happened are superseded by this one. An earlier change
@@ -1292,17 +1295,22 @@ $$;
 -- Reverts still owed (Stop's Stripe call failed): those whose renewal has come are marked revert_failed (the
 -- subscriber renewed at the new price; an alert for the team), the rest are returned for the cron to try again.
 -- {failed: <count newly failed>, reverts: [{moveId, ownerId, stripeSubscriptionId, fromPriceId, toPriceId}]}
-create function public.price_move_reverts_due(p_limit integer) returns jsonb
+create function public.price_move_reverts_due(p_limit integer, p_fail boolean default true) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
-declare n integer;
+declare n integer := 0;
 begin
-  update public.price_moves set status = 'revert_failed' where status = 'revert_pending' and move_at <= now();
-  get diagnostics n = row_count;
+  -- p_fail false (the cron's second pass, after the moves): reverts owed since the first pass get one try before
+  -- any of them can be counted as failed.
+  if coalesce(p_fail, true) then
+    update public.price_moves set status = 'revert_failed' where status = 'revert_pending' and move_at <= now();
+    get diagnostics n = row_count;
+  end if;
   -- A claim of a stopped change left unfinished (the worker died, or the Stripe call's outcome was unknown):
   -- Stripe may have the new price. Owed a revert; revertMove finds 'moot' when the swap never happened.
   update public.price_moves m set status = 'revert_pending'
    where m.status = 'moving' and m.claimed_at < now() - interval '1 hour'
-     and exists (select 1 from public.price_changes c where c.id = m.change_id and c.status = 'stopped');
+     and (exists (select 1 from public.price_changes c where c.id = m.change_id and c.status = 'stopped')
+          or not exists (select 1 from public.billing_prices bp where bp.stripe_price_id = m.to_price_id and bp.current));
   return jsonb_build_object('failed', n, 'reverts', coalesce((
     select jsonb_agg(jsonb_build_object('moveId', m.id, 'ownerId', m.owner_id, 'stripeSubscriptionId', m.stripe_subscription_id,
                                         'fromPriceId', m.from_price_id, 'toPriceId', m.to_price_id) order by m.move_at)
@@ -1320,6 +1328,13 @@ begin
   -- The change row first (Stop holds it for update while it stops the moves): claim and Stop run one after the
   -- other, never interleaved, and in the same lock order (change, then move).
   perform 1 from public.price_changes c where c.id = (select x.change_id from public.price_moves x where x.id = p_id) for share;
+  -- A stale claim whose target is no longer the key's current price (staff set another price since, e.g. to roll
+  -- a rise back): never finish it. Stripe may or may not have the target, so it's owed a revert (revertMove finds
+  -- 'moot' when the swap never happened); the sweep then plans the move to the current price from scratch.
+  update public.price_moves pm set status = 'revert_pending', claimed_at = null
+   where pm.id = p_id and pm.status = 'moving' and pm.claimed_at < now() - interval '1 hour'
+     and not exists (select 1 from public.billing_prices bp where bp.stripe_price_id = pm.to_price_id and bp.current);
+  if found then return null; end if;
   update public.price_moves set status = 'moving', claimed_at = now()
    where id = p_id
      and (status = 'notified' or (status = 'moving' and claimed_at < now() - interval '1 hour'))
@@ -1383,7 +1398,10 @@ begin
       from public.subscriptions s
       join public.billing_prices bp on bp.stripe_price_id = s.stripe_price_id
       join public.billing_prices nowp on nowp.lookup_key = bp.lookup_key and nowp.current
-     where public._sub_keeps(s.status, s.past_due_since) and bp.amount <> nowp.amount and s.schedule_id is null
+     where public._sub_keeps(s.status, s.past_due_since) and bp.amount <> nowp.amount
+       -- None while a scheduled change is still to come; a schedule whose last phase has started (it releases
+       -- itself after that phase, and the API releases it on the next sync) doesn't count.
+       and (s.scheduled_at is null or s.scheduled_at <= now())
        and not exists (select 1 from public.price_moves m where m.owner_id = s.owner_id
                          and (m.status in ('pending', 'notified', 'moving', 'revert_pending')
                               or (m.status = 'stopped' and m.to_price_id = nowp.stripe_price_id)
@@ -1695,6 +1713,6 @@ grant execute on function
   public.price_moves_due(integer),
   public.price_move_mark(uuid, text),
   public.price_move_claim(uuid),
-  public.price_move_reverts_due(integer),
+  public.price_move_reverts_due(integer, boolean),
   public.admin_billing_overview(uuid)
 to service_role;

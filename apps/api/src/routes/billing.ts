@@ -21,7 +21,7 @@ import {
 } from '@zephyr/shared';
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { billingDb, type CurrentPrice, type StoredSubscription } from '../billing/db';
-import { scheduleChange } from '../billing/schedule';
+import { releaseSchedule, scheduleChange, scheduleOf, scheduleStateOf } from '../billing/schedule';
 import { idOf, isStripeError, type Stripe, stripeClient } from '../billing/stripe';
 import { applyCheckoutSession, OwnerMismatch, SUBSCRIPTION_EXPAND, syncSubscription } from '../billing/sync';
 import { handleWebhook } from '../billing/webhook';
@@ -291,12 +291,16 @@ interface ChangeContext {
   kind: PlanChangeKind;
   target: CurrentPrice;
   to: { plan: PaidPlanId; interval: BillingInterval };
+  /** The live schedule with a change still to come (a downgrade or switch to monthly), or null. */
+  scheduleId: string | null;
 }
 
 /** Loads and checks everything a change needs, or answers the request. */
 async function loadChange(
   c: Ctx,
   to: { plan: PaidPlanId; interval: BillingInterval },
+  /** POST /change: a finished schedule is released first. The preview changes nothing in Stripe. */
+  apply = false,
 ): Promise<ChangeContext | Response> {
   const stripe = stripeClient(c.env);
   if (!stripe) return unavailable(c);
@@ -320,29 +324,14 @@ async function loadChange(
   // An upgrade while a downgrade (or switch to monthly) is scheduled: the member undoes the scheduled change
   // first. Releasing it here and putting it back if the upgrade fails or waits for payment proved fragile
   // (docs/phase-7.md, Billing API › Change), so nothing is touched in Stripe.
-  if (kind === 'upgrade') {
-    const scheduled = scheduledChangeOf(sub);
-    if (scheduled)
-      return c.json(
-        fail('conflict', {
-          reason: 'scheduled_change',
-          ...(scheduled.at ? { scheduledAt: scheduled.at } : {}),
-        }),
-        409,
-      );
+  // A schedule whose last phase has started is a change that already happened, not a scheduled one.
+  const state = scheduleStateOf(await scheduleOf(stripe, sub));
+  if (state?.kind === 'pending' && kind === 'upgrade') {
+    return c.json(fail('conflict', { reason: 'scheduled_change', scheduledAt: state.at }), 409);
   }
-  return { stripe, owner, stored, sub, item, kind, target, to };
-}
-
-/** The subscription's live schedule (every schedule Zephyr makes is a scheduled downgrade), or null. */
-function scheduledChangeOf(sub: Stripe.Subscription): { at: string | null } | null {
-  if (!sub.schedule) return null;
-  if (typeof sub.schedule === 'string') return { at: null };
-  const s = sub.schedule;
-  if (s.status !== 'active' && s.status !== 'not_started') return null;
-  const now = Math.floor(Date.now() / 1000);
-  const next = s.phases.find((p) => p.start_date > now);
-  return { at: next ? new Date(next.start_date * 1000).toISOString() : null };
+  if (state?.kind === 'finished' && apply) await releaseSchedule(stripe, state.id);
+  const scheduleId = state?.kind === 'pending' ? idOf(sub.schedule) : null;
+  return { stripe, owner, stored, sub, item, kind, target, to, scheduleId };
 }
 
 billingRoutes.post('/change/preview', async (c) => {
@@ -409,15 +398,15 @@ billingRoutes.post('/change', async (c) => {
   if (!body) return c.json(fail('invalid'), 400);
   const requestId = c.get('requestId');
   try {
-    const ctx = await loadChange(c, body);
+    const ctx = await loadChange(c, body, true);
     if (ctx instanceof Response) return ctx;
-    const { stripe, owner, sub, item, kind, target, to } = ctx;
+    const { stripe, owner, sub, item, kind, target, to, scheduleId } = ctx;
     const minute = Math.floor(Date.now() / 60_000);
-    const scheduleId = idOf(sub.schedule);
     let actionUrl: string | null = null;
     const currentPrice = typeof item.price === 'string' ? item.price : item.price.id;
     if (kind === 'upgrade') {
-      // loadChange refused an upgrade while a change is scheduled, so no schedule manages this subscription.
+      // loadChange refused an upgrade while a change is scheduled and released a finished schedule, so no
+      // schedule manages this subscription.
       const updated = await stripe.subscriptions.update(
         sub.id,
         {
@@ -461,7 +450,7 @@ billingRoutes.delete('/change', async (c) => {
     const sub = await stripe.subscriptions.retrieve(stored.stripeSubscriptionId);
     const scheduleId = idOf(sub.schedule);
     if (!scheduleId) return c.json(fail('conflict'), 409);
-    await stripe.subscriptionSchedules.release(scheduleId, {}, { idempotencyKey: `release:${scheduleId}` });
+    await releaseSchedule(stripe, scheduleId);
     await syncSubscription(c.env, stripe, sub.id, c.get('requestId'), owner);
     const status = await statusResult(c);
     return status ? c.json(status) : c.json(fail('server'), 500);

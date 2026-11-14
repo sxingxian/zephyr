@@ -1,8 +1,9 @@
-# Names checked against both isSafeLabel (packages/shared) and public._safe_label (80_teams_test.sql).
-# Format: ok|<name> or no|<name>. Each name is NFKC-normalised first (as the API stores it).
-# Which non-ASCII characters count as letters in SQL depends on the database locale ([[:alpha:]]); the API's
-# Unicode check (isSafeLabel) is the gatekeeper for scripts, so locale-dependent cases (e.g. Arabic-Indic digits)
-# are tested in packages/shared only. Everything that makes a name read as a link or address is listed here.
+# Names checked against both rules: isSafeLabel in packages/shared (the API's full character policy) and
+# public._safe_label in SQL (the security floor beneath it; 80_teams_test.sql). Each name is NFKC-normalised
+# first, as the API stores it. Format:
+#   ok|<name>      both accept it (every name the API accepts must pass the database floor)
+#   link|<name>    both refuse it: it reads as an address or a link, or carries markup (the floor's job)
+#   policy|<name>  the API refuses it (characters outside the policy); the database floor may accept it
 ok|Tan Studio
 ok|Tân Studio 54
 ok|Mei Lin's Studio
@@ -13,21 +14,29 @@ ok|Studio-9
 ok|写真スタジオ
 ok|Ålborg Foto
 ok|สตูดิโอ ภาพ
+ok|फ़ोटो स्टूडियो
 ok|St. Clair
-no|evil.com
-no|evil.cc
-no|evil.ⅽⅽ
-no|x.ⅿⅾ
-no|evil。com
-no|evil．com
-no|evil｡com
-no|mei＠example
-no|mei@example
-no|www.studio
-no|http://studio
-no|studio.io now
 ok|Studio²
 ok|Studio Ⅻ
-no|Studio!
-no|Studio_9
-no|
+link|evil.com
+link|evil.cc
+link|evil.ⅽⅽ
+link|x.ⅿⅾ
+link|evil。com
+link|evil．com
+link|evil｡com
+link|mei＠example
+link|mei@example
+link|@
+link|www.studio
+link|WWW.Studio
+link|http://studio
+link|studio.io now
+link|evil.9
+link|Tan <b>
+link|Say "hi"
+policy|Studio!
+policy|Studio_9
+policy|Studio ٣
+policy|Studio ३
+policy|Café ☕

@@ -10,16 +10,20 @@
 -- ---------------------------------------------------------------------------------------------
 -- Tables
 -- ---------------------------------------------------------------------------------------------
--- A team name goes into invite emails sent to any address, so it's held to a strict pattern: letters, the digits
--- 0-9, spaces and . , ' & - only, and nothing that reads as an address or a link: no "://", no "www.", and a dot
--- only before a space, one of those marks or the end. Stored names are NFKC-normalised (lookalikes such as
--- fullwidth "@" or Roman-numeral letters are judged as what they become). isSafeLabel in packages/shared is
--- the same rule; supabase/tests/80_teams_test.sql and the shared tests check one list of names against both.
+-- A team name goes into invite emails sent to any address. The API (isSafeLabel in packages/shared) holds it to
+-- the full character policy: letters with their combining marks, the digits 0-9, spaces and . , ' & - only.
+-- This is the security floor beneath it, independent of the database locale, so a name the API accepts never
+-- fails here: NFKC-normalised (lookalikes such as fullwidth "@" or Roman-numeral letters are judged as what they
+-- become), 1-60 characters, no control characters or markup characters (< > " `), and nothing that reads as an
+-- address or a link: no "@", no "://", no "www.", and a dot (or the ideographic full stop, which browsers treat as
+-- a dot in domain names) only before whitespace, one of . , ' & - or the end. supabase/tests/80_teams_test.sql
+-- and the shared tests check one list of names against both rules.
 create function public._safe_label(p text) returns boolean
 language sql immutable set search_path = '' as $$
   select p is not null and p = normalize(p, NFKC) and length(p) between 1 and 60
-     and p ~ '^[[:alpha:]0-9 .,''&-]+$'
-     and p !~* '(www\.|://|\.[^[:space:].,''&-])';
+     and p !~ '[[:cntrl:]<>"`]'
+     and position('@' in p) = 0
+     and p !~* '(www[.。]|://|[.。][^[:space:].,''&-])';
 $$;
 
 create table public.teams (

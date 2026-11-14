@@ -474,7 +474,7 @@ select pg_temp.ok((:'rd2'::jsonb ->> 'failed')::int = 1 and jsonb_array_length(:
 select pg_temp.ok(public.price_move_mark(:'mvm', 'reverted') ->> 'status' = 'revert_failed', 'a failed revert isn''t silently marked done');
 
 select pg_temp.ok(has_function_privilege('service_role', 'public.price_move_claim(uuid)', 'execute')
-  and has_function_privilege('service_role', 'public.price_move_reverts_due(integer)', 'execute')
+  and has_function_privilege('service_role', 'public.price_move_reverts_due(integer, boolean)', 'execute')
   and has_function_privilege('service_role', 'public.billing_topup_refund(text, integer, integer)', 'execute')
   and not has_function_privilege('authenticated', 'public.price_move_claim(uuid)', 'execute'), 'the new move functions are for the API only');
 
@@ -595,6 +595,58 @@ select pg_temp.ok(has_function_privilege('service_role', 'public.billing_duplica
   and has_function_privilege('service_role', 'public.billing_deletion_resumes_due(integer)', 'execute')
   and not has_function_privilege('authenticated', 'public.billing_duplicate_mark(text, text)', 'execute')
   and not has_function_privilege('anon', 'public.billing_deletion_pending(uuid)', 'execute'), 'the round-3 functions are for the API only');
+
+-- ---- Round-4 review fixes ------------------------------------------------------------------------
+insert into auth.users (id, email, email_confirmed_at) values
+  ('b7000000-0000-0000-0000-000000000011', 'r4a.bill@example.com', now()),
+  ('b7000000-0000-0000-0000-000000000012', 'r4b.bill@example.com', now());
+\set r4a '\'b7000000-0000-0000-0000-000000000011\''
+\set r4b '\'b7000000-0000-0000-0000-000000000012\''
+select public.billing_customer_set(:r4a, 'cus_R4a');
+select public.billing_customer_set(:r4b, 'cus_R4b');
+-- r4a's schedule already did its change (no phase to come: no scheduled change recorded); r4b's is still to come.
+select public.billing_apply(:r4a, pg_temp.sub('sub_R4a', 'cus_R4a', 'active', 'price_StuM1', now() - interval '20 days', now() + interval '10 days',
+                                              '{"schedule_id": "sub_sched_R4a"}'), now());
+select public.billing_apply(:r4b, pg_temp.sub('sub_R4b', 'cus_R4b', 'active', 'price_StuM1', now() - interval '20 days', now() + interval '10 days',
+                                              jsonb_build_object('schedule_id', 'sub_sched_R4b', 'scheduled_price_id', 'price_StuM1',
+                                                                 'scheduled_at', now() + interval '10 days')), now());
+select public.admin_price_set(:fin, 'zephyr_studio_monthly', 'price_StuM5', 2699, 'Round 4', false) as r4c \gset
+select public.price_moves_due(500);
+select pg_temp.ok(exists (select 1 from public.price_moves where owner_id = :r4a and to_price_id = 'price_StuM5')
+  and not exists (select 1 from public.price_moves where owner_id = :r4b),
+  'a schedule whose change already happened doesn''t hold back price moves; one still to come does');
+
+-- A stale claim whose target was replaced since (staff set another price) is never finished: owed a revert.
+select id as r4m from public.price_moves where owner_id = :r4a and to_price_id = 'price_StuM5' \gset
+select public.price_move_mark(:'r4m', 'notified');
+update public.price_moves set move_at = now() + interval '1 day' where id = :'r4m';
+select pg_temp.ok(public.price_move_claim(:'r4m') ->> 'status' = 'moving', 'claimed for the swap');
+update public.price_moves set claimed_at = now() - interval '2 hours' where id = :'r4m';
+select public.admin_price_set(:fin, 'zephyr_studio_monthly', 'price_StuM6', 2599, 'Roll back', false);
+select pg_temp.ok((select status from public.price_moves where id = :'r4m') = 'moving',
+  'a new price leaves an unfinished claim alone (its outcome is unknown)');
+select pg_temp.ok(public.price_move_claim(:'r4m') is null, 'a stale claim whose target is no longer current isn''t retaken');
+select pg_temp.ok((select status from public.price_moves where id = :'r4m') = 'revert_pending', 'it goes to revert_pending instead');
+-- The cron's second pass (p_fail false) gives it a try even past its date; only the next first pass can fail it.
+update public.price_moves set move_at = now() - interval '1 minute' where id = :'r4m';
+select public.price_move_reverts_due(100, false) as r4rd \gset
+select pg_temp.ok((:'r4rd'::jsonb ->> 'failed')::int = 0 and (select status from public.price_moves where id = :'r4m') = 'revert_pending'
+  and (select count(*) from jsonb_array_elements(:'r4rd'::jsonb -> 'reverts') x where (x ->> 'moveId')::uuid = :'r4m') = 1,
+  'the second pass offers the revert without failing it');
+select pg_temp.ok((public.price_move_reverts_due(100) ->> 'failed')::int >= 1, 'the next first pass counts it failed');
+select pg_temp.ok((select status from public.price_moves where id = :'r4m') = 'revert_failed', 'and marks it revert_failed');
+
+-- The same for a stale claim the sweep's reverts list finds (worker died; target replaced).
+select public.price_moves_due(500);
+select id as r4m2 from public.price_moves where owner_id = :r4a and to_price_id = 'price_StuM6' \gset
+select public.price_move_mark(:'r4m2', 'notified');
+update public.price_moves set move_at = now() + interval '1 day' where id = :'r4m2';
+select public.price_move_claim(:'r4m2');
+update public.price_moves set claimed_at = now() - interval '2 hours' where id = :'r4m2';
+select public.admin_price_set(:fin, 'zephyr_studio_monthly', 'price_StuM7', 2799, 'Again', false);
+select public.price_move_reverts_due(100, false);
+select pg_temp.ok((select status from public.price_moves where id = :'r4m2') = 'revert_pending',
+  'price_move_reverts_due also sends a stale claim with a replaced target to revert_pending');
 
 -- ---- Privileges -----------------------------------------------------------------------------------
 select pg_temp.ok(not exists (

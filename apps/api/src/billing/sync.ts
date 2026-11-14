@@ -18,6 +18,7 @@ import { sendEmail } from '../email/resend';
 import type { Env } from '../env';
 import { logError } from '../http';
 import { billingDb, type SubscriptionSnapshot } from './db';
+import { releaseSchedule, scheduleStateOf } from './schedule';
 import { idOf, isMissing, isStripeError, type Stripe } from './stripe';
 
 /** The event's object belongs to no owner we know, or to a different one than its customer: never applied. */
@@ -30,6 +31,20 @@ export class OwnerMismatch extends Error {
 
 /** Subscription metadata flag: cancel_at_period_end was set by an account-deletion request, not by the member. */
 export const DELETION_CANCEL_FLAG = 'zephyr_deletion_cancel';
+/** When our deletion request set cancel_at_period_end (unix seconds), next to the flag. */
+export const DELETION_CANCEL_AT = 'zephyr_deletion_cancel_at';
+
+/**
+ * True only for a cancel our deletion request made: the flag is set, the subscription is set to cancel, and the
+ * cancellation was requested when we set the flag (Stripe's canceled_at, within 5 minutes). A cancel the member
+ * makes later in the portal never counts, even if a stale flag survived.
+ */
+export function isDeletionCancel(sub: Stripe.Subscription): boolean {
+  if (sub.metadata?.[DELETION_CANCEL_FLAG] !== '1' || !sub.cancel_at_period_end) return false;
+  const at = Number(sub.metadata?.[DELETION_CANCEL_AT]);
+  if (!Number.isFinite(at) || at <= 0 || !sub.canceled_at) return false;
+  return Math.abs(sub.canceled_at - at) <= 300;
+}
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const iso = (t: number | null | undefined) => (t ? new Date(t * 1000).toISOString() : null);
@@ -101,7 +116,7 @@ export function snapshot(sub: Stripe.Subscription): SubscriptionSnapshot {
     scheduled_interval: scheduled?.interval ?? null,
     scheduled_at: scheduled?.at ?? null,
     scheduled_price_id: scheduledPriceId,
-    deletion_cancel: sub.metadata?.[DELETION_CANCEL_FLAG] === '1',
+    deletion_cancel: isDeletionCancel(sub),
     amount: price?.unit_amount ?? null,
   };
 }
@@ -150,12 +165,16 @@ export async function syncSubscription(
   const customerId = idOf(sub.customer);
   const owner = await resolveOwner(env, stripe, customerId, sub.metadata);
   if (knownOwner && knownOwner !== owner) throw new OwnerMismatch('owner_mismatch');
-  let out = await billingDb.apply(env, owner, snapshot(sub), syncedAt);
+  const snap = snapshot(sub);
+  await tidyAfterRead(stripe, sub, snap, requestId);
+  let out = await billingDb.apply(env, owner, snap, syncedAt);
   if (out?.duplicate && out.recorded) {
     // Recorded earlier (billing_duplicates): never applied, whatever happened to the stored one since. Finish
     // whatever an earlier try left undone.
+    // Once canceled, refunds run again on every event for it (idempotent per charge): a payment that landed after
+    // the last refund pass is refunded too.
     await settleDuplicate(env, stripe, sub, {
-      refunded: Boolean(out.refunded),
+      refunded: Boolean(out.refunded) && !out.canceled,
       canceled: Boolean(out.canceled),
     });
   } else if (out?.duplicate && out.storedSubscriptionId) {
@@ -166,6 +185,43 @@ export async function syncSubscription(
   }
   return { owner, duplicate: Boolean(out?.duplicate) };
 }
+
+/**
+ * Best-effort housekeeping on every read (failures are logged; the next read tries again):
+ * - a schedule whose change already happened (its last phase started) is released, so it never counts as a
+ *   scheduled change or blocks upgrades and price moves;
+ * - our deletion flag left on a subscription that renews again (the member renewed in the portal) is cleared,
+ *   so a later cancel of the member's own never carries it.
+ */
+async function tidyAfterRead(
+  stripe: Stripe,
+  sub: Stripe.Subscription,
+  snap: SubscriptionSnapshot,
+  requestId: string,
+) {
+  const schedule = sub.schedule && typeof sub.schedule !== 'string' ? sub.schedule : null;
+  if (scheduleStateOf(schedule)?.kind === 'finished' && schedule) {
+    try {
+      await releaseSchedule(stripe, schedule.id);
+      snap.schedule_id = null;
+    } catch (err) {
+      logError(requestId, 'billing_schedule_release', err);
+    }
+  }
+  if (sub.metadata?.[DELETION_CANCEL_FLAG] === '1' && !sub.cancel_at_period_end && !ENDED.has(sub.status)) {
+    try {
+      await stripe.subscriptions.update(
+        sub.id,
+        { metadata: { [DELETION_CANCEL_FLAG]: '', [DELETION_CANCEL_AT]: '' } },
+        { idempotencyKey: `deletion-flag-clear:${sub.id}:${crypto.randomUUID()}` },
+      );
+    } catch (err) {
+      logError(requestId, 'billing_deletion_flag_clear', err);
+    }
+  }
+}
+
+const ENDED = new Set(['canceled', 'incomplete_expired']);
 
 const keepsPlan = (sub: Stripe.Subscription) =>
   PLAN_KEEPING_STATUSES.includes(sub.status as SubscriptionStatus);
@@ -210,9 +266,11 @@ async function resolveDuplicate(
 }
 
 /**
- * Settles a recorded duplicate: refund first, then cancel, each recorded once done. If the refund fails, the
- * webhook answers 500 (and the daily cron retries), and the cancel waits, so the duplicate is still live to
- * retry against. Only ever called for a subscription with a billing_duplicates row.
+ * Settles a recorded duplicate: cancel first (any status but ended, unpaid included) and void its open invoices,
+ * so it can't bill again; then refund every paid invoice, and record each step once done. A refund failure never
+ * blocks the cancel: the billing_duplicates row drives the retries (webhook 500, then the daily cron), and a
+ * canceled subscription's invoices can still be refunded. Only ever called for a subscription with a
+ * billing_duplicates row.
  */
 export async function settleDuplicate(
   env: Env,
@@ -220,19 +278,34 @@ export async function settleDuplicate(
   sub: Stripe.Subscription,
   done: { refunded: boolean; canceled: boolean },
 ) {
-  if (!done.refunded) {
-    await refundPaidInvoices(stripe, sub.id);
-    await billingDb.duplicateMark(env, sub.id, 'refunded');
-  }
   if (!done.canceled) {
-    if (keepsPlan(sub) || sub.status === 'incomplete' || sub.status === 'paused') {
+    if (!ENDED.has(sub.status)) {
       await stripe.subscriptions.cancel(
         sub.id,
         { prorate: false, invoice_now: false },
         { idempotencyKey: `dup-cancel:${sub.id}` },
       );
     }
+    await voidOpenInvoices(stripe, sub.id);
     await billingDb.duplicateMark(env, sub.id, 'canceled');
+  }
+  if (!done.refunded) {
+    await refundPaidInvoices(stripe, sub.id);
+    await billingDb.duplicateMark(env, sub.id, 'refunded');
+  }
+}
+
+/** Voids a canceled duplicate's open invoices, so no retry of an earlier charge can still be paid. */
+async function voidOpenInvoices(stripe: Stripe, subscriptionId: string) {
+  const open = await stripe.invoices.list({ subscription: subscriptionId, status: 'open', limit: 24 });
+  for (const inv of open.data) {
+    if (!inv.id) continue;
+    try {
+      await stripe.invoices.voidInvoice(inv.id, {}, { idempotencyKey: `dup-void:${inv.id}` });
+    } catch (err) {
+      // Paid or voided meanwhile (a paid one is refunded next): nothing to void.
+      if (!(isStripeError(err) && (err as { statusCode?: number }).statusCode === 400)) throw err;
+    }
   }
 }
 

@@ -48,15 +48,17 @@ create temp table label_cases as
 do $$
 declare r record; n integer := 0;
 begin
+  -- The floor: every name the API accepts passes (ok), every address- or link-like one fails (link). Names the
+  -- API refuses for its character policy (policy) aren't the floor's business.
   for r in select split_part(line, '|', 1) as want, substr(line, position('|' in line) + 1) as name
-             from label_cases where line ~ '^(ok|no)\|' loop
+             from label_cases where line ~ '^(ok|link)\|' loop
     if public._safe_label(normalize(r.name, NFKC)) is distinct from (r.want = 'ok') then
       raise exception 'FAILED: _safe_label(%) should be %', r.name, r.want;
     end if;
     n := n + 1;
   end loop;
   if n < 20 then raise exception 'FAILED: only % label cases read', n; end if;
-  raise notice 'ok - % shared name cases agree with the SQL rule', n;
+  raise notice 'ok - % shared name cases agree with the SQL floor', n;
 end $$;
 select pg_temp.ok(public.team_set_name(:mei, 'Studio Ⅻ') ->> 'name' = 'Studio XII'
   and not public._safe_label('Studio Ⅻ'),

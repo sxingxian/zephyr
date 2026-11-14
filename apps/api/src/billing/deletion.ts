@@ -10,7 +10,7 @@
 import type { Env } from '../env';
 import { billingDb } from './db';
 import { idOf, isMissing, type Stripe, stripeClient } from './stripe';
-import { DELETION_CANCEL_FLAG as FLAG } from './sync';
+import { DELETION_CANCEL_FLAG as FLAG, DELETION_CANCEL_AT as FLAG_AT, isDeletionCancel } from './sync';
 
 const SUB = /^sub_[A-Za-z0-9]+$/;
 
@@ -46,7 +46,10 @@ export async function cancelForDeletion(env: Env, owner: string, fromDb?: unknow
     }
     await stripe.subscriptions.update(
       id,
-      { cancel_at_period_end: true, metadata: { [FLAG]: '1' } },
+      {
+        cancel_at_period_end: true,
+        metadata: { [FLAG]: '1', [FLAG_AT]: String(Math.floor(Date.now() / 1000)) },
+      },
       { idempotencyKey: `deletion-cancel:${id}:${nonce}` },
     );
     // A restore that landed while we were cancelling: put it back now (the daily cron also reconciles).
@@ -59,10 +62,11 @@ export async function cancelForDeletion(env: Env, owner: string, fromDb?: unknow
 /** Renews again if our deletion request was what stopped it. */
 async function resume(stripe: Stripe, id: string) {
   const sub = await stripe.subscriptions.retrieve(id);
-  if (sub.metadata?.[FLAG] !== '1' || !sub.cancel_at_period_end) return;
+  // Only a cancel our deletion request made (never one the member made later in the portal).
+  if (!isDeletionCancel(sub)) return;
   await stripe.subscriptions.update(
     id,
-    { cancel_at_period_end: false, metadata: { [FLAG]: '' } },
+    { cancel_at_period_end: false, metadata: { [FLAG]: '', [FLAG_AT]: '' } },
     { idempotencyKey: `deletion-resume:${id}:${crypto.randomUUID()}` },
   );
 }

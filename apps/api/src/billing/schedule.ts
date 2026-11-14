@@ -7,6 +7,38 @@
 import type { BillingInterval } from '@zephyr/shared';
 import type { Stripe } from './stripe';
 
+/**
+ * What a subscription's schedule means now:
+ * - 'pending': a phase still starts in the future (a downgrade or switch to monthly is scheduled, at `at`);
+ * - 'finished': live, but its last phase has started (the change already happened; Stripe releases it only when
+ *   that phase ends, up to a year later). Not a scheduled change: the API releases it;
+ * - null: no live schedule.
+ */
+export function scheduleStateOf(
+  schedule: Stripe.SubscriptionSchedule | null,
+  now = Math.floor(Date.now() / 1000),
+): { kind: 'pending'; at: string } | { kind: 'finished'; id: string } | null {
+  if (!schedule || (schedule.status !== 'active' && schedule.status !== 'not_started')) return null;
+  const next = schedule.phases.find((p) => p.start_date > now);
+  if (next) return { kind: 'pending', at: new Date(next.start_date * 1000).toISOString() };
+  return { kind: 'finished', id: schedule.id };
+}
+
+/** The subscription's schedule as an object (retrieved when only its id is known), or null. */
+export async function scheduleOf(
+  stripe: Stripe,
+  sub: Stripe.Subscription,
+): Promise<Stripe.SubscriptionSchedule | null> {
+  if (!sub.schedule) return null;
+  if (typeof sub.schedule !== 'string') return sub.schedule;
+  return stripe.subscriptionSchedules.retrieve(sub.schedule);
+}
+
+/** Releases a schedule whose change already happened (the subscription stays as it is). Idempotent. */
+export async function releaseSchedule(stripe: Stripe, scheduleId: string) {
+  await stripe.subscriptionSchedules.release(scheduleId, {}, { idempotencyKey: `release:${scheduleId}` });
+}
+
 /** Puts the subscription on a schedule: the current price until the period end, then `next` for an interval. */
 export async function scheduleChange(
   stripe: Stripe,

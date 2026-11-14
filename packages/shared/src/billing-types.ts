@@ -121,17 +121,13 @@ export const MAX_TEAM_LIBRARIES = 10;
 // ---------------------------------------------------------------- team (owner's view)
 export const TEAM_NAME_MAX = 60;
 /**
- * Team names (and any name shown in a team invite email) go to addresses the owner chooses, so they're held to a
- * strict pattern: letters, numbers, spaces and . , ' & - only, and nothing that reads as an address or a link
- * (no "@", "://", "www.", or a dot followed by a letter, as in a domain). Mirrors public._safe_label.
- */
-/**
  * Names that go into emails sent to any address (team names, inviter names): checked after NFKC normalisation,
  * so lookalikes (fullwidth "@", Roman-numeral letters, ideographic dots) are judged as what they become.
- * Letters (with their combining marks, for scripts such as Thai or Devanagari), the digits 0-9, spaces and
- * . , ' & - only; a dot may only be followed by a space, one of those marks
- * or the end, so nothing reads as a domain. public._safe_label in SQL is the same rule, and stored names are
- * already NFKC (`normalizeLabel`).
+ * The full character policy, enforced by the API: letters (with their combining marks, for scripts such as Thai
+ * or Devanagari), the digits 0-9, spaces and . , ' & - only; a dot may only be followed by a space, one of those
+ * marks or the end, so nothing reads as a domain. public._safe_label in SQL is the security floor beneath it
+ * (NFKC, no control characters, nothing address- or link-like) and accepts every name this accepts; stored names
+ * are already NFKC (`normalizeLabel`). supabase/tests/safe_label_cases.txt is checked against both.
  */
 export const SAFE_LABEL = /^[\p{L}\p{M}0-9 .,'&-]{1,60}$/u;
 const LINK_LIKE = /(www\.|:\/\/|\.[^\s.,'&-])/iu;

@@ -66,12 +66,15 @@ describe('safe labels', () => {
     const { default: text } = await import('../../../supabase/tests/safe_label_cases.txt?raw');
     const cases = text
       .split('\n')
-      .filter((l) => /^(ok|no)\|/.test(l))
-      .map((l) => ({ want: l.startsWith('ok|'), name: l.slice(3) }));
-    expect(cases.length).toBeGreaterThanOrEqual(20);
-    for (const c of cases) expect([c.name, isSafeLabel(c.name)]).toEqual([c.name, c.want]);
+      .map((l) => /^(ok|link|policy)\|(.*)$/.exec(l))
+      .filter((m): m is RegExpExecArray => m !== null)
+      .map((m) => ({ kind: m[1], name: m[2] as string }));
+    expect(cases.filter((c) => c.kind === 'ok').length).toBeGreaterThanOrEqual(10);
+    expect(cases.filter((c) => c.kind === 'link').length).toBeGreaterThanOrEqual(10);
+    // The full policy: only `ok` names pass; links and characters outside the policy are refused.
+    for (const c of cases) expect([c.name, isSafeLabel(c.name)]).toEqual([c.name, c.kind === 'ok']);
   });
-  it('refuses digits other than 0-9 (checked here only: SQL letter classes depend on the database locale)', () => {
+  it('refuses digits other than 0-9 and allows letters’ combining marks', () => {
     expect(isSafeLabel('Studio ٣')).toBe(false);
     expect(isSafeLabel('Studio ३')).toBe(false);
     // Combining marks (Devanagari, after NFKC) are letters' parts, not punctuation.

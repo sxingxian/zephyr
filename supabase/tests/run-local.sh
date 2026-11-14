@@ -11,7 +11,16 @@ cleanup() { "$bin/pg_ctl" -D "$data" -m immediate stop >/dev/null 2>&1 || true; 
 trap cleanup EXIT
 
 if [ "$(id -u)" = 0 ]; then echo "Run as a non-root user (initdb refuses root)." >&2; exit 1; fi
-"$bin/initdb" -D "$data" -U postgres -A trust >/dev/null
+# UTF-8 always (normalize(), NFKC team names and non-ASCII test names need it), whatever the caller's locale:
+# C.UTF-8 when the system has it, else any UTF-8 locale, else the default locale with UTF8 encoding.
+loc=""
+if locale -a 2>/dev/null | grep -qiE '^c\.utf-?8$'; then loc="C.UTF-8"
+else loc=$(locale -a 2>/dev/null | grep -iE 'utf-?8$' | head -n 1); fi
+if [ -n "$loc" ]; then
+  "$bin/initdb" -D "$data" -U postgres -A trust -E UTF8 --locale="$loc" >/dev/null
+else
+  "$bin/initdb" -D "$data" -U postgres -A trust -E UTF8 --locale=C >/dev/null
+fi
 "$bin/pg_ctl" -D "$data" -o "-p $port -k $data -c listen_addresses=''" -w start >/dev/null
 psql=(psql -X -q -v ON_ERROR_STOP=1 -v testdir="$here" -h "$data" -p "$port" -U postgres -d postgres)
 

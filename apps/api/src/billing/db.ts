@@ -254,8 +254,9 @@ export const billingDb = {
   /** Claims a notified move for the Stripe swap (null: stopped, already moved, or claimed by another run). */
   moveClaim: (env: Env, id: string) => rpc<DueMove | null>(env, 'price_move_claim', { p_id: id }),
   /** Reverts Stop still owes; those past their renewal are marked failed (counted). */
-  revertsDue: async (env: Env, limit: number) =>
+  revertsDue: async (env: Env, limit: number, fail = true) =>
     (await rpc<{ failed: number; reverts: RevertMove[] } | null>(env, 'price_move_reverts_due', {
       p_limit: limit,
+      p_fail: fail,
     })) ?? { failed: 0, reverts: [] },
 };

@@ -13,6 +13,7 @@ import type { Env } from '../env';
 import { logError } from '../http';
 import { billingDb, type DueMove, type RevertMove } from './db';
 import { cancelForDeletion, undoCancelForDeletion } from './deletion';
+import { releaseSchedule, scheduleOf, scheduleStateOf } from './schedule';
 import { isMissing, isStripeError, type Stripe, stripeClient } from './stripe';
 import { settleDuplicate, syncSubscription } from './sync';
 
@@ -54,12 +55,13 @@ export interface BillingCronCounts {
 export async function revertMove(stripe: Stripe, r: RevertMove): Promise<'reverted' | 'moot'> {
   let sub: Stripe.Subscription;
   try {
-    sub = await stripe.subscriptions.retrieve(r.stripeSubscriptionId);
+    sub = await stripe.subscriptions.retrieve(r.stripeSubscriptionId, { expand: ['schedule'] });
   } catch (err) {
     if (isMissing(err)) return 'moot';
     throw err;
   }
   if (!PLAN_KEEPING_STATUSES.includes(sub.status as SubscriptionStatus)) return 'moot';
+  await releaseIfFinished(stripe, sub);
   const item = sub.items.data[0];
   if (!item || sub.items.data.length !== 1) return 'moot';
   const current = typeof item.price === 'string' ? item.price : item.price.id;
@@ -120,7 +122,7 @@ export async function swapPrice(
 ): Promise<'swapped' | 'changed' | 'gone'> {
   let sub: Stripe.Subscription;
   try {
-    sub = await stripe.subscriptions.retrieve(subscriptionId);
+    sub = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['schedule'] });
   } catch (err) {
     if (isMissing(err)) return 'gone';
     throw err;
@@ -130,6 +132,11 @@ export async function swapPrice(
   const current = item ? (typeof item.price === 'string' ? item.price : item.price.id) : null;
   if (item && current === to && sub.items.data.length === 1) return 'swapped';
   if (!item || current !== from || sub.items.data.length !== 1) return 'changed';
+  // A downgrade or switch still to come: its phases would undo the swap, so the sweep plans again after it runs.
+  const state = scheduleStateOf(await scheduleOf(stripe, sub));
+  if (state?.kind === 'pending') return 'changed';
+  // Stripe won't change the price of a subscription a schedule manages: release one whose change already happened.
+  if (state?.kind === 'finished') await releaseSchedule(stripe, state.id);
   try {
     await stripe.subscriptions.update(
       subscriptionId,
@@ -143,6 +150,12 @@ export async function swapPrice(
     throw new UnknownSwapOutcome(err);
   }
   return 'swapped';
+}
+
+/** Releases the subscription's schedule if its change already happened (before a price update). */
+async function releaseIfFinished(stripe: Stripe, sub: Stripe.Subscription) {
+  const state = scheduleStateOf(await scheduleOf(stripe, sub));
+  if (state?.kind === 'finished') await releaseSchedule(stripe, state.id);
 }
 
 /** A Stripe 4xx (other than 409 and 429): the request was refused and nothing changed. */
@@ -261,6 +274,9 @@ export async function runBillingCron(
       logError(requestId, 'price_move', err);
     }
   }
+  // Reverts owed since the first pass (a stale claim whose target was replaced, or one finished after Stop) get a
+  // try now, before tomorrow's first pass could count them as failed.
+  await retryReverts(env, stripe, requestId, counts, false);
   return counts;
 }
 
@@ -282,9 +298,15 @@ async function endPastDuePlans(env: Env, requestId: string, counts: BillingCronC
 }
 
 /** Reverts Stop still owes. Any that the renewal reached first are counted and alerted (billed at the new price). */
-async function retryReverts(env: Env, stripe: Stripe, requestId: string, counts: BillingCronCounts) {
+async function retryReverts(
+  env: Env,
+  stripe: Stripe,
+  requestId: string,
+  counts: BillingCronCounts,
+  fail = true,
+) {
   try {
-    const due = await billingDb.revertsDue(env, BILLING_CRON_LIMITS.reverts);
+    const due = await billingDb.revertsDue(env, BILLING_CRON_LIMITS.reverts, fail);
     if (due.failed > 0) {
       counts.revertFailed += due.failed;
       logError(requestId, 'price_revert_failed', new Error(String(due.failed)));

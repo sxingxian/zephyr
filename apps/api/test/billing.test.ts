@@ -121,7 +121,7 @@ interface FakeStripe {
   invoicePayments: { list: Fn };
   refunds: { create: Fn };
   subscriptionSchedules: { create: Fn; retrieve: Fn; update: Fn; release: Fn };
-  invoices: { createPreview: Fn; list: Fn };
+  invoices: { createPreview: Fn; list: Fn; voidInvoice: Fn };
   billingPortal: { sessions: { create: Fn } };
   prices: { retrieve: Fn; list: Fn; create: Fn };
 }
@@ -145,6 +145,7 @@ function subscription(
     price: unknown;
     schedule: unknown;
     cancel: boolean;
+    canceledAt: number | null;
     meta: Record<string, string>;
   }> = {},
 ) {
@@ -154,6 +155,7 @@ function subscription(
     customer: CUS,
     status: o.status ?? 'active',
     cancel_at_period_end: o.cancel ?? false,
+    canceled_at: o.canceledAt ?? null,
     metadata: o.meta ?? { owner_id: MEI.id },
     schedule: o.schedule ?? null,
     pending_update: null,
@@ -169,6 +171,17 @@ function subscription(
     },
   };
 }
+
+/** Metadata our deletion request leaves (the flag and when it was set), as on a subscription it stopped. */
+const DEL_META = { owner_id: MEI.id, zephyr_deletion_cancel: '1', zephyr_deletion_cancel_at: String(NOW) };
+/** A subscription our deletion request set to cancel (Stripe's canceled_at = when the request was made). */
+const stoppedByDeletion = () => subscription({ cancel: true, canceledAt: NOW, meta: DEL_META });
+/** The metadata our cancel sends; the time is checked loosely. */
+const deletionCancelMeta = {
+  zephyr_deletion_cancel: '1',
+  zephyr_deletion_cancel_at: expect.stringMatching(/^\d+$/),
+};
+const deletionResumeMeta = { zephyr_deletion_cancel: '', zephyr_deletion_cancel_at: '' };
 
 beforeAll(initKeys);
 beforeEach(() => {
@@ -214,6 +227,7 @@ beforeEach(() => {
     },
     invoices: {
       list: vi.fn(async () => ({ data: [] })),
+      voidInvoice: vi.fn(async (id: string) => ({ id, status: 'void' })),
       createPreview: vi.fn(async () => ({
         amount_due: 954,
         currency: 'usd',
@@ -479,7 +493,9 @@ describe('Stripe webhook', () => {
     world.rpc.billing_duplicate_record = () => ({ recorded: true, refunded: false, canceled: false });
     world.rpc.billing_duplicate_mark = () => true;
     stripe.subscriptions.retrieve.mockImplementation(async (id: string) => ({ ...subscription(), id }));
-    stripe.invoices.list.mockResolvedValue({ data: [{ id: 'in_2' }] });
+    stripe.invoices.list.mockImplementation(async ({ status }: { status: string }) => ({
+      data: status === 'open' ? [{ id: 'in_open' }] : [{ id: 'in_2' }],
+    }));
     stripe.invoicePayments.list.mockResolvedValue({
       data: [
         { id: 'inpay_1', status: 'paid', payment: { type: 'payment_intent', payment_intent: 'pi_dup' } },
@@ -487,7 +503,7 @@ describe('Stripe webhook', () => {
     });
     const res = await deliver(stripeEvent('customer.subscription.created', { id: SUB2 }));
     expect(res.status).toBe(200);
-    // Recorded in our database (never on the Stripe object), refunded, then canceled.
+    // Recorded in our database (never on the Stripe object), canceled (open invoices voided), then refunded.
     expect(rpcArgs('billing_duplicate_record')).toEqual([{ p_owner: MEI.id, p_subscription: SUB2 }]);
     expect(stripe.subscriptions.update).not.toHaveBeenCalled();
     expect(stripe.subscriptions.cancel).toHaveBeenCalledWith(
@@ -495,8 +511,13 @@ describe('Stripe webhook', () => {
       { prorate: false, invoice_now: false },
       { idempotencyKey: `dup-cancel:${SUB2}` },
     );
-    expect(stripe.refunds.create.mock.invocationCallOrder[0]).toBeLessThan(
-      stripe.subscriptions.cancel.mock.invocationCallOrder[0] as number,
+    expect(stripe.subscriptions.cancel.mock.invocationCallOrder[0]).toBeLessThan(
+      stripe.refunds.create.mock.invocationCallOrder[0] as number,
+    );
+    expect(stripe.invoices.voidInvoice).toHaveBeenCalledWith(
+      'in_open',
+      {},
+      { idempotencyKey: 'dup-void:in_open' },
     );
     expect(stripe.invoices.list).toHaveBeenCalledWith({ subscription: SUB2, status: 'paid', limit: 24 });
     expect(stripe.invoicePayments.list).toHaveBeenCalledWith({ invoice: 'in_2', status: 'paid', limit: 10 });
@@ -505,13 +526,13 @@ describe('Stripe webhook', () => {
       { idempotencyKey: 'dup-refund:pi_dup' },
     );
     expect(rpcArgs('billing_duplicate_mark')).toEqual([
-      { p_subscription: SUB2, p_what: 'refunded' },
       { p_subscription: SUB2, p_what: 'canceled' },
+      { p_subscription: SUB2, p_what: 'refunded' },
     ]);
     expect(world.emails).toHaveLength(0);
   });
 
-  it('leaves the duplicate live (to retry) when the refund fails, and never marks it refunded', async () => {
+  it('cancels the duplicate even when the refund fails, and leaves the refund to retry', async () => {
     const SUB2 = 'sub_Second2';
     world.rpc.billing_apply = () => ({
       applied: false,
@@ -532,8 +553,63 @@ describe('Stripe webhook', () => {
     );
     const res = await deliver(stripeEvent('customer.subscription.created', { id: SUB2 }));
     expect(res.status).toBe(500);
-    expect(stripe.subscriptions.cancel).not.toHaveBeenCalled();
-    expect(rpcArgs('billing_duplicate_mark')).toEqual([]);
+    // It can't bill again; the refund waits for the retry (webhook, then the daily cron).
+    expect(stripe.subscriptions.cancel).toHaveBeenCalledTimes(1);
+    expect(rpcArgs('billing_duplicate_mark')).toEqual([{ p_subscription: SUB2, p_what: 'canceled' }]);
+  });
+
+  it('cancels an unpaid duplicate too, and refunds again on later events once it is canceled', async () => {
+    const SUB2 = 'sub_Second2';
+    world.rpc.billing_apply = () => ({
+      applied: false,
+      duplicate: true,
+      recorded: true,
+      refunded: true,
+      canceled: false,
+      planBefore: 'pro',
+      planAfter: 'pro',
+    });
+    world.rpc.billing_duplicate_mark = () => true;
+    stripe.subscriptions.retrieve.mockImplementation(async (id: string) => ({
+      ...subscription({ status: 'unpaid' }),
+      id,
+    }));
+    await deliver(stripeEvent('customer.subscription.updated', { id: SUB2 }, 'evt_unpaid'));
+    expect(stripe.subscriptions.cancel).toHaveBeenCalledWith(
+      SUB2,
+      { prorate: false, invoice_now: false },
+      { idempotencyKey: `dup-cancel:${SUB2}` },
+    );
+    // Canceled and refunded before: a later event (a payment landing late) runs the refunds again.
+    world.rpc.billing_apply = () => ({
+      applied: false,
+      duplicate: true,
+      recorded: true,
+      refunded: true,
+      canceled: true,
+      planBefore: 'pro',
+      planAfter: 'pro',
+    });
+    stripe.subscriptions.retrieve.mockImplementation(async (id: string) => ({
+      ...subscription({ status: 'canceled' }),
+      id,
+    }));
+    stripe.invoices.list.mockResolvedValue({ data: [{ id: 'in_late' }] });
+    stripe.invoicePayments.list.mockResolvedValue({
+      data: [{ id: 'p_late', status: 'paid', payment: { payment_intent: 'pi_late' } }],
+    });
+    await deliver(
+      stripeEvent(
+        'invoice.paid',
+        { id: 'in_late', parent: { subscription_details: { subscription: SUB2 } } },
+        'evt_late',
+      ),
+    );
+    expect(stripe.refunds.create).toHaveBeenCalledWith(
+      { payment_intent: 'pi_late', reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
+      { idempotencyKey: 'dup-refund:pi_late' },
+    );
+    expect(stripe.subscriptions.cancel).toHaveBeenCalledTimes(1);
   });
 
   it('treats a disputed or already refunded charge as settled and still cancels', async () => {
@@ -785,13 +861,25 @@ describe('mapping', () => {
     expect(s.scheduled_at).toBe(new Date((NOW + 20 * DAY) * 1000).toISOString());
   });
 
-  it('records whether a deletion request set the cancel', () => {
+  it('records whether a deletion request set the cancel (only that cancel, never a later one of the member’s)', () => {
     expect(snapshot(subscription({ cancel: true }) as never).deletion_cancel).toBe(false);
+    expect(snapshot(stoppedByDeletion() as never).deletion_cancel).toBe(true);
+    // A stale flag left after the member renewed, then a cancel of their own days later: not ours.
+    expect(
+      snapshot(subscription({ cancel: true, canceledAt: NOW + 3 * DAY, meta: DEL_META }) as never)
+        .deletion_cancel,
+    ).toBe(false);
+    // The flag without its time (or not set to cancel at all): not ours.
     expect(
       snapshot(
-        subscription({ cancel: true, meta: { owner_id: MEI.id, zephyr_deletion_cancel: '1' } }) as never,
+        subscription({
+          cancel: true,
+          canceledAt: NOW,
+          meta: { owner_id: MEI.id, zephyr_deletion_cancel: '1' },
+        }) as never,
       ).deletion_cancel,
-    ).toBe(true);
+    ).toBe(false);
+    expect(snapshot(subscription({ canceledAt: NOW, meta: DEL_META }) as never).deletion_cancel).toBe(false);
   });
 
   it('classifies plan changes', () => {
@@ -1155,8 +1243,9 @@ describe('plan changes', () => {
     expect(stripe.subscriptions.update).not.toHaveBeenCalled();
     expect(stripe.subscriptionSchedules.release).not.toHaveBeenCalled();
     expect(stripe.invoices.createPreview).not.toHaveBeenCalled();
-    // An unexpanded schedule id is treated the same.
+    // An unexpanded schedule id is read and treated the same.
     stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: 'sub_sched_1' }));
+    stripe.subscriptionSchedules.retrieve.mockResolvedValue(scheduledToYearly());
     const again = await call(BILLING_API.change, { jar: j, body: { plan: 'studio', interval: 'month' } });
     expect(again.status).toBe(409);
     expect((await read(again)).reason).toBe('scheduled_change');
@@ -1171,6 +1260,63 @@ describe('plan changes', () => {
     stripe.subscriptions.retrieve.mockResolvedValue(subscription());
     const up = await call(BILLING_API.change, { jar: j, body: { plan: 'studio', interval: 'month' } });
     expect(up.status).toBe(200);
+  });
+
+  it('treats a schedule whose change already happened as none: releases it and upgrades', async () => {
+    // A yearly downgrade's last phase started months ago: Stripe keeps the schedule until that phase ends.
+    const finished = {
+      id: 'sub_sched_done',
+      status: 'active',
+      phases: [
+        { start_date: NOW - 400 * DAY, items: [{ price: price('price_studio_y', 'studio', 'year') }] },
+        { start_date: NOW - 30 * DAY, items: [{ price: price('price_pro_y', 'pro', 'year') }] },
+      ],
+    };
+    stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: finished }));
+    const j = await signedIn();
+    // The preview says nothing is scheduled and changes nothing in Stripe.
+    const preview = await call(BILLING_API.changePreview, {
+      jar: j,
+      body: { plan: 'studio', interval: 'month' },
+    });
+    expect(preview.status).toBe(200);
+    expect(stripe.subscriptionSchedules.release).not.toHaveBeenCalled();
+    const res = await call(BILLING_API.change, { jar: j, body: { plan: 'studio', interval: 'month' } });
+    expect(res.status).toBe(200);
+    expect(stripe.subscriptionSchedules.release).toHaveBeenCalledWith(
+      'sub_sched_done',
+      {},
+      { idempotencyKey: 'release:sub_sched_done' },
+    );
+    expect(stripe.subscriptionSchedules.release.mock.invocationCallOrder[0]).toBeLessThan(
+      stripe.subscriptions.update.mock.invocationCallOrder[0] as number,
+    );
+  });
+
+  it('releases a finished schedule when it reads the subscription, and records no scheduled change', async () => {
+    const finished = {
+      id: 'sub_sched_done',
+      status: 'active',
+      phases: [{ start_date: NOW - 30 * DAY, items: [{ price: price('price_pro_y', 'pro', 'year') }] }],
+    };
+    stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: finished }));
+    await deliver(stripeEvent('customer.subscription.updated', { id: SUB }, 'evt_fin'));
+    expect(stripe.subscriptionSchedules.release).toHaveBeenCalledWith(
+      'sub_sched_done',
+      {},
+      { idempotencyKey: 'release:sub_sched_done' },
+    );
+    expect(rpcArgs('billing_apply').at(-1)?.p_sub).toMatchObject({ schedule_id: null, scheduled_at: null });
+    // Best-effort: a failed release is logged and the read still applies.
+    stripe.subscriptionSchedules.release.mockRejectedValueOnce(
+      new Stripe.errors.StripeAPIError({ message: 'down', type: 'api_error' }),
+    );
+    const r = await deliver(stripeEvent('customer.subscription.updated', { id: SUB }, 'evt_fin2'));
+    expect(r.status).toBe(200);
+    expect(rpcArgs('billing_apply').at(-1)?.p_sub).toMatchObject({
+      schedule_id: 'sub_sched_done',
+      scheduled_at: null,
+    });
   });
 
   it('ignores a schedule that has already ended', async () => {
@@ -1379,6 +1525,42 @@ describe('price-move cron', () => {
     expect(marks).toEqual([{ p_id: 'mv_1', p_status: 'moved' }]);
   });
 
+  it('waits while a downgrade is still to come, and releases a finished schedule before swapping', async () => {
+    const marks: unknown[] = [];
+    world.rpc.price_move_mark = (a) => {
+      marks.push(a);
+      return { status: a.p_status };
+    };
+    const due = move({ status: 'notified', moveAt: new Date((NOW + DAY) * 1000).toISOString() });
+    world.rpc.price_moves_due = () => [due];
+    const onOld = (schedule: unknown) =>
+      subscription({ price: price('price_pro_m1', 'pro', 'month'), schedule });
+    // A downgrade is scheduled: its phases would undo the swap, so the move is skipped (the sweep plans again).
+    stripe.subscriptions.retrieve.mockResolvedValue(
+      onOld({
+        id: 'sub_sched_1',
+        status: 'active',
+        phases: [{ start_date: NOW - 10 * DAY }, { start_date: NOW + 20 * DAY }],
+      }),
+    );
+    expect(await runBillingCron(env)).toMatchObject({ moved: 0, skipped: 1 });
+    expect(stripe.subscriptions.update).not.toHaveBeenCalled();
+    // The schedule's change already happened: released first, then the price is swapped.
+    marks.length = 0;
+    stripe.subscriptions.retrieve.mockResolvedValue(
+      onOld({ id: 'sub_sched_done', status: 'active', phases: [{ start_date: NOW - 30 * DAY }] }),
+    );
+    expect(await runBillingCron(env)).toMatchObject({ moved: 1 });
+    expect(stripe.subscriptionSchedules.release).toHaveBeenCalledWith(
+      'sub_sched_done',
+      {},
+      { idempotencyKey: 'release:sub_sched_done' },
+    );
+    expect(stripe.subscriptionSchedules.release.mock.invocationCallOrder[0]).toBeLessThan(
+      stripe.subscriptions.update.mock.invocationCallOrder[0] as number,
+    );
+  });
+
   it('retries reverts Stop still owes, and alerts on ones the renewal reached first', async () => {
     const marks: unknown[] = [];
     world.rpc.price_move_mark = (a) => {
@@ -1386,12 +1568,21 @@ describe('price-move cron', () => {
       return null;
     };
     world.rpc.price_moves_due = () => [];
-    world.rpc.price_move_reverts_due = () => ({
-      failed: 2,
-      reverts: [
-        { moveId: 'mv_9', stripeSubscriptionId: SUB, fromPriceId: 'price_pro_m1', toPriceId: 'price_pro_m2' },
-      ],
-    });
+    // The second pass (after the moves) never counts failures, and here finds nothing new.
+    world.rpc.price_move_reverts_due = (a) =>
+      a.p_fail === false
+        ? { failed: 0, reverts: [] }
+        : {
+            failed: 2,
+            reverts: [
+              {
+                moveId: 'mv_9',
+                stripeSubscriptionId: SUB,
+                fromPriceId: 'price_pro_m1',
+                toPriceId: 'price_pro_m2',
+              },
+            ],
+          };
     stripe.subscriptions.retrieve.mockResolvedValue(
       subscription({ price: price('price_pro_m2', 'pro', 'month') }),
     );
@@ -1405,6 +1596,10 @@ describe('price-move cron', () => {
     );
     expect(marks).toEqual([{ p_id: 'mv_9', p_status: 'reverted' }]);
     expect(JSON.stringify(errors.mock.calls)).toContain('price_revert_failed');
+    expect(rpcArgs('price_move_reverts_due')).toEqual([
+      { p_limit: 100, p_fail: true },
+      { p_limit: 100, p_fail: false },
+    ]);
   });
 
   it('skips a move when the plan changed since the notice', async () => {
@@ -1440,7 +1635,7 @@ describe('price-move cron', () => {
     expect(world.emails.map((e) => e.subject)).toEqual(['Your Zephyr plan has ended']);
     expect(stripe.subscriptions.update.mock.calls[0]?.[1]).toEqual({
       cancel_at_period_end: true,
-      metadata: { zephyr_deletion_cancel: '1' },
+      metadata: deletionCancelMeta,
     });
   });
 
@@ -1500,14 +1695,12 @@ describe('price-move cron', () => {
     world.rpc.price_moves_due = () => [];
     world.rpc.billing_deletion_pending = () => false;
     world.rpc.billing_deletion_resumes_due = () => [{ ownerId: MEI.id, stripeSubscriptionId: SUB }];
-    stripe.subscriptions.retrieve.mockResolvedValue(
-      subscription({ cancel: true, meta: { owner_id: MEI.id, zephyr_deletion_cancel: '1' } }),
-    );
+    stripe.subscriptions.retrieve.mockResolvedValue(stoppedByDeletion());
     const counts = await runBillingCron(env);
     expect(counts.deletionResumes).toBe(1);
     expect(stripe.subscriptions.update.mock.calls[0]?.[1]).toEqual({
       cancel_at_period_end: false,
-      metadata: { zephyr_deletion_cancel: '' },
+      metadata: deletionResumeMeta,
     });
   });
 });
@@ -1531,7 +1724,7 @@ describe('account deletion and the subscription', () => {
     await cancelForDeletion(env, MEI.id, '2026-12-14T00:00:00Z');
     expect(stripe.subscriptions.update.mock.calls[0]?.[1]).toEqual({
       cancel_at_period_end: true,
-      metadata: { zephyr_deletion_cancel: '1' },
+      metadata: deletionCancelMeta,
     });
     // Restored: no longer pending deletion.
     world.rpc.billing_deletion_pending = () => false;
@@ -1540,13 +1733,11 @@ describe('account deletion and the subscription', () => {
     );
     await undoCancelForDeletion(env, MEI.id, true);
     expect(stripe.subscriptions.update).toHaveBeenCalledTimes(1); // the member had cancelled themselves
-    stripe.subscriptions.retrieve.mockResolvedValue(
-      subscription({ cancel: true, meta: { zephyr_deletion_cancel: '1' } }),
-    );
+    stripe.subscriptions.retrieve.mockResolvedValue(stoppedByDeletion());
     await undoCancelForDeletion(env, MEI.id, { restored: true, stripeSubscriptionId: SUB });
     expect(stripe.subscriptions.update.mock.calls[1]?.[1]).toEqual({
       cancel_at_period_end: false,
-      metadata: { zephyr_deletion_cancel: '' },
+      metadata: deletionResumeMeta,
     });
     expect(stripe.subscriptions.update.mock.calls[1]?.[2]).toMatchObject({
       idempotencyKey: expect.stringMatching(/^deletion-resume:/),
@@ -1554,9 +1745,7 @@ describe('account deletion and the subscription', () => {
   });
 
   it('never resumes while the deletion is pending again', async () => {
-    stripe.subscriptions.retrieve.mockResolvedValue(
-      subscription({ cancel: true, meta: { zephyr_deletion_cancel: '1' } }),
-    );
+    stripe.subscriptions.retrieve.mockResolvedValue(stoppedByDeletion());
     await undoCancelForDeletion(env, MEI.id, { restored: true, stripeSubscriptionId: SUB });
     expect(stripe.subscriptions.update).not.toHaveBeenCalled();
   });
@@ -1571,9 +1760,11 @@ describe('account deletion and the subscription', () => {
     let current = subscription();
     stripe.subscriptions.retrieve.mockImplementation(async () => current);
     stripe.subscriptions.update.mockImplementation(async (_id: string, p: Record<string, unknown>) => {
+      const meta = p.metadata as Record<string, string>;
       current = subscription({
         cancel: Boolean(p.cancel_at_period_end),
-        meta: { owner_id: MEI.id, zephyr_deletion_cancel: p.cancel_at_period_end ? '1' : '' },
+        canceledAt: p.cancel_at_period_end ? Number(meta.zephyr_deletion_cancel_at) : null,
+        meta: { owner_id: MEI.id, ...meta },
       });
       return current;
     });
@@ -1583,6 +1774,27 @@ describe('account deletion and the subscription', () => {
         (c) => (c[1] as { cancel_at_period_end: boolean }).cancel_at_period_end,
       ),
     ).toEqual([true, false]);
+  });
+
+  it('clears a deletion flag left on a subscription that renews again, so a later cancel of the member’s never carries it', async () => {
+    stripe.subscriptions.retrieve.mockResolvedValue(
+      subscription({ cancel: false, canceledAt: null, meta: DEL_META }),
+    );
+    await deliver(stripeEvent('customer.subscription.updated', { id: SUB }, 'evt_renewed'));
+    expect(stripe.subscriptions.update).toHaveBeenCalledWith(
+      SUB,
+      { metadata: deletionResumeMeta },
+      { idempotencyKey: expect.stringMatching(/^deletion-flag-clear:sub_Mei123:/) },
+    );
+    expect(rpcArgs('billing_apply').at(-1)?.p_sub).toMatchObject({ deletion_cancel: false });
+    // And a cancel the member makes later (the flag survived, say the clear failed) is never resumed.
+    stripe.subscriptions.update.mockClear();
+    world.rpc.billing_deletion_pending = () => false;
+    stripe.subscriptions.retrieve.mockResolvedValue(
+      subscription({ cancel: true, canceledAt: NOW + 5 * DAY, meta: DEL_META }),
+    );
+    await undoCancelForDeletion(env, MEI.id, { restored: true, stripeSubscriptionId: SUB });
+    expect(stripe.subscriptions.update).not.toHaveBeenCalled();
   });
 
   it('does nothing when the account was restored before the cancel started', async () => {
