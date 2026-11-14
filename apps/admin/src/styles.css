@@ -877,3 +877,115 @@ a.anav__item:hover {
     gap: 6px;
   }
 }
+
+/* ---- Plans & billing (phase 7) ---- */
+.bl-kpi__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--ink2);
+}
+.bl-kpi__note--good {
+  color: var(--good);
+}
+.bl-kpi__note--warn {
+  color: var(--warn);
+}
+.bl-actions {
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+}
+.bl-change {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--warnTint);
+  color: var(--warn);
+  font-size: 13px;
+}
+.bl-change__text {
+  flex: 1 1 320px;
+  line-height: 1.45;
+}
+.bl-email {
+  overflow-wrap: anywhere;
+}
+.bl-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.bl-events__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.bl-events__type {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.bl-events__spacer {
+  flex: 1;
+}
+.bl-events__at {
+  min-width: 70px;
+  text-align: right;
+}
+.bl-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.bl-dialog__pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
+  gap: 12px;
+}
+.bl-impact {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  overflow: hidden;
+}
+.bl-impact__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 14px;
+  font-size: 13.5px;
+  color: var(--ink2);
+}
+.bl-impact__row + .bl-impact__row {
+  border-top: 1px solid var(--line);
+}
+.bl-impact__row > span:first-child {
+  color: var(--ink);
+}
+.bl-impact__row > span:last-child {
+  text-align: right;
+}
+.bl-dialog__note {
+  margin: 0;
+  display: flex;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--bg2);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.bl-dialog__note svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}

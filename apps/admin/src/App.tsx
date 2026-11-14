@@ -4,6 +4,7 @@ import { createBrowserRouter, Navigate, Outlet, type RouteObject, useNavigate } 
 import { AdminSessionProvider, useAdminSession } from './lib/session';
 import { AiControls } from './routes/AiControls';
 import { AiJobs } from './routes/AiJobs';
+import { Billing } from './routes/Billing';
 import { Enrol } from './routes/Enrol';
 import { SignIn } from './routes/SignIn';
 import { Signups } from './routes/Signups';
@@ -86,6 +87,14 @@ export const routes: RouteObject[] = [
         element: (
           <RequireStaff>
             <AiJobs />
+          </RequireStaff>
+        ),
+      },
+      {
+        path: '/billing',
+        element: (
+          <RequireStaff>
+            <Billing />
           </RequireStaff>
         ),
       },

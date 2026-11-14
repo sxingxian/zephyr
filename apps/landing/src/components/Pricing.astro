@@ -41,25 +41,24 @@ function features(p: Plan): [string, boolean][] {
     [`${l.seats} team seats`, true],
     ['Client proofing with favourites', true],
     ['Watermarks and gallery branding', l.branding],
-    ['Priority GPU queue', l.priorityQueue],
     ['Gallery access log', true],
   ];
 }
 ---
-<section id="pricing" class="section section--tint">
+<section id="pricing" class="section section--tint" data-pricing>
   <div class="wrap pricing">
     <header class="section-head section-head--center">
       <span class="eyebrow">Pricing</span>
       <h2 class="h2">Free once you’re in. Upgrade when the shoots get bigger.</h2>
       <p class="lede" style="text-align: center">
-        Zephyr is invite-only during early access. Every plan is open to you as soon as you join. Prices in brackets are
-        placeholders.
+        Zephyr is invite-only during early access. Every plan is open to you as soon as you join. Prices are in US
+        dollars; tax is added at checkout where it applies.
       </p>
     </header>
     <fieldset class="pricing__period">
       <legend class="sr-only">Billing period</legend>
       <label><input type="radio" name="period" value="monthly" checked class="sr-only" />Monthly</label>
-      <label><input type="radio" name="period" value="yearly" class="sr-only" />Yearly · 2 months free</label>
+      <label><input type="radio" name="period" value="yearly" class="sr-only" /><span data-yearly-label>Yearly · 2 months free</span></label>
     </fieldset>
     <div class="grid-auto pricing__plans" style="--min: 300px">
       {
@@ -72,9 +71,9 @@ function features(p: Plan): [string, boolean][] {
             <div class="pricing__price">
               {p.priceYearly ? (
                 <>
-                  <span class="pricing__amount monthly">{p.priceMonthly}</span>
+                  <span class="pricing__amount monthly" data-price={`${p.id}:month`}>{p.priceMonthly}</span>
                   <span class="pricing__per monthly">per month</span>
-                  <span class="pricing__amount yearly">{p.priceYearly}</span>
+                  <span class="pricing__amount yearly" data-price={`${p.id}:year`}>{p.priceYearly}</span>
                   <span class="pricing__per yearly">per year</span>
                 </>
               ) : (
@@ -104,11 +103,16 @@ function features(p: Plan): [string, boolean][] {
       <Icon name="breeze" size={18} />
       <span>
         Zephyr AI on your device is free and unlimited on every plan. Cloud credits are only for studio background
-        removal, at 1 credit per photo. Top up <strong>{CREDIT_TOP_UP.credits} credits for {CREDIT_TOP_UP.price}</strong> on any plan.
+        removal, at 1 credit per photo. Top up <strong data-pack>{CREDIT_TOP_UP.credits} credits for {CREDIT_TOP_UP.price}</strong> on any plan.
       </span>
     </p>
   </div>
 </section>
+<script>
+  import { initPricing } from '../scripts/pricing';
+  const root = document.querySelector<HTMLElement>('[data-pricing]');
+  if (root) void initPricing(root);
+</script>
 <style>
   .pricing {
     display: flex;
