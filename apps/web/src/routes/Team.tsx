@@ -482,6 +482,17 @@ function OwnerTeam() {
         }}
       >
         <p>They lose access to your library straight away. Edits they made stay in your library.</p>
+        {removing && removing.liveGalleries > 0 && (
+          <Note tone="warn" icon="alert">
+            {`${removing.displayName || 'They'} could open ${
+              removing.liveGalleries === 1
+                ? '1 live gallery link'
+                : `${removing.liveGalleries} live gallery links`
+            } and may have copied ${removing.liveGalleries === 1 ? 'it' : 'them'}. Removing them doesn’t change the links. `}
+            In <Link to="/shared">Shared galleries</Link>, set a new passcode or end any gallery you’re
+            concerned about.
+          </Note>
+        )}
       </ConfirmDialog>
     </>
   );

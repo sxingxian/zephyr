@@ -37,6 +37,28 @@ describe('invite links', () => {
     expect(args).toMatch(/\\\\x[0-9a-f]{64}/);
   });
 
+  it('masks the address of a Studio team invite (the link may have been forwarded)', async () => {
+    world.rpc.preview_invite = () => ({
+      ...live,
+      source: 'team',
+      emailHint: 'w•••@example.com',
+      inviterName: 'Tan Studio',
+    });
+    const res = await call('/api/v1/invites/preview', { body: { token: TOKEN } });
+    expect(res.status).toBe(200);
+    const body = await read(res);
+    expect(body.email).toBe('w•••@example.com');
+    expect(JSON.stringify(body)).not.toContain('wei@example.com');
+    expect(body.inviterName).toBe('Tan Studio');
+  });
+
+  it('redeems a Studio team invite with its real address', async () => {
+    world.rpc.preview_invite = () => ({ ...live, source: 'team', emailHint: 'w•••@example.com' });
+    const res = await call('/api/v1/invites/redeem', { body: { token: TOKEN }, jar: jar() });
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(gotrue('/admin/users')[0]?.body)).toContain('wei@example.com');
+  });
+
   it('unknown, malformed and dead tokens all look the same', async () => {
     world.rpc.preview_invite = () => null;
     const a = await call('/api/v1/invites/preview', { body: { token: TOKEN } });

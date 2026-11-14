@@ -356,3 +356,54 @@ describe('team invite accept', () => {
     expect(await screen.findByText('This invite link doesn’t work')).toBeTruthy();
   });
 });
+
+// ---------------------------------------------------------------- team removal
+describe('removing a teammate', () => {
+  const member = (liveGalleries: number) => ({
+    userId: '33333333-3333-4333-8333-333333333333',
+    email: 'aisha@example.com',
+    displayName: 'Aisha M.',
+    role: 'viewer' as const,
+    addedAt: '2026-11-01T00:00:00Z',
+    suspended: false,
+    liveGalleries,
+  });
+  const team = (liveGalleries: number) => ({
+    name: 'Jun’s Studio',
+    seats: 3,
+    used: 2,
+    available: true,
+    invites: [],
+    members: [
+      {
+        userId: ME,
+        email: 'jun@example.com',
+        displayName: 'Jun Hao',
+        role: 'owner' as const,
+        addedAt: '2026-10-28T00:00:00Z',
+        suspended: false,
+        liveGalleries: 0,
+      },
+      member(liveGalleries),
+    ],
+  });
+
+  it('warns that gallery links they could open still work', async () => {
+    mockApi((url) => (url === '/api/v1/team' ? json(200, { ok: true, team: team(2) }) : undefined));
+    renderAt('/settings/team');
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove Aisha M. from the team' }));
+    const note = (await screen.findByText(/could open 2 live gallery links/)).closest(
+      '[role="dialog"], dialog',
+    );
+    const link = [...(note?.querySelectorAll('a') ?? [])].find((a) => a.textContent === 'Shared galleries');
+    expect(link?.getAttribute('href')).toBe('/shared');
+  });
+
+  it('says nothing about galleries for someone who never had Editor access', async () => {
+    mockApi((url) => (url === '/api/v1/team' ? json(200, { ok: true, team: team(0) }) : undefined));
+    renderAt('/settings/team');
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove Aisha M. from the team' }));
+    await screen.findByText(/lose access to your library straight away/);
+    expect(screen.queryByText(/live gallery link/)).toBeNull();
+  });
+});

@@ -40,6 +40,9 @@ const INVALID = () => fail('invite_invalid');
 interface PreviewRow {
   id: string;
   email: string;
+  /** j•••@example.com: what the preview shows for a team invite (phase 7). */
+  emailHint?: string;
+  source?: string;
   inviterName: string | null;
   expiresAt: string;
 }
@@ -89,7 +92,9 @@ inviteRoutes.post('/preview', async (c) => {
     if (!row) return c.json(INVALID(), 404);
     const out: InvitePreview = {
       ok: true,
-      email: row.email,
+      // A Studio team's invite link may have been forwarded: show the masked address, never the full one.
+      // Redeeming still uses the invite's real address server-side, so nothing else changes.
+      email: row.source === 'team' ? (row.emailHint ?? '') : row.email,
       inviterName: row.inviterName ?? null,
       expiresAt: row.expiresAt,
     };

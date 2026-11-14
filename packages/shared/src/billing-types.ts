@@ -129,6 +129,11 @@ export interface TeamMember {
   addedAt: string;
   /** Beyond the plan's seats (Admin lowered seats, or the plan changed): no access until someone is removed. */
   suspended: boolean;
+  /**
+   * Live gallery links this member could have opened (they have had Editor access here); 0 otherwise. Removing
+   * them doesn't change those links, so the Team page warns and points to Shared galleries.
+   */
+  liveGalleries: number;
 }
 export interface TeamInvite {
   id: string;

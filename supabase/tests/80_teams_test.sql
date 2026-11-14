@@ -152,6 +152,90 @@ update public.profiles set deletion_requested_at = null, deletion_due = null whe
 delete from auth.users where id = :jun;
 select pg_temp.ok(not exists (select 1 from public.library_members where member_id = :jun), 'deleting a member''s account removes their memberships');
 
+-- ---- Security review fixes -----------------------------------------------------------------------------
+insert into auth.users (id, email, email_confirmed_at) values
+  ('c8200000-0000-0000-0000-000000000001', 'anon.owner@example.com', now()),
+  ('c8200000-0000-0000-0000-000000000002', 'ed.member@example.com', now());
+update public.profiles set plan_id = 'studio' where id = 'c8200000-0000-0000-0000-000000000001';
+\set ao '\'c8200000-0000-0000-0000-000000000001\''
+\set ed '\'c8200000-0000-0000-0000-000000000002\''
+
+-- Names never show any part of an email address to teammates or invitees.
+select public.team_invite_create(:ao, 'someone.new@example.com', 'editor', pg_temp.h('r-new')) as rnew \gset
+select pg_temp.ok(:'rnew'::jsonb ->> 'ownerName' = 'Studio owner' and :'rnew'::jsonb ->> 'teamName' = 'Studio team'
+  and public.team_invite_preview(pg_temp.h('r-new')) ->> 'ownerName' = 'Studio owner'
+  and public.team_invite_preview(pg_temp.h('r-new')) ->> 'teamName' = 'Studio team',
+  'an owner without a display name is "Studio owner" of "Studio team", never their address');
+select pg_temp.ok(public.list_libraries(:free) #>> '{0,name}' = 'free.team', 'a member''s own library can still use their own address');
+select pg_temp.ok(public.preview_invite(pg_temp.h('r-new')) ->> 'emailHint' = 's•••@example.com'
+  and public.preview_invite(pg_temp.h('r-new')) ->> 'source' = 'team'
+  and public.preview_invite(pg_temp.h('r-new')) ->> 'inviterName' = 'Studio team',
+  'the sign-up page preview of a team link carries a masked hint and the team name');
+
+-- A team that stops being usable: its invites don't work anywhere, even before they are revoked.
+select signup_mode::text as saved_mode from public.app_settings where id = 1 \gset
+update public.app_settings set signup_mode = 'invite_only' where id = 1;
+select pg_temp.ok(public.hook_before_user_created(jsonb_build_object('user', jsonb_build_object('email', 'someone.new@example.com'))) = '{}'::jsonb,
+  'a live team invite allows an invite-only sign-up');
+alter table public.profiles disable trigger profiles_team_guard;
+update public.profiles set plan_id = 'pro' where id = :ao;
+select pg_temp.ok(public.preview_invite(pg_temp.h('r-new')) is null and public.team_invite_preview(pg_temp.h('r-new')) is null,
+  'a downgraded owner''s invite previews as nothing (sign-up page and team page)');
+select pg_temp.ok(public.hook_before_user_created(jsonb_build_object('user', jsonb_build_object('email', 'someone.new@example.com'))) ? 'error',
+  'and no longer allows an invite-only sign-up');
+select pg_temp.ok(public.team_invite_resend(:ao, (:'rnew'::jsonb #>> '{invite,id}')::uuid, pg_temp.h('r-new2')) ->> 'error' = 'plan_required',
+  'resending needs team seats');
+insert into auth.users (id, email, email_confirmed_at) values ('c8200000-0000-0000-0000-000000000003', 'someone.new@example.com', now());
+select pg_temp.ok(not exists (select 1 from public.library_members where member_id = 'c8200000-0000-0000-0000-000000000003'),
+  'confirming an account doesn''t join a team that is no longer usable');
+alter table public.profiles enable trigger profiles_team_guard;
+update public.profiles set plan_id = 'studio' where id = :ao;
+update public.app_settings set signup_mode = :'saved_mode' where id = 1;
+
+-- Open invites are revoked when the team stops being usable.
+select public.team_invite_create(:ao, 'later.one@example.com', 'viewer', pg_temp.h('r-later')) as rlater \gset
+select pg_temp.ok(:'rlater'::jsonb ->> 'error' is null, 'a Studio owner can invite again');
+update public.profiles set plan_id = 'pro' where id = :ao;
+select pg_temp.ok((select revoked_at is not null from public.invites where token_hash = pg_temp.h('r-later')),
+  'dropping to a plan with one seat revokes open team invites');
+update public.profiles set plan_id = 'studio' where id = :ao;
+select public.team_invite_create(:ao, 'later.two@example.com', 'viewer', pg_temp.h('r-later2')) as rl2 \gset
+select public.request_account_deletion(:ao) is not null as scheduled \gset
+select pg_temp.ok(:'scheduled' and (select revoked_at is not null from public.invites where token_hash = pg_temp.h('r-later2')),
+  'scheduling the owner''s deletion revokes open team invites');
+select public.restore_account(:ao) as restored \gset
+select public.team_invite_create(:ao, 'later.three@example.com', 'viewer', pg_temp.h('r-later3')) as rl3 \gset
+delete from auth.users where id = :ao;
+select pg_temp.ok((select revoked_at is not null from public.invites where token_hash = pg_temp.h('r-later3'))
+  and public.preview_invite(pg_temp.h('r-later3')) is null, 'purging the owner''s account leaves no live invite behind');
+
+-- At most 30 team invites a month per owner.
+insert into auth.users (id, email, email_confirmed_at) values ('c8200000-0000-0000-0000-000000000004', 'cap.owner@example.com', now());
+update public.profiles set plan_id = 'studio', display_name = 'Cap' where id = 'c8200000-0000-0000-0000-000000000004';
+with inv as (
+  insert into public.invites (email, token_hash, source, invited_by, expires_at, revoked_at)
+  select 'cap' || n || '@example.com', pg_temp.h('cap-' || n), 'team', 'c8200000-0000-0000-0000-000000000004', now() + interval '7 days', now()
+    from generate_series(1, 30) n returning id)
+insert into public.team_invites (owner_id, invite_id, role) select 'c8200000-0000-0000-0000-000000000004', id, 'viewer' from inv;
+select pg_temp.ok(public.team_invite_create('c8200000-0000-0000-0000-000000000004', 'cap31@example.com', 'viewer', pg_temp.h('cap-31')) ->> 'error' = 'limit_reached',
+  'the 31st team invite in a month is refused, even with free seats');
+
+-- Members who had Editor access carry the live-gallery count for the removal warning.
+insert into auth.users (id, email, email_confirmed_at) values ('c8200000-0000-0000-0000-000000000005', 'gal.owner@example.com', now());
+update public.profiles set plan_id = 'studio', display_name = 'Gal' where id = 'c8200000-0000-0000-0000-000000000005';
+insert into public.library_members (owner_id, member_id, role, had_editor) values
+  ('c8200000-0000-0000-0000-000000000005', :ed, 'viewer', false);
+insert into public.galleries (id, owner_id, name, token_hash, link_hint, link_ciphertext, link_iv, downloads, expires_at)
+values (gen_random_uuid(), 'c8200000-0000-0000-0000-000000000005', 'Live', pg_temp.h('g-live'), 'abcd', decode(repeat('00', 32), 'hex'), decode(repeat('00', 12), 'hex'), 'web', now() + interval '7 days'),
+       (gen_random_uuid(), 'c8200000-0000-0000-0000-000000000005', 'Ended', pg_temp.h('g-ended'), 'efgh', decode(repeat('00', 32), 'hex'), decode(repeat('00', 12), 'hex'), 'web', now() - interval '1 day');
+select pg_temp.ok((public.team_get('c8200000-0000-0000-0000-000000000005') #>> '{members,1,liveGalleries}')::int = 0,
+  'a Viewer who never edited could open no gallery links');
+select public.team_member_set_role('c8200000-0000-0000-0000-000000000005', :ed, 'editor') as r1 \gset
+select public.team_member_set_role('c8200000-0000-0000-0000-000000000005', :ed, 'viewer') as r2 \gset
+select pg_temp.ok(:'r1' and :'r2'
+  and (public.team_get('c8200000-0000-0000-0000-000000000005') #>> '{members,1,liveGalleries}')::int = 1,
+  'once an Editor, always counted: 1 live gallery (ended ones don''t count)');
+
 -- ---- Privileges ----------------------------------------------------------------------------------------
 select pg_temp.ok(not exists (
   select 1 from unnest(array['teams', 'library_members', 'team_invites']) t
@@ -164,6 +248,10 @@ select pg_temp.ok(not has_function_privilege('authenticated', 'public.library_ac
   and has_function_privilege('service_role', 'public.library_access(uuid, uuid)', 'execute')
   and not has_function_privilege('service_role', 'public._team_join(uuid, uuid, text, uuid, boolean)', 'execute'),
   'only the API checks library access; helpers aren''t callable');
+select pg_temp.ok(has_function_privilege('supabase_auth_admin', 'public._team_invite_usable(uuid)', 'execute')
+  and not has_function_privilege('authenticated', 'public._team_invite_usable(uuid)', 'execute')
+  and not has_function_privilege('anon', 'public._team_invite_usable(uuid)', 'execute'),
+  'the sign-up hook can check team invites; browsers can''t');
 
 rollback;
 \echo 'All teams tests passed.'

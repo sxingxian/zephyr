@@ -52,6 +52,7 @@ const TEAM: Team = {
       role: 'owner',
       addedAt: '2026-11-01T00:00:00Z',
       suspended: false,
+      liveGalleries: 0,
     },
     {
       userId: JUN.id,
@@ -60,6 +61,7 @@ const TEAM: Team = {
       role: 'editor',
       addedAt: '2026-11-02T00:00:00Z',
       suspended: false,
+      liveGalleries: 0,
     },
   ],
   invites: [],
