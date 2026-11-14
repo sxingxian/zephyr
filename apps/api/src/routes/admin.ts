@@ -54,6 +54,7 @@ import {
 import { rpc, UpstreamError } from '../supabase';
 import type { HonoEnv, StaffContext } from '../types';
 import { registerAdminAiRoutes } from './admin-ai';
+import { registerAdminBillingRoutes } from './admin-billing';
 import { sendInvite } from './invites';
 
 const WINDOW = 15 * 60;
@@ -619,3 +620,6 @@ adminRoutes.post('/v1/signups/requests/decide', requireStaff({ write: true }), a
 
 // ---- Zephyr AI (phase 6) ---------------------------------------------------------------------------
 registerAdminAiRoutes(adminRoutes, requireStaff);
+
+// ---- Plans & billing (phase 7) ---------------------------------------------------------------------------
+registerAdminBillingRoutes(adminRoutes, requireStaff);

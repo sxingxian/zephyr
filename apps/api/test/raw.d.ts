@@ -11,3 +11,8 @@ interface ImportMeta {
     options: { query: '?raw'; import: 'default'; eager: true },
   ): Record<string, T>;
 }
+
+declare module '*.mjs?raw' {
+  const text: string;
+  export default text;
+}
