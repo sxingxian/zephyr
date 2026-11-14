@@ -23,6 +23,7 @@ import { errorMessage } from '../lib/api';
 import { emitLibrary } from '../lib/bus';
 import { renderQueue } from '../lib/editor/queue';
 import { bulk } from '../lib/library';
+import { canInLibrary, useActiveLibrary } from '../lib/libraryContext';
 import { type PhotoList, usePhotoList } from '../lib/photos';
 import { type Selection, useSelection } from '../lib/selection';
 import { useSession } from '../lib/session';
@@ -77,14 +78,40 @@ export function useLibraryActions(list: PhotoList, sel: Selection, extra: BarAct
   const editing = useEditActions(list, sel);
   const sharing = useShareGallery();
   const ai = useAiBatch();
+  // Phase 7: only what the member's role in this library allows (the API enforces it too).
+  const lib = useActiveLibrary();
+  const can = (a: Parameters<typeof canInLibrary>[1]) => canInLibrary(lib, a);
   const actions: BarAction[] = [
-    ...editing.actions,
-    ...(ai.available ? [{ icon: 'breeze' as const, label: 'Zephyr AI', onClick: () => ai.open(ids) }] : []),
-    { icon: 'folder', label: 'Add to album', onClick: () => setPicker(true) },
-    { icon: 'heart', label: allFav ? 'Unfavourite' : 'Favourite', onClick: favourite, busy: busy === 'fav' },
-    { icon: 'share', label: 'Share', onClick: () => sharing.open(ids) },
-    ...extra,
-    { icon: 'trash', label: 'Move to Trash', onClick: trash, busy: busy === 'trash', danger: true },
+    ...(can('edit') ? editing.actions : []),
+    ...(ai.available && can('ai')
+      ? [{ icon: 'breeze' as const, label: 'Zephyr AI', onClick: () => ai.open(ids) }]
+      : []),
+    ...(can('edit')
+      ? [
+          { icon: 'folder' as const, label: 'Add to album', onClick: () => setPicker(true) },
+          {
+            icon: 'heart' as const,
+            label: allFav ? 'Unfavourite' : 'Favourite',
+            onClick: favourite,
+            busy: busy === 'fav',
+          },
+        ]
+      : []),
+    ...(can('galleries')
+      ? [{ icon: 'share' as const, label: 'Share', onClick: () => sharing.open(ids) }]
+      : []),
+    ...(can('edit') ? extra : []),
+    ...(can('trash')
+      ? [
+          {
+            icon: 'trash' as const,
+            label: 'Move to Trash',
+            onClick: trash,
+            busy: busy === 'trash',
+            danger: true,
+          },
+        ]
+      : []),
   ];
   const pickerEl = (
     <>

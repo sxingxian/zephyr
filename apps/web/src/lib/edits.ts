@@ -14,6 +14,7 @@ import {
 } from '@zephyr/shared/client';
 import { api } from './api';
 import { expectedUser, ownerHeader, putBytes } from './library';
+import { withLibrary } from './libraryContext';
 
 /** Edit and recipe calls. Writes name the member this tab believes is signed in (409 session_changed). */
 export const getEdit = (photoId: string, signal?: AbortSignal) =>
@@ -96,6 +97,6 @@ export const deleteRecipe = (id: string) =>
 
 /** The unedited preview (always the original, even when the photo has an edit). */
 export const originalPreviewUrl = (id: string) =>
-  `${LIBRARY_API.photoFile(id, 'preview')}?${ORIGINAL_VARIANT_QUERY}`;
+  withLibrary(`${LIBRARY_API.photoFile(id, 'preview')}?${ORIGINAL_VARIANT_QUERY}`);
 export const originalThumbUrl = (id: string) =>
-  `${LIBRARY_API.photoFile(id, 'thumb')}?${ORIGINAL_VARIANT_QUERY}`;
+  withLibrary(`${LIBRARY_API.photoFile(id, 'thumb')}?${ORIGINAL_VARIANT_QUERY}`);

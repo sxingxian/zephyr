@@ -21,6 +21,7 @@ import {
   type VariantKind,
 } from '@zephyr/shared/client';
 import { ApiFailure, api, notifyFailure, toFailure } from './api';
+import { libraryHeaders, withLibrary } from './libraryContext';
 import { sessionUserId } from './sessionGuard';
 
 /** Builds the query string for GET /photos, leaving out empty values. */
@@ -148,7 +149,7 @@ export function putBytes(
     xhr.setRequestHeader('content-type', opts.contentType);
     xhr.setRequestHeader('accept', 'application/json');
     const who = opts.owner !== undefined ? ownerHeader(opts.owner) : expectedUser();
-    for (const [k, v] of Object.entries(who)) xhr.setRequestHeader(k, v);
+    for (const [k, v] of Object.entries({ ...libraryHeaders(), ...who })) xhr.setRequestHeader(k, v);
     xhr.upload.onprogress = (e) => opts.onProgress?.(e.loaded);
     xhr.onload = () => {
       done();
@@ -194,9 +195,9 @@ export const putVariant = (uploadId: string, kind: VariantKind, bytes: Blob, sig
 /** `editVersion` busts the browser's memory cache once an edited thumbnail exists (the server revalidates anyway). */
 const bust = (v?: number | null) => (v ? `?e=${v}` : '');
 export const thumbUrl = (id: string, editVersion?: number | null) =>
-  `${LIBRARY_API.photoFile(id, 'thumb')}${bust(editVersion)}`;
+  withLibrary(`${LIBRARY_API.photoFile(id, 'thumb')}${bust(editVersion)}`);
 export const previewUrl = (id: string, editVersion?: number | null) =>
-  `${LIBRARY_API.photoFile(id, 'preview')}${bust(editVersion)}`;
+  withLibrary(`${LIBRARY_API.photoFile(id, 'preview')}${bust(editVersion)}`);
 /** Cache key of a photo's current edited variants (0 when unedited or not rendered yet). */
 export const editKey = (p: Pick<PhotoItem, 'edit'>) => (p.edit?.rendered ? p.edit.version : 0);
-export const originalUrl = (id: string) => LIBRARY_API.photoFile(id, 'original');
+export const originalUrl = (id: string) => withLibrary(LIBRARY_API.photoFile(id, 'original'));

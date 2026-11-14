@@ -25,6 +25,7 @@ import {
   patchAlbum,
   thumbUrl,
 } from '../lib/library';
+import { useCan } from '../lib/libraryContext';
 import { usePhotoList } from '../lib/photos';
 import { useSelection } from '../lib/selection';
 import { EmptyHint, GridSkeleton, useLibraryActions } from './Library';
@@ -107,6 +108,7 @@ function NewAlbumDialog({ open, onClose }: { open: boolean; onClose: () => void 
 
 /** Albums: mosaic cards, plus Favourites and Trash on phones (they live in the sidebar on wide screens). */
 export function AlbumsPage() {
+  const canEdit = useCan('edit');
   const [albums, setAlbums] = useState<AlbumItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sort, setSort] = useState<AlbumSort>('updated');
@@ -157,9 +159,17 @@ export function AlbumsPage() {
             { value: 'created', label: 'Date created' },
           ]}
         />
-        <Button kind="primary" size="sm" icon="plus" className="desk-only" onClick={() => setCreating(true)}>
-          New album
-        </Button>
+        {canEdit && (
+          <Button
+            kind="primary"
+            size="sm"
+            icon="plus"
+            className="desk-only"
+            onClick={() => setCreating(true)}
+          >
+            New album
+          </Button>
+        )}
       </div>
       {error && (
         <Note tone="bad" icon="alert" role="alert">
@@ -186,11 +196,13 @@ export function AlbumsPage() {
           <p className="empty__text">
             Group a shoot, a trip or a client’s picks. Photos stay in your library too.
           </p>
-          <div className="empty__actions">
-            <Button kind="primary" size="lg" icon="plus" onClick={() => setCreating(true)}>
-              New album
-            </Button>
-          </div>
+          {canEdit && (
+            <div className="empty__actions">
+              <Button kind="primary" size="lg" icon="plus" onClick={() => setCreating(true)}>
+                New album
+              </Button>
+            </div>
+          )}
         </section>
       ) : (
         <ul className="albums" aria-label="Albums">
@@ -235,6 +247,8 @@ export function AlbumsPage() {
 
 /** One album: the library grid filtered to it, with rename, delete, remove and set cover. */
 export function AlbumPage({ albumId }: { albumId: string }) {
+  const canEdit = useCan('edit');
+  const canShare = useCan('galleries');
   const nav = useNavigate();
   const loc = useLocation();
   const toast = useToast();
@@ -373,33 +387,39 @@ export function AlbumPage({ albumId }: { albumId: string }) {
       title={album?.name ?? 'Album'}
       actions={
         <>
-          <Button
-            size="sm"
-            icon="share"
-            onClick={shareAlbum}
-            busy={busy === 'share'}
-            disabled={!album?.photoCount}
-          >
-            Share album
-          </Button>
-          <Button
-            size="sm"
-            kind="ghost"
-            onClick={() => {
-              setName(album?.name ?? '');
-              setRenaming(true);
-            }}
-            disabled={!album}
-          >
-            Rename
-          </Button>
-          <IconButton
-            icon="trash"
-            size="sm"
-            label="Delete album"
-            onClick={() => setDeleting(true)}
-            disabled={!album}
-          />
+          {canShare && (
+            <Button
+              size="sm"
+              icon="share"
+              onClick={shareAlbum}
+              busy={busy === 'share'}
+              disabled={!album?.photoCount}
+            >
+              Share album
+            </Button>
+          )}
+          {canEdit && (
+            <>
+              <Button
+                size="sm"
+                kind="ghost"
+                onClick={() => {
+                  setName(album?.name ?? '');
+                  setRenaming(true);
+                }}
+                disabled={!album}
+              >
+                Rename
+              </Button>
+              <IconButton
+                icon="trash"
+                size="sm"
+                label="Delete album"
+                onClick={() => setDeleting(true)}
+                disabled={!album}
+              />
+            </>
+          )}
         </>
       }
     >

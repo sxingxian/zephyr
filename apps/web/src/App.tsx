@@ -1,5 +1,5 @@
-import { Spinner, ToastProvider } from '@zephyr/ui';
-import { lazy, Suspense, useCallback } from 'react';
+import { Spinner, ToastProvider, useToast } from '@zephyr/ui';
+import { lazy, Suspense, useCallback, useEffect, useRef } from 'react';
 import { createBrowserRouter, Outlet, type RouteObject, useLocation, useNavigate } from 'react-router';
 import { AiHost } from './components/ai/AiHost';
 import { EditTray } from './components/editor/EditTray';
@@ -7,6 +7,7 @@ import { PublicOnly, RequireAuth } from './components/Guards';
 import { LibraryHost } from './components/LibraryHost';
 import { ShareTray } from './components/share/ShareTray';
 import { UploadProvider } from './components/Uploads';
+import { refreshLibraries, takeLibraryNotice, useCan } from './lib/libraryContext';
 import { safeReturnPath } from './lib/returnPath';
 import { SessionProvider, useSession } from './lib/session';
 import { About } from './routes/About';
@@ -31,14 +32,38 @@ import { You } from './routes/You';
 function Uploads({ children }: { children: React.ReactNode }) {
   const { user } = useSession();
   const on = Boolean(user && !user.pendingDeletion);
+  // Phase 7: no picker or drop zone where the member's role (Viewer) or a read-only library forbids uploads.
+  const canUpload = useCan('upload');
   return (
-    <UploadProvider enabled={on}>
+    <UploadProvider enabled={on && canUpload}>
       {children}
       {on && <AiHost />}
       {on && <EditTray />}
       {on && <ShareTray />}
     </UploadProvider>
   );
+}
+
+/**
+ * Phase 7: loads the member's libraries once signed in (validating the team library this tab has open), and
+ * shows the notice left by a fall-back to the member's own library.
+ */
+function LibraryBoot() {
+  const { user } = useSession();
+  const toast = useToast();
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+  const id = user && !user.pendingDeletion ? user.id : null;
+  useEffect(() => {
+    if (!id) return;
+    void refreshLibraries();
+    if (takeLibraryNotice() === 'unavailable')
+      toastRef.current.show(
+        'You no longer have access to that team library. You’re back in your own library.',
+        'bad',
+      );
+  }, [id]);
+  return null;
 }
 
 function Root() {
@@ -52,6 +77,7 @@ function Root() {
   return (
     <SessionProvider onUnauthenticated={onUnauthenticated}>
       <ToastProvider>
+        <LibraryBoot />
         <Uploads>
           <Outlet />
         </Uploads>
@@ -65,6 +91,14 @@ const AiQueuePage = lazy(() => import('./routes/AiQueue').then((m) => ({ default
 const AiSettingsPage = lazy(() => import('./routes/AiSettings').then((m) => ({ default: m.AiSettingsPage })));
 const CleanupPage = lazy(() => import('./routes/Cleanup').then((m) => ({ default: m.CleanupPage })));
 const PeoplePage = lazy(() => import('./routes/People').then((m) => ({ default: m.PeoplePage })));
+// Phase 7: billing and teams.
+const PlansPage = lazy(() => import('./routes/Plans').then((m) => ({ default: m.PlansPage })));
+const BillingPage = lazy(() => import('./routes/Billing').then((m) => ({ default: m.BillingPage })));
+const BillingReturnPage = lazy(() =>
+  import('./routes/BillingReturn').then((m) => ({ default: m.BillingReturnPage })),
+);
+const TeamPage = lazy(() => import('./routes/Team').then((m) => ({ default: m.TeamPage })));
+const TeamAcceptPage = lazy(() => import('./routes/TeamAccept').then((m) => ({ default: m.TeamAcceptPage })));
 const ScenesPage = lazy(() => import('./routes/Scenes').then((m) => ({ default: m.ScenesPage })));
 const page = (el: React.ReactNode) => (
   <Suspense
@@ -104,6 +138,12 @@ export const routes: RouteObject[] = [
       { path: '/cleanup', element: auth(page(<CleanupPage />)) },
       { path: '/ai/queue', element: auth(page(<AiQueuePage />)) },
       { path: '/settings/ai', element: auth(page(<AiSettingsPage />)) },
+      { path: '/plans', element: auth(page(<PlansPage />)) },
+      { path: '/billing/return', element: auth(page(<BillingReturnPage />)) },
+      { path: '/settings/billing', element: auth(page(<BillingPage />)) },
+      { path: '/settings/team', element: auth(page(<TeamPage />)) },
+      // Opening a team invite works whether or not someone is signed in on this device.
+      { path: '/team/accept', element: page(<TeamAcceptPage />) },
       { path: '/albums', element: auth(<AlbumsPage />) },
       { path: '/trash', element: auth(<TrashPage />) },
       { path: '/shared', element: auth(<GalleriesPage />) },

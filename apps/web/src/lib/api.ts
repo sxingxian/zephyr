@@ -1,4 +1,5 @@
 import type { ApiError, ApiErrorCode } from '@zephyr/shared/client';
+import { fallbackToOwnLibrary, libraryHeaders } from './libraryContext';
 
 /** A failed API call, carrying the contract's error code. */
 export class ApiFailure extends Error {
@@ -30,11 +31,15 @@ let onSessionChanged: Listener | null = null;
 export function setSessionChangedHandler(fn: Listener | null): void {
   onSessionChanged = fn;
 }
-/** Shared by every request helper: global reactions to 401, 403 account_pending_deletion and 409 session_changed. */
+/**
+ * Shared by every request helper: global reactions to 401, 403 account_pending_deletion, 409 session_changed
+ * and (phase 7) 403 library_unavailable, which sends the tab back to the member's own library.
+ */
 export function notifyFailure(failure: ApiFailure, quiet401?: boolean): void {
   if (failure.code === 'unauthenticated' && !quiet401) onUnauthenticated?.();
   if (failure.code === 'account_pending_deletion') onPendingDeletion?.();
   if (failure.code === 'session_changed') onSessionChanged?.();
+  if (failure.code === 'library_unavailable') void fallbackToOwnLibrary();
 }
 
 export interface RequestOptions {
@@ -78,6 +83,10 @@ const KNOWN: ApiErrorCode[] = [
   'pending',
   'insufficient_credits',
   'feature_off',
+  'library_unavailable',
+  'role_forbidden',
+  'library_read_only',
+  'billing_unavailable',
   'server',
 ];
 
@@ -110,6 +119,8 @@ export async function api<T>(path: string, opts: RequestOptions = {}): Promise<T
       method,
       credentials: 'same-origin',
       headers: {
+        // Phase 7: the library open in this tab (absent in the member's own library).
+        ...libraryHeaders(),
         ...opts.headers,
         accept: 'application/json',
         ...(method === 'GET' ? {} : { 'content-type': 'application/json' }),
@@ -197,6 +208,14 @@ export function errorMessage(err: unknown): string {
     }
     case 'feature_off':
       return 'That Zephyr AI feature is switched off right now.';
+    case 'library_unavailable':
+      return 'You no longer have access to that team library. You’re back in your own library.';
+    case 'role_forbidden':
+      return 'Your role in this library doesn’t allow that. Ask the library’s owner.';
+    case 'library_read_only':
+      return 'This library is read-only because it’s over its plan’s storage. Free up space or renew the plan.';
+    case 'billing_unavailable':
+      return 'Billing isn’t available right now. Nothing was charged. Try again in a few minutes.';
     default:
       return 'Something went wrong on our side. Try again in a minute.';
   }

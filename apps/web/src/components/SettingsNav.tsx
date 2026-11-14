@@ -7,7 +7,8 @@ const ITEMS: { label: string; icon: IconName; to?: string }[] = [
   { label: 'Sharing & branding', icon: 'share', to: '/settings/sharing' },
   { label: 'Zephyr AI', icon: 'breeze', to: '/settings/ai' },
   { label: 'Appearance', icon: 'sun' },
-  { label: 'Plan & billing', icon: 'card' },
+  { label: 'Plan & billing', icon: 'card', to: '/settings/billing' },
+  { label: 'Team', icon: 'people', to: '/settings/team' },
   { label: 'Privacy & data', icon: 'database' },
   { label: 'About & licences', icon: 'info', to: '/settings/about' },
 ];

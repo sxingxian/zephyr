@@ -7,6 +7,7 @@ import { Shell } from '../components/Shell';
 import { photosLabel, ShNote, StatusChip } from '../components/share/ShareBits';
 import { errorMessage } from '../lib/api';
 import { thumbUrl } from '../lib/library';
+import { useCan } from '../lib/libraryContext';
 import { listGalleries } from '../lib/share';
 import { shareRenders } from '../lib/shareRenders';
 import { EmptyHint, GridSkeleton } from './Library';
@@ -26,6 +27,7 @@ function stats(g: GallerySummary): string {
 
 /** Shared galleries: every link the member has made, live or ended. */
 export function GalleriesPage() {
+  const canManage = useCan('galleries');
   const [items, setItems] = useState<GallerySummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
@@ -130,6 +132,11 @@ export function GalleriesPage() {
   return (
     <Shell title="Shared galleries">
       <div className="sh-page">
+        {!canManage && (
+          <Note tone="neutral" icon="lock">
+            You can open and copy gallery links. The library’s Owner and Editors create and change galleries.
+          </Note>
+        )}
         {items && items.length > 0 && (
           <div className="sh-head">
             <h2 className="sh-h2">Shared galleries</h2>

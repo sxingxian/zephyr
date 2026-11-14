@@ -1,5 +1,6 @@
 import { AI_API, type CutoutSettings, type EditRecipe } from '@zephyr/shared/client';
 import { ApiFailure } from '../api';
+import { libraryHeaders, withLibrary } from '../libraryContext';
 import { onEditorReset } from './resets';
 
 /**
@@ -198,8 +199,9 @@ export const defaultMaskDeps: MaskDeps = {
   async fetchMask(photoId, maskId, signal) {
     // Owner-only route, served `private, no-cache` with an ETag: the browser revalidates every time (one
     // ownership check, usually a 304), so a signed-out or switched session never reads a cached mask.
-    const res = await fetch(AI_API.mask(photoId, maskId), {
+    const res = await fetch(withLibrary(AI_API.mask(photoId, maskId)), {
       credentials: 'same-origin',
+      headers: libraryHeaders(),
       cache: 'no-cache',
       signal,
     });

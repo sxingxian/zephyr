@@ -7,7 +7,8 @@
  * is ever sent with the next member's cookie.
  */
 
-export type EndReason = 'sign-out' | 'unauthenticated' | 'switched' | 'deleted';
+/** `library`: the member switched library in this tab (phase 7); the session itself goes on. */
+export type EndReason = 'sign-out' | 'unauthenticated' | 'switched' | 'deleted' | 'library';
 /** `server`: the session is still valid, so a hook may tell the server to drop work in progress. */
 export type EndHook = (o: { reason: EndReason; server: boolean }) => void | Promise<void>;
 
