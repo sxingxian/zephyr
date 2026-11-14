@@ -23,8 +23,8 @@ import {
 } from '@zephyr/shared';
 import { base64url, sha256, toPgBytea } from '../crypto';
 import { fail, logError, readBody } from '../http';
-import { stores } from '../library/objects';
 import { mediaHeaders } from '../share/media';
+import { photoStore } from '../storage';
 import { rpc } from '../supabase';
 import {
   type AdminRouter,
@@ -136,14 +136,14 @@ export function registerAdminSafetyRoutes(router: AdminRouter, requireStaff: Req
     // Same 404 for every refusal: wrong token, someone else's grant, expired, held, not in the grant.
     if (!grant || !photo || !t.success) return c.json(fail('not_found'), 404);
     try {
-      const ok = await rpc<{ key: string } | null>(c.env, 'reveal_grant_check', {
+      const ok = await rpc<{ key: string; storeId?: string } | null>(c.env, 'reveal_grant_check', {
         p_grant: grant,
         p_token_hash: await tokenHash(t.data),
         p_staff: staffId(c),
         p_photo: photo,
       });
       if (!ok || isDbError(ok) || typeof ok.key !== 'string') return c.json(fail('not_found'), 404);
-      const obj = await stores(c.env).photos.get(ok.key);
+      const obj = await photoStore(c.env, ok.storeId).get(ok.key);
       if (!obj) return c.json(fail('not_found'), 404);
       if (obj.size > REVEAL_SOURCE_MAX_BYTES) {
         await obj.body.cancel().catch(() => undefined);

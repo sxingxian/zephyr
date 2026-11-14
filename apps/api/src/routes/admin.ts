@@ -62,8 +62,8 @@ import { registerAdminRetentionRoutes } from './admin-retention';
 import { registerAdminSafetyRoutes } from './admin-safety';
 import { registerAdminSettingsRoutes } from './admin-settings';
 import { registerAdminStaffRoutes } from './admin-staff';
-import { registerAdminUserRoutes } from './admin-users';
 import { registerAdminStorageRoutes } from './admin-storage';
+import { registerAdminUserRoutes } from './admin-users';
 import { sendInvite } from './invites';
 
 const WINDOW = 15 * 60;
