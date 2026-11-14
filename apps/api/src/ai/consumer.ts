@@ -17,7 +17,9 @@ import { sendEmail } from '../email/resend';
 import type { AiMessage, Env } from '../env';
 import { logError } from '../http';
 import { imageInfo } from '../library/files';
-import { deleteKeys, photoKey } from '../library/storage';
+import { photoKey } from '../library/storage';
+import { deleteEverywhere } from '../storage';
+import { photoStore, storeIdOf } from '../storage/config';
 import { rpc } from '../supabase';
 import { encodeMask, MaskError, readMask, resizeMask } from './png';
 import {
@@ -89,7 +91,14 @@ export async function sendSpendAlerts(
 }
 
 type Begin =
-  | { status: 'go'; ownerId: string; photoId: string; attempts: number; alerts?: SpendAlert[] }
+  | {
+      status: 'go';
+      ownerId: string;
+      photoId: string;
+      attempts: number;
+      alerts?: SpendAlert[];
+      storeId?: string | null;
+    }
   | { status: 'wait'; until: string; alerts?: SpendAlert[] }
   | { status: 'skip' | 'failed' };
 
@@ -110,6 +119,7 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
   if (begin.status !== 'go') return begin.status === 'failed' ? 'failed' : 'skipped';
   await sendSpendAlerts(env, begin.alerts, s.atCap);
   const { ownerId, photoId } = begin;
+  const store = photoStore(env, storeIdOf(begin));
   // This run's attempt number: a late report from a run taken over as stuck is ignored by the database.
   const attempt = Number.isInteger(begin.attempts) ? begin.attempts : null;
   const calls: CallLog[] = [];
@@ -125,9 +135,9 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
   };
 
   // The untouched preview (≤ 2048 px). Never the original file.
-  const obj = await env.PHOTOS.get(photoKey(ownerId, photoId, 'preview'));
-  if (!obj || !('body' in obj)) return failed('no_preview');
-  const preview = new Uint8Array(await obj.arrayBuffer());
+  const obj = await store.get(photoKey(ownerId, photoId, 'preview'));
+  if (!obj) return failed('no_preview');
+  const preview = await obj.bytes();
   const info = imageInfo(preview);
   if (!info) return failed('no_preview');
   const mime = info.format === 'jpeg' ? 'image/jpeg' : 'image/webp';
@@ -167,7 +177,7 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
 
       const maskId = crypto.randomUUID();
       const key = `u/${ownerId}/p/${photoId}/m/${maskId}.png`;
-      await env.PHOTOS.put(key, png, { httpMetadata: { contentType: 'image/png' } });
+      await store.put(key, png, { contentType: 'image/png' });
       // If this call fails (or its answer is lost after it committed), the mask is left in place: the
       // orphan sweep removes it later if no row records it. Deleting it here could break a recipe that does.
       const done = await rpc<{ status: string; deleteKeys?: string[] }>(env, 'ai_item_complete', {
@@ -186,8 +196,9 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
       const drop = (done.deleteKeys ?? []).filter(
         (k) => typeof k === 'string' && k.startsWith(`u/${ownerId}/p/`),
       );
+      // Replaced masks go on every store: the photo may be mid-move, with a copy on both.
       if (drop.length)
-        await deleteKeys(env.PHOTOS, drop).catch((err) => logError('queue', 'ai_mask_drop', err));
+        await deleteEverywhere(env, drop).catch((err) => logError('queue', 'ai_mask_drop', err));
       return done.status === 'ok' ? 'completed' : 'failed';
     } catch (err) {
       if (!(err instanceof ProviderFailure)) throw err;
@@ -206,7 +217,7 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
 }
 
 type SceneBegin =
-  | { status: 'go'; day?: string; run?: string; alerts?: SpendAlert[] }
+  | { status: 'go'; day?: string; run?: string; alerts?: SpendAlert[]; storeId?: string | null }
   | { status: 'wait'; alerts?: SpendAlert[] }
   | { status: 'skip' };
 
@@ -245,12 +256,13 @@ export async function processScene(
   let called = false;
   const t0 = Date.now();
   try {
-    const obj = await env.PHOTOS.get(photoKey(owner, photo, 'thumb'));
-    if (!obj || !('body' in obj)) {
+    const store = photoStore(env, begin.status === 'go' ? storeIdOf(begin) : 'r2');
+    const obj = await store.get(photoKey(owner, photo, 'thumb'));
+    if (!obj) {
       await done('retry', []);
       return 'waiting';
     }
-    const thumb = new Uint8Array(await obj.arrayBuffer());
+    const thumb = await obj.bytes();
     called = true;
     try {
       const labels = await classifyScene(env, s, thumb);

@@ -57,6 +57,8 @@ export const teamInviteLimiter = { ok: true, keys: [] as string[] };
 /** Phase 8: admin writes per staff member, ad reads/events per member. */
 export const adminLimiter = { ok: true, keys: [] as string[] };
 export const adsLimiter = { ok: true, keys: [] as string[] };
+/** Phase 8: the zephyr-storage queue (messages sent). */
+export const storageQueue = { sent: [] as unknown[], fail: false };
 export const MEDIA_HOST = 'media.test';
 export const MEDIA_SECRET = 'media-host-secret';
 
@@ -137,6 +139,12 @@ export const env: Env = {
   AI_GATEWAY_TOKEN: 'gateway-token',
   RUNWARE_API_KEY: 'runware-key',
   FAL_KEY: 'fal-key',
+  STORAGE_QUEUE: {
+    send: async (body: unknown) => {
+      if (storageQueue.fail) throw new Error('queue down');
+      storageQueue.sent.push(body);
+    },
+  } as unknown as Queue<import('../src/env').StorageMessage>,
 };
 
 // ---- keys --------------------------------------------------------------------------------------------

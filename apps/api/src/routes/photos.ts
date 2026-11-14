@@ -24,6 +24,7 @@ import {
   purgeNow,
   UUID,
 } from '../library/storage';
+import { photoStore, storeIdOf } from '../storage/config';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 import { editRoutes } from './edits';
@@ -156,6 +157,8 @@ interface PhotoFile {
   editVersion?: number | null;
   editThumbKey?: string | null;
   editPreviewKey?: string | null;
+  /** Phase 8: the store the photo lives on ('r2' until photo_file returns it). */
+  storeId?: string | null;
 }
 
 /** If-None-Match lists this tag (or `*`). */
@@ -186,12 +189,16 @@ photoRoutes.get('/:id/masks/:mask', async (c) => {
   const mask = c.req.param('mask');
   if (!UUID.test(id) || !UUID.test(mask)) return c.json(fail('not_found'), 404);
   try {
-    const key = await rpc<string | null>(c.env, 'ai_mask_key', {
+    // Phase 8: { key, storeId } (masks live under the photo's prefix, on the photo's store); a bare key
+    // string from the phase 6 function still means R2.
+    const found = await rpc<string | { key: string; storeId?: string | null } | null>(c.env, 'ai_mask_key', {
       p_owner: ownerOf(c),
       p_photo: id,
       p_mask: mask,
     });
+    const key = typeof found === 'string' ? found : (found?.key ?? null);
     if (!key) return c.json(fail('not_found'), 404);
+    const storeId = typeof found === 'string' ? 'r2' : storeIdOf(found);
     // Revalidated on every use (like thumbnails and previews), so a browser never shows a mask the member
     // can no longer read, e.g. after signing out on a shared device or deleting the photo. A mask id never
     // changes its bytes, so the ETag is the id and a revalidation costs one database lookup, no R2 read.
@@ -204,8 +211,9 @@ photoRoutes.get('/:id/masks/:mask', async (c) => {
       h.delete('Content-Type');
       return new Response(null, { status: 304, headers: h });
     }
-    const obj = await c.env.PHOTOS.get(key);
-    if (!obj || !('body' in obj)) return c.json(fail('not_found'), 404);
+    const obj = await photoStore(c.env, storeId).get(key);
+    if (!obj) return c.json(fail('not_found'), 404);
+    if (c.req.method === 'HEAD') await obj.body.cancel().catch(() => undefined);
     const h = mediaHeaders('image/png');
     h.set('Cache-Control', 'private, no-cache');
     h.set('ETag', etag);
@@ -229,6 +237,7 @@ photoRoutes.get('/:id/:kind', async (c) => {
     const file = await rpc<PhotoFile | null>(c.env, 'photo_file', { p_owner: owner, p_id: id });
     if (!file) return c.json(fail('not_found'), 404);
     const key = photoKey(owner, id, kind);
+    const store = photoStore(c.env, storeIdOf(file));
 
     if (kind !== 'original') {
       // The edited variant when it was rendered from the current edit, unless ?original=1 (compare views).
@@ -237,16 +246,16 @@ photoRoutes.get('/:id/:kind', async (c) => {
         c.req.query('original') === '1' ? null : kind === 'thumb' ? file.editThumbKey : file.editPreviewKey;
       const editV = file.editVersion;
       let source: { key: string; tag: (etag: string) => string } | null = null;
-      let meta = editK && editV ? await c.env.PHOTOS.head(editK) : null;
+      let meta = editK && editV ? await store.head(editK) : null;
       if (editK && editV && meta) {
         source = { key: editK, tag: (e) => `"${e}-e${editV}"` };
       } else if (kind === 'thumb' ? file.hasThumb : file.hasPreview) {
-        meta = await c.env.PHOTOS.head(key);
+        meta = await store.head(key);
         if (meta) source = { key, tag: (e) => `"${e}"` };
       }
       if (!source || !meta) return c.json(fail('not_found'), 404);
       // Variants are only ever stored as JPEG or WEBP by the upload and edit routes.
-      const h = mediaHeaders(meta.httpMetadata?.contentType === 'image/jpeg' ? 'image/jpeg' : 'image/webp');
+      const h = mediaHeaders(meta.contentType === 'image/jpeg' ? 'image/jpeg' : 'image/webp');
       // Stored but revalidated every time: the 304 still passes the session and owner checks, and
       // sign-out clears the cache (Clear-Site-Data), so nothing is readable once signed out. The tag
       // names the edit version, so an edited and an original variant never share one.
@@ -255,8 +264,9 @@ photoRoutes.get('/:id/:kind', async (c) => {
       h.set('ETag', tag);
       if (matchesTag(c.req.header('If-None-Match'), tag))
         return new Response(null, { status: 304, headers: h });
-      const obj = await c.env.PHOTOS.get(source.key);
-      if (!obj || !('body' in obj)) return c.json(fail('not_found'), 404);
+      const obj = await store.get(source.key);
+      if (!obj) return c.json(fail('not_found'), 404);
+      if (c.req.method === 'HEAD') await obj.body.cancel().catch(() => undefined);
       if (obj.etag !== meta.etag) h.set('ETag', source.tag(obj.etag));
       h.set('Content-Length', String(obj.size));
       return new Response(c.req.method === 'HEAD' ? null : obj.body, { status: 200, headers: h });
@@ -273,8 +283,9 @@ photoRoutes.get('/:id/:kind', async (c) => {
       h.set('Content-Range', `bytes */${size}`);
       return new Response(null, { status: 416, headers: h });
     }
-    const obj = await c.env.PHOTOS.get(key, range ? { range } : {});
-    if (!obj || !('body' in obj)) return c.json(fail('not_found'), 404);
+    const obj = await store.get(key, range ? { range } : {});
+    if (!obj) return c.json(fail('not_found'), 404);
+    if (c.req.method === 'HEAD') await obj.body.cancel().catch(() => undefined);
     if (range) {
       h.set('Content-Range', `bytes ${range.offset}-${range.offset + range.length - 1}/${size}`);
       h.set('Content-Length', String(range.length));

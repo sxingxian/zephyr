@@ -100,7 +100,20 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET?: string;
   /** Pinned Stripe API version; defaults to the installed SDK's version. */
   STRIPE_API_VERSION?: string;
+
+  // ---- Phase 8: storage switch ----
+  /**
+   * Extra photo stores (JSON array; docs/setup.md §3.8). 'r2' (the PHOTOS binding) always exists. Keys are
+   * secrets named STORE_<ID>_ACCESS_KEY_ID / STORE_<ID>_SECRET (+ STORE_<ID>_ACCESS_CLIENT_ID / _SECRET for
+   * tunnel stores); Workers VPC services are bindings named in the store's `binding`.
+   */
+  STORAGE_STORES?: string | unknown[];
+  /** The zephyr-storage queue: migration batches (ids only). */
+  STORAGE_QUEUE: Queue<StorageMessage>;
 }
+
+/** Messages on the zephyr-storage queue: "claim and copy the next batch of this migration". */
+export type StorageMessage = { t: 'migrate'; migration: string };
 
 /** The slice of the Workers AI binding the API uses. */
 export interface WorkersAi {

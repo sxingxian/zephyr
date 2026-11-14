@@ -118,8 +118,13 @@
   "ai": { "binding": "AI" },
   // Phase 6: the zephyr-ai queue (src/ai/consumer.ts). Messages carry ids only. The consumer is this Worker.
   // Create both queues first: wrangler queues create zephyr-ai && wrangler queues create zephyr-ai-dlq
+  // Phase 8: the zephyr-storage queue (src/storage/migrate.ts): each message is "copy the next 20 photos of
+  // this migration" (ids only). wrangler queues create zephyr-storage && wrangler queues create zephyr-storage-dlq
   "queues": {
-    "producers": [{ "binding": "AI_QUEUE", "queue": "zephyr-ai" }],
+    "producers": [
+      { "binding": "AI_QUEUE", "queue": "zephyr-ai" },
+      { "binding": "STORAGE_QUEUE", "queue": "zephyr-storage" }
+    ],
     "consumers": [
       {
         "queue": "zephyr-ai",
@@ -130,13 +135,28 @@
         "max_concurrency": 4,
         "max_retries": 3,
         "dead_letter_queue": "zephyr-ai-dlq"
+      },
+      {
+        "queue": "zephyr-storage",
+        // One message = one batch of 20 photos; two batches at once keeps the copy steady without
+        // saturating a small on-premises uplink.
+        "max_batch_size": 1,
+        "max_batch_timeout": 5,
+        "max_concurrency": 2,
+        "max_retries": 5,
+        "dead_letter_queue": "zephyr-storage-dlq"
       }
     ]
   },
+  // Phase 8: on-premises stores reached over Workers VPC (beta) are service bindings, named in the store's
+  // "binding" (docs/setup.md §3.8). Example:
+  // "vpc_services": [{ "binding": "VPC_GARAGE", "service_id": "<from wrangler vpc service create>", "remote": true }],
   // Library clean-up jobs (src/jobs.ts): expired uploads, Trash purges, account purges; and Zephyr AI's
   // queue upkeep (src/ai/cron.ts): re-enqueue due items, scene-tag backfill, face-data plan lapses.
   // Phase 7: billing's daily job at 02:10 UTC (src/billing/cron.ts): price-change notices and moves.
-  "triggers": { "crons": ["*/15 * * * *", "10 2 * * *", "20 2 * * *"] },
+  // Phase 8: storage every 5 minutes (src/storage/cron.ts): write-store health check (auto read-only after 3
+  // failures), migration re-enqueue and old-copy deletion after the hold; admin daily jobs at 02:20.
+  "triggers": { "crons": ["*/15 * * * *", "10 2 * * *", "20 2 * * *", "*/5 * * * *"] },
   "vars": {
     "ENVIRONMENT": "production",
     "SUPABASE_URL": "https://YOUR-PROJECT-REF.supabase.co",
@@ -160,6 +180,18 @@
     "AI_GATEWAY_ACCOUNT_ID": "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID",
     "AI_GATEWAY_ID": "zephyr-prod"
     // Phase 7: STRIPE_API_VERSION may pin a Stripe API version; unset uses the installed SDK's own version.
+    // Phase 8: STORAGE_STORES declares extra photo stores (docs/setup.md §3.8); 'r2' (PHOTOS) always exists.
+    // No credentials here: endpoint, bucket, connection, declared cost and capacity only. Example:
+    // "STORAGE_STORES": [
+    //   { "id": "b2-eu", "name": "Backblaze B2 (EU)", "kind": "s3", "connection": "https",
+    //     "endpoint": "https://s3.eu-central-003.backblazeb2.com", "bucket": "zephyr-photos-eu",
+    //     "region": "eu-central-003", "costPerTbMonthUsd": 6, "egressNote": "Free up to 3× stored",
+    //     "encryptionAtRest": true },
+    //   { "id": "studio-nas", "name": "Studio NAS (Garage)", "kind": "s3", "connection": "vpc",
+    //     "binding": "VPC_GARAGE", "endpoint": "http://garage.internal:3900", "bucket": "zephyr",
+    //     "region": "garage", "pathStyle": true, "capacityBytes": 8000000000000,
+    //     "costPerTbMonthUsd": null, "encryptionAtRest": true }
+    // ]
   }
   // Secrets (wrangler secret put …): SUPABASE_SECRET_KEY, TURNSTILE_SECRET_KEY, IP_HASH_SECRET,
   // SESSION_HMAC_SECRET, RESEND_API_KEY. (SUPABASE_SERVICE_ROLE_KEY is still read if the new name
@@ -178,4 +210,7 @@
   // Phase 7 secrets (docs/phase-7.md, Build step 0):
   //   STRIPE_SECRET_KEY      restricted key (rk_…) with only the permissions listed in docs/phase-7.md
   //   STRIPE_WEBHOOK_SECRET  the webhook endpoint's signing secret (whsec_…), printed by scripts/stripe-setup.mjs
+  // Phase 8 secrets, per store in STORAGE_STORES (<ID>: the id upper-cased, dashes → underscores):
+  //   STORE_<ID>_ACCESS_KEY_ID, STORE_<ID>_SECRET         the store's S3 access key (least privilege: one bucket)
+  //   STORE_<ID>_ACCESS_CLIENT_ID, STORE_<ID>_ACCESS_CLIENT_SECRET   tunnel stores: the Access service token
 }

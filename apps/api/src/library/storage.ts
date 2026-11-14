@@ -1,11 +1,13 @@
 /**
- * R2 helpers for the photo library: object keys, batched deletes, prefix purges and the byte streams
- * that put upload parts into R2 at exactly their declared length.
+ * Object helpers for the photo library: object keys, batched deletes, prefix purges and the byte streams
+ * that put upload parts into the photo store at exactly their declared length.
  */
 import type { MiddlewareHandler } from 'hono';
 import { hmac, toPgBytea } from '../crypto';
 import { type Env, list } from '../env';
 import { fail, guardWrite } from '../http';
+import { photoStore, storeIdOf } from '../storage/config';
+import type { ObjectStore } from '../storage/types';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 
@@ -118,45 +120,65 @@ export const expectedUser: MiddlewareHandler<HonoEnv> = async (c, next) => {
 export const memberHash = async (env: Env, userId: string) =>
   toPgBytea(await hmac(`member:${userId}`, env.IP_HASH_SECRET));
 
-/** Deletes keys in batches of 1,000 (R2's limit per call). Deleting a missing key is not an error. */
-export async function deleteKeys(bucket: R2Bucket, keys: string[]): Promise<number> {
+/** Deletes keys in batches of 1,000 (the limit per call). Deleting a missing key is not an error. */
+export async function deleteKeys(store: ObjectStore, keys: string[]): Promise<number> {
   for (let i = 0; i < keys.length; i += LIBRARY_LIMITS.deleteBatch) {
-    await bucket.delete(keys.slice(i, i + LIBRARY_LIMITS.deleteBatch));
+    await store.delete(keys.slice(i, i + LIBRARY_LIMITS.deleteBatch));
   }
   return keys.length;
 }
 
 /** Deletes up to `maxPages` × 1,000 objects under a prefix. `complete` once nothing is left. */
 export async function deletePrefix(
-  bucket: R2Bucket,
+  store: ObjectStore,
   prefix: string,
   maxPages: number,
 ): Promise<{ deleted: number; complete: boolean }> {
   let deleted = 0;
   for (let page = 0; page < maxPages; page++) {
-    const listed = await bucket.list({ prefix, limit: LIBRARY_LIMITS.deleteBatch });
+    const listed = await store.list(prefix, { limit: LIBRARY_LIMITS.deleteBatch });
     if (listed.objects.length === 0) return { deleted, complete: true };
     deleted += await deleteKeys(
-      bucket,
+      store,
       listed.objects.map((o) => o.key),
     );
   }
-  const rest = await bucket.list({ prefix, limit: 1 });
+  const rest = await store.list(prefix, { limit: 1 });
   return { deleted, complete: rest.objects.length === 0 };
 }
 
 export interface PurgeItem {
   photoId: string;
   keys: string[];
+  /** The store the photo lives on (phase 8; 'r2' until the purge function returns it). */
+  storeId?: string | null;
 }
-/** Deletes purging photos' objects, then their rows and usage. On an R2 failure the job finishes later. */
+/**
+ * Deletes purging photos' objects on each photo's own store, then their rows and usage. Rows are confirmed
+ * only for the photos whose objects are gone: a store that fails leaves its photos for the next run.
+ */
 export async function purgeNow(env: Env, items: PurgeItem[]): Promise<void> {
   if (items.length === 0) return;
-  await deleteKeys(
-    env.PHOTOS,
-    items.flatMap((i) => i.keys),
-  );
-  await rpc<number>(env, 'confirm_photo_purges', { p_ids: items.map((i) => i.photoId) });
+  const byStore = new Map<string, PurgeItem[]>();
+  for (const i of items) {
+    const id = storeIdOf(i);
+    byStore.set(id, [...(byStore.get(id) ?? []), i]);
+  }
+  const done: string[] = [];
+  let firstError: unknown = null;
+  for (const [id, group] of byStore) {
+    try {
+      await deleteKeys(
+        photoStore(env, id),
+        group.flatMap((i) => i.keys),
+      );
+      done.push(...group.map((i) => i.photoId));
+    } catch (err) {
+      firstError ??= err;
+    }
+  }
+  if (done.length) await rpc<number>(env, 'confirm_photo_purges', { p_ids: done });
+  if (firstError) throw firstError;
 }
 
 const BINARY_TYPES = new Set(['application/octet-stream', 'image/jpeg', 'image/webp']);

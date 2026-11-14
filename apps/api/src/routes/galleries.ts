@@ -422,7 +422,7 @@ galleryRoutes.put('/:id/renders/:photoId', async (c) => {
       await rest.cancel().catch(() => undefined);
       return c.json(fail('invalid'), 400);
     }
-    const { photos } = stores(c.env);
+    const photos = stores(c.env).galleryRenders;
     // This request's own key; the database decides (under the storage lock) whether it counts.
     const key = `u/${owner}/g/${id}/${photoId}/full-${version}-${nonce()}`;
     const limited = exactLength(rest, len);
@@ -463,7 +463,7 @@ galleryRoutes.put('/:id/renders/:photoId', async (c) => {
         const env = c.env;
         await background(c, async () => {
           try {
-            await stores(env).photos.delete([key]);
+            await stores(env).galleryRenders.delete([key]);
           } catch (err) {
             logError(requestId, 'render_drop', err);
           }

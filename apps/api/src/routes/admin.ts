@@ -63,6 +63,7 @@ import { registerAdminSafetyRoutes } from './admin-safety';
 import { registerAdminSettingsRoutes } from './admin-settings';
 import { registerAdminStaffRoutes } from './admin-staff';
 import { registerAdminUserRoutes } from './admin-users';
+import { registerAdminStorageRoutes } from './admin-storage';
 import { sendInvite } from './invites';
 
 const WINDOW = 15 * 60;
@@ -100,7 +101,9 @@ adminRoutes.use('*', (c, next) =>
  * 3. A staff session whose email matches the Access identity, active in the last 30 minutes.
  * enrolOnly sessions (email code, no passkey yet) may only enrol a passkey.
  */
-function requireStaff(opts: { allowEnrol?: boolean; write?: boolean } = {}): MiddlewareHandler<HonoEnv> {
+export function requireStaff(
+  opts: { allowEnrol?: boolean; write?: boolean } = {},
+): MiddlewareHandler<HonoEnv> {
   return async (c, next) => {
     const s = await resolveSession(c, 'admin');
     if (!s) return c.json(fail('unauthenticated'), 401);
@@ -641,3 +644,5 @@ registerAdminRetentionRoutes(adminRoutes, requireStaff);
 registerAdminStaffRoutes(adminRoutes, requireStaff);
 registerAdminAuditRoutes(adminRoutes, requireStaff);
 registerAdminSettingsRoutes(adminRoutes, requireStaff);
+// Phase 8: Admin › Storage.
+registerAdminStorageRoutes(adminRoutes, requireStaff);
