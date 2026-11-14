@@ -484,16 +484,129 @@ select pg_temp.ok(has_function_privilege('service_role', 'public.billing_checkou
   and not has_function_privilege('service_role', 'public._topup_refund(uuid, integer, integer)', 'execute')
   and not has_function_privilege('service_role', 'public._key_floor(text)', 'execute'), 'new functions are for the API only; helpers for nobody');
 
+-- ---- Round-3 review fixes ------------------------------------------------------------------------
+insert into auth.users (id, email, email_confirmed_at) values
+  ('b7000000-0000-0000-0000-00000000000d', 'dup3.bill@example.com', now()),
+  ('b7000000-0000-0000-0000-00000000000e', 'part3.bill@example.com', now()),
+  ('b7000000-0000-0000-0000-00000000000f', 'res3.bill@example.com', now()),
+  ('b7000000-0000-0000-0000-000000000010', 'mv3.bill@example.com', now());
+\set dup3 '\'b7000000-0000-0000-0000-00000000000d\''
+\set part3 '\'b7000000-0000-0000-0000-00000000000e\''
+\set res3 '\'b7000000-0000-0000-0000-00000000000f\''
+\set mv3 '\'b7000000-0000-0000-0000-000000000010\''
+
+-- Duplicates are recorded in the database and never applied, even after the stored subscription ends.
+select public.billing_customer_set(:dup3, 'cus_Dup3');
+select public.billing_apply(:dup3, pg_temp.sub('sub_R3A', 'cus_Dup3', 'active', 'price_ProM1', now() - interval '1 day', now() + interval '29 days'), now());
+select pg_temp.ok(public.billing_duplicate_record(:dup3, 'sub_R3A') ->> 'error' = 'stored',
+  'the stored subscription is never recorded as a duplicate');
+select pg_temp.ok((public.billing_duplicate_record(:dup3, 'sub_R3B') ->> 'recorded')::boolean
+  and (public.billing_duplicate_record(:dup3, 'sub_R3B') ->> 'refunded')::boolean = false, 'a confirmed duplicate is recorded, once');
+select pg_temp.ok(public.billing_duplicate_record(:mei, 'sub_R3B') ->> 'error' = 'stored', 'and belongs to its owner only');
+select public.billing_apply(:dup3, pg_temp.sub('sub_R3B', 'cus_Dup3', 'active', 'price_StuM1', now(), now() + interval '30 days'), now() + interval '1 second') as d3 \gset
+select pg_temp.ok((:'d3'::jsonb ->> 'duplicate')::boolean and (:'d3'::jsonb ->> 'recorded')::boolean
+  and (:'d3'::jsonb ->> 'refunded')::boolean = false, 'a recorded duplicate is reported for settling, not applied');
+select public.billing_apply(:dup3, pg_temp.sub('sub_R3A', 'cus_Dup3', 'canceled', 'price_ProM1', now() - interval '1 day', now() + interval '29 days'), now() + interval '2 seconds');
+select public.billing_apply(:dup3, pg_temp.sub('sub_R3B', 'cus_Dup3', 'active', 'price_StuM1', now(), now() + interval '30 days'), now() + interval '3 seconds') as d3b \gset
+select pg_temp.ok((:'d3b'::jsonb ->> 'recorded')::boolean
+  and (select stripe_subscription_id from public.subscriptions where owner_id = :dup3) = 'sub_R3A'
+  and (select plan_id from public.profiles where id = :dup3) = 'free',
+  'once the stored one ends, a recorded duplicate is still never adopted');
+select pg_temp.ok((select count(*) from jsonb_array_elements(public.billing_duplicates_unsettled(50)) x
+                    where x ->> 'stripeSubscriptionId' = 'sub_R3B') = 1, 'an unsettled duplicate is listed for the cron');
+select public.billing_duplicate_mark('sub_R3B', 'refunded');
+select pg_temp.ok((select count(*) from jsonb_array_elements(public.billing_duplicates_unsettled(50)) x
+                    where x ->> 'stripeSubscriptionId' = 'sub_R3B' and (x ->> 'refunded')::boolean) = 1, 'refunded but not canceled: still listed');
+select public.billing_duplicate_mark('sub_R3B', 'canceled');
+select pg_temp.ok((select count(*) from jsonb_array_elements(public.billing_duplicates_unsettled(50)) x
+                    where x ->> 'stripeSubscriptionId' = 'sub_R3B') = 0, 'settled: no longer listed');
+select public.billing_apply(:dup3, pg_temp.sub('sub_R3B', 'cus_Dup3', 'canceled', 'price_StuM1', now(), now() + interval '30 days'), now() + interval '4 seconds') as d3c \gset
+select pg_temp.ok((:'d3c'::jsonb ->> 'refunded')::boolean and (:'d3c'::jsonb ->> 'canceled')::boolean,
+  'a late event for a settled duplicate reports nothing left to do');
+select public.billing_apply(:dup3, pg_temp.sub('sub_R3C', 'cus_Dup3', 'active', 'price_ProM1', now(), now() + interval '30 days'), now() + interval '5 seconds');
+select pg_temp.ok((select stripe_subscription_id from public.subscriptions where owner_id = :dup3) = 'sub_R3C'
+  and (select plan_id from public.profiles where id = :dup3) = 'pro', 'a new subscription after both ended is applied normally');
+
+-- A partial refund owed while jobs hold the credits is paid off from their refunds first.
+select public.billing_checkout_record(:part3, 'cs_test_part3top001', 'topup', 'zephyr_topup_500');
+select public.billing_topup_grant(:part3, 'cs_test_part3top001', 'pi_Part3', 'zephyr_topup_500');
+select id as t3 from public.credit_topups where payment_intent_id = 'pi_Part3' \gset
+update public.credit_balances set balance = 0 where owner_id = :part3;
+select public.ai_bg_job_create(:part3, array[pg_temp.photo(:part3, 'p1.jpg'), pg_temp.photo(:part3, 'p2.jpg')]::uuid[], '{"bg": "white"}', null, false) as j3 \gset
+-- Make it a job holding 400 of the 500 credits (200 per item).
+update public.ai_jobs set topup_drawn = jsonb_build_object(:'t3'::text, 400) where id = (:'j3'::jsonb #>> '{job,id}')::uuid;
+update public.ai_job_items set credits = 200 where job_id = (:'j3'::jsonb #>> '{job,id}')::uuid;
+update public.credit_topups set remaining = 100 where id = :'t3';
+select public.billing_topup_refund('pi_Part3', 250, 500) as r3 \gset
+select pg_temp.ok((:'r3'::jsonb ->> 'removed')::int = 100
+  and (select refund_target = 250 and refund_removed = 100 from public.credit_topups where id = :'t3'),
+  'a half refund takes the 100 left and records 150 still owed');
+select public._ai_refund_item((select id from public.ai_job_items where job_id = (:'j3'::jsonb #>> '{job,id}')::uuid order by seq limit 1));
+select pg_temp.ok((select remaining = 50 and refund_removed = 250 from public.credit_topups where id = :'t3')
+  and exists (select 1 from public.credit_ledger where owner_id = :part3 and reason = 'job_refund' and delta = 50
+               and label like '%150 from a refunded or expired top-up not returned%'),
+  'the first job refund pays off the 150 owed, returns 50, and says so');
+select public._ai_refund_item((select id from public.ai_job_items where job_id = (:'j3'::jsonb #>> '{job,id}')::uuid order by seq offset 1 limit 1));
+select pg_temp.ok((select remaining from public.credit_topups where id = :'t3') = 250
+  and (select balance from public.credit_balances where owner_id = :part3) = 0,
+  'the member keeps 250 of 500: never more than credits − refund owed');
+select public.billing_topup_refund('pi_Part3', 300, 500) as r3b \gset
+select pg_temp.ok((:'r3b'::jsonb ->> 'removed')::int = 50
+  and (select remaining from public.credit_topups where id = :'t3') = 200, 'a larger refund later takes only the difference');
+
+-- Price moves: a claim of a stopped change left unfinished is owed a revert.
+select public.billing_customer_set(:mv3, 'cus_Mv3');
+select public.billing_apply(:mv3, pg_temp.sub('sub_Mv3', 'cus_Mv3', 'active', 'price_StuY3', now() - interval '360 days', now() + interval '3 days'), now());
+select public.admin_price_set(:fin, 'zephyr_studio_yearly', 'price_StuYr2', 28900, 'Costs', false) as mv3c \gset
+select public.price_moves_due(500);
+select id as mv3m from public.price_moves where owner_id = :mv3 and to_price_id = 'price_StuYr2' \gset
+select public.price_move_mark(:'mv3m', 'notified');
+update public.price_moves set move_at = now() + interval '1 day' where id = :'mv3m';
+select pg_temp.ok(public.price_move_claim(:'mv3m') ->> 'status' = 'moving', 'claimed for the swap');
+select public.admin_price_change_stop(:fin, (:'mv3c'::jsonb ->> 'priceChangeId')::uuid);
+select pg_temp.ok((select count(*) from jsonb_array_elements(public.price_move_reverts_due(100) -> 'reverts') x
+                    where (x ->> 'moveId')::uuid = :'mv3m') = 0, 'a fresh claim of a stopped change is left to its worker');
+update public.price_moves set claimed_at = now() - interval '2 hours' where id = :'mv3m';
+select public.price_move_reverts_due(100) as rd3 \gset
+select pg_temp.ok((select status from public.price_moves where id = :'mv3m') = 'revert_pending'
+  and (select count(*) from jsonb_array_elements(:'rd3'::jsonb -> 'reverts') x where (x ->> 'moveId')::uuid = :'mv3m') = 1,
+  'an unfinished claim of a stopped change (outcome unknown) goes to revert_pending for the cron');
+
+-- Deletion: a cancel set by a deletion request is remembered; a restored account still set to cancel is listed.
+select public.billing_customer_set(:res3, 'cus_Res3');
+select public.billing_apply(:res3, pg_temp.sub('sub_Res3', 'cus_Res3', 'active', 'price_ProM1', now() - interval '1 day', now() + interval '29 days',
+                                               '{"cancel_at_period_end": true, "deletion_cancel": true}'), now());
+select pg_temp.ok((select deletion_cancel from public.subscriptions where owner_id = :res3)
+  and not public.billing_deletion_pending(:res3)
+  and (select count(*) from jsonb_array_elements(public.billing_deletion_resumes_due(100)) x where (x ->> 'ownerId')::uuid = :res3) = 1,
+  'a restored account still set to cancel by a deletion request is listed to resume');
+update public.profiles set deletion_requested_at = now(), deletion_due = now() + interval '30 days' where id = :res3;
+select pg_temp.ok(public.billing_deletion_pending(:res3)
+  and (select count(*) from jsonb_array_elements(public.billing_deletion_resumes_due(100)) x where (x ->> 'ownerId')::uuid = :res3) = 0,
+  'not while the deletion is pending');
+update public.profiles set deletion_requested_at = null, deletion_due = null where id = :res3;
+select public.billing_apply(:res3, pg_temp.sub('sub_Res3', 'cus_Res3', 'active', 'price_ProM1', now() - interval '1 day', now() + interval '29 days',
+                                               '{"cancel_at_period_end": true}'), now() + interval '1 second');
+select pg_temp.ok((select count(*) from jsonb_array_elements(public.billing_deletion_resumes_due(100)) x where (x ->> 'ownerId')::uuid = :res3) = 0,
+  'a cancel the member chose themselves is never resumed');
+
+select pg_temp.ok(has_function_privilege('service_role', 'public.billing_duplicate_record(uuid, text)', 'execute')
+  and has_function_privilege('service_role', 'public.billing_duplicates_unsettled(integer)', 'execute')
+  and has_function_privilege('service_role', 'public.billing_deletion_resumes_due(integer)', 'execute')
+  and not has_function_privilege('authenticated', 'public.billing_duplicate_mark(text, text)', 'execute')
+  and not has_function_privilege('anon', 'public.billing_deletion_pending(uuid)', 'execute'), 'the round-3 functions are for the API only');
+
 -- ---- Privileges -----------------------------------------------------------------------------------
 select pg_temp.ok(not exists (
   select 1 from unnest(array['billing_customers', 'billing_prices', 'subscriptions', 'billing_events', 'checkout_sessions',
-                             'credit_topups', 'price_changes', 'price_moves']) t
+                             'credit_topups', 'price_changes', 'price_moves', 'billing_duplicates']) t
    where has_table_privilege('anon', 'public.' || t, 'select') or has_table_privilege('authenticated', 'public.' || t, 'select')
       or has_table_privilege('authenticated', 'public.' || t, 'insert') or has_table_privilege('authenticated', 'public.' || t, 'update')),
   'browser roles can''t read or write any billing table');
 select pg_temp.ok((select bool_and(c.relrowsecurity) from pg_class c join pg_namespace n on n.oid = c.relnamespace
                     where n.nspname = 'public' and c.relname in ('billing_customers', 'billing_prices', 'subscriptions', 'billing_events',
-                                                                  'checkout_sessions', 'credit_topups', 'price_changes', 'price_moves')),
+                                                                  'checkout_sessions', 'credit_topups', 'price_changes', 'price_moves',
+                                                                  'billing_duplicates')),
   'RLS is on for every billing table');
 set local role authenticated;
 select pg_temp.ok((select count(*) from public.profiles) = 0, 'authenticated without a session sees no profiles');

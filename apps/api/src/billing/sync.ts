@@ -28,6 +28,9 @@ export class OwnerMismatch extends Error {
   }
 }
 
+/** Subscription metadata flag: cancel_at_period_end was set by an account-deletion request, not by the member. */
+export const DELETION_CANCEL_FLAG = 'zephyr_deletion_cancel';
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const iso = (t: number | null | undefined) => (t ? new Date(t * 1000).toISOString() : null);
 
@@ -98,6 +101,7 @@ export function snapshot(sub: Stripe.Subscription): SubscriptionSnapshot {
     scheduled_interval: scheduled?.interval ?? null,
     scheduled_at: scheduled?.at ?? null,
     scheduled_price_id: scheduledPriceId,
+    deletion_cancel: sub.metadata?.[DELETION_CANCEL_FLAG] === '1',
     amount: price?.unit_amount ?? null,
   };
 }
@@ -127,9 +131,6 @@ export async function resolveOwner(
   return owner;
 }
 
-/** Subscription metadata flag: a second live subscription we canceled and refunded (two Checkouts paid). */
-export const DUPLICATE_FLAG = 'zephyr_duplicate';
-
 export interface SyncResult {
   owner: string;
   /** The subscription was a duplicate purchase: canceled and refunded (its Checkout shows "refunded"). */
@@ -150,13 +151,15 @@ export async function syncSubscription(
   const owner = await resolveOwner(env, stripe, customerId, sub.metadata);
   if (knownOwner && knownOwner !== owner) throw new OwnerMismatch('owner_mismatch');
   let out = await billingDb.apply(env, owner, snapshot(sub), syncedAt);
-  if (out?.duplicate && out.storedSubscriptionId) {
+  if (out?.duplicate && out.recorded) {
+    // Recorded earlier (billing_duplicates): never applied, whatever happened to the stored one since. Finish
+    // whatever an earlier try left undone.
+    await settleDuplicate(env, stripe, sub, {
+      refunded: Boolean(out.refunded),
+      canceled: Boolean(out.canceled),
+    });
+  } else if (out?.duplicate && out.storedSubscriptionId) {
     out = await resolveDuplicate(env, stripe, owner, sub, syncedAt, out.storedSubscriptionId, requestId);
-  } else if (out?.ignored === 'older_subscription' && sub.metadata?.[DUPLICATE_FLAG] === '1') {
-    // A duplicate we flagged earlier, now ended: finish its refund if an earlier try failed (idempotent keys:
-    // a refund already made is never repeated).
-    await settleDuplicate(stripe, sub);
-    out = { planBefore: 'free', planAfter: 'free', duplicate: true };
   }
   if (out && !out.stale && !out.duplicate && out.planBefore !== 'free' && out.planAfter === 'free') {
     await notifyPlanEnded(env, stripe, out.email ?? null, customerId, requestId);
@@ -170,8 +173,8 @@ const keepsPlan = (sub: Stripe.Subscription) =>
 /**
  * A second live subscription for an owner whose stored one still keeps the plan (two Checkouts paid, e.g. two
  * tabs). First the stored one is checked in Stripe: if it has in fact ended, that is applied and the newer one
- * takes its place. Otherwise the newer one is canceled at once and its paid invoice refunded in full, so the
- * member is never billed twice for one plan. Returns the final apply result.
+ * takes its place. Otherwise the newer one is recorded as a duplicate (billing_duplicates, so it can never be
+ * adopted later), its paid invoices are refunded in full and it is canceled. Returns the final apply result.
  */
 async function resolveDuplicate(
   env: Env,
@@ -196,49 +199,65 @@ async function resolveDuplicate(
     return billingDb.apply(env, owner, snapshot(newer), newerSyncedAt);
   }
   logError(requestId, 'billing_duplicate_subscription', new Error('duplicate'));
-  if (newer.metadata?.[DUPLICATE_FLAG] !== '1' && (keepsPlan(newer) || newer.status === 'incomplete')) {
-    // Flagged first (Stripe won't update a canceled subscription), so a retry after the cancel still refunds.
-    await stripe.subscriptions.update(
-      newer.id,
-      { metadata: { [DUPLICATE_FLAG]: '1' } },
-      { idempotencyKey: `dup-flag:${newer.id}` },
-    );
-  }
-  await settleDuplicate(stripe, newer);
+  const rec = await billingDb.duplicateRecord(env, owner, newer.id);
+  // The stored subscription itself is never treated as a duplicate.
+  if (!rec || rec.error) throw new Error('duplicate_record_refused');
+  await settleDuplicate(env, stripe, newer, {
+    refunded: Boolean(rec.refunded),
+    canceled: Boolean(rec.canceled),
+  });
   return { planBefore: 'free', planAfter: 'free', duplicate: true };
 }
 
 /**
- * Refund first, then cancel: if the refund fails, the webhook answers 500 and Stripe's retry still finds a live
- * duplicate and finishes. If the cancel fails after the refund, the retry's refund is a no-op (same keys).
+ * Settles a recorded duplicate: refund first, then cancel, each recorded once done. If the refund fails, the
+ * webhook answers 500 (and the daily cron retries), and the cancel waits, so the duplicate is still live to
+ * retry against. Only ever called for a subscription with a billing_duplicates row.
  */
-async function settleDuplicate(stripe: Stripe, sub: Stripe.Subscription) {
-  await refundLatestInvoice(stripe, sub);
-  if (keepsPlan(sub) || sub.status === 'incomplete') {
-    await stripe.subscriptions.cancel(
-      sub.id,
-      { prorate: false, invoice_now: false },
-      { idempotencyKey: `dup-cancel:${sub.id}` },
-    );
+export async function settleDuplicate(
+  env: Env,
+  stripe: Stripe,
+  sub: Stripe.Subscription,
+  done: { refunded: boolean; canceled: boolean },
+) {
+  if (!done.refunded) {
+    await refundPaidInvoices(stripe, sub.id);
+    await billingDb.duplicateMark(env, sub.id, 'refunded');
+  }
+  if (!done.canceled) {
+    if (keepsPlan(sub) || sub.status === 'incomplete' || sub.status === 'paused') {
+      await stripe.subscriptions.cancel(
+        sub.id,
+        { prorate: false, invoice_now: false },
+        { idempotencyKey: `dup-cancel:${sub.id}` },
+      );
+    }
+    await billingDb.duplicateMark(env, sub.id, 'canceled');
   }
 }
 
-/** Refunds every paid payment of a subscription's latest invoice in full (a duplicate purchase). */
-async function refundLatestInvoice(stripe: Stripe, sub: Stripe.Subscription) {
-  const invoice = idOf(sub.latest_invoice as string | { id: string } | null);
-  if (!invoice) return;
-  const payments = await stripe.invoicePayments.list({ invoice, status: 'paid', limit: 10 });
-  for (const p of payments.data) {
-    const pi = idOf(p.payment?.payment_intent as string | { id: string } | null | undefined);
-    if (!pi) continue;
-    try {
-      await stripe.refunds.create(
-        { payment_intent: pi, reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
-        { idempotencyKey: `dup-refund:${pi}` },
-      );
-    } catch (err) {
-      // Refunded already (an earlier try, after the 24 h idempotency window): done, not a failure to retry.
-      if (!(isStripeError(err) && err.code === 'charge_already_refunded')) throw err;
+/** Refund errors that mean the charge needs nothing more from us. */
+const SETTLED_REFUND_CODES = new Set(['charge_already_refunded', 'charge_disputed']);
+
+/** Refunds every paid payment of every paid invoice of a duplicate subscription, in full. */
+async function refundPaidInvoices(stripe: Stripe, subscriptionId: string) {
+  const invoices = await stripe.invoices.list({ subscription: subscriptionId, status: 'paid', limit: 24 });
+  for (const inv of invoices.data) {
+    if (!inv.id) continue;
+    const payments = await stripe.invoicePayments.list({ invoice: inv.id, status: 'paid', limit: 10 });
+    for (const p of payments.data) {
+      const pi = idOf(p.payment?.payment_intent as string | { id: string } | null | undefined);
+      if (!pi) continue;
+      try {
+        await stripe.refunds.create(
+          { payment_intent: pi, reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
+          { idempotencyKey: `dup-refund:${pi}` },
+        );
+      } catch (err) {
+        // Refunded already (an earlier try, past the 24 h idempotency window) or disputed (the dispute returns
+        // the money): nothing more to do for this charge.
+        if (!(isStripeError(err) && SETTLED_REFUND_CODES.has(err.code ?? ''))) throw err;
+      }
     }
   }
 }

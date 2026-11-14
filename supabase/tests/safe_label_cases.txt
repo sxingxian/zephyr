@@ -1,0 +1,33 @@
+# Names checked against both isSafeLabel (packages/shared) and public._safe_label (80_teams_test.sql).
+# Format: ok|<name> or no|<name>. Each name is NFKC-normalised first (as the API stores it).
+# Which non-ASCII characters count as letters in SQL depends on the database locale ([[:alpha:]]); the API's
+# Unicode check (isSafeLabel) is the gatekeeper for scripts, so locale-dependent cases (e.g. Arabic-Indic digits)
+# are tested in packages/shared only. Everything that makes a name read as a link or address is listed here.
+ok|Tan Studio
+ok|Tân Studio 54
+ok|Mei Lin's Studio
+ok|A & B Photography
+ok|Smith, Jones & Co.
+ok|J. R. Studio
+ok|Studio-9
+ok|写真スタジオ
+ok|Ålborg Foto
+ok|สตูดิโอ ภาพ
+ok|St. Clair
+no|evil.com
+no|evil.cc
+no|evil.ⅽⅽ
+no|x.ⅿⅾ
+no|evil。com
+no|evil．com
+no|evil｡com
+no|mei＠example
+no|mei@example
+no|www.studio
+no|http://studio
+no|studio.io now
+ok|Studio²
+ok|Studio Ⅻ
+no|Studio!
+no|Studio_9
+no|

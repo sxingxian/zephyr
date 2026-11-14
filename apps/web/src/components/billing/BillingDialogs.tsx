@@ -8,8 +8,17 @@ import type {
 } from '@zephyr/shared/client';
 import { Button, Dialog, Icon, Note, Spinner } from '@zephyr/ui';
 import { type ReactNode, useEffect, useId, useState } from 'react';
-import { errorMessage } from '../../lib/api';
-import { changePlan, leave, longDate, PLAN_NAME, previewChange, startCheckout, usd } from '../../lib/billing';
+import { ApiFailure, errorMessage } from '../../lib/api';
+import {
+  changePlan,
+  leave,
+  longDate,
+  PLAN_NAME,
+  previewChange,
+  startCheckout,
+  undoScheduledChange,
+  usd,
+} from '../../lib/billing';
 
 /** Invoice-style rows with a total, as in the upgrade and top-up dialogs. */
 export function LineItems({
@@ -53,28 +62,56 @@ export function ChangePlanDialog({
   current,
   onClose,
   onDone,
+  onUndone,
 }: {
   open: boolean;
   target: { plan: PaidPlanId; interval: BillingInterval } | null;
   current: { plan: PlanId; interval: BillingInterval | null };
   onClose: () => void;
   onDone: (r: PlanChangeResult, kind: 'upgrade' | 'downgrade') => void;
+  /** The scheduled change was undone from this dialog (the billing page reloads its status). */
+  onUndone?: () => void;
 }) {
   const [preview, setPreview] = useState<PlanChangePreviewResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // An upgrade while a downgrade (or switch to monthly) is scheduled: undo that first (409 scheduled_change).
+  const [scheduled, setScheduled] = useState<{ at: string | null } | null>(null);
+  const [undoing, setUndoing] = useState(false);
+  const [reload, setReload] = useState(0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `reload` re-runs the preview after an undo
   useEffect(() => {
     if (!open || !target) return;
     setPreview(null);
     setError(null);
+    setScheduled(null);
     let live = true;
     previewChange(target)
       .then((p) => live && setPreview(p))
-      .catch((e) => live && setError(errorMessage(e)));
+      .catch((e) => {
+        if (!live) return;
+        const s = scheduledChangeOf(e);
+        if (s) setScheduled(s);
+        else setError(errorMessage(e));
+      });
     return () => {
       live = false;
     };
-  }, [open, target]);
+  }, [open, target, reload]);
+
+  const undo = async () => {
+    setUndoing(true);
+    setError(null);
+    try {
+      await undoScheduledChange();
+      onUndone?.();
+      setReload((n) => n + 1);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setUndoing(false);
+    }
+  };
 
   const go = async () => {
     if (!target || !preview) return;
@@ -89,7 +126,11 @@ export function ChangePlanDialog({
       onDone(r, preview.kind);
       onClose();
     } catch (e) {
-      setError(errorMessage(e));
+      const s = scheduledChangeOf(e);
+      if (s) {
+        setPreview(null);
+        setScheduled(s);
+      } else setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -120,20 +161,33 @@ export function ChangePlanDialog({
           <Button kind="ghost" onClick={onClose}>
             {preview && !up ? `Keep ${curName}` : 'Cancel'}
           </Button>
-          <Button kind="primary" busy={busy} disabled={!preview} onClick={go}>
-            {!preview
-              ? 'Continue'
-              : up
-                ? due
-                  ? `Pay ${due} and upgrade`
-                  : 'Upgrade now'
-                : `Move to ${name} on ${longDate(preview.effectiveAt)}`}
-          </Button>
+          {scheduled ? (
+            <Button kind="primary" busy={undoing} onClick={undo}>
+              Undo scheduled change
+            </Button>
+          ) : (
+            <Button kind="primary" busy={busy} disabled={!preview} onClick={go}>
+              {!preview
+                ? 'Continue'
+                : up
+                  ? due
+                    ? `Pay ${due} and upgrade`
+                    : 'Upgrade now'
+                  : `Move to ${name} on ${longDate(preview.effectiveAt)}`}
+            </Button>
+          )}
         </>
       }
     >
       <div className="bl-dialog">
-        {!preview && !error && <Spinner size={20} label="Working out the change" />}
+        {!preview && !error && !scheduled && <Spinner size={20} label="Working out the change" />}
+        {scheduled && (
+          <Note tone="neutral" icon="info">
+            {scheduled.at
+              ? `You have a change scheduled for ${longDate(scheduled.at)}. Undo it first, then upgrade.`
+              : 'You have a change scheduled. Undo it first, then upgrade.'}
+          </Note>
+        )}
         {preview && up && (
           <>
             <span className="z-muted">Takes effect now</span>
@@ -318,4 +372,12 @@ export function SecureNote() {
       Secure checkout by Stripe
     </span>
   );
+}
+
+/** A 409 conflict with reason `scheduled_change` (an upgrade while a change is scheduled), or null. */
+function scheduledChangeOf(e: unknown): { at: string | null } | null {
+  if (!(e instanceof ApiFailure) || e.code !== 'conflict') return null;
+  const b = e.body as { reason?: unknown; scheduledAt?: unknown } | undefined;
+  if (b?.reason !== 'scheduled_change') return null;
+  return { at: typeof b.scheduledAt === 'string' ? b.scheduledAt : null };
 }

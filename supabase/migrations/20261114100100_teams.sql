@@ -10,14 +10,16 @@
 -- ---------------------------------------------------------------------------------------------
 -- Tables
 -- ---------------------------------------------------------------------------------------------
--- A team name goes into invite emails sent to any address, so it's held to a strict pattern: letters, numbers,
--- spaces and . , ' & - only, and nothing that reads as an address or a link (no "@", "://", "www.", or a dot
--- followed by a letter, as in a domain). public._safe_label is the same rule (the API mirrors it in SAFE_LABEL).
+-- A team name goes into invite emails sent to any address, so it's held to a strict pattern: letters, the digits
+-- 0-9, spaces and . , ' & - only, and nothing that reads as an address or a link: no "://", no "www.", and a dot
+-- only before a space, one of those marks or the end. Stored names are NFKC-normalised (lookalikes such as
+-- fullwidth "@" or Roman-numeral letters are judged as what they become). isSafeLabel in packages/shared is
+-- the same rule; supabase/tests/80_teams_test.sql and the shared tests check one list of names against both.
 create function public._safe_label(p text) returns boolean
 language sql immutable set search_path = '' as $$
-  select p is not null and length(p) between 1 and 60
-     and p ~ '^[[:alpha:][:digit:] .,''&-]+$'
-     and p !~* '(www\.|://|\.[[:alpha:]])';
+  select p is not null and p = normalize(p, NFKC) and length(p) between 1 and 60
+     and p ~ '^[[:alpha:]0-9 .,''&-]+$'
+     and p !~* '(www\.|://|\.[^[:space:].,''&-])';
 $$;
 
 create table public.teams (
@@ -255,7 +257,7 @@ language sql stable security definer set search_path = '' as $$ select public._t
 
 create function public.team_set_name(p_owner uuid, p_name text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
-declare n text := nullif(btrim(regexp_replace(coalesce(p_name, ''), '[[:cntrl:]]', '', 'g')), '');
+declare n text := nullif(btrim(normalize(regexp_replace(coalesce(p_name, ''), '[[:cntrl:]]', '', 'g'), NFKC)), '');
 begin
   if n is null or not public._safe_label(n) then return jsonb_build_object('error', 'invalid'); end if;
   if not exists (select 1 from public.profiles where id = p_owner and deleted_at is null) then return null; end if;

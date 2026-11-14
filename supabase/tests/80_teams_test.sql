@@ -41,6 +41,27 @@ select pg_temp.ok(public.team_set_name(:mei, 'Claim it at evil.com') ->> 'error'
   'team names that read as links or addresses are refused');
 select pg_temp.ok(public.team_set_name(:mei, 'St. John''s & Sons - Co.') ->> 'name' = 'St. John''s & Sons - Co.'
   and public._safe_label('Tân Studio 54'), 'letters (any script), numbers, spaces and . , '' & - are fine');
+-- The shared list (supabase/tests/safe_label_cases.txt), also checked against isSafeLabel in packages/shared.
+\set casefile :testdir '/safe_label_cases.txt'
+create temp table label_cases as
+  select line from regexp_split_to_table(pg_read_file(:'casefile'), E'\n') as line;
+do $$
+declare r record; n integer := 0;
+begin
+  for r in select split_part(line, '|', 1) as want, substr(line, position('|' in line) + 1) as name
+             from label_cases where line ~ '^(ok|no)\|' loop
+    if public._safe_label(normalize(r.name, NFKC)) is distinct from (r.want = 'ok') then
+      raise exception 'FAILED: _safe_label(%) should be %', r.name, r.want;
+    end if;
+    n := n + 1;
+  end loop;
+  if n < 20 then raise exception 'FAILED: only % label cases read', n; end if;
+  raise notice 'ok - % shared name cases agree with the SQL rule', n;
+end $$;
+select pg_temp.ok(public.team_set_name(:mei, 'Studio Ⅻ') ->> 'name' = 'Studio XII'
+  and not public._safe_label('Studio Ⅻ'),
+  'names are stored NFKC-normalised, and an unnormalised name never passes the table check');
+select pg_temp.ok(public.team_set_name(:mei, 'evil.ⅽⅽ') ->> 'error' = 'invalid', 'a Roman-numeral domain is refused');
 select pg_temp.ok(public.team_set_name(:mei, 'Tan Studio') ->> 'name' = 'Tan Studio', 'back to Tan Studio');
 do $$ begin
   begin

@@ -21,13 +21,7 @@ import {
 } from '@zephyr/shared';
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { billingDb, type CurrentPrice, type StoredSubscription } from '../billing/db';
-import {
-  clearPendingDowngrade,
-  notePendingDowngrade,
-  type ScheduledTarget,
-  scheduleChange,
-  scheduledTarget,
-} from '../billing/schedule';
+import { scheduleChange } from '../billing/schedule';
 import { idOf, isStripeError, type Stripe, stripeClient } from '../billing/stripe';
 import { applyCheckoutSession, OwnerMismatch, SUBSCRIPTION_EXPAND, syncSubscription } from '../billing/sync';
 import { handleWebhook } from '../billing/webhook';
@@ -323,7 +317,32 @@ async function loadChange(
   if (!item || sub.items.data.length !== 1 || !PLAN_KEEPING_STATUSES.includes(sub.status as never)) {
     return c.json(fail('conflict'), 409);
   }
+  // An upgrade while a downgrade (or switch to monthly) is scheduled: the member undoes the scheduled change
+  // first. Releasing it here and putting it back if the upgrade fails or waits for payment proved fragile
+  // (docs/phase-7.md, Billing API › Change), so nothing is touched in Stripe.
+  if (kind === 'upgrade') {
+    const scheduled = scheduledChangeOf(sub);
+    if (scheduled)
+      return c.json(
+        fail('conflict', {
+          reason: 'scheduled_change',
+          ...(scheduled.at ? { scheduledAt: scheduled.at } : {}),
+        }),
+        409,
+      );
+  }
   return { stripe, owner, stored, sub, item, kind, target, to };
+}
+
+/** The subscription's live schedule (every schedule Zephyr makes is a scheduled downgrade), or null. */
+function scheduledChangeOf(sub: Stripe.Subscription): { at: string | null } | null {
+  if (!sub.schedule) return null;
+  if (typeof sub.schedule === 'string') return { at: null };
+  const s = sub.schedule;
+  if (s.status !== 'active' && s.status !== 'not_started') return null;
+  const now = Math.floor(Date.now() / 1000);
+  const next = s.phases.find((p) => p.start_date > now);
+  return { at: next ? new Date(next.start_date * 1000).toISOString() : null };
 }
 
 billingRoutes.post('/change/preview', async (c) => {
@@ -385,30 +404,6 @@ billingRoutes.post('/change/preview', async (c) => {
   }
 });
 
-/** An upgrade that failed outright: the downgrade the member had scheduled goes back as it was. */
-async function restoreDowngrade(
-  c: Ctx,
-  stripe: Stripe,
-  owner: string,
-  sub: Stripe.Subscription,
-  item: Stripe.SubscriptionItem,
-  currentPrice: string,
-  pending: ScheduledTarget,
-  minute: number,
-) {
-  try {
-    await scheduleChange(stripe, sub, item, currentPrice, null, {
-      ...pending,
-      key: `restore:${owner}:${sub.id}:${pending.price}:${minute}`,
-      scheduleKey: `restore-schedule:${owner}:${sub.id}:${minute}`,
-    });
-    await clearPendingDowngrade(stripe, sub.id, `pending-clear:${sub.id}:${minute}`);
-  } catch (err) {
-    // Logged as an alert; the note stays on the subscription, so the member can schedule it again.
-    logError(c.get('requestId'), 'billing_schedule_restore', err);
-  }
-}
-
 billingRoutes.post('/change', async (c) => {
   const body = await readBody(c, planChangeSchema);
   if (!body) return c.json(fail('invalid'), 400);
@@ -422,43 +417,21 @@ billingRoutes.post('/change', async (c) => {
     let actionUrl: string | null = null;
     const currentPrice = typeof item.price === 'string' ? item.price : item.price.id;
     if (kind === 'upgrade') {
-      // A subscription managed by a schedule can't be updated directly: drop the scheduled downgrade first. Its
-      // target is noted on the subscription, so an upgrade that fails gets it back at once, and one that waits
-      // for payment gets it back only if that payment never comes (the webhook, on pending_update_expired). It
-      // isn't recreated while the upgrade is pending: the schedule would later override a paid upgrade.
-      const pending = scheduleId ? await scheduledTarget(stripe, scheduleId) : null;
-      if (scheduleId)
-        await stripe.subscriptionSchedules.release(
-          scheduleId,
-          {},
-          { idempotencyKey: `release:${scheduleId}` },
-        );
-      if (pending) await notePendingDowngrade(stripe, sub.id, pending, `pending-note:${sub.id}:${minute}`);
-      let updated: Stripe.Subscription;
-      try {
-        updated = await stripe.subscriptions.update(
-          sub.id,
-          {
-            items: [{ id: item.id, price: target.stripePriceId }],
-            proration_behavior: 'always_invoice',
-            // Nothing changes unless the proration is paid: an unpaid upgrade never unlocks the higher plan.
-            payment_behavior: 'pending_if_incomplete',
-            expand: ['latest_invoice'],
-          },
-          { idempotencyKey: `change:${owner}:${sub.id}:${target.lookupKey}:${minute}` },
-        );
-      } catch (err) {
-        // The upgrade failed outright: the downgrade goes back as it was, and the note is cleared.
-        if (pending) await restoreDowngrade(c, stripe, owner, sub, item, currentPrice, pending, minute);
-        throw err;
-      }
+      // loadChange refused an upgrade while a change is scheduled, so no schedule manages this subscription.
+      const updated = await stripe.subscriptions.update(
+        sub.id,
+        {
+          items: [{ id: item.id, price: target.stripePriceId }],
+          proration_behavior: 'always_invoice',
+          // Nothing changes unless the proration is paid: an unpaid upgrade never unlocks the higher plan.
+          payment_behavior: 'pending_if_incomplete',
+          expand: ['latest_invoice'],
+        },
+        { idempotencyKey: `change:${owner}:${sub.id}:${target.lookupKey}:${minute}` },
+      );
       if (updated.pending_update) {
-        // Waiting for payment: the note stays until Stripe says the update was paid or expired.
         const inv = updated.latest_invoice;
         actionUrl = inv && typeof inv !== 'string' ? (inv.hosted_invoice_url ?? null) : null;
-      } else if (pending) {
-        // Paid at once: the upgrade replaces the downgrade.
-        await clearPendingDowngrade(stripe, sub.id, `pending-clear:${sub.id}:${minute}`);
       }
     } else {
       await scheduleChange(stripe, sub, item, currentPrice, scheduleId, {

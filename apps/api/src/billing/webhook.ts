@@ -7,7 +7,6 @@ import type { Context } from 'hono';
 import { fail, logError } from '../http';
 import type { HonoEnv } from '../types';
 import { billingDb } from './db';
-import { settlePendingDowngrade } from './schedule';
 import { idOf, isMissing, type Stripe, stripeClient, verifyWebhook } from './stripe';
 import { applyCheckoutSession, OwnerMismatch, syncSubscription } from './sync';
 
@@ -104,20 +103,7 @@ export async function dispatch(
     const sub = subscriptionOf(event);
     if (!sub) return { status: 'ignored', owner: null };
     try {
-      if (
-        event.type === 'customer.subscription.pending_update_applied' ||
-        event.type === 'customer.subscription.pending_update_expired'
-      ) {
-        // An upgrade that waited for payment ended: put back the noted downgrade if it expired unpaid.
-        await settlePendingDowngrade(
-          env,
-          stripe,
-          sub,
-          event.type.endsWith('expired') ? 'expired' : 'applied',
-          event.id,
-          requestId,
-        );
-      }
+      // pending_update_applied / _expired (an upgrade that waited for payment) are plain re-syncs too.
       const { owner } = await syncSubscription(env, stripe, sub, requestId);
       return { status: 'processed', owner };
     } catch (err) {

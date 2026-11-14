@@ -1,4 +1,4 @@
-import { isSafeLabel, type TeamRole } from '@zephyr/shared';
+import { isSafeLabel, normalizeLabel, type TeamRole } from '@zephyr/shared';
 import { escapeHtml, oneLine } from './escape';
 
 export interface TeamInviteEmail {
@@ -30,7 +30,8 @@ export const TEAM_INVITE_SUBJECT = 'You’re invited to join a team on Zephyr';
 
 /** A name only if it passes the strict pattern (SAFE_LABEL); otherwise null and generic wording is used. */
 const safeName = (s: string | null) => {
-  const v = s ? oneLine(s).trim() : '';
+  // Shown as its NFKC form, the form that was checked (a lookalike never reaches the email as itself).
+  const v = s ? normalizeLabel(oneLine(s)).trim() : '';
   return v && isSafeLabel(v) ? v : null;
 };
 

@@ -60,6 +60,8 @@ export interface SubscriptionSnapshot {
   scheduled_at: string | null;
   /** The next phase's price (a scheduled downgrade), so the DB can map prices it has seen. */
   scheduled_price_id: string | null;
+  /** cancel_at_period_end came from an account-deletion request (metadata zephyr_deletion_cancel). */
+  deletion_cancel: boolean;
   /** The current price's unit amount (cents), for a price the DB hasn't seen. */
   amount: number | null;
 }
@@ -76,6 +78,10 @@ export interface ApplyResult {
    */
   duplicate?: boolean;
   storedSubscriptionId?: string;
+  /** A duplicate already recorded in billing_duplicates: settle it (never apply), skipping what's done. */
+  recorded?: boolean;
+  refunded?: boolean;
+  canceled?: boolean;
   /** Not applied: an ended subscription that never replaces a live one, or another customer's. */
   ignored?: 'older_subscription' | 'customer_mismatch';
   email?: string | null;
@@ -165,6 +171,18 @@ export const billingDb = {
       p_sub: sub,
       p_synced_at: syncedAt.toISOString(),
     }),
+  duplicateRecord: (env: Env, owner: string, subscription: string) =>
+    rpc<{ recorded?: boolean; refunded?: boolean; canceled?: boolean; error?: string } | null>(
+      env,
+      'billing_duplicate_record',
+      { p_owner: owner, p_subscription: subscription },
+    ),
+  duplicateMark: (env: Env, subscription: string, what: 'refunded' | 'canceled') =>
+    rpc<boolean>(env, 'billing_duplicate_mark', { p_subscription: subscription, p_what: what }),
+  duplicatesUnsettled: async (env: Env, limit: number) =>
+    (await rpc<
+      { stripeSubscriptionId: string; ownerId: string; refunded: boolean; canceled: boolean }[] | null
+    >(env, 'billing_duplicates_unsettled', { p_limit: limit })) ?? [],
   topupGrant: (
     env: Env,
     owner: string,
@@ -197,6 +215,16 @@ export const billingDb = {
       p_limit: limit,
     })) ?? [],
   /** Accounts pending deletion whose subscription still renews. */
+  deletionResumesDue: async (env: Env, limit: number) =>
+    (await rpc<{ ownerId: string; stripeSubscriptionId: string }[] | null>(
+      env,
+      'billing_deletion_resumes_due',
+      {
+        p_limit: limit,
+      },
+    )) ?? [],
+  deletionPending: async (env: Env, owner: string) =>
+    Boolean(await rpc<boolean>(env, 'billing_deletion_pending', { p_owner: owner })),
   deletionCancelsDue: async (env: Env, limit: number) =>
     (await rpc<{ ownerId: string; stripeSubscriptionId: string }[] | null>(
       env,

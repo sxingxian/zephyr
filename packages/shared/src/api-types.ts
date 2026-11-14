@@ -107,6 +107,12 @@ export interface ApiError {
   balance?: number;
   /** conflict on a device job: the device that holds it. */
   holder?: string;
+  /**
+   * Phase 7, conflict on a plan change: `scheduled_change` means a downgrade or switch to monthly is scheduled
+   * and must be undone (DELETE BILLING_API.change) before upgrading. `scheduledAt` is when it takes effect.
+   */
+  reason?: 'scheduled_change';
+  scheduledAt?: string;
 }
 export interface Accepted {
   ok: true;

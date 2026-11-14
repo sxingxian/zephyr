@@ -418,6 +418,7 @@ export function BillingPage() {
               'good',
             );
           }}
+          onUndone={() => void refresh()}
         />
       )}
       {status && <TopUpDialog open={topup} packs={status.packs} onClose={() => setTopup(false)} />}

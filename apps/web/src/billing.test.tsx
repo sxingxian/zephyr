@@ -300,6 +300,71 @@ describe('upgrade dialog', () => {
     expect(calls.find((c) => c.url === '/api/v1/billing/change')?.body).toEqual(target);
     expect(onDone).not.toHaveBeenCalled();
   });
+
+  it('asks to undo a scheduled change first, then shows the upgrade', async () => {
+    let scheduled = true;
+    mockApi((url, method) => {
+      if (url === '/api/v1/billing/change/preview')
+        return scheduled
+          ? json(409, {
+              ok: false,
+              error: 'conflict',
+              reason: 'scheduled_change',
+              scheduledAt: '2026-12-14T00:00:00Z',
+            })
+          : json(200, {
+              ok: true,
+              kind: 'upgrade',
+              lines: [{ description: 'Studio · rest of this month', amount: 1620 }],
+              dueNow: { amount: 1620, currency: 'usd' },
+              effectiveAt: '2026-11-14T00:00:00Z',
+              effects: {
+                storageGb: { from: 250, to: 1000 },
+                seats: { from: 1, to: 3 },
+                lost: [],
+                teammatesLosingAccess: 0,
+                overStorage: false,
+              },
+            });
+      if (url === '/api/v1/billing/change' && method === 'DELETE') {
+        scheduled = false;
+        return json(200, {
+          ok: true,
+          plan: 'pro',
+          subscription: null,
+          state: 'active',
+          storage: { usedBytes: 1, limitBytes: 1 },
+          packs: [],
+          hasCustomer: true,
+        });
+      }
+      return undefined;
+    });
+    const onUndone = vi.fn();
+    render(
+      <ToastProvider>
+        <ChangePlanDialog
+          open
+          target={{ plan: 'studio', interval: 'month' }}
+          current={{ plan: 'pro', interval: 'year' }}
+          onClose={() => {}}
+          onDone={() => {}}
+          onUndone={onUndone}
+        />
+      </ToastProvider>,
+    );
+    expect(
+      await screen.findByText('You have a change scheduled for 14 Dec 2026. Undo it first, then upgrade.'),
+    ).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /upgrade/i })).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Undo scheduled change' }));
+    });
+    expect(await screen.findByText('Studio · rest of this month')).toBeTruthy();
+    expect(onUndone).toHaveBeenCalledTimes(1);
+    expect(calls.filter((c) => c.url === '/api/v1/billing/change' && c.method === 'DELETE')).toHaveLength(1);
+    expect(calls.some((c) => c.url === '/api/v1/billing/change' && c.method === 'POST')).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------- roles

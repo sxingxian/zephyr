@@ -125,9 +125,21 @@ export const TEAM_NAME_MAX = 60;
  * strict pattern: letters, numbers, spaces and . , ' & - only, and nothing that reads as an address or a link
  * (no "@", "://", "www.", or a dot followed by a letter, as in a domain). Mirrors public._safe_label.
  */
-export const SAFE_LABEL = /^[\p{L}\p{N} .,'&-]{1,60}$/u;
-const LINK_LIKE = /(www\.|:\/\/|\.\p{L})/iu;
-export const isSafeLabel = (s: string): boolean => SAFE_LABEL.test(s) && !LINK_LIKE.test(s);
+/**
+ * Names that go into emails sent to any address (team names, inviter names): checked after NFKC normalisation,
+ * so lookalikes (fullwidth "@", Roman-numeral letters, ideographic dots) are judged as what they become.
+ * Letters (with their combining marks, for scripts such as Thai or Devanagari), the digits 0-9, spaces and
+ * . , ' & - only; a dot may only be followed by a space, one of those marks
+ * or the end, so nothing reads as a domain. public._safe_label in SQL is the same rule, and stored names are
+ * already NFKC (`normalizeLabel`).
+ */
+export const SAFE_LABEL = /^[\p{L}\p{M}0-9 .,'&-]{1,60}$/u;
+const LINK_LIKE = /(www\.|:\/\/|\.[^\s.,'&-])/iu;
+export const normalizeLabel = (s: string): string => s.normalize('NFKC');
+export const isSafeLabel = (s: string): boolean => {
+  const n = normalizeLabel(s);
+  return SAFE_LABEL.test(n) && !LINK_LIKE.test(n);
+};
 export const TEAM_INVITE_DAYS = 7;
 export interface TeamMember {
   userId: string;

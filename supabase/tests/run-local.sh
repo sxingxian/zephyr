@@ -13,7 +13,7 @@ trap cleanup EXIT
 if [ "$(id -u)" = 0 ]; then echo "Run as a non-root user (initdb refuses root)." >&2; exit 1; fi
 "$bin/initdb" -D "$data" -U postgres -A trust >/dev/null
 "$bin/pg_ctl" -D "$data" -o "-p $port -k $data -c listen_addresses=''" -w start >/dev/null
-psql=(psql -X -q -v ON_ERROR_STOP=1 -h "$data" -p "$port" -U postgres -d postgres)
+psql=(psql -X -q -v ON_ERROR_STOP=1 -v testdir="$here" -h "$data" -p "$port" -U postgres -d postgres)
 
 "${psql[@]}" -f "$here/00_local_stub.sql"
 for f in "$root"/migrations/*.sql; do

@@ -72,6 +72,9 @@ create table public.subscriptions (
   current_period_start timestamptz not null,
   current_period_end timestamptz not null,
   cancel_at_period_end boolean not null default false,
+  -- cancel_at_period_end was set by an account-deletion request (Stripe metadata zephyr_deletion_cancel), not by
+  -- the member: the daily cron resumes it if the account is no longer pending deletion.
+  deletion_cancel boolean not null default false,
   schedule_id text check (schedule_id is null or schedule_id ~ '^sub_sched_[A-Za-z0-9]{1,250}$'),
   scheduled_price_id text,
   scheduled_plan text check (scheduled_plan is null or scheduled_plan in ('pro', 'studio')),
@@ -127,10 +130,14 @@ create table public.credit_topups (
   expires_at timestamptz not null,
   checkout_session_id text not null unique,
   payment_intent_id text unique check (payment_intent_id is null or payment_intent_id ~ '^pi_[A-Za-z0-9]{1,250}$'),
-  -- Fully refunded or disputed. A partial refund removes credits in proportion (refund_removed tracks how many
-  -- credits refunds have already removed), never more than are left.
+  -- Fully refunded or disputed. A partial refund owes credits back in proportion: refund_target is how many
+  -- (ceil(credits × refunded ÷ amount), cumulative), refund_removed how many have been taken so far. What's
+  -- left can't be taken while jobs hold the credits; when those jobs are refunded, the credits pay off the rest
+  -- first, so the member never keeps more than credits − refund_target.
   refunded_at timestamptz,
-  refund_removed integer not null default 0 check (refund_removed >= 0),
+  refund_target integer not null default 0,
+  refund_removed integer not null default 0,
+  check (refund_target between 0 and credits and refund_removed between 0 and refund_target),
   created_at timestamptz not null default now()
 );
 create index credit_topups_owner on public.credit_topups (owner_id, expires_at) where remaining > 0;
@@ -178,6 +185,21 @@ create index price_moves_open on public.price_moves (status, move_at)
   where status in ('pending', 'notified', 'moving', 'moved', 'revert_pending');
 create index price_moves_owner on public.price_moves (owner_id, created_at desc);
 alter table public.price_moves enable row level security;
+
+-- A second live subscription for one owner (two Checkouts paid), recorded once the API has confirmed the stored
+-- one still keeps the plan. Recorded here, not on the Stripe object, so it can never be adopted later or applied
+-- to any other subscription: billing_apply never applies a recorded duplicate, and only these rows are ever
+-- refunded and canceled as duplicates.
+create table public.billing_duplicates (
+  stripe_subscription_id text primary key check (stripe_subscription_id ~ '^sub_[A-Za-z0-9]+$'),
+  owner_id uuid not null references auth.users (id) on delete cascade,
+  detected_at timestamptz not null default now(),
+  refunded_at timestamptz,
+  canceled_at timestamptz
+);
+create index billing_duplicates_open on public.billing_duplicates (detected_at)
+  where refunded_at is null or canceled_at is null;
+alter table public.billing_duplicates enable row level security;
 
 -- Credits (phase 6 tables): new reasons, which top-ups a job drew from.
 alter table public.credit_ledger drop constraint credit_ledger_reason_check;
@@ -419,6 +441,8 @@ declare
   lost integer := 0;
   t record;
   give integer;
+  pay integer;
+  keep integer;
   drawn jsonb;
 begin
   select * into it from public.ai_job_items where id = p_item;
@@ -436,14 +460,19 @@ begin
             where ct.id::text in (select jsonb_object_keys(drawn)) and (drawn ->> ct.id::text)::integer > 0
             order by ct.expires_at desc, ct.id for update of ct loop
     exit when left_ <= 0;
-    -- Never above what refunds left of the top-up (credits a refund removed don't come back).
-    give := least(t.d, left_, t.credits - t.refund_removed - t.remaining);
+    give := least(t.d, left_);
     if give <= 0 then continue; end if;
-    if t.refunded_at is null and t.expires_at > now() then
-      update public.credit_topups set remaining = remaining + give where id = t.id;
-      back := back + give;
-    else
+    if t.refunded_at is not null or t.expires_at <= now() then
+      -- Fully refunded or expired: these credits are gone.
       lost := lost + give;
+    else
+      -- A partial refund still owed credits it couldn't take while this job held them: pay that off first.
+      pay := least(give, greatest(t.refund_target - t.refund_removed, 0));
+      -- Then never above the top-up's size (remaining + removed ≤ credits).
+      keep := least(give - pay, greatest(t.credits - (t.refund_removed + pay) - t.remaining, 0));
+      update public.credit_topups set remaining = remaining + keep, refund_removed = refund_removed + pay where id = t.id;
+      back := back + keep;
+      lost := lost + (give - keep);
     end if;
     drawn := drawn || jsonb_build_object(t.id::text, t.d - give);
     left_ := left_ - give;
@@ -456,7 +485,10 @@ begin
   update public.ai_job_items set credits = 0 where id = p_item;
   if back > 0 then
     insert into public.credit_ledger (owner_id, delta, reason, label, job_id, item_id, item_charge, period_start)
-    values (it.owner_id, back, 'job_refund', 'Refund · ' || left(it.filename, 140), it.job_id, it.id, it.charge_seq, b.period_start)
+    values (it.owner_id, back, 'job_refund',
+            left('Refund · ' || left(it.filename, 100)
+                 || case when lost > 0 then ' (' || lost || ' from a refunded or expired top-up not returned)' else '' end, 160),
+            it.job_id, it.id, it.charge_seq, b.period_start)
     on conflict do nothing;
   end if;
   return back;
@@ -592,6 +624,9 @@ begin
   get diagnostics ev = row_count;
   delete from public.checkout_sessions where created_at < now() - interval '90 days';
   get diagnostics cs = row_count;
+  -- Settled duplicates are kept for a year (late Stripe events must still find them), then dropped.
+  delete from public.billing_duplicates
+   where refunded_at is not null and canceled_at is not null and detected_at < now() - interval '400 days';
   -- Expired top-ups of members who haven't touched their credits (bounded per run).
   for o in select distinct t.owner_id from public.credit_topups t
             where t.remaining > 0 and t.expires_at <= now() and t.refunded_at is null limit 200 loop
@@ -768,6 +803,15 @@ begin
   if (select c.stripe_customer_id from public.billing_customers c where c.owner_id = p_owner) is distinct from p_sub ->> 'stripe_customer_id' then
     return jsonb_build_object('applied', false, 'ignored', 'customer_mismatch');
   end if;
+  -- A recorded duplicate is never applied, whatever happened to the stored subscription since: the API settles
+  -- it (refund, cancel) instead.
+  if exists (select 1 from public.billing_duplicates d
+              where d.stripe_subscription_id = p_sub ->> 'stripe_subscription_id' and d.owner_id = p_owner) then
+    return (select jsonb_build_object('applied', false, 'duplicate', true, 'recorded', true,
+                                      'refunded', d.refunded_at is not null, 'canceled', d.canceled_at is not null,
+                                      'planBefore', pr.plan_id, 'planAfter', pr.plan_id)
+              from public.billing_duplicates d where d.stripe_subscription_id = p_sub ->> 'stripe_subscription_id');
+  end if;
   select * into cur from public.subscriptions where owner_id = p_owner;
   -- When this subscription went past due (kept across reads of the same past_due subscription).
   since := case when st = 'past_due' then
@@ -811,11 +855,12 @@ begin
   m0 := public._plan_monthly_credits(plan_before);
 
   insert into public.subscriptions as s (owner_id, stripe_subscription_id, stripe_customer_id, status, plan_id, billing_interval,
-    stripe_price_id, item_id, current_period_start, current_period_end, cancel_at_period_end, schedule_id, scheduled_price_id,
+    stripe_price_id, item_id, current_period_start, current_period_end, cancel_at_period_end, deletion_cancel, schedule_id, scheduled_price_id,
     scheduled_plan, scheduled_interval, scheduled_at, past_due_since, payment_attempts, synced_at, updated_at)
   values (p_owner, p_sub ->> 'stripe_subscription_id', p_sub ->> 'stripe_customer_id', st, price.plan_id, price.billing_interval, price.stripe_price_id,
     p_sub ->> 'item_id', (p_sub ->> 'current_period_start')::timestamptz, (p_sub ->> 'current_period_end')::timestamptz,
-    coalesce((p_sub ->> 'cancel_at_period_end')::boolean, false), p_sub ->> 'schedule_id', sched.stripe_price_id,
+    coalesce((p_sub ->> 'cancel_at_period_end')::boolean, false), coalesce((p_sub ->> 'deletion_cancel')::boolean, false),
+    p_sub ->> 'schedule_id', sched.stripe_price_id,
     coalesce(sched.plan_id, p_sub ->> 'scheduled_plan'), coalesce(sched.billing_interval, p_sub ->> 'scheduled_interval'),
     case when coalesce(sched.plan_id, p_sub ->> 'scheduled_plan') is not null then (p_sub ->> 'scheduled_at')::timestamptz end,
     since, coalesce((p_sub ->> 'payment_attempts')::integer, 0), p_synced_at, now())
@@ -824,7 +869,8 @@ begin
     status = excluded.status, plan_id = excluded.plan_id, billing_interval = excluded.billing_interval,
     stripe_price_id = excluded.stripe_price_id, item_id = excluded.item_id,
     current_period_start = excluded.current_period_start, current_period_end = excluded.current_period_end,
-    cancel_at_period_end = excluded.cancel_at_period_end, schedule_id = excluded.schedule_id,
+    cancel_at_period_end = excluded.cancel_at_period_end, deletion_cancel = excluded.deletion_cancel,
+    schedule_id = excluded.schedule_id,
     scheduled_price_id = excluded.scheduled_price_id, scheduled_plan = excluded.scheduled_plan,
     scheduled_interval = excluded.scheduled_interval, scheduled_at = excluded.scheduled_at,
     past_due_since = excluded.past_due_since,
@@ -861,6 +907,53 @@ $$;
 -- The stored subscription, for changing or cancelling it (also on account deletion), or null:
 -- {stripeSubscriptionId, stripeCustomerId, itemId, status, stripePriceId, lookupKey, plan, interval, amount, scheduleId,
 --  scheduledPlan, scheduledInterval, scheduledAt, currentPeriodStart, currentPeriodEnd, cancelAtPeriodEnd, keepsPlan, syncedAt}.
+-- Records a confirmed duplicate (idempotent). Refuses the owner's stored subscription: that one is never a
+-- duplicate. Returns {recorded, refunded, canceled} or {error: 'stored'}.
+create function public.billing_duplicate_record(p_owner uuid, p_subscription text) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare d public.billing_duplicates;
+begin
+  if p_subscription is null or p_subscription !~ '^sub_[A-Za-z0-9]+$' then
+    raise exception 'bad subscription' using errcode = 'invalid_parameter_value';
+  end if;
+  perform public._lock_billing(p_owner);
+  if exists (select 1 from public.subscriptions s where s.owner_id = p_owner and s.stripe_subscription_id = p_subscription) then
+    return jsonb_build_object('error', 'stored');
+  end if;
+  insert into public.billing_duplicates (stripe_subscription_id, owner_id) values (p_subscription, p_owner)
+  on conflict (stripe_subscription_id) do nothing;
+  select * into d from public.billing_duplicates where stripe_subscription_id = p_subscription;
+  if d.owner_id <> p_owner then return jsonb_build_object('error', 'stored'); end if;
+  return jsonb_build_object('recorded', true, 'refunded', d.refunded_at is not null, 'canceled', d.canceled_at is not null);
+end;
+$$;
+
+-- Marks a duplicate refunded or canceled (idempotent; the first time is kept).
+create function public.billing_duplicate_mark(p_subscription text, p_what text) returns boolean
+language plpgsql volatile security definer set search_path = '' as $$
+begin
+  if p_what = 'refunded' then
+    update public.billing_duplicates set refunded_at = coalesce(refunded_at, now()) where stripe_subscription_id = p_subscription;
+  elsif p_what = 'canceled' then
+    update public.billing_duplicates set canceled_at = coalesce(canceled_at, now()) where stripe_subscription_id = p_subscription;
+  else
+    raise exception 'bad mark' using errcode = 'invalid_parameter_value';
+  end if;
+  return found;
+end;
+$$;
+
+-- Duplicates not yet fully settled (the daily cron retries them), oldest first.
+create function public.billing_duplicates_unsettled(p_limit integer) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select coalesce(jsonb_agg(jsonb_build_object('stripeSubscriptionId', d.stripe_subscription_id, 'ownerId', d.owner_id,
+                                               'refunded', d.refunded_at is not null, 'canceled', d.canceled_at is not null)
+                            order by d.detected_at), '[]'::jsonb)
+    from (select * from public.billing_duplicates
+           where refunded_at is null or canceled_at is null
+           order by detected_at limit greatest(1, least(coalesce(p_limit, 50), 200))) d;
+$$;
+
 create function public.billing_subscription(p_owner uuid) returns jsonb
 language sql stable security definer set search_path = '' as $$
   select jsonb_build_object('stripeSubscriptionId', s.stripe_subscription_id, 'stripeCustomerId', s.stripe_customer_id, 'itemId', s.item_id,
@@ -985,8 +1078,10 @@ begin
   select * into t from public.credit_topups where id = t.id for update;
   if t.refunded_at is not null then return jsonb_build_object('ownerId', t.owner_id, 'removed', 0); end if;
   -- Refunded totals are cumulative, so a repeated or out-of-order event never removes credits twice.
-  target := case when full_refund then t.credits
-                 else least(t.credits, ceil(t.credits::numeric * greatest(p_refunded, 0) / p_amount)::integer) end;
+  target := greatest(t.refund_target,
+                     case when full_refund then t.credits
+                          else least(t.credits, ceil(t.credits::numeric * greatest(p_refunded, 0) / p_amount)::integer) end);
+  -- Take what's there now; the rest is taken from the job refunds that bring credits back (_ai_refund_item).
   n := least(t.remaining, greatest(target - t.refund_removed, 0));
   b := public._credits_roll(t.owner_id);
   if n > 0 then
@@ -995,7 +1090,7 @@ begin
             b.period_start);
   end if;
   update public.credit_topups
-     set remaining = remaining - n, refund_removed = refund_removed + n,
+     set remaining = remaining - n, refund_removed = refund_removed + n, refund_target = target,
          refunded_at = case when full_refund then now() else null end
    where id = t.id;
   return jsonb_build_object('ownerId', t.owner_id, 'removed', n);
@@ -1203,6 +1298,11 @@ declare n integer;
 begin
   update public.price_moves set status = 'revert_failed' where status = 'revert_pending' and move_at <= now();
   get diagnostics n = row_count;
+  -- A claim of a stopped change left unfinished (the worker died, or the Stripe call's outcome was unknown):
+  -- Stripe may have the new price. Owed a revert; revertMove finds 'moot' when the swap never happened.
+  update public.price_moves m set status = 'revert_pending'
+   where m.status = 'moving' and m.claimed_at < now() - interval '1 hour'
+     and exists (select 1 from public.price_changes c where c.id = m.change_id and c.status = 'stopped');
   return jsonb_build_object('failed', n, 'reverts', coalesce((
     select jsonb_agg(jsonb_build_object('moveId', m.id, 'ownerId', m.owner_id, 'stripeSubscriptionId', m.stripe_subscription_id,
                                         'fromPriceId', m.from_price_id, 'toPriceId', m.to_price_id) order by m.move_at)
@@ -1217,6 +1317,9 @@ create function public.price_move_claim(p_id uuid) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare m public.price_moves;
 begin
+  -- The change row first (Stop holds it for update while it stops the moves): claim and Stop run one after the
+  -- other, never interleaved, and in the same lock order (change, then move).
+  perform 1 from public.price_changes c where c.id = (select x.change_id from public.price_moves x where x.id = p_id) for share;
   update public.price_moves set status = 'moving', claimed_at = now()
    where id = p_id
      and (status = 'notified' or (status = 'moving' and claimed_at < now() - interval '1 hour'))
@@ -1256,6 +1359,9 @@ declare
   r record;
   ch uuid;
 begin
+  -- Lock order as in Stop, claim and mark: open change rows first, then moves. The sweep and a Stop run one after
+  -- the other instead of deadlocking.
+  perform 1 from public.price_changes c where c.status in ('notifying', 'moving') order by c.id for share;
   -- A notice that never went out by the move date (no address, or sending kept failing): never moved. A rise
   -- is never applied without a notice.
   update public.price_moves set status = 'skipped', skip_reason = 'no_email'
@@ -1325,6 +1431,9 @@ declare
   fa integer;
   ta integer;
 begin
+  -- Lock order as in Stop and claim: the change row, then the move. Without the change lock, a Stop committing
+  -- between this read and the update could leave a move 'moved' under a stopped change, never reverted.
+  perform 1 from public.price_changes c where c.id = (select x.change_id from public.price_moves x where x.id = p_id) for share;
   select * into m from public.price_moves where id = p_id for update;
   if not found then return null; end if;
   if p_status = 'notified' and m.status = 'pending' then
@@ -1335,7 +1444,8 @@ begin
            move_at = case when s.owner_id is not null then public._move_at(s, fa, ta, now()) else move_at end
      where id = p_id returning * into m;
   elsif p_status = 'notified' and m.status = 'moving' then
-    -- The swap didn't happen (a transient Stripe error): release the claim for the next run.
+    -- The swap certainly didn't happen (the error came before the Stripe update was sent): release the claim.
+    -- An unknown outcome is never released: the move stays 'moving' and is retaken (or reverted) later.
     update public.price_moves set status = 'notified', claimed_at = null where id = p_id returning * into m;
   elsif p_status = 'moved' and m.status in ('notified', 'moving') then
     -- Stopped while the cron was swapping: Stripe now has the new price, so it goes straight to revert_pending
@@ -1451,6 +1561,24 @@ language sql stable security definer set search_path = '' as $$
            order by p.deletion_due limit least(greatest(coalesce(p_limit, 100), 1), 500)) x;
 $$;
 
+-- Accounts no longer pending deletion (restored) whose subscription is still set to cancel by our deletion request
+-- (a cancel that landed after the restore, or a restore whose Stripe call failed): the cron resumes them.
+create function public.billing_deletion_resumes_due(p_limit integer) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select coalesce(jsonb_agg(jsonb_build_object('ownerId', x.owner_id, 'stripeSubscriptionId', x.stripe_subscription_id)), '[]'::jsonb)
+    from (select s.owner_id, s.stripe_subscription_id from public.subscriptions s join public.profiles p on p.id = s.owner_id
+           where p.deletion_due is null and p.deleted_at is null and s.cancel_at_period_end and s.deletion_cancel
+             and public._sub_keeps_plan(s.status)
+           order by s.current_period_end limit least(greatest(coalesce(p_limit, 100), 1), 500)) x;
+$$;
+
+-- Whether the account is pending deletion right now (checked around the Stripe calls, so a restore that lands in
+-- between is never undone).
+create function public.billing_deletion_pending(p_owner uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select exists (select 1 from public.profiles p where p.id = p_owner and p.deletion_due is not null and p.deleted_at is null);
+$$;
+
 -- ---------------------------------------------------------------------------------------------
 -- Account deletion: the API cancels the subscription (at period end when scheduled, at once on purge).
 -- Purge work now carries the Stripe subscription id.
@@ -1508,7 +1636,8 @@ $$;
 -- Privileges: service_role only. Internal helpers (_*) are callable by no role but their owner.
 -- ---------------------------------------------------------------------------------------------
 revoke all on public.billing_customers, public.billing_prices, public.subscriptions, public.billing_events,
-  public.checkout_sessions, public.credit_topups, public.price_changes, public.price_moves
+  public.checkout_sessions, public.credit_topups, public.price_changes, public.price_moves,
+  public.billing_duplicates
 from anon, authenticated;
 revoke execute on all functions in schema public from public, anon, authenticated;
 revoke execute on function
@@ -1545,9 +1674,14 @@ grant execute on function
   public.billing_topup_refund_by_session(text, integer, integer),
   public.billing_past_due_expire(integer),
   public.billing_deletion_cancels_due(integer),
+  public.billing_deletion_resumes_due(integer),
+  public.billing_deletion_pending(uuid),
   public.billing_checkout_status(uuid, text),
   public.billing_checkout_mark(text, text),
   public.billing_apply(uuid, jsonb, timestamptz),
+  public.billing_duplicate_record(uuid, text),
+  public.billing_duplicate_mark(text, text),
+  public.billing_duplicates_unsettled(integer),
   public.billing_subscription(uuid),
   public.billing_status(uuid),
   public.billing_topup_grant(uuid, text, text, text),

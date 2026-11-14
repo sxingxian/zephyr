@@ -6,8 +6,9 @@ import {
   planChangeSchema,
   teamInviteSchema,
   teamInviteTokenSchema,
+  teamNamePatchSchema,
 } from './billing-schemas';
-import { LOOKUP_KEYS, roleCan } from './billing-types';
+import { isSafeLabel, LOOKUP_KEYS, normalizeLabel, roleCan } from './billing-types';
 
 describe('billing schemas', () => {
   it('accepts subscription and top-up checkouts only with known values', () => {
@@ -57,5 +58,29 @@ describe('roles', () => {
     expect(roleCan('editor', 'purge')).toBe(false);
     expect(roleCan('editor', 'aiSettings')).toBe(false);
     expect(roleCan('owner', 'billing')).toBe(true);
+  });
+});
+
+describe('safe labels', () => {
+  it('agrees with the SQL rule on the shared list (supabase/tests/safe_label_cases.txt)', async () => {
+    const { default: text } = await import('../../../supabase/tests/safe_label_cases.txt?raw');
+    const cases = text
+      .split('\n')
+      .filter((l) => /^(ok|no)\|/.test(l))
+      .map((l) => ({ want: l.startsWith('ok|'), name: l.slice(3) }));
+    expect(cases.length).toBeGreaterThanOrEqual(20);
+    for (const c of cases) expect([c.name, isSafeLabel(c.name)]).toEqual([c.name, c.want]);
+  });
+  it('refuses digits other than 0-9 (checked here only: SQL letter classes depend on the database locale)', () => {
+    expect(isSafeLabel('Studio ٣')).toBe(false);
+    expect(isSafeLabel('Studio ३')).toBe(false);
+    // Combining marks (Devanagari, after NFKC) are letters' parts, not punctuation.
+    expect(isSafeLabel('फ़ोटो स्टूडियो')).toBe(true);
+  });
+  it('stores the NFKC form', () => {
+    const r = teamNamePatchSchema.parse({ name: 'Studio Ⅻ' });
+    expect(r.name).toBe('Studio XII');
+    expect(teamNamePatchSchema.safeParse({ name: 'evil.ⅽⅽ' }).success).toBe(false);
+    expect(normalizeLabel('ｍｅｉ＠x')).toBe('mei@x');
   });
 });

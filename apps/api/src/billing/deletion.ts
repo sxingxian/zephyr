@@ -9,10 +9,9 @@
  */
 import type { Env } from '../env';
 import { billingDb } from './db';
-import { idOf, isMissing, stripeClient } from './stripe';
+import { idOf, isMissing, type Stripe, stripeClient } from './stripe';
+import { DELETION_CANCEL_FLAG as FLAG } from './sync';
 
-/** Subscription metadata flag: cancel_at_period_end was set by a deletion request, not by the member. */
-const FLAG = 'zephyr_deletion_cancel';
 const SUB = /^sub_[A-Za-z0-9]+$/;
 
 /** The subscription id: from the deletion function's answer when it gives one, else the stored row. */
@@ -34,6 +33,8 @@ export async function cancelForDeletion(env: Env, owner: string, fromDb?: unknow
   const id = await subscriptionIdFor(env, owner, fromDb);
   if (!id) return;
   try {
+    // Restored meanwhile (delete and restore seconds apart both run in the background): nothing to stop.
+    if (!(await billingDb.deletionPending(env, owner))) return;
     const sub = await stripe.subscriptions.retrieve(id);
     if (sub.status === 'canceled' || sub.status === 'incomplete_expired' || sub.cancel_at_period_end) return;
     // A fresh key per request: a deletion requested, restored and requested again on one day must reach Stripe
@@ -48,9 +49,22 @@ export async function cancelForDeletion(env: Env, owner: string, fromDb?: unknow
       { cancel_at_period_end: true, metadata: { [FLAG]: '1' } },
       { idempotencyKey: `deletion-cancel:${id}:${nonce}` },
     );
+    // A restore that landed while we were cancelling: put it back now (the daily cron also reconciles).
+    if (!(await billingDb.deletionPending(env, owner))) await resume(stripe, id);
   } catch (err) {
     if (!isMissing(err)) throw err;
   }
+}
+
+/** Renews again if our deletion request was what stopped it. */
+async function resume(stripe: Stripe, id: string) {
+  const sub = await stripe.subscriptions.retrieve(id);
+  if (sub.metadata?.[FLAG] !== '1' || !sub.cancel_at_period_end) return;
+  await stripe.subscriptions.update(
+    id,
+    { cancel_at_period_end: false, metadata: { [FLAG]: '' } },
+    { idempotencyKey: `deletion-resume:${id}:${crypto.randomUUID()}` },
+  );
 }
 
 /** Deletion restored: renew again, but only if our deletion request was what stopped it. */
@@ -60,13 +74,9 @@ export async function undoCancelForDeletion(env: Env, owner: string, fromDb?: un
   const id = await subscriptionIdFor(env, owner, fromDb);
   if (!id) return;
   try {
-    const sub = await stripe.subscriptions.retrieve(id);
-    if (sub.metadata?.[FLAG] !== '1' || !sub.cancel_at_period_end) return;
-    await stripe.subscriptions.update(
-      id,
-      { cancel_at_period_end: false, metadata: { [FLAG]: '' } },
-      { idempotencyKey: `deletion-resume:${id}:${crypto.randomUUID()}` },
-    );
+    // Deletion requested again meanwhile: leave the cancel in place.
+    if (await billingDb.deletionPending(env, owner)) return;
+    await resume(stripe, id);
   } catch (err) {
     if (!isMissing(err)) throw err;
   }

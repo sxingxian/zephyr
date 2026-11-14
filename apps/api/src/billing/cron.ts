@@ -2,7 +2,9 @@
  * The daily billing job (02:10 UTC) (docs/phase-7.md, Billing API › Cron):
  * - price moves: subscribers on an older price of their lookup key get a notice, then move at their renewal;
  * - plans past due beyond the grace period end (Stripe's dunning should have canceled them);
- * - accounts pending deletion whose subscription still renews are asked again to stop.
+ * - accounts pending deletion whose subscription still renews are asked again to stop, and restored accounts
+ *   still set to cancel by a late deletion request renew again;
+ * - duplicate subscriptions an earlier try didn't finish are refunded and canceled.
  */
 import { PLAN_KEEPING_STATUSES, type SubscriptionStatus } from '@zephyr/shared';
 import { planEndedEmail, priceNoticeEmail } from '../email/billing-templates';
@@ -10,12 +12,18 @@ import { sendEmail } from '../email/resend';
 import type { Env } from '../env';
 import { logError } from '../http';
 import { billingDb, type DueMove, type RevertMove } from './db';
-import { cancelForDeletion } from './deletion';
-import { isMissing, type Stripe, stripeClient } from './stripe';
-import { syncSubscription } from './sync';
+import { cancelForDeletion, undoCancelForDeletion } from './deletion';
+import { isMissing, isStripeError, type Stripe, stripeClient } from './stripe';
+import { settleDuplicate, syncSubscription } from './sync';
 
 export const BILLING_CRON = '10 2 * * *';
-export const BILLING_CRON_LIMITS = { moves: 200, pastDue: 200, deletions: 100, reverts: 100 } as const;
+export const BILLING_CRON_LIMITS = {
+  moves: 200,
+  pastDue: 200,
+  deletions: 100,
+  reverts: 100,
+  duplicates: 50,
+} as const;
 /** Moves are applied this long before the renewal, so the renewal invoice uses the new price. */
 export const MOVE_LEAD_MS = 48 * 3600 * 1000;
 
@@ -32,6 +40,10 @@ export interface BillingCronCounts {
   reverted: number;
   /** Stopped moves the renewal reached before a revert succeeded (an alert: billed at the new price). */
   revertFailed: number;
+  /** Restored accounts whose subscription a late deletion request still had set to cancel: renewing again. */
+  deletionResumes: number;
+  /** Duplicate subscriptions finished (refund and cancel) after an earlier try failed. */
+  duplicatesSettled: number;
 }
 
 /**
@@ -83,7 +95,22 @@ export async function revertAndMark(
   }
 }
 
-/** Puts a subscription's item on `price` without proration. Returns false when the item isn't on `from`. */
+/**
+ * The Stripe update was sent and its outcome is unknown (timeout, network error, 5xx): the move stays claimed
+ * ('moving'), so the next run retakes it (the swap is idempotent: already on `to` counts as swapped) or, if the
+ * change was stopped meanwhile, reverts it.
+ */
+export class UnknownSwapOutcome extends Error {
+  constructor(cause: unknown) {
+    super('unknown_swap_outcome', { cause });
+    this.name = 'UnknownSwapOutcome';
+  }
+}
+
+/**
+ * Puts a subscription's item on `to` without proration. 'swapped' also when it's already on `to` (an earlier
+ * try went through but its answer was lost); 'changed' when it's on any other price; 'gone' when it ended.
+ */
 export async function swapPrice(
   stripe: Stripe,
   subscriptionId: string,
@@ -101,13 +128,28 @@ export async function swapPrice(
   if (!PLAN_KEEPING_STATUSES.includes(sub.status as SubscriptionStatus)) return 'gone';
   const item = sub.items.data[0];
   const current = item ? (typeof item.price === 'string' ? item.price : item.price.id) : null;
+  if (item && current === to && sub.items.data.length === 1) return 'swapped';
   if (!item || current !== from || sub.items.data.length !== 1) return 'changed';
-  await stripe.subscriptions.update(
-    subscriptionId,
-    { items: [{ id: item.id, price: to }], proration_behavior: 'none' },
-    { idempotencyKey },
-  );
+  try {
+    await stripe.subscriptions.update(
+      subscriptionId,
+      { items: [{ id: item.id, price: to }], proration_behavior: 'none' },
+      { idempotencyKey },
+    );
+  } catch (err) {
+    // A clear refusal (4xx from Stripe: bad request, card or permission) means nothing changed; anything else
+    // may have gone through.
+    if (isStripeRefusal(err)) throw err;
+    throw new UnknownSwapOutcome(err);
+  }
   return 'swapped';
+}
+
+/** A Stripe 4xx (other than 409 and 429): the request was refused and nothing changed. */
+function isStripeRefusal(err: unknown): boolean {
+  if (!isStripeError(err)) return false;
+  const status = (err as { statusCode?: number }).statusCode ?? 0;
+  return status >= 400 && status < 500 && status !== 409 && status !== 429;
 }
 
 async function notify(env: Env, m: DueMove, requestId: string): Promise<boolean> {
@@ -149,12 +191,16 @@ export async function runBillingCron(
     deletionCancels: 0,
     reverted: 0,
     revertFailed: 0,
+    deletionResumes: 0,
+    duplicatesSettled: 0,
   };
   // Past-due plans end without Stripe (the database's own cap), so this runs even when Stripe isn't set up.
   await endPastDuePlans(env, requestId, counts);
   const stripe = stripeClient(env);
   if (!stripe) return counts;
   await retryDeletionCancels(env, requestId, counts);
+  await retryDeletionResumes(env, requestId, counts);
+  await retryDuplicates(env, stripe, requestId, counts);
   await retryReverts(env, stripe, requestId, counts);
   let due: DueMove[];
   try {
@@ -182,8 +228,10 @@ export async function runBillingCron(
       try {
         r = await swapPrice(stripe, m.stripeSubscriptionId, m.fromPriceId, m.toPriceId, `move:${m.id}`);
       } catch (err) {
-        // Not swapped: release the claim for the next run.
-        await billingDb.moveMark(env, m.id, 'notified').catch(() => undefined);
+        // Certainly not swapped: release the claim for the next run. Unknown: keep the claim (see
+        // UnknownSwapOutcome); the next run retakes it after an hour, or reverts it if the change was stopped.
+        if (!(err instanceof UnknownSwapOutcome))
+          await billingDb.moveMark(env, m.id, 'notified').catch(() => undefined);
         throw err;
       }
       if (r === 'swapped') {
@@ -264,5 +312,49 @@ async function retryDeletionCancels(env: Env, requestId: string, counts: Billing
     }
   } catch (err) {
     logError(requestId, 'billing_deletion_cancels_due', err);
+  }
+}
+
+/** Restored accounts still set to cancel by a deletion request (a late cancel, or a failed resume): renew again. */
+async function retryDeletionResumes(env: Env, requestId: string, counts: BillingCronCounts) {
+  try {
+    for (const r of await billingDb.deletionResumesDue(env, BILLING_CRON_LIMITS.deletions)) {
+      try {
+        await undoCancelForDeletion(env, r.ownerId, { stripeSubscriptionId: r.stripeSubscriptionId });
+        counts.deletionResumes += 1;
+      } catch (err) {
+        counts.failed += 1;
+        logError(requestId, 'deletion_billing_resume_retry', err);
+      }
+    }
+  } catch (err) {
+    logError(requestId, 'billing_deletion_resumes_due', err);
+  }
+}
+
+/** Recorded duplicates an earlier try didn't finish: refund, then cancel (only these rows, never another). */
+async function retryDuplicates(env: Env, stripe: Stripe, requestId: string, counts: BillingCronCounts) {
+  try {
+    for (const d of await billingDb.duplicatesUnsettled(env, BILLING_CRON_LIMITS.duplicates)) {
+      try {
+        let sub: Stripe.Subscription;
+        try {
+          sub = await stripe.subscriptions.retrieve(d.stripeSubscriptionId);
+        } catch (err) {
+          if (!isMissing(err)) throw err;
+          // Gone in Stripe: nothing left to cancel or refund.
+          await billingDb.duplicateMark(env, d.stripeSubscriptionId, 'refunded');
+          await billingDb.duplicateMark(env, d.stripeSubscriptionId, 'canceled');
+          continue;
+        }
+        await settleDuplicate(env, stripe, sub, { refunded: d.refunded, canceled: d.canceled });
+        counts.duplicatesSettled += 1;
+      } catch (err) {
+        counts.failed += 1;
+        logError(requestId, 'billing_duplicate_retry', err);
+      }
+    }
+  } catch (err) {
+    logError(requestId, 'billing_duplicates_unsettled', err);
   }
 }
