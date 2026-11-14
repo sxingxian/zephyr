@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { listJobs, useAiStatus, useAiStatusPolling } from '../../lib/aiClient';
+import { useCan } from '../../lib/libraryContext';
 import { useSession } from '../../lib/session';
 
 /**
@@ -14,7 +15,9 @@ export function AiHost() {
   const on = Boolean(user && !user.pendingDeletion);
   useAiStatusPolling(on);
   const s = useAiStatus();
-  const enabled = Boolean(on && s?.enabled);
+  // Viewers neither scan nor run device jobs in a team library (the API would refuse with role_forbidden).
+  const canAi = useCan('ai');
+  const enabled = Boolean(on && s?.enabled && canAi);
   const signals =
     enabled &&
     (s?.features.cleanup === 'on' || s?.features.scene_tags === 'on' || s?.features.scene_tags === 'paused');

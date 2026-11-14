@@ -18,6 +18,7 @@ import {
 import { errorMessage } from '../lib/api';
 import { deviceRunner, type LocalJob, useDeviceRunner } from '../lib/deviceRunner';
 import { thumbUrl } from '../lib/library';
+import { useCan } from '../lib/libraryContext';
 import { EmptyHint } from './Library';
 import '../ai.css';
 
@@ -385,6 +386,22 @@ function JobCard({
 }
 
 export function AiQueuePage() {
+  // The queue (and the credits it spends) is for the library's Owner and Editors.
+  if (!useCanAi()) {
+    return (
+      <Shell title="AI queue">
+        <Note tone="neutral" icon="lock">
+          The AI queue is for this library’s Owner and Editors.
+        </Note>
+      </Shell>
+    );
+  }
+  return <AiQueueContent />;
+}
+
+const useCanAi = () => useCan('ai');
+
+function AiQueueContent() {
   const status = useAiStatus();
   const local = useDeviceRunner();
   const [state, setState] = useState<JobState>('running');

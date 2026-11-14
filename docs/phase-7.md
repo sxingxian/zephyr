@@ -154,7 +154,9 @@ Account deletion (phase 2 functions):
   - `PATCH /ai/settings` and `DELETE /ai/faces`: `aiSettings`.
   - Device-job claim/progress: `ai` (runner tokens unchanged; leases name the session, not the library).
 - **Read-only:** `requireWritable` on upload, copy, edit saves, AI job create, gallery create and gallery extend → 403 `library_read_only`. Trash, restore, purge, album deletes and downloads still work.
-- `X-Zephyr-Expected-User` keeps naming the signed-in user (not the library).
+- `X-Zephyr-Expected-User` keeps naming the signed-in user (not the library). A team-library request whose expected user isn't the session gets 409 `session_changed` (a tab left open by someone else resets instead of switching).
+- **Media URLs:** `<img>` tags and download links can't send headers, so GET and HEAD requests also accept `?library=<ownerId>`, with the same `library_access` check. Writes always need the header. Session cookies are SameSite, so another site can't use this.
+- **Viewers get no galleries or branding access at all**, reads included: share links, guest activity and favourites are client data.
 - `X-Zephyr-Library` is added to the CORS allowed headers and to `Vary`.
 - Media responses stay `private`. Keys are by owner, so a removed member's next request fails at `library_access`.
 - **Credits, storage and plan limits are always the library owner's.**
@@ -162,7 +164,7 @@ Account deletion (phase 2 functions):
 
 ## Billing API (`apps/api/src/billing/`, `routes/billing.ts`, `routes/team.ts`, `routes/admin-billing.ts`)
 
-- **Stripe client:** `new Stripe(env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION, httpClient: Stripe.createFetchHttpClient(), maxNetworkRetries: 1, timeout: 15000 })`. One module; nothing else imports `stripe`.
+- **Stripe client:** `new Stripe(env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION, httpClient: Stripe.createFetchHttpClient(), maxNetworkRetries: 1, timeout: 15000 })`. One module; nothing else imports `stripe`. `STRIPE_API_VERSION` defaults to the SDK's pinned version (`2026-10-28.endive` with stripe 23.1.0), so the types and webhook payloads match; the webhook endpoint must use the same version.
   - Idempotency keys on every POST: `checkout:<owner>:<kind>:<lookup>:<10-minute bucket>`, `change:<owner>:<subId>:<target>:<minute>`, `move:<moveId>`.
   - Missing key → 503 `billing_unavailable`, and `AdminBillingResult.configured = false`.
 - **Checkout:** `POST /billing/checkout`, owner of their own library only (billing is personal; the header is ignored here). It:
@@ -194,7 +196,7 @@ Account deletion (phase 2 functions):
   - `price_moves_due`: send notices (`price_notice` email), then apply moves within 48 h with `subscriptions.update(sub, { items: [{ id, price: to }], proration_behavior: 'none' })`. If the subscription changed plan, interval or status since the notice → `skipped`.
   - Stop: revert applied moves whose `move_at` is still in the future.
 - **Emails (Resend, `email/billing-templates.ts`, plain HTML + text, escaped):**
-  - `team_invite` (to the invitee);
+  - `team_invite` (to the invitee; link `<app>/team/accept#token=…`, a URL fragment, so the token never reaches a server log or a Referer);
   - `team_removed` (optional; on removal);
   - `price_notice` (to the subscriber: old and new amount, the date, how to cancel);
   - `price_change_owners` (to every staff Owner on a raise, and on stop);
@@ -229,7 +231,7 @@ Account deletion (phase 2 functions):
 
 ## Landing
 
-`Pricing.astro` renders the `PLANS` fallback at build time. A small hashed inline script fetches `BILLING_API.pricing` from the app host and updates the amounts. It needs CSP `connect-src` for that host and must be no-JS safe.
+`Pricing.astro` renders the `PLANS` fallback at build time. A bundled module script fetches `/api/v1/public/pricing` on the landing host itself (the landing Worker forwards `/api/*` to the API, as for the invite form), so the CSP stays `connect-src 'self'`. The response is validated, a 6-second timeout applies, and any failure or no-JS leaves the built prices.
 
 ## Security checklist (for the reviews)
 

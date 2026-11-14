@@ -78,6 +78,19 @@ describe('libraryContext', () => {
     expect(rpcCalls('create_album')[0]?.p_owner).toBe(MEI.id);
   });
 
+  it('accepts ?library= on GET (media URLs) but never on writes', async () => {
+    const j = await signedIn(JUN);
+    const list = await call(`/api/v1/albums?library=${MEI.id}`, { jar: j });
+    expect(list.status).toBe(200);
+    expect(rpcCalls('list_albums')[0]?.p_owner).toBe(MEI.id);
+    const made = await call(`/api/v1/albums?library=${MEI.id}`, { jar: j, body: { name: 'Own' } });
+    expect(made.status).toBe(201);
+    expect(rpcCalls('create_album')[0]?.p_owner).toBe(JUN.id);
+    const outsider = await call(`/api/v1/albums?library=${MEI.id}`, { jar: await signedIn(OUTSIDER) });
+    expect(outsider.status).toBe(403);
+    expect((await read(outsider)).error).toBe('library_unavailable');
+  });
+
   it('lets a Viewer read but not write', async () => {
     const j = await signedIn(AISHA);
     expect((await call('/api/v1/albums', { jar: j, headers: inTeam })).status).toBe(200);
@@ -415,7 +428,7 @@ describe('library routes take the owner only from the library context', () => {
   ];
 
   it('covers every route file that passes p_owner (new files must be classified)', () => {
-    const personal = new Set(['me.ts', 'team.ts']);
+    const personal = new Set(['me.ts', 'team.ts', 'billing.ts']);
     const withOwner = Object.keys(sources).filter((f) => /p_owner/.test(sources[f] ?? ''));
     expect(withOwner.length).toBeGreaterThan(5);
     for (const f of withOwner) expect(LIBRARY_ROUTE_FILES.includes(f) || personal.has(f), f).toBe(true);

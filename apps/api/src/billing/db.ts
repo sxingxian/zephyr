@@ -55,6 +55,10 @@ export interface SubscriptionSnapshot {
   scheduled_plan: PaidPlanId | null;
   scheduled_interval: BillingInterval | null;
   scheduled_at: string | null;
+  /** The next phase's price (a scheduled downgrade), so the DB can map prices it has seen. */
+  scheduled_price_id: string | null;
+  /** The current price's unit amount (cents), for a price the DB hasn't seen. */
+  amount: number | null;
 }
 
 /** billing_apply → what changed (for emails). `email` is the owner's account email when the DB has it. */
@@ -136,7 +140,7 @@ export const billingDb = {
     paymentIntent: string | null,
     lookupKey: TopUpLookupKey,
   ) =>
-    rpc<{ credits?: number; granted?: boolean } | null>(env, 'billing_topup_grant', {
+    rpc<{ credits?: number; granted?: boolean; error?: string } | null>(env, 'billing_topup_grant', {
       p_owner: owner,
       p_session: session,
       p_payment_intent: paymentIntent,
@@ -160,6 +164,6 @@ export const billingDb = {
     rpc<unknown>(env, 'billing_event_finish', { p_id: id, p_status: status, p_error: error, p_owner: owner }),
   movesDue: async (env: Env, limit: number) =>
     (await rpc<DueMove[] | null>(env, 'price_moves_due', { p_limit: limit })) ?? [],
-  moveMark: (env: Env, id: string, status: 'notified' | 'moved' | 'skipped' | 'stopped') =>
+  moveMark: (env: Env, id: string, status: 'notified' | 'moved' | 'skipped' | 'reverted') =>
     rpc<unknown>(env, 'price_move_mark', { p_id: id, p_status: status }),
 };

@@ -68,6 +68,7 @@ export function snapshot(sub: Stripe.Subscription): SubscriptionSnapshot {
   const price = item?.price ?? null;
   const current = planOfPrice(price);
   let scheduled: { plan: PaidPlanId; interval: BillingInterval; at: string } | null = null;
+  let scheduledPriceId: string | null = null;
   const schedule = sub.schedule && typeof sub.schedule !== 'string' ? sub.schedule : null;
   if (schedule && (schedule.status === 'active' || schedule.status === 'not_started')) {
     const now = Math.floor(Date.now() / 1000);
@@ -77,6 +78,7 @@ export function snapshot(sub: Stripe.Subscription): SubscriptionSnapshot {
       typeof nextPrice === 'string' ? null : (nextPrice as Stripe.Price | undefined),
     );
     if (next && target) scheduled = { ...target, at: iso(next.start_date) as string };
+    if (next && nextPrice) scheduledPriceId = typeof nextPrice === 'string' ? nextPrice : nextPrice.id;
   }
   return {
     stripe_subscription_id: sub.id,
@@ -94,6 +96,8 @@ export function snapshot(sub: Stripe.Subscription): SubscriptionSnapshot {
     scheduled_plan: scheduled?.plan ?? null,
     scheduled_interval: scheduled?.interval ?? null,
     scheduled_at: scheduled?.at ?? null,
+    scheduled_price_id: scheduledPriceId,
+    amount: price?.unit_amount ?? null,
   };
 }
 
@@ -183,7 +187,9 @@ export async function applyCheckoutSession(
     const key = session.metadata?.lookup_key;
     if (session.payment_status === 'paid' && isPackKey(key)) {
       // The credits come from our price table by lookup key, never from the event.
-      await billingDb.topupGrant(env, owner, session.id, idOf(session.payment_intent), key);
+      const out = await billingDb.topupGrant(env, owner, session.id, idOf(session.payment_intent), key);
+      // Not recorded by our Checkout, or recorded for another owner or pack: never grant, never retry.
+      if (!out || out.error) throw new OwnerMismatch('owner_mismatch');
       await billingDb.checkoutMark(env, session.id, 'done');
     }
   }

@@ -129,8 +129,8 @@ function TeammateView() {
             {name} is on {PLAN_NAME[lib.summary?.plan ?? 'studio']}
           </h2>
           <span className="z-muted">
-            The team’s owner manages the plan, seats and billing for this team library. Your own library has
-            its own plan.
+            {lib.summary?.ownerName ?? 'The team’s owner'} manages the plan, seats and billing for this team
+            library. Your own library has its own plan.
           </span>
         </div>
         {c && (

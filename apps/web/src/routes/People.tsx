@@ -212,6 +212,7 @@ export function PeoplePage() {
   const [sugg, setSugg] = useState(false);
   const state = status?.features.face_grouping;
   const on = Boolean(status?.enabled && state === 'on');
+  const canEdit = useCan('edit');
 
   const load = useCallback(
     async (signal?: AbortSignal) => {
@@ -269,9 +270,11 @@ export function PeoplePage() {
             <h2 id="people-h">People</h2>
             <span className="z-muted">Found on your devices, kept in your account</span>
             <span className="lib-toolbar__spacer" />
-            <Button size="sm" kind="tint" iconRight="chevR" onClick={() => setSugg(true)}>
-              Review suggestions
-            </Button>
+            {canEdit && (
+              <Button size="sm" kind="tint" iconRight="chevR" onClick={() => setSugg(true)}>
+                Review suggestions
+              </Button>
+            )}
             <Button size="sm" kind="ghost" onClick={() => setHidden((h) => !h)} aria-pressed={hidden}>
               {hidden ? 'Hide hidden' : 'Show hidden'}
             </Button>
@@ -409,6 +412,9 @@ export function PersonPage({ personId }: { personId: string }) {
   const [menu, setMenu] = useState(false);
   const [picker, setPicker] = useState<null | 'merge' | 'move'>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // Viewers see people and their photos; naming, merging and sorting faces is for the Owner and Editors.
+  const canEdit = useCan('edit');
+  const canShare = useCan('galleries');
   const query = useMemo(() => ({ person: personId, sort: 'taken' as const }), [personId]);
   const list = usePhotoList(query);
   const sel = useSelection();
@@ -491,6 +497,7 @@ export function PersonPage({ personId }: { personId: string }) {
             maxLength={60}
             onChange={(e) => setName(e.target.value)}
             onBlur={rename}
+            readOnly={!canEdit}
             onKeyDown={(e) => e.key === 'Enter' && (e.currentTarget as HTMLInputElement).blur()}
           />
           {person && (
@@ -503,57 +510,63 @@ export function PersonPage({ personId }: { personId: string }) {
             </span>
           )}
         </div>
-        <Button size="sm" icon="people" onClick={() => setPicker('merge')}>
-          Merge with…
-        </Button>
-        <Button
-          size="sm"
-          icon="share"
-          busy={busy === 'share'}
-          onClick={() => void run('share', async () => sharing.open(await allPhotoIds(query)))}
-        >
-          Share these photos
-        </Button>
-        <span className="ai-more">
-          <IconButton icon="more" label="More" aria-expanded={menu} onClick={() => setMenu((m) => !m)} />
-          {menu && person && (
-            <div className="ai-menu" role="menu">
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  setMenu(false);
-                  void run(
-                    'hide',
-                    async () => {
-                      const r = await patchPerson(person.id, { hidden: !person.hidden });
-                      setPerson(r.person);
-                    },
-                    person.hidden ? 'Shown in People again' : 'Hidden from People',
-                  );
-                }}
-              >
-                {person.hidden ? 'Show in People' : 'Hide this person'}
-              </button>
-              {person.name && (
+        {canEdit && (
+          <Button size="sm" icon="people" onClick={() => setPicker('merge')}>
+            Merge with…
+          </Button>
+        )}
+        {canShare && (
+          <Button
+            size="sm"
+            icon="share"
+            busy={busy === 'share'}
+            onClick={() => void run('share', async () => sharing.open(await allPhotoIds(query)))}
+          >
+            Share these photos
+          </Button>
+        )}
+        {canEdit && (
+          <span className="ai-more">
+            <IconButton icon="more" label="More" aria-expanded={menu} onClick={() => setMenu((m) => !m)} />
+            {menu && person && (
+              <div className="ai-menu" role="menu">
                 <button
                   type="button"
                   role="menuitem"
                   onClick={() => {
                     setMenu(false);
-                    void run('unname', async () => {
-                      const r = await patchPerson(person.id, { name: null });
-                      setPerson(r.person);
-                      setName('');
-                    });
+                    void run(
+                      'hide',
+                      async () => {
+                        const r = await patchPerson(person.id, { hidden: !person.hidden });
+                        setPerson(r.person);
+                      },
+                      person.hidden ? 'Shown in People again' : 'Hidden from People',
+                    );
                   }}
                 >
-                  Remove name
+                  {person.hidden ? 'Show in People' : 'Hide this person'}
                 </button>
-              )}
-            </div>
-          )}
-        </span>
+                {person.name && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMenu(false);
+                      void run('unname', async () => {
+                        const r = await patchPerson(person.id, { name: null });
+                        setPerson(r.person);
+                        setName('');
+                      });
+                    }}
+                  >
+                    Remove name
+                  </button>
+                )}
+              </div>
+            )}
+          </span>
+        )}
       </div>
       {error && (
         <Note tone="bad" icon="alert" role="alert">
@@ -562,7 +575,7 @@ export function PersonPage({ personId }: { personId: string }) {
       )}
       <div className="lib-toolbar">
         <span className="lib-toolbar__spacer" />
-        {list.items.length > 0 && (
+        {canEdit && list.items.length > 0 && (
           <Button
             size="sm"
             kind={sel.selecting ? 'primary' : 'secondary'}

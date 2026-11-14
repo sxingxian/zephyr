@@ -177,11 +177,12 @@ $$;
 create function public.list_libraries(p_member uuid) returns jsonb
 language sql stable security definer set search_path = '' as $$
   select coalesce((select jsonb_build_array(jsonb_build_object(
-           'ownerId', pr.id, 'name', public._person_name(pr.id), 'role', 'owner', 'plan', pr.plan_id,
+           'ownerId', pr.id, 'name', public._person_name(pr.id), 'ownerName', public._person_name(pr.id), 'role', 'owner', 'plan', pr.plan_id,
            'state', public._library_state(pr.id), 'initials', public._initials(public._person_name(pr.id))))
          || coalesce((select jsonb_agg(x.j order by x.name, x.owner_id) from (
               select m.owner_id, public._team_name(m.owner_id) as name,
-                     jsonb_build_object('ownerId', m.owner_id, 'name', public._team_name(m.owner_id), 'role', m.role,
+                     jsonb_build_object('ownerId', m.owner_id, 'name', public._team_name(m.owner_id),
+                                        'ownerName', public._person_name(m.owner_id), 'role', m.role,
                                         'plan', op.plan_id, 'state', public._library_state(m.owner_id),
                                         'initials', public._initials(public._team_name(m.owner_id))) as j
                 from public.library_members m join public.profiles op on op.id = m.owner_id

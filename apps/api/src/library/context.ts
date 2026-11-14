@@ -52,7 +52,13 @@ export const actorOf = (c: Context<HonoEnv>) => c.get('session').userId;
  */
 export const libraryContext: MiddlewareHandler<HonoEnv> = async (c, next) => {
   const self = c.get('session').userId.toLowerCase();
-  const raw = c.req.header(LIBRARY_HEADER);
+  // <img> tags and download links can't send headers, so GET media URLs in a team library carry
+  // ?library=<ownerId> instead (writes always need the header). Session cookies are SameSite, so a
+  // cross-site page can't use this to load a team's images with a member's session.
+  const method = c.req.method;
+  const raw =
+    c.req.header(LIBRARY_HEADER) ??
+    (method === 'GET' || method === 'HEAD' ? c.req.query('library') : undefined);
   let owner = self;
   if (raw !== undefined && raw.trim() !== '') {
     // Any 8-4-4-4-12 hex id (the same check as every :id route); library_access decides the rest.

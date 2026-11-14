@@ -45,7 +45,15 @@ const role =
   };
 
 async function overview(c: Ctx): Promise<AdminBillingResult> {
-  const out = await rpc<Omit<AdminBillingResult, 'ok' | 'configured'>>(c.env, 'admin_billing_overview');
+  const out = await rpc<Omit<AdminBillingResult, 'ok' | 'configured'> | null>(
+    c.env,
+    'admin_billing_overview',
+    {
+      p_actor: c.get('staff').id,
+    },
+  );
+  // The role middleware already checked; null means the staff row changed in between.
+  if (!out) throw new UpstreamError('admin_billing_overview', 403);
   return { ok: true, ...out, configured: Boolean(c.env.STRIPE_SECRET_KEY) };
 }
 
@@ -260,6 +268,7 @@ export function registerAdminBillingRoutes(router: Hono<HonoEnv>, requireStaff: 
       for (const r of out.reverts ?? []) {
         try {
           if (await revertMove(stripe, r)) {
+            await rpc(c.env, 'price_move_mark', { p_id: r.moveId, p_status: 'reverted' });
             await syncSubscription(c.env, stripe, r.stripeSubscriptionId, c.get('requestId')).catch((err) =>
               logError(c.get('requestId'), 'price_revert_sync', err),
             );

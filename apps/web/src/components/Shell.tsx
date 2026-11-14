@@ -87,6 +87,7 @@ function Sidebar() {
   const ai = useAiStatus();
   const running = useRunningJobs();
   const lib = useActiveLibrary();
+  const canAi = useCan('ai');
   // A team library shows its owner's plan (Studio); the member's own plan is on Plan & billing.
   const plan = lib.self ? (user?.plan ?? 'free') : (lib.summary?.plan ?? 'studio');
   // Zephyr AI pages show unless an admin switched Zephyr AI off for everyone.
@@ -106,16 +107,18 @@ function Sidebar() {
         <span className="sidebar__heading">Zephyr AI</span>
         {aiOn ? (
           <>
-            <Item
-              d={{ label: 'AI queue', icon: 'stack', to: '/ai/queue' }}
-              chip={
-                running > 0 ? (
-                  <Chip tone="acc" size="sm">
-                    {running} running
-                  </Chip>
-                ) : undefined
-              }
-            />
+            {canAi && (
+              <Item
+                d={{ label: 'AI queue', icon: 'stack', to: '/ai/queue' }}
+                chip={
+                  running > 0 ? (
+                    <Chip tone="acc" size="sm">
+                      {running} running
+                    </Chip>
+                  ) : undefined
+                }
+              />
+            )}
             <Item d={{ label: 'AI settings', icon: 'settings', to: '/settings/ai' }} />
           </>
         ) : (

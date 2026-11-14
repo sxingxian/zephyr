@@ -35,6 +35,8 @@ export function GalleriesPage() {
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: `tick` re-runs the load (Try again)
   useEffect(() => {
+    // Viewers can't open galleries (share links, guest activity and favourites are client data).
+    if (!canManage) return;
     const c = new AbortController();
     setError(null);
     listGalleries(c.signal)
@@ -47,7 +49,7 @@ export function GalleriesPage() {
         if ((e as Error).name !== 'AbortError') setError(errorMessage(e));
       });
     return () => c.abort();
-  }, [tick]);
+  }, [tick, canManage]);
 
   const shown = useMemo(
     () =>
@@ -134,7 +136,7 @@ export function GalleriesPage() {
       <div className="sh-page">
         {!canManage && (
           <Note tone="neutral" icon="lock">
-            You can open and copy gallery links. The library’s Owner and Editors create and change galleries.
+            Shared galleries are managed by this library’s Owner and Editors.
           </Note>
         )}
         {items && items.length > 0 && (

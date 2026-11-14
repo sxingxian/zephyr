@@ -96,8 +96,6 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET?: string;
   /** Pinned Stripe API version; defaults to the installed SDK's version. */
   STRIPE_API_VERSION?: string;
-  /** Per-member billing and team writes (20 a minute). */
-  BILLING_LIMITER: RateLimit;
 }
 
 /** The slice of the Workers AI binding the API uses. */

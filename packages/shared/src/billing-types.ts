@@ -102,6 +102,8 @@ export interface LibrarySummary {
   /** "Tan Studio" for a team library (the owner's team name), or the member's own name for their own. */
   name: string;
   role: LibraryRole;
+  /** The library owner's display name ("Mei Lin"), for "managed by" copy. */
+  ownerName: string;
   /** The owner's plan (a team library is always Studio while it's usable). */
   plan: PlanId;
   state: LibraryState;

@@ -36,6 +36,7 @@ const USER = {
 const OWN: LibrarySummary = {
   ownerId: ME,
   name: 'Jun Hao',
+  ownerName: 'Jun Hao',
   role: 'owner',
   plan: 'free',
   state: 'active',
@@ -44,6 +45,7 @@ const OWN: LibrarySummary = {
 const TEAM = (role: LibrarySummary['role']): LibrarySummary => ({
   ownerId: OWNER,
   name: 'Tan Studio',
+  ownerName: 'Mei Lin',
   role,
   plan: 'studio',
   state: 'active',
