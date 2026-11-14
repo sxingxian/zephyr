@@ -1,0 +1,8 @@
+# Gitleaks config: the default rules, plus one narrow allowlist.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Stripe lookup keys are public product names, not secrets (docs/phase-7.md)"
+regexTarget = "match"
+regexes = ['''zephyr_(pro|studio)_(monthly|yearly)|zephyr_topup_[0-9]{3,4}''']
