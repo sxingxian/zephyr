@@ -130,7 +130,8 @@ export const TEAM_NAME_MAX = 60;
  * are already NFKC (`normalizeLabel`). supabase/tests/safe_label_cases.txt is checked against both.
  */
 export const SAFE_LABEL = /^[\p{L}\p{M}0-9 .,'&-]{1,60}$/u;
-const LINK_LIKE = /(www\.|:\/\/|\.[^\s.,'&-])/iu;
+// Dots, plus letters that look like one (Lisu U+A4F8, Canadian syllabics U+1427), so "evilꓸcom" never reads as a domain.
+const LINK_LIKE = /(www[.\uA4F8\u1427]|:\/\/|[.\uA4F8\u1427][^\s.,'&-])/iu;
 export const normalizeLabel = (s: string): string => s.normalize('NFKC');
 export const isSafeLabel = (s: string): boolean => {
   const n = normalizeLabel(s);

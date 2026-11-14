@@ -110,8 +110,9 @@ export interface ApiError {
   /**
    * Phase 7, conflict on a plan change: `scheduled_change` means a downgrade or switch to monthly is scheduled
    * and must be undone (DELETE BILLING_API.change) before upgrading. `scheduledAt` is when it takes effect.
+   * `managed_schedule` means the subscription follows a schedule made in the Stripe Dashboard (staff manage it).
    */
-  reason?: 'scheduled_change';
+  reason?: 'scheduled_change' | 'managed_schedule';
   scheduledAt?: string;
 }
 export interface Accepted {

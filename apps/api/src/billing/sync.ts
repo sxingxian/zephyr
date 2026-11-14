@@ -320,11 +320,17 @@ async function refundPaidInvoices(stripe: Stripe, subscriptionId: string) {
     const payments = await stripe.invoicePayments.list({ invoice: inv.id, status: 'paid', limit: 10 });
     for (const p of payments.data) {
       const pi = idOf(p.payment?.payment_intent as string | { id: string } | null | undefined);
-      if (!pi) continue;
+      if (!pi || !p.id || !(p.amount_paid && p.amount_paid > 0)) continue;
       try {
+        // Only this invoice's share: one payment can pay several invoices, and the others aren't duplicates.
         await stripe.refunds.create(
-          { payment_intent: pi, reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
-          { idempotencyKey: `dup-refund:${pi}` },
+          {
+            payment_intent: pi,
+            amount: p.amount_paid,
+            reason: 'duplicate',
+            metadata: { zephyr: 'duplicate_subscription', invoice: inv.id },
+          },
+          { idempotencyKey: `dup-refund:${p.id}` },
         );
       } catch (err) {
         // Refunded already (an earlier try, past the 24 h idempotency window) or disputed (the dispute returns

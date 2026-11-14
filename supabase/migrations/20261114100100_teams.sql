@@ -23,7 +23,8 @@ language sql immutable set search_path = '' as $$
   select p is not null and p = normalize(p, NFKC) and length(p) between 1 and 60
      and p !~ '[[:cntrl:]<>"`]'
      and position('@' in p) = 0
-     and p !~* '(www[.。]|://|[.。][^[:space:].,''&-])';
+     -- Dots, plus characters that look like one (ideographic full stop, Lisu U+A4F8, syllabics U+1427).
+     and p !~* '(www[.。ꓸᐧ]|://|[.。ꓸᐧ][^[:space:].,''&-])';
 $$;
 
 create table public.teams (

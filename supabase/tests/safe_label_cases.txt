@@ -40,3 +40,5 @@ policy|Studio_9
 policy|Studio ٣
 policy|Studio ३
 policy|Café ☕
+link|evilꓸcom
+link|shopᐧnet

@@ -7,21 +7,42 @@
 import type { BillingInterval } from '@zephyr/shared';
 import type { Stripe } from './stripe';
 
+/** Metadata on every schedule Zephyr creates; any other schedule is never released or changed by Zephyr. */
+export const OUR_SCHEDULE = { zephyr: 'plan_change' } as const;
+
+export type ScheduleState =
+  | { kind: 'pending'; at: string | null }
+  | { kind: 'finished'; id: string }
+  | { kind: 'foreign'; id: string }
+  | null;
+
 /**
  * What a subscription's schedule means now:
- * - 'pending': a phase still starts in the future (a downgrade or switch to monthly is scheduled, at `at`);
- * - 'finished': live, but its last phase has started (the change already happened; Stripe releases it only when
- *   that phase ends, up to a year later). Not a scheduled change: the API releases it;
+ * - 'pending': ours, and Stripe hasn't reached its last phase yet (a downgrade or switch to monthly is
+ *   scheduled; `at` is the next phase's start when known);
+ * - 'finished': ours, and Stripe's own current phase is the last one (the change already happened; Stripe
+ *   releases it only when that phase ends, up to a year later). Not a scheduled change: the API releases it.
+ *   Decided from Stripe's `current_phase`, never from our clock, so a renewal Stripe hasn't processed yet
+ *   is still pending;
+ * - 'foreign': made in the Stripe Dashboard (or not ending in release): never released, plan changes refused,
+ *   price moves skipped;
  * - null: no live schedule.
  */
 export function scheduleStateOf(
   schedule: Stripe.SubscriptionSchedule | null,
   now = Math.floor(Date.now() / 1000),
-): { kind: 'pending'; at: string } | { kind: 'finished'; id: string } | null {
+): ScheduleState {
   if (!schedule || (schedule.status !== 'active' && schedule.status !== 'not_started')) return null;
-  const next = schedule.phases.find((p) => p.start_date > now);
-  if (next) return { kind: 'pending', at: new Date(next.start_date * 1000).toISOString() };
-  return { kind: 'finished', id: schedule.id };
+  if (schedule.metadata?.zephyr !== OUR_SCHEDULE.zephyr || schedule.end_behavior !== 'release') {
+    return { kind: 'foreign', id: schedule.id };
+  }
+  const last = schedule.phases.at(-1);
+  const cur = schedule.current_phase;
+  if (schedule.status === 'active' && last && cur && cur.start_date >= last.start_date) {
+    return { kind: 'finished', id: schedule.id };
+  }
+  const next = schedule.phases.find((p) => p.start_date > now) ?? last ?? null;
+  return { kind: 'pending', at: next ? new Date(next.start_date * 1000).toISOString() : null };
 }
 
 /** The subscription's schedule as an object (retrieved when only its id is known), or null. */
@@ -65,6 +86,7 @@ export async function scheduleChange(
     schedule.id,
     {
       end_behavior: 'release',
+      metadata: { ...OUR_SCHEDULE },
       phases: [
         {
           items: [{ price: currentPrice, quantity: 1 }],

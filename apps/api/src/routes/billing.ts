@@ -327,7 +327,12 @@ async function loadChange(
   // A schedule whose last phase has started is a change that already happened, not a scheduled one.
   const state = scheduleStateOf(await scheduleOf(stripe, sub));
   if (state?.kind === 'pending' && kind === 'upgrade') {
-    return c.json(fail('conflict', { reason: 'scheduled_change', scheduledAt: state.at }), 409);
+    return c.json(fail('conflict', { reason: 'scheduled_change', scheduledAt: state.at ?? undefined }), 409);
+  }
+  // A schedule made in the Stripe Dashboard (a fixed term, a discount phase): staff manage that subscription.
+  if (state?.kind === 'foreign') {
+    logError(c.get('requestId'), 'billing_foreign_schedule', new Error('foreign_schedule'));
+    return c.json(fail('conflict', { reason: 'managed_schedule' }), 409);
   }
   if (state?.kind === 'finished' && apply) await releaseSchedule(stripe, state.id);
   const scheduleId = state?.kind === 'pending' ? idOf(sub.schedule) : null;
@@ -447,10 +452,11 @@ billingRoutes.delete('/change', async (c) => {
   try {
     const stored = await billingDb.subscription(c.env, owner);
     if (!keeping(stored)) return c.json(fail('conflict'), 409);
-    const sub = await stripe.subscriptions.retrieve(stored.stripeSubscriptionId);
-    const scheduleId = idOf(sub.schedule);
-    if (!scheduleId) return c.json(fail('conflict'), 409);
-    await releaseSchedule(stripe, scheduleId);
+    const sub = await stripe.subscriptions.retrieve(stored.stripeSubscriptionId, { expand: ['schedule'] });
+    const state = scheduleStateOf(await scheduleOf(stripe, sub));
+    // Only Zephyr's own schedules are undone here; one made in the Dashboard is staff's to change.
+    if (!state || state.kind === 'foreign') return c.json(fail('conflict'), 409);
+    await releaseSchedule(stripe, idOf(sub.schedule) as string);
     await syncSubscription(c.env, stripe, sub.id, c.get('requestId'), owner);
     const status = await statusResult(c);
     return status ? c.json(status) : c.json(fail('server'), 500);

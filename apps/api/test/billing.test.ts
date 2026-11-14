@@ -221,7 +221,15 @@ beforeEach(() => {
         current_phase: { start_date: NOW - 10 * DAY },
         phases: [],
       })),
-      retrieve: vi.fn(),
+      // An unexpanded schedule id resolves to Zephyr's own pending downgrade unless a test says otherwise.
+      retrieve: vi.fn(async (id: string) => ({
+        id,
+        status: 'active',
+        metadata: { zephyr: 'plan_change' },
+        end_behavior: 'release',
+        current_phase: { start_date: NOW - 10 * DAY },
+        phases: [{ start_date: NOW - 10 * DAY }, { start_date: NOW + 20 * DAY }],
+      })),
       update: vi.fn(async () => ({})),
       release: vi.fn(async () => ({})),
     },
@@ -498,7 +506,12 @@ describe('Stripe webhook', () => {
     }));
     stripe.invoicePayments.list.mockResolvedValue({
       data: [
-        { id: 'inpay_1', status: 'paid', payment: { type: 'payment_intent', payment_intent: 'pi_dup' } },
+        {
+          id: 'inpay_1',
+          status: 'paid',
+          amount_paid: 999,
+          payment: { type: 'payment_intent', payment_intent: 'pi_dup' },
+        },
       ],
     });
     const res = await deliver(stripeEvent('customer.subscription.created', { id: SUB2 }));
@@ -522,8 +535,13 @@ describe('Stripe webhook', () => {
     expect(stripe.invoices.list).toHaveBeenCalledWith({ subscription: SUB2, status: 'paid', limit: 24 });
     expect(stripe.invoicePayments.list).toHaveBeenCalledWith({ invoice: 'in_2', status: 'paid', limit: 10 });
     expect(stripe.refunds.create).toHaveBeenCalledWith(
-      { payment_intent: 'pi_dup', reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
-      { idempotencyKey: 'dup-refund:pi_dup' },
+      {
+        payment_intent: 'pi_dup',
+        amount: 999,
+        reason: 'duplicate',
+        metadata: { zephyr: 'duplicate_subscription', invoice: 'in_2' },
+      },
+      { idempotencyKey: 'dup-refund:inpay_1' },
     );
     expect(rpcArgs('billing_duplicate_mark')).toEqual([
       { p_subscription: SUB2, p_what: 'canceled' },
@@ -546,7 +564,7 @@ describe('Stripe webhook', () => {
     stripe.subscriptions.retrieve.mockImplementation(async (id: string) => ({ ...subscription(), id }));
     stripe.invoices.list.mockResolvedValue({ data: [{ id: 'in_2' }] });
     stripe.invoicePayments.list.mockResolvedValue({
-      data: [{ id: 'inpay_1', status: 'paid', payment: { payment_intent: 'pi_dup' } }],
+      data: [{ id: 'inpay_1', status: 'paid', amount_paid: 999, payment: { payment_intent: 'pi_dup' } }],
     });
     stripe.refunds.create.mockRejectedValueOnce(
       new Stripe.errors.StripeAPIError({ message: 'down', type: 'api_error' }),
@@ -596,7 +614,7 @@ describe('Stripe webhook', () => {
     }));
     stripe.invoices.list.mockResolvedValue({ data: [{ id: 'in_late' }] });
     stripe.invoicePayments.list.mockResolvedValue({
-      data: [{ id: 'p_late', status: 'paid', payment: { payment_intent: 'pi_late' } }],
+      data: [{ id: 'p_late', status: 'paid', amount_paid: 999, payment: { payment_intent: 'pi_late' } }],
     });
     await deliver(
       stripeEvent(
@@ -606,8 +624,8 @@ describe('Stripe webhook', () => {
       ),
     );
     expect(stripe.refunds.create).toHaveBeenCalledWith(
-      { payment_intent: 'pi_late', reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
-      { idempotencyKey: 'dup-refund:pi_late' },
+      expect.objectContaining({ payment_intent: 'pi_late', amount: 999, reason: 'duplicate' }),
+      { idempotencyKey: 'dup-refund:p_late' },
     );
     expect(stripe.subscriptions.cancel).toHaveBeenCalledTimes(1);
   });
@@ -627,7 +645,14 @@ describe('Stripe webhook', () => {
     stripe.subscriptions.retrieve.mockImplementation(async (id: string) => ({ ...subscription(), id }));
     stripe.invoices.list.mockResolvedValue({ data: [{ id: 'in_2' }, { id: 'in_3' }] });
     stripe.invoicePayments.list.mockImplementation(async ({ invoice }: { invoice: string }) => ({
-      data: [{ id: `p_${invoice}`, status: 'paid', payment: { payment_intent: `pi_${invoice}` } }],
+      data: [
+        {
+          id: `p_${invoice}`,
+          status: 'paid',
+          amount_paid: 500,
+          payment: { payment_intent: `pi_${invoice}` },
+        },
+      ],
     }));
     stripe.refunds.create
       .mockRejectedValueOnce(
@@ -1186,6 +1211,9 @@ describe('plan changes', () => {
   const scheduledToYearly = () => ({
     id: 'sub_sched_1',
     status: 'active',
+    metadata: { zephyr: 'plan_change' },
+    end_behavior: 'release',
+    current_phase: { start_date: NOW - 10 * DAY, end_date: NOW + 20 * DAY },
     phases: [
       { start_date: NOW - 10 * DAY, items: [{ price: price('price_pro_m2', 'pro', 'month') }] },
       { start_date: NOW + 20 * DAY, items: [{ price: price('price_pro_y', 'pro', 'year') }] },
@@ -1267,6 +1295,9 @@ describe('plan changes', () => {
     const finished = {
       id: 'sub_sched_done',
       status: 'active',
+      metadata: { zephyr: 'plan_change' },
+      end_behavior: 'release',
+      current_phase: { start_date: NOW - 30 * DAY, end_date: NOW + 335 * DAY },
       phases: [
         { start_date: NOW - 400 * DAY, items: [{ price: price('price_studio_y', 'studio', 'year') }] },
         { start_date: NOW - 30 * DAY, items: [{ price: price('price_pro_y', 'pro', 'year') }] },
@@ -1293,10 +1324,56 @@ describe('plan changes', () => {
     );
   });
 
+  it('keeps a downgrade Stripe has not reached yet, even past its start time', async () => {
+    // The renewal moment: phase 2's start has passed on our clock, but Stripe's current phase is still phase 1.
+    const due = {
+      ...scheduledToYearly(),
+      phases: [
+        { start_date: NOW - 30 * DAY, items: [{ price: price('price_pro_m2', 'pro', 'month') }] },
+        { start_date: NOW - 60, items: [{ price: price('price_pro_y', 'pro', 'year') }] },
+      ],
+      current_phase: { start_date: NOW - 30 * DAY, end_date: NOW - 60 },
+    };
+    stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: due }));
+    await deliver(stripeEvent('customer.subscription.updated', { id: SUB }, 'evt_due'));
+    expect(stripe.subscriptionSchedules.release).not.toHaveBeenCalled();
+    const res = await call(BILLING_API.change, {
+      jar: await signedIn(),
+      body: { plan: 'studio', interval: 'month' },
+    });
+    expect(res.status).toBe(409);
+    expect((await read(res)).reason).toBe('scheduled_change');
+    expect(stripe.subscriptionSchedules.release).not.toHaveBeenCalled();
+  });
+
+  it('never releases or changes a schedule made in the Stripe Dashboard', async () => {
+    const foreign = {
+      id: 'sub_sched_staff',
+      status: 'active',
+      metadata: {},
+      end_behavior: 'cancel',
+      current_phase: { start_date: NOW - 30 * DAY },
+      phases: [{ start_date: NOW - 30 * DAY, items: [{ price: price('price_pro_y', 'pro', 'year') }] }],
+    };
+    stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: foreign }));
+    await deliver(stripeEvent('customer.subscription.updated', { id: SUB }, 'evt_foreign'));
+    const j = await signedIn();
+    const res = await call(BILLING_API.change, { jar: j, body: { plan: 'studio', interval: 'month' } });
+    expect(res.status).toBe(409);
+    expect((await read(res)).reason).toBe('managed_schedule');
+    expect((await call(BILLING_API.change, { jar: j, method: 'DELETE' })).status).toBe(409);
+    expect(stripe.subscriptionSchedules.release).not.toHaveBeenCalled();
+    expect(stripe.subscriptionSchedules.update).not.toHaveBeenCalled();
+    expect(stripe.subscriptions.update).not.toHaveBeenCalled();
+  });
+
   it('releases a finished schedule when it reads the subscription, and records no scheduled change', async () => {
     const finished = {
       id: 'sub_sched_done',
       status: 'active',
+      metadata: { zephyr: 'plan_change' },
+      end_behavior: 'release',
+      current_phase: { start_date: NOW - 30 * DAY, end_date: NOW + 335 * DAY },
       phases: [{ start_date: NOW - 30 * DAY, items: [{ price: price('price_pro_y', 'pro', 'year') }] }],
     };
     stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: finished }));
@@ -1340,6 +1417,7 @@ describe('plan changes', () => {
     expect(stripe.subscriptionSchedules.create.mock.calls[0]?.[0]).toEqual({ from_subscription: SUB });
     expect(stripe.subscriptionSchedules.update.mock.calls[0]?.[1]).toEqual({
       end_behavior: 'release',
+      metadata: { zephyr: 'plan_change' },
       phases: [
         {
           items: [{ price: 'price_studio_m', quantity: 1 }],
@@ -1540,6 +1618,9 @@ describe('price-move cron', () => {
       onOld({
         id: 'sub_sched_1',
         status: 'active',
+        metadata: { zephyr: 'plan_change' },
+        end_behavior: 'release',
+        current_phase: { start_date: NOW - 10 * DAY },
         phases: [{ start_date: NOW - 10 * DAY }, { start_date: NOW + 20 * DAY }],
       }),
     );
@@ -1548,7 +1629,14 @@ describe('price-move cron', () => {
     // The schedule's change already happened: released first, then the price is swapped.
     marks.length = 0;
     stripe.subscriptions.retrieve.mockResolvedValue(
-      onOld({ id: 'sub_sched_done', status: 'active', phases: [{ start_date: NOW - 30 * DAY }] }),
+      onOld({
+        id: 'sub_sched_done',
+        status: 'active',
+        metadata: { zephyr: 'plan_change' },
+        end_behavior: 'release',
+        current_phase: { start_date: NOW - 30 * DAY },
+        phases: [{ start_date: NOW - 30 * DAY }],
+      }),
     );
     expect(await runBillingCron(env)).toMatchObject({ moved: 1 });
     expect(stripe.subscriptionSchedules.release).toHaveBeenCalledWith(

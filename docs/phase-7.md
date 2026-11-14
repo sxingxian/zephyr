@@ -248,6 +248,9 @@ Account deletion (phase 2 functions):
 - **Rate limits:** `BILLING_LIMITER` (namespace 1010; 20 a minute per user) on checkout, portal, change, preview and team writes. `TEAM_INVITE_LIMITER` (1011; 10 per 10 minutes per user) on invite create and resend. Webhooks aren't rate-limited by us (signature first, then work).
 - **Secrets:** `STRIPE_SECRET_KEY` (restricted key), `STRIPE_WEBHOOK_SECRET`. Var: `STRIPE_API_VERSION`.
 
+- **Only Zephyr's own schedules are touched.** Schedules Zephyr creates carry `metadata.zephyr = 'plan_change'` and end in `release`. A schedule counts as finished (and is released) only when Stripe's own `current_phase` is its last phase, never by our clock, so a downgrade at the renewal moment is never lost. A schedule made in the Stripe Dashboard (a fixed term, a discount phase) is never released or changed: plan changes answer 409 `conflict` with `reason: 'managed_schedule'`, undo refuses, and price moves skip that subscription.
+- **Duplicate refunds** refund each invoice payment's own amount (`amount_paid`, idempotency key per invoice payment), so a payment that covered several invoices is never refunded beyond the duplicate's share.
+
 ## Admin (`apps/admin`, `routes/admin-billing.ts`)
 
 - **Access:** Plans & billing is visible to Owner, Admin and Finance. Price and pack changes are for Owner and Finance.

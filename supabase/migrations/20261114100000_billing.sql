@@ -1307,6 +1307,11 @@ begin
   end if;
   -- A claim of a stopped change left unfinished (the worker died, or the Stripe call's outcome was unknown):
   -- Stripe may have the new price. Owed a revert; revertMove finds 'moot' when the swap never happened.
+  -- Change rows first, in id order, as Stop, claim, mark and the sweep take them (no deadlock with Stop).
+  perform 1 from public.price_changes c
+   where c.id in (select m.change_id from public.price_moves m
+                   where m.status = 'moving' and m.claimed_at < now() - interval '1 hour')
+   order by c.id for share;
   update public.price_moves m set status = 'revert_pending'
    where m.status = 'moving' and m.claimed_at < now() - interval '1 hour'
      and (exists (select 1 from public.price_changes c where c.id = m.change_id and c.status = 'stopped')

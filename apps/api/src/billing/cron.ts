@@ -134,7 +134,8 @@ export async function swapPrice(
   if (!item || current !== from || sub.items.data.length !== 1) return 'changed';
   // A downgrade or switch still to come: its phases would undo the swap, so the sweep plans again after it runs.
   const state = scheduleStateOf(await scheduleOf(stripe, sub));
-  if (state?.kind === 'pending') return 'changed';
+  // A schedule made outside Zephyr is never touched: the move is skipped (logged by the caller as changed).
+  if (state?.kind === 'pending' || state?.kind === 'foreign') return 'changed';
   // Stripe won't change the price of a subscription a schedule manages: release one whose change already happened.
   if (state?.kind === 'finished') await releaseSchedule(stripe, state.id);
   try {
@@ -354,7 +355,7 @@ async function retryDeletionResumes(env: Env, requestId: string, counts: Billing
   }
 }
 
-/** Recorded duplicates an earlier try didn't finish: refund, then cancel (only these rows, never another). */
+/** Recorded duplicates an earlier try didn't finish: cancel, void open invoices, then refund (only these rows). */
 async function retryDuplicates(env: Env, stripe: Stripe, requestId: string, counts: BillingCronCounts) {
   try {
     for (const d of await billingDb.duplicatesUnsettled(env, BILLING_CRON_LIMITS.duplicates)) {
