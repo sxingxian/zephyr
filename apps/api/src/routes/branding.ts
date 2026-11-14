@@ -102,14 +102,14 @@ brandingRoutes.get('/:kind', async (c) => {
   }
 });
 
-const sniff = (b: Uint8Array): 'png' | 'jpeg' | 'webp' | null => {
+export const sniff = (b: Uint8Array): 'png' | 'jpeg' | 'webp' | null => {
   if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'png';
   if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'jpeg';
   const ascii = (at: number, s: string) => [...s].every((ch, i) => b[at + i] === ch.charCodeAt(0));
   if (ascii(0, 'RIFF') && ascii(8, 'WEBP')) return 'webp';
   return null;
 };
-const asStream = (b: Uint8Array) => new Response(b).body as ReadableStream<Uint8Array>;
+export const asStream = (b: Uint8Array) => new Response(b).body as ReadableStream<Uint8Array>;
 
 brandingRoutes.put('/:kind', async (c) => {
   const kind = kindOf(c);

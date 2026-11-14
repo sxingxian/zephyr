@@ -17,6 +17,7 @@ import {
 import { type GoTrueSession, gotrue } from '../auth/gotrue';
 import {
   appendCookies,
+  clearCookies,
   endSession,
   resolveSession,
   sessionCookies,
@@ -41,7 +42,7 @@ import {
 import { rpc, UpstreamError } from '../supabase';
 import { TURNSTILE_ACTIONS, verifyTurnstile } from '../turnstile';
 import type { HonoEnv } from '../types';
-import { getProfile, requireMember, sessionUser } from './session-helpers';
+import { getProfile, isSuspended, requireMember, sessionUser } from './session-helpers';
 
 const WINDOW = 15 * 60;
 const DAY = 24 * 60 * 60;
@@ -212,11 +213,18 @@ export async function startMemberSession(
   const claims = await verifyAccessToken(c.env, session.access_token);
   if (!claims) throw new UpstreamError('auth:token', 502, 'unverifiable');
   const profile = await getProfile(c.env, claims.sub);
-  if (!profile || profile.isStaff || profile.deleted) {
+  const suspended =
+    !!profile && !profile.isStaff && !profile.deleted && (await isSuspended(c.env, claims.sub, profile));
+  if (!profile || profile.isStaff || profile.deleted || suspended) {
     try {
       await gotrue.logout(c.env, session.access_token);
     } catch {
       /* ignore */
+    }
+    if (suspended) {
+      // Phase 8: a suspended account can't sign in; any old session cookies go too.
+      appendCookies(c, clearCookies('app'));
+      return c.json(fail('account_suspended'), 403);
     }
     return c.json(fail('forbidden'), 403);
   }

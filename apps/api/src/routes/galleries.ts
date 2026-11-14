@@ -5,6 +5,7 @@
  *   GET/POST              /api/v1/galleries/:id/photos
  *   POST/DELETE           /api/v1/galleries/:id/passcode
  *   GET                   /api/v1/galleries/:id/link
+ *   POST                  /api/v1/galleries/:id/link/replace   (phase 8)
  *   GET                   /api/v1/galleries/:id/favourites
  *   GET                   /api/v1/galleries/:id/activity
  *   GET                   /api/v1/galleries/:id/renders        (render queue)
@@ -16,6 +17,7 @@
 import {
   type GalleryCreated,
   type GalleryDetail,
+  type GalleryLinkResult,
   type GallerySummary,
   GUEST_PATH,
   galleryCreateSchema,
@@ -219,6 +221,34 @@ galleryRoutes.get('/:id/link', async (c) => {
     return c.json({ ok: true, url: guestUrl(c, token) });
   } catch (err) {
     logError(c.get('requestId'), 'gallery_link', err);
+    return c.json(fail('server'), 500);
+  }
+});
+
+/**
+ * Phase 8 (MEMBER8_API.galleryLinkReplace): a new link token and its encrypted copy. The old link stops at once,
+ * the gallery's guest sessions end, and the owner's activity log records it (all in `gallery_link_replace`).
+ * Allowed in read-only mode: replacing a leaked link is a safety action, not a library write.
+ */
+galleryRoutes.post('/:id/link/replace', async (c) => {
+  const id = c.req.param('id');
+  try {
+    const { token, hash } = await newGalleryToken();
+    const link = await encryptLink(c.env, id, token);
+    const res = await rpc<boolean | { error: GalleryError } | null>(c.env, 'gallery_link_replace', {
+      p_owner: ownerOf(c),
+      p_actor: actorOf(c),
+      p_id: id,
+      p_token_hash: hash,
+      p_link_hint: token.slice(0, 8),
+      p_link_ciphertext: link.ciphertext,
+      p_link_iv: link.iv,
+    });
+    if (!res) return notFound(c);
+    if (typeof res === 'object' && 'error' in res) return galleryError(c, res.error);
+    return c.json({ ok: true, link: guestUrl(c, token) } satisfies GalleryLinkResult);
+  } catch (err) {
+    logError(c.get('requestId'), 'gallery_link_replace', err);
     return c.json(fail('server'), 500);
   }
 });

@@ -5,7 +5,7 @@
  *   GET/PATCH      /api/v1/team                         the owner's team (always their own library)
  *   POST           /api/v1/team/invites                 invite by email (Studio, a free seat)
  *   POST/DELETE    /api/v1/team/invites/:id             resend (new token) / revoke
- *   PATCH/DELETE   /api/v1/team/members/:memberId       change role / remove
+ *   PATCH/DELETE   /api/v1/team/members/:memberId       change role / remove (?replaceLinks=1, phase 8)
  *   POST           /api/v1/team/invite/preview          no session: what an invite link is for
  *   POST           /api/v1/team/invite/accept           signed in with the invited email
  * Team management is personal: it ignores X-Zephyr-Library and always acts on the signed-in member's own
@@ -14,6 +14,7 @@
 import {
   type LibrariesResult,
   type LibrarySummary,
+  TEAM_REMOVE_REPLACE_LINKS_PARAM,
   type Team,
   type TeamInvitePreview,
   type TeamInvitePreviewResult,
@@ -31,6 +32,7 @@ import { teamInviteEmail } from '../email/team-templates';
 import { type Env, list } from '../env';
 import { burstOk, fail, guardWrite, limitHit, logError, networkHash, rateLimited, readBody } from '../http';
 import { expectedUser, memberHash, UUID } from '../library/storage';
+import { encryptLink, newGalleryToken } from '../share/signing';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 import { requireMember } from './session-helpers';
@@ -331,10 +333,33 @@ teamRoutes.patch('/members/:memberId', async (c) => {
   }
 });
 
+/**
+ * Phase 8: `?replaceLinks=1` also replaces the link of every live gallery in the library (the removed member may
+ * have copied them). The links are replaced first, in one transaction (`gallery_links_replace`), so a failure
+ * leaves the member in place to retry; a removal that then fails has only cost the old links.
+ */
+async function replaceLiveLinks(c: Ctx) {
+  const owner = self(c);
+  const ids = (await rpc<string[] | null>(c.env, 'live_gallery_ids', { p_owner: owner })) ?? [];
+  if (!ids.length) return;
+  const links = await Promise.all(
+    ids.slice(0, REPLACE_LINKS_MAX).map(async (id) => {
+      const { token, hash } = await newGalleryToken();
+      const link = await encryptLink(c.env, id, token);
+      return { id, tokenHash: hash, linkHint: token.slice(0, 8), ciphertext: link.ciphertext, iv: link.iv };
+    }),
+  );
+  await rpc(c.env, 'gallery_links_replace', { p_owner: owner, p_actor: owner, p_links: links });
+}
+const REPLACE_LINKS_MAX = 1000;
+
 teamRoutes.delete('/members/:memberId', async (c) => {
   const member = (c.req.param('memberId') ?? '').toLowerCase();
   if (!UUID.test(member) || member === self(c)) return c.json(fail('not_found'), 404);
+  const replace = c.req.query(TEAM_REMOVE_REPLACE_LINKS_PARAM);
+  if (replace !== undefined && replace !== '0' && replace !== '1') return c.json(fail('invalid'), 400);
   try {
+    if (replace === '1') await replaceLiveLinks(c);
     const ok = await rpc<boolean | null>(c.env, 'team_member_remove', { p_owner: self(c), p_member: member });
     if (!ok) return c.json(fail('not_found'), 404);
     return await teamReply(c);

@@ -10,6 +10,10 @@ export interface SessionProfile {
   deleted: boolean;
   /** When a scheduled account deletion runs (ISO), or null. */
   deletionDue: string | null;
+  /** Phase 8: staff suspended the account. Optional: when absent, `member_suspended` is asked. */
+  suspended?: boolean;
+  /** Phase 8: the last retention batch of the member's own library within 30 days, or null. */
+  retention?: { trashedAt: string; photos: number; restoreBy: string } | null;
 }
 export interface StaffContext {
   id: string;

@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { rejectDuplicateCookies } from './auth/session';
 import { fail, logError } from './http';
 import { adminRoutes } from './routes/admin';
+import { adsRoutes } from './routes/ads';
 import { aiRoutes } from './routes/ai';
 import { albumRoutes } from './routes/albums';
 import { appAuthRoutes } from './routes/app-auth';
@@ -14,6 +15,7 @@ import { meRoutes } from './routes/me';
 import { photoRoutes } from './routes/photos';
 import { publicRoutes } from './routes/public';
 import { recipeRoutes } from './routes/recipes';
+import { statusRoutes } from './routes/status';
 import { librariesRoutes, teamRoutes } from './routes/team';
 import { trashRoutes } from './routes/trash';
 import { uploadRoutes } from './routes/uploads';
@@ -80,6 +82,9 @@ app.route('/api/v1/g', guestRoutes);
 app.route('/api/v1/billing', billingRoutes);
 app.route('/api/v1/public/pricing', pricingRoutes);
 app.route('/api/v1/stripe', stripeWebhookRoutes);
+// Phase 8: read-only mode / maintenance notice (no session) and Free-plan ads.
+app.route('/api/v1/status', statusRoutes);
+app.route('/api/v1/ads', adsRoutes);
 // Admin console (zephyr.midnightpoetry.studio/admin, behind Cloudflare Access).
 app.route('/admin/api', adminRoutes);
 

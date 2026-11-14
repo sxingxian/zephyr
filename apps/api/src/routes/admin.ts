@@ -53,8 +53,16 @@ import {
 } from '../http';
 import { rpc, UpstreamError } from '../supabase';
 import type { HonoEnv, StaffContext } from '../types';
+import { adImageGuard, isAdImageUpload, registerAdminAdsRoutes } from './admin-ads';
 import { registerAdminAiRoutes } from './admin-ai';
+import { registerAdminAuditRoutes } from './admin-audit';
 import { registerAdminBillingRoutes } from './admin-billing';
+import { registerAdminLimitsRoutes } from './admin-limits';
+import { registerAdminRetentionRoutes } from './admin-retention';
+import { registerAdminSafetyRoutes } from './admin-safety';
+import { registerAdminSettingsRoutes } from './admin-settings';
+import { registerAdminStaffRoutes } from './admin-staff';
+import { registerAdminUserRoutes } from './admin-users';
 import { sendInvite } from './invites';
 
 const WINDOW = 15 * 60;
@@ -82,10 +90,10 @@ adminRoutes.use('*', async (c, next) => {
   c.set('accessEmail', email);
   await next();
 });
-// 2. Writes: same-origin JSON only.
-adminRoutes.use(
-  '*',
-  guardWrite((env) => list(env.ADMIN_ORIGINS), 20 * 1024),
+// 2. Writes: same-origin JSON only (the ad image upload: same-origin image, size-checked by its route).
+const jsonGuard = guardWrite((env) => list(env.ADMIN_ORIGINS), 20 * 1024);
+adminRoutes.use('*', (c, next) =>
+  isAdImageUpload(c.req.method, c.req.path) ? adImageGuard(c, next) : jsonGuard(c, next),
 );
 
 /**
@@ -623,3 +631,13 @@ registerAdminAiRoutes(adminRoutes, requireStaff);
 
 // ---- Plans & billing (phase 7) ---------------------------------------------------------------------------
 registerAdminBillingRoutes(adminRoutes, requireStaff);
+
+// ---- phase 8: the admin portal (docs/phase-8.md › Admin routes) ---------------------------------------
+registerAdminUserRoutes(adminRoutes, requireStaff);
+registerAdminSafetyRoutes(adminRoutes, requireStaff);
+registerAdminLimitsRoutes(adminRoutes, requireStaff);
+registerAdminAdsRoutes(adminRoutes, requireStaff);
+registerAdminRetentionRoutes(adminRoutes, requireStaff);
+registerAdminStaffRoutes(adminRoutes, requireStaff);
+registerAdminAuditRoutes(adminRoutes, requireStaff);
+registerAdminSettingsRoutes(adminRoutes, requireStaff);

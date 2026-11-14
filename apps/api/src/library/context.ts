@@ -7,6 +7,7 @@ import {
   roleCan,
 } from '@zephyr/shared';
 import type { Context, MiddlewareHandler } from 'hono';
+import { isReadOnly } from '../admin/app-status';
 import { fail, logError } from '../http';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
@@ -116,9 +117,12 @@ export const roleAllows = (c: Context<HonoEnv>, action: LibraryAction) =>
 /**
  * 403 `library_read_only` while the library is over its plan's storage (after a lapse or downgrade):
  * uploads, copies, edit saves, AI jobs, new galleries and extensions. Trash, restore, purge and downloads
- * stay open so the owner can get back under.
+ * stay open so the owner can get back under. While read-only mode is on, the same writes answer 503
+ * `read_only_mode` for every library.
  */
 export const requireWritable: MiddlewareHandler<HonoEnv> = async (c, next) => {
+  // Phase 8: read-only mode (Admin › Settings, or automatic when the photo store stops answering), cached 15 s.
+  if (await isReadOnly(c.env)) return c.json(fail('read_only_mode'), 503, { 'Retry-After': '60' });
   if (c.get('library').state === 'read_only') return c.json(fail('library_read_only'), 403);
   await next();
 };

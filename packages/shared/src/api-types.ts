@@ -158,6 +158,11 @@ export interface SessionUser {
   createdAt: string;
   /** Set while the account is scheduled for deletion: the app shows the Restore screen. */
   pendingDeletion?: { purgeAt: string };
+  /**
+   * Phase 8: the retention clean-up moved photos of the member's own library to Trash in the last 30 days (the app
+   * shows the Trash notice until restoreBy). Null when there was none; absent from older APIs.
+   */
+  retention?: { trashedAt: string; photos: number; restoreBy: string } | null;
 }
 export interface SessionResponse {
   ok: true;

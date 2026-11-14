@@ -81,6 +81,10 @@ export interface Env {
   BILLING_LIMITER: RateLimit;
   /** Per-member team invite sends (5 a minute; plus 20 an hour in Postgres). */
   TEAM_INVITE_LIMITER: RateLimit;
+  /** Phase 8: admin writes, 60 a minute per staff member (namespace 1012). */
+  ADMIN_LIMITER: RateLimit;
+  /** Phase 8: ad reads and events, 120 a minute per member (namespace 1013). */
+  ADS_LIMITER: RateLimit;
   /** Cloudflare account id and gateway id of the AI Gateway every cloud AI call goes through. */
   AI_GATEWAY_ACCOUNT_ID?: string;
   AI_GATEWAY_ID?: string;

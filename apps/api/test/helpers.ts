@@ -4,6 +4,7 @@
  */
 import { exportJWK, generateKeyPair, type JWK, SignJWT } from 'jose';
 import { vi } from 'vitest';
+import { resetAppStatusCache } from '../src/admin/app-status';
 import { app } from '../src/app';
 import { CODE_TIMING } from '../src/auth/code-limits';
 import type { Env } from '../src/env';
@@ -53,6 +54,9 @@ export const aiReadLimiter = { ok: true, keys: [] as string[] };
 /** Phase 7 per-member limiters. */
 export const billingLimiter = { ok: true, keys: [] as string[] };
 export const teamInviteLimiter = { ok: true, keys: [] as string[] };
+/** Phase 8: admin writes per staff member, ad reads/events per member. */
+export const adminLimiter = { ok: true, keys: [] as string[] };
+export const adsLimiter = { ok: true, keys: [] as string[] };
 export const MEDIA_HOST = 'media.test';
 export const MEDIA_SECRET = 'media-host-secret';
 
@@ -126,6 +130,8 @@ export const env: Env = {
   AI_READ_LIMITER: fakeLimiter(aiReadLimiter),
   BILLING_LIMITER: fakeLimiter(billingLimiter),
   TEAM_INVITE_LIMITER: fakeLimiter(teamInviteLimiter),
+  ADMIN_LIMITER: fakeLimiter(adminLimiter),
+  ADS_LIMITER: fakeLimiter(adsLimiter),
   AI_GATEWAY_ACCOUNT_ID: 'acct123',
   AI_GATEWAY_ID: 'zephyr-test',
   AI_GATEWAY_TOKEN: 'gateway-token',
@@ -196,6 +202,8 @@ export interface User {
   staff?: 'owner' | 'admin' | 'finance' | 'safety' | 'support';
   passkeys?: number;
   displayName?: string | null;
+  /** Phase 8: staff suspended this member (the default member_suspended). */
+  suspended?: boolean;
 }
 export interface Call {
   url: string;
@@ -233,6 +241,8 @@ export interface World {
   /** Phase 7: the state and plan library_access reports. */
   libraryState?: 'active' | 'read_only';
   libraryPlan?: 'free' | 'pro' | 'studio';
+  /** Phase 8: what the default app_status returns. */
+  appStatus?: { readOnly: { on: boolean; message: string } | null; maintenance: unknown };
 }
 export const world: World = {} as World;
 
@@ -289,7 +299,8 @@ export function resetWorld() {
   facesLimiter.keys.length = 0;
   aiReadLimiter.ok = true;
   aiReadLimiter.keys.length = 0;
-  for (const l of [billingLimiter, teamInviteLimiter]) {
+  resetAppStatusCache();
+  for (const l of [billingLimiter, teamInviteLimiter, adminLimiter, adsLimiter]) {
     l.ok = true;
     l.keys.length = 0;
   }
@@ -391,6 +402,9 @@ const defaultRpc: Record<string, (a: Record<string, unknown>) => unknown> = {
       return { role: 'owner', plan: world.libraryPlan ?? 'free', state: world.libraryState ?? 'active' };
     return team ? { role: team, plan: 'studio', state: world.libraryState ?? 'active' } : null;
   },
+  // Phase 8: suspension and read-only mode.
+  member_suspended: (a) => Boolean(byId(String(a.p_user))?.suspended),
+  app_status: () => world.appStatus ?? { readOnly: null, maintenance: null },
   update_display_name: (a) => {
     const u = byId(String(a.p_user_id));
     if (u) u.displayName = String(a.p_name);

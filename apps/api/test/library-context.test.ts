@@ -431,7 +431,11 @@ describe('library routes take the owner only from the library context', () => {
     const personal = new Set(['me.ts', 'team.ts', 'billing.ts']);
     const withOwner = Object.keys(sources).filter((f) => /p_owner/.test(sources[f] ?? ''));
     expect(withOwner.length).toBeGreaterThan(5);
-    for (const f of withOwner) expect(LIBRARY_ROUTE_FILES.includes(f) || personal.has(f), f).toBe(true);
+    // Phase 8 staff routes name members and owners by id on purpose (every staff function re-checks the role).
+    const staff = (f: string) => f.startsWith('admin-');
+    for (const f of withOwner) {
+      expect(LIBRARY_ROUTE_FILES.includes(f) || personal.has(f) || staff(f), f).toBe(true);
+    }
   });
 
   it.each(LIBRARY_ROUTE_FILES)('%s never passes the session user as an owner', (f) => {
