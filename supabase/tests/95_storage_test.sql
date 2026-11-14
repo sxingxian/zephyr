@@ -173,8 +173,13 @@ select public.storage_item_mark(:'m2'::uuid, (e ->> 'photoId')::uuid, 'deleted',
 select pg_temp.ok((select state = 'rolled_back' and finished_at is not null from public.storage_migrations where id = :'m2'::uuid), 'clean-up finishes the rollback');
 
 -- ---- A photo purged mid-migration -------------------------------------------------------------------------
+select pg_temp.photo(:mei, 'gone.jpg') as pe \gset
+update public.photos set store_id = 'nas' where id = :'pe'::uuid;
 select public.storage_switch(:own, 's3', 'To S3') ->> 'migrationId' as m3 \gset
+-- Claim the dedicated photo first, so the purge never hits pa/pb (used by later assertions).
+update public.storage_migration_items set updated_at = now() + interval '1 hour' where migration_id = :'m3'::uuid and photo_id <> :'pe'::uuid;
 select public.storage_migration_batch(:'m3'::uuid, 1) -> 0 ->> 'photoId' as gone \gset
+select pg_temp.ok(:'gone' = :'pe', 'the dedicated photo is claimed first');
 update public.photos set status = 'purging', trashed_at = now(), purge_after = now() where id = :'gone'::uuid;
 select public.storage_item_mark(:'m3'::uuid, :'gone'::uuid, 'verified', 1300, null, null) as r \gset
 select pg_temp.ok(:'r'::jsonb ->> 'state' = 'skipped'
