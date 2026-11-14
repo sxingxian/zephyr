@@ -7,18 +7,20 @@ import { ApiFailure, api, errorMessage } from '../lib/api';
 
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
-/** Reads `#token=…` once and strips it from the address bar (and history) straight away. */
+/** Reads `#t=…` (or `#token=…`) once and strips it from the address bar (and history) straight away. */
 export function takeInviteToken(): string | null {
   const hash = window.location.hash.replace(/^#/, '');
   if (!hash) return null;
-  const token = new URLSearchParams(hash).get('token');
+  const params = new URLSearchParams(hash);
+  const token = params.get('t') ?? params.get('token');
   window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search);
   return token && TOKEN_RE.test(token) ? token : null;
 }
 
 /**
- * Staff invite link: /admin/invite#token=… The token is in the fragment so it never reaches a server log; it's
- * exchanged once, then the person continues with the normal email code → passkey enrolment.
+ * Staff invite link: /admin/staff-invite#t=… The token is in the fragment so it never reaches a server log; it's
+ * exchanged once (the Cloudflare Access identity must be the invited email), then the person continues with the
+ * normal email code → passkey enrolment.
  */
 export function StaffInvite() {
   const nav = useNavigate();
@@ -48,7 +50,9 @@ export function StaffInvite() {
         setError(
           e instanceof ApiFailure && (e.code === 'invalid' || e.code === 'not_found' || e.code === 'conflict')
             ? 'This invite has expired or was already used. Ask an Owner to send a new one.'
-            : errorMessage(e),
+            : e instanceof ApiFailure && e.code === 'forbidden'
+              ? 'This invite is for a different email than the one you signed in to Cloudflare Access with. Sign in to Access with the invited address and open the link again.'
+              : errorMessage(e),
         );
       }
     })();

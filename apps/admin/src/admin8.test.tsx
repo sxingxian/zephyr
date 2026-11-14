@@ -770,13 +770,13 @@ describe('Audit log', () => {
 describe('Staff invite link', () => {
   it('strips the fragment, accepts the token and continues to enrolment with the email prefilled', async () => {
     const token = 'a'.repeat(43);
-    window.history.replaceState(null, '', `/admin/invite#token=${token}`);
+    window.history.replaceState(null, '', `/admin/staff-invite#t=${token}`);
     mock(null, (c) =>
       c.url.endsWith('/staff/invite/accept')
         ? json(200, { ok: true, email: 'ravi@midnightpoetry.studio' })
         : undefined,
     );
-    renderAt('/invite');
+    renderAt('/staff-invite');
     const email = (await screen.findByLabelText('Staff email', {}, T)) as HTMLInputElement;
     expect(email.value).toBe('ravi@midnightpoetry.studio');
     expect(window.location.hash).toBe('');
@@ -784,10 +784,24 @@ describe('Staff invite link', () => {
     expect(writes('/staff/invite/accept')[0]?.body).toEqual({ token });
   });
 
+  it('also accepts #token= and explains an invite for a different Access identity', async () => {
+    const token = 'b'.repeat(43);
+    window.history.replaceState(null, '', `/admin/staff-invite#token=${token}`);
+    mock(null, (c) =>
+      c.url.endsWith('/staff/invite/accept') ? json(403, { ok: false, error: 'forbidden' }) : undefined,
+    );
+    renderAt('/staff-invite');
+    expect(
+      await screen.findByText(/different email than the one you signed in to Cloudflare Access/, {}, T),
+    ).toBeTruthy();
+    expect(writes('/staff/invite/accept')[0]?.body).toEqual({ token });
+    expect(window.location.hash).toBe('');
+  });
+
   it('explains a missing or malformed token without calling the API', async () => {
-    window.history.replaceState(null, '', '/admin/invite#token=short');
+    window.history.replaceState(null, '', '/admin/staff-invite#t=short');
     mock(null);
-    renderAt('/invite');
+    renderAt('/staff-invite');
     expect(await screen.findByText(/isn’t complete/, {}, T)).toBeTruthy();
     expect(window.location.hash).toBe('');
     expect(writes('/staff/invite/accept')).toHaveLength(0);

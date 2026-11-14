@@ -182,8 +182,9 @@ export const routes: RouteObject[] = [
           </RequireStaff>
         ),
       },
-      // Public: the staff invite link (token in the fragment). It never needs a session.
-      { path: '/invite', element: <StaffInvite /> },
+      // Public: the staff invite link (token in the fragment, #t=…). It never needs a session.
+      { path: '/staff-invite', element: <StaffInvite /> },
+      { path: '/invite', element: <StaffInvite /> }, // older link shape
       { path: '*', element: <Navigate to="/signups" replace /> },
     ],
   },
