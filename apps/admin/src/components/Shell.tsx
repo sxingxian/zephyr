@@ -4,15 +4,24 @@ import { NavLink, useNavigate } from 'react-router';
 import { ROLE_LABEL, useAdminSession } from '../lib/session';
 import { Avatar } from './Avatar';
 
-const NAV: { label: string; icon: IconName; to?: string; end?: boolean; phase?: number }[] = [
+type Role = NonNullable<ReturnType<typeof useAdminSession>['staff']>['role'];
+const NAV: {
+  label: string;
+  icon: IconName;
+  to?: string;
+  end?: boolean;
+  phase?: number;
+  /** Only these roles see the item (the API enforces the same). */
+  roles?: Role[];
+}[] = [
   { label: 'Overview', icon: 'home', phase: 8 },
   { label: 'Users', icon: 'people', phase: 8 },
   { label: 'Sign-ups & invites', icon: 'mail', to: '/signups' },
   { label: 'Safety & reports', icon: 'shield', phase: 5 },
   { label: 'AI jobs', icon: 'cpu', to: '/ai/jobs' },
   { label: 'Zephyr AI', icon: 'breeze', to: '/ai', end: true },
-  { label: 'Plans & billing', icon: 'card', phase: 7 },
-  { label: 'Plan limits', icon: 'sliders', phase: 7 },
+  { label: 'Plans & billing', icon: 'card', to: '/billing', roles: ['owner', 'admin', 'finance'] },
+  { label: 'Plan limits', icon: 'sliders', phase: 8 },
   { label: 'Ads', icon: 'megaphone', phase: 8 },
   { label: 'Galleries', icon: 'link', phase: 5 },
   { label: 'Audit log', icon: 'file', phase: 8 },
@@ -60,7 +69,7 @@ export function AdminShell({
           Production
         </div>
         <div className="anav__items">
-          {NAV.map((n) =>
+          {NAV.filter((n) => !n.roles || (staff && n.roles.includes(staff.role))).map((n) =>
             n.to ? (
               <NavLink key={n.label} to={n.to} end={n.end} className="anav__item">
                 <Icon name={n.icon} size={18} />

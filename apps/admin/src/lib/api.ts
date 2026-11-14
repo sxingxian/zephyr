@@ -43,6 +43,7 @@ const KNOWN: ApiErrorCode[] = [
   'passkey_required',
   'reauth_required',
   'feature_off',
+  'billing_unavailable',
   'not_found',
   'conflict',
   'server',
