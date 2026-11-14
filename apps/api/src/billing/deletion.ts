@@ -1,12 +1,15 @@
 /**
  * Account deletion and the subscription (docs/phase-7.md, Account deletion):
- * - scheduling a deletion sets cancel_at_period_end (marked, so a restore only undoes our own change);
- * - restoring undoes it;
- * - the purge cancels at once, before the account is deleted.
+ * - scheduling a deletion sets cancel_at_period_end (marked, so a restore only undoes our own change). A
+ *   scheduled downgrade is released first: Stripe won't set cancel_at_period_end on a subscription a schedule
+ *   manages. If it fails, the daily billing cron tries again;
+ * - restoring undoes it (a released downgrade isn't put back: the member can schedule it again);
+ * - the purge cancels every live subscription of the customer at once and deletes the Stripe customer, before
+ *   the account is deleted.
  */
 import type { Env } from '../env';
 import { billingDb } from './db';
-import { isMissing, stripeClient } from './stripe';
+import { idOf, isMissing, stripeClient } from './stripe';
 
 /** Subscription metadata flag: cancel_at_period_end was set by a deletion request, not by the member. */
 const FLAG = 'zephyr_deletion_cancel';
@@ -33,10 +36,15 @@ export async function cancelForDeletion(env: Env, owner: string, fromDb?: unknow
   try {
     const sub = await stripe.subscriptions.retrieve(id);
     if (sub.status === 'canceled' || sub.status === 'incomplete_expired' || sub.cancel_at_period_end) return;
+    const day = new Date().toISOString().slice(0, 10);
+    const schedule = idOf(sub.schedule);
+    if (schedule) {
+      await stripe.subscriptionSchedules.release(schedule, {}, { idempotencyKey: `release:${schedule}` });
+    }
     await stripe.subscriptions.update(
       id,
       { cancel_at_period_end: true, metadata: { [FLAG]: '1' } },
-      { idempotencyKey: `deletion-cancel:${id}:${new Date().toISOString().slice(0, 10)}` },
+      { idempotencyKey: `deletion-cancel:${id}:${day}` },
     );
   } catch (err) {
     if (!isMissing(err)) throw err;
@@ -52,26 +60,55 @@ export async function undoCancelForDeletion(env: Env, owner: string, fromDb?: un
   try {
     const sub = await stripe.subscriptions.retrieve(id);
     if (sub.metadata?.[FLAG] !== '1' || !sub.cancel_at_period_end) return;
-    await stripe.subscriptions.update(id, { cancel_at_period_end: false, metadata: { [FLAG]: '' } });
+    await stripe.subscriptions.update(
+      id,
+      { cancel_at_period_end: false, metadata: { [FLAG]: '' } },
+      { idempotencyKey: `deletion-resume:${id}:${new Date().toISOString().slice(0, 10)}` },
+    );
   } catch (err) {
     if (!isMissing(err)) throw err;
   }
 }
 
+const ENDED = new Set(['canceled', 'incomplete_expired']);
+
 /**
- * Purge: cancel at once. Throws when Stripe can't be reached, so the purge job keeps the account for its
- * next run instead of deleting it while it's still billed.
+ * Purge: cancel at once every subscription the customer still has in Stripe (not only the one we track: a
+ * duplicate or a stray one must not keep billing a deleted account), then delete the Stripe customer (email,
+ * address). Throws when Stripe can't be reached, so the purge job keeps the account for its next run instead
+ * of deleting it while it's still billed. Our billing rows go with the account (on delete cascade).
  */
 export async function cancelForPurge(env: Env, owner: string, fromDb?: unknown): Promise<void> {
   const stripe = stripeClient(env);
   if (!stripe) return;
-  const id = await subscriptionIdFor(env, owner, fromDb);
-  if (!id) return;
-  try {
-    const sub = await stripe.subscriptions.retrieve(id);
-    if (sub.status === 'canceled' || sub.status === 'incomplete_expired') return;
-    await stripe.subscriptions.cancel(id, {}, { idempotencyKey: `purge-cancel:${id}` });
-  } catch (err) {
-    if (!isMissing(err)) throw err;
+  const customer = await billingDb.customer(env, owner);
+  const ids = new Set<string>();
+  const tracked = await subscriptionIdFor(env, owner, fromDb);
+  if (tracked) ids.add(tracked);
+  if (customer) {
+    try {
+      for await (const sub of stripe.subscriptions.list({ customer, status: 'all', limit: 100 })) {
+        if (!ENDED.has(sub.status)) ids.add(sub.id);
+      }
+    } catch (err) {
+      if (!isMissing(err)) throw err;
+    }
+  }
+  for (const id of ids) {
+    try {
+      const sub = await stripe.subscriptions.retrieve(id);
+      if (ENDED.has(sub.status)) continue;
+      await stripe.subscriptions.cancel(id, {}, { idempotencyKey: `purge-cancel:${id}` });
+    } catch (err) {
+      if (!isMissing(err)) throw err;
+    }
+  }
+  if (customer) {
+    try {
+      // DELETE is idempotent in Stripe (idempotency keys apply to POSTs); a second delete is resource_missing.
+      await stripe.customers.del(customer);
+    } catch (err) {
+      if (!isMissing(err)) throw err;
+    }
   }
 }

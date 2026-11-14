@@ -142,7 +142,8 @@ export function registerAdminBillingRoutes(router: Hono<HonoEnv>, requireStaff: 
         p_amount: body.amount,
       });
       if (!p) return c.json(fail('not_found'), 404);
-      return c.json({ ok: true, ...p, raise: p.to > p.from } satisfies AdminPricePreviewResult);
+      // raise comes from the database: above the current price or above what any subscriber pays.
+      return c.json({ ok: true, ...p, raise: p.raise === true } satisfies AdminPricePreviewResult);
     } catch (err) {
       return failed(c, 'admin_price_preview', err);
     }
@@ -157,7 +158,13 @@ export function registerAdminBillingRoutes(router: Hono<HonoEnv>, requireStaff: 
         (await billingDb.pricesCurrent(c.env)).find((p) => p.lookupKey === body.lookupKey) ?? null;
       if (!current) return c.json(fail('not_found'), 404);
       if (current.amount === body.amount) return c.json(fail('conflict'), 409);
-      const raise = body.amount > current.amount;
+      // A rise for anyone (also a "cut" that is still above what grandfathered subscribers pay) needs the
+      // passkey and emails the Owners.
+      const preview = await rpc<{ raise?: boolean } | null>(c.env, 'admin_price_preview', {
+        p_lookup_key: body.lookupKey,
+        p_amount: body.amount,
+      });
+      const raise = body.amount > current.amount || preview?.raise === true;
       if (raise && !staff.recentPasskey) return c.json(fail('reauth_required'), 403);
       const stripe = stripeClient(c.env);
       if (!stripe) return c.json(fail('billing_unavailable'), 503);
@@ -185,7 +192,7 @@ export function registerAdminBillingRoutes(router: Hono<HonoEnv>, requireStaff: 
       );
       // Sanity: what Stripe created is the plan we meant (metadata round-trip).
       if (plan && planOfPrice(price)?.plan !== plan.plan) throw new Error('PriceMismatch');
-      const out = await rpc<{ error?: string } | null>(c.env, 'admin_price_set', {
+      const out = await rpc<{ error?: string; raise?: boolean } | null>(c.env, 'admin_price_set', {
         p_staff: staff.id,
         p_lookup_key: body.lookupKey,
         p_stripe_price_id: price.id,
@@ -198,7 +205,7 @@ export function registerAdminBillingRoutes(router: Hono<HonoEnv>, requireStaff: 
           fail(out.error === 'forbidden' ? 'forbidden' : 'invalid'),
           out.error === 'forbidden' ? 403 : 400,
         );
-      if (raise) {
+      if (raise || out?.raise === true) {
         await tellOwners(c, {
           kind: 'raise',
           actor: actorOf(c),

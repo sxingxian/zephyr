@@ -36,6 +36,9 @@ export interface StoredSubscription {
   stripePriceId: string;
   scheduleId: string | null;
   currentPeriodEnd: string;
+  /** Keeps the paid plan now (active, trialing, or past_due within the grace period). */
+  keepsPlan?: boolean;
+  cancelAtPeriodEnd?: boolean;
 }
 
 /** The subscription as `billing_apply` stores it (snake_case = the `subscriptions` columns). */
@@ -67,6 +70,12 @@ export interface ApplyResult {
   planAfter: PlanId;
   /** True when the write was older than the stored read and ignored. */
   stale?: boolean;
+  /**
+   * A second plan-keeping subscription for an owner whose stored one still keeps the plan: not applied. The API
+   * checks the stored one in Stripe, then cancels and refunds the newer one.
+   */
+  duplicate?: boolean;
+  storedSubscriptionId?: string;
   email?: string | null;
 }
 
@@ -110,13 +119,25 @@ export const billingDb = {
   setCustomer: (env: Env, owner: string, customer: string) =>
     rpc<unknown>(env, 'billing_customer_set', { p_owner: owner, p_customer: customer }),
   pricesCurrent: async (env: Env) => (await rpc<CurrentPrice[] | null>(env, 'billing_prices_current')) ?? [],
-  checkoutRecord: (env: Env, owner: string, session: string, kind: string, lookupKey: string) =>
+  checkoutRecord: (env: Env, owner: string, session: string, kind: string, lookupKey: string, idem: string) =>
     rpc<unknown>(env, 'billing_checkout_record', {
       p_owner: owner,
       p_session: session,
       p_kind: kind,
       p_lookup_key: lookupKey,
+      p_idem: idem,
     }),
+  /** The owner's other open Checkout sessions of a kind (not the one this idempotency key returns). */
+  checkoutOpen: async (env: Env, owner: string, kind: 'subscription' | 'topup', idem: string) =>
+    (await rpc<string[] | null>(env, 'billing_checkout_open', {
+      p_owner: owner,
+      p_kind: kind,
+      p_idem: idem,
+    })) ?? [],
+  /** True at most once per 10 s per session: the return page may make the API ask Stripe itself. */
+  checkoutPoll: async (env: Env, owner: string, session: string) =>
+    (await rpc<boolean | null>(env, 'billing_checkout_poll', { p_owner: owner, p_session: session })) ===
+    true,
   checkoutStatus: (env: Env, owner: string, session: string) =>
     rpc<{
       state: 'pending' | 'done' | 'failed';
@@ -147,7 +168,25 @@ export const billingDb = {
       p_lookup_key: lookupKey,
     }),
   topupRefund: (env: Env, paymentIntent: string) =>
-    rpc<unknown>(env, 'billing_topup_refund', { p_payment_intent: paymentIntent }),
+    rpc<{ ownerId: string; removed: number } | null>(env, 'billing_topup_refund', {
+      p_payment_intent: paymentIntent,
+    }),
+  topupRefundBySession: (env: Env, session: string) =>
+    rpc<{ ownerId: string; removed: number } | null>(env, 'billing_topup_refund_by_session', {
+      p_session: session,
+    }),
+  /** Plans ended because past_due outlasted the grace period: [{ownerId, email}]. */
+  pastDueExpire: async (env: Env, limit: number) =>
+    (await rpc<{ ownerId: string; email: string | null }[] | null>(env, 'billing_past_due_expire', {
+      p_limit: limit,
+    })) ?? [],
+  /** Accounts pending deletion whose subscription still renews. */
+  deletionCancelsDue: async (env: Env, limit: number) =>
+    (await rpc<{ ownerId: string; stripeSubscriptionId: string }[] | null>(
+      env,
+      'billing_deletion_cancels_due',
+      { p_limit: limit },
+    )) ?? [],
   eventBegin: (env: Env, id: string, type: string, created: number) =>
     rpc<'new' | 'retry' | 'done'>(env, 'billing_event_begin', {
       p_id: id,

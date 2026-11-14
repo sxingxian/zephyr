@@ -54,7 +54,9 @@ export function priceChangeOwnersEmail(e: {
       ? `${e.actor} put the top-up pack ${e.lookupKey} on sale.`
       : e.kind === 'stopped'
         ? `${e.actor} stopped the price change for ${e.lookupKey}. Subscribers not yet moved stay on their current price.`
-        : `${e.actor} raised ${e.lookupKey} from ${usdCents(e.from ?? 0)} to ${usdCents(e.to ?? 0)}. New sign-ups pay it now; existing subscribers move at their first renewal at least 30 days after their notice.`;
+        : (e.to ?? 0) > (e.from ?? 0)
+          ? `${e.actor} raised ${e.lookupKey} from ${usdCents(e.from ?? 0)} to ${usdCents(e.to ?? 0)}. New sign-ups pay it now; existing subscribers move at their first renewal at least 30 days after their notice.`
+          : `${e.actor} changed ${e.lookupKey} from ${usdCents(e.from ?? 0)} to ${usdCents(e.to ?? 0)}. That's still a rise for subscribers paying less on an older price: they move at their first renewal at least 30 days after their notice.`;
   return layout(
     e.kind === 'stopped' ? '[Zephyr billing] Price change stopped' : '[Zephyr billing] Price changed',
     e.kind === 'stopped' ? 'A price change was stopped' : 'A price was changed',

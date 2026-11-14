@@ -115,15 +115,26 @@ const STORED: StoredSubscription = {
 // ---- a fake Stripe ------------------------------------------------------------------------------------------
 type Fn = ReturnType<typeof vi.fn>;
 interface FakeStripe {
-  customers: { create: Fn; retrieve: Fn };
-  checkout: { sessions: { create: Fn; retrieve: Fn } };
-  subscriptions: { retrieve: Fn; update: Fn; cancel: Fn };
+  customers: { create: Fn; retrieve: Fn; del: Fn };
+  checkout: { sessions: { create: Fn; retrieve: Fn; expire: Fn; list: Fn } };
+  subscriptions: { retrieve: Fn; update: Fn; cancel: Fn; list: Fn };
+  invoicePayments: { list: Fn };
+  refunds: { create: Fn };
   subscriptionSchedules: { create: Fn; retrieve: Fn; update: Fn; release: Fn };
   invoices: { createPreview: Fn };
   billingPortal: { sessions: { create: Fn } };
   prices: { retrieve: Fn; list: Fn; create: Fn };
 }
 let stripe: FakeStripe;
+
+/** A Stripe list call: awaitable ({data}) and async-iterable (auto-pagination). */
+function listOf<T>(items: T[]) {
+  return Object.assign(Promise.resolve({ data: items, has_more: false }), {
+    async *[Symbol.asyncIterator]() {
+      yield* items;
+    },
+  });
+}
 
 function price(id: string, plan: 'pro' | 'studio', interval: 'month' | 'year', lookup: string | null = null) {
   return { id, object: 'price', lookup_key: lookup, metadata: { plan, interval }, recurring: { interval } };
@@ -169,6 +180,7 @@ beforeEach(() => {
     customers: {
       create: vi.fn(async () => ({ id: CUS })),
       retrieve: vi.fn(async () => ({ id: CUS, email: MEI.email, metadata: { owner_id: MEI.id } })),
+      del: vi.fn(async () => ({ id: CUS, deleted: true })),
     },
     checkout: {
       sessions: {
@@ -177,13 +189,18 @@ beforeEach(() => {
           url: 'https://checkout.stripe.com/c/pay/cs_test_abc',
         })),
         retrieve: vi.fn(),
+        expire: vi.fn(async (id: string) => ({ id, status: 'expired' })),
+        list: vi.fn(async () => ({ data: [] })),
       },
     },
     subscriptions: {
       retrieve: vi.fn(async () => subscription()),
       update: vi.fn(async () => subscription()),
       cancel: vi.fn(async () => ({})),
+      list: vi.fn(() => listOf([])),
     },
+    invoicePayments: { list: vi.fn(async () => ({ data: [] })) },
+    refunds: { create: vi.fn(async () => ({ id: 're_1' })) },
     subscriptionSchedules: {
       create: vi.fn(async () => ({
         id: 'sub_sched_1',
@@ -230,7 +247,12 @@ beforeEach(() => {
   setStripeFactory(() => stripe as unknown as Stripe);
   world.rpc.billing_prices_current = () => PRICES;
   world.rpc.billing_customer_get = (a) => (a.p_owner === MEI.id ? CUS : null);
-  world.rpc.billing_customer_set = () => null;
+  world.rpc.billing_customer_set = (a) => a.p_customer;
+  world.rpc.billing_checkout_open = () => [];
+  world.rpc.billing_checkout_poll = () => true;
+  world.rpc.billing_topup_refund_by_session = () => null;
+  world.rpc.billing_past_due_expire = () => [];
+  world.rpc.billing_deletion_cancels_due = () => [];
   world.rpc.billing_subscription = () => null;
   world.rpc.billing_checkout_record = () => null;
   world.rpc.billing_checkout_mark = () => null;
@@ -415,6 +437,97 @@ describe('Stripe webhook', () => {
     expect(rpcArgs('billing_event_finish').at(-1)).toMatchObject({ p_id: 'evt_ign', p_status: 'ignored' });
   });
 
+  it('finds a refunded top-up by its Checkout session when the payment intent wasn’t recorded', async () => {
+    stripe.checkout.sessions.list.mockResolvedValue({
+      data: [{ id: 'cs_test_topup123456', mode: 'payment' }],
+    });
+    world.rpc.billing_topup_refund_by_session = () => ({ ownerId: MEI.id, removed: 400 });
+    await deliver(
+      stripeEvent('charge.dispute.created', { id: 'dp_1', object: 'dispute', payment_intent: 'pi_7' }),
+    );
+    expect(stripe.checkout.sessions.list).toHaveBeenCalledWith({ payment_intent: 'pi_7', limit: 1 });
+    expect(rpcArgs('billing_topup_refund_by_session')).toEqual([{ p_session: 'cs_test_topup123456' }]);
+    expect(rpcArgs('billing_event_finish').at(-1)).toMatchObject({ p_status: 'processed', p_owner: MEI.id });
+  });
+
+  it('cancels and refunds a second live subscription instead of tracking two', async () => {
+    const SUB2 = 'sub_Second2';
+    world.rpc.billing_apply = (a) =>
+      (a.p_sub as { stripe_subscription_id: string }).stripe_subscription_id === SUB2
+        ? { applied: false, duplicate: true, storedSubscriptionId: SUB, planBefore: 'pro', planAfter: 'pro' }
+        : { applied: true, planBefore: 'pro', planAfter: 'pro' };
+    stripe.subscriptions.retrieve.mockImplementation(async (id: string) => ({
+      ...subscription(),
+      id,
+      latest_invoice: id === SUB2 ? 'in_2' : 'in_1',
+    }));
+    stripe.invoicePayments.list.mockResolvedValue({
+      data: [
+        { id: 'inpay_1', status: 'paid', payment: { type: 'payment_intent', payment_intent: 'pi_dup' } },
+      ],
+    });
+    const res = await deliver(stripeEvent('customer.subscription.created', { id: SUB2 }));
+    expect(res.status).toBe(200);
+    expect(stripe.subscriptions.cancel).toHaveBeenCalledWith(
+      SUB2,
+      { prorate: false, invoice_now: false },
+      { idempotencyKey: `dup-cancel:${SUB2}` },
+    );
+    expect(stripe.invoicePayments.list).toHaveBeenCalledWith({ invoice: 'in_2', status: 'paid', limit: 10 });
+    expect(stripe.refunds.create).toHaveBeenCalledWith(
+      { payment_intent: 'pi_dup', reason: 'duplicate', metadata: { zephyr: 'duplicate_subscription' } },
+      { idempotencyKey: 'dup-refund:pi_dup' },
+    );
+    expect(world.emails).toHaveLength(0);
+  });
+
+  it('lets the newer subscription take over when the stored one has in fact ended', async () => {
+    const SUB2 = 'sub_Second2';
+    let calls = 0;
+    world.rpc.billing_apply = (a) => {
+      calls += 1;
+      const id = (a.p_sub as { stripe_subscription_id: string }).stripe_subscription_id;
+      return id === SUB2 && calls === 1
+        ? { applied: false, duplicate: true, storedSubscriptionId: SUB, planBefore: 'pro', planAfter: 'pro' }
+        : { applied: true, planBefore: 'pro', planAfter: 'pro' };
+    };
+    stripe.subscriptions.retrieve.mockImplementation(async (id: string) =>
+      id === SUB ? { ...subscription({ status: 'canceled' }), id } : { ...subscription(), id },
+    );
+    await deliver(stripeEvent('customer.subscription.created', { id: SUB2 }));
+    const applied = rpcArgs('billing_apply').map(
+      (a) => (a.p_sub as { stripe_subscription_id: string }).stripe_subscription_id,
+    );
+    expect(applied).toEqual([SUB2, SUB, SUB2]);
+    expect(stripe.subscriptions.cancel).not.toHaveBeenCalled();
+    expect(stripe.refunds.create).not.toHaveBeenCalled();
+  });
+
+  it('stops reading a body without Content-Length once it passes 512 KB', async () => {
+    const chunk = new TextEncoder().encode('x'.repeat(64 * 1024));
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(ctrl) {
+        sent += 1;
+        if (sent > 100) ctrl.close();
+        else ctrl.enqueue(chunk);
+      },
+    });
+    const res = await app.request(
+      `https://zephyrapp.midnightpoetry.studio${BILLING_API.webhook}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Stripe-Signature': 't=1,v1=x' },
+        body,
+        duplex: 'half',
+      } as RequestInit,
+      env,
+    );
+    expect(res.status).toBe(413);
+    expect(sent).toBeLessThan(20);
+    expect(rpcArgs('billing_event_begin')).toHaveLength(0);
+  });
+
   it('emails the owner when a paid plan ends', async () => {
     world.rpc.billing_apply = () => ({ planBefore: 'pro', planAfter: 'free', email: MEI.email });
     stripe.subscriptions.retrieve.mockResolvedValue(subscription({ status: 'canceled' }));
@@ -548,9 +661,69 @@ describe('checkout', () => {
         p_session: 'cs_test_abcdefghij123',
         p_kind: 'subscription',
         p_lookup_key: 'zephyr_pro_monthly',
+        p_idem: opts.idempotencyKey,
       },
     ]);
     expect(billingLimiter.keys).toEqual([`billing:${MEI.id}`]);
+  });
+
+  it('expires the member’s other open subscription Checkouts first (two tabs can’t buy two plans)', async () => {
+    world.rpc.billing_checkout_open = (a) => {
+      expect(a).toMatchObject({ p_owner: MEI.id, p_kind: 'subscription' });
+      expect(String(a.p_idem)).toMatch(/^checkout:/);
+      return ['cs_test_othertab00001'];
+    };
+    const marks: unknown[] = [];
+    world.rpc.billing_checkout_mark = (a) => {
+      marks.push(a);
+      return null;
+    };
+    const j = await signedIn();
+    const res = await call(BILLING_API.checkout, {
+      jar: j,
+      body: { kind: 'subscription', plan: 'studio', interval: 'month' },
+    });
+    expect(res.status).toBe(201);
+    expect(stripe.checkout.sessions.expire).toHaveBeenCalledWith(
+      'cs_test_othertab00001',
+      {},
+      { idempotencyKey: 'expire:cs_test_othertab00001' },
+    );
+    expect(marks).toEqual([{ p_session: 'cs_test_othertab00001', p_state: 'failed' }]);
+
+    // The other tab was already paid: apply it and refuse a second plan.
+    stripe.checkout.sessions.expire.mockRejectedValueOnce(
+      new Stripe.errors.StripeInvalidRequestError({ message: 'not open', type: 'invalid_request_error' }),
+    );
+    stripe.checkout.sessions.retrieve.mockResolvedValueOnce({
+      id: 'cs_test_othertab00001',
+      mode: 'subscription',
+      status: 'complete',
+      customer: CUS,
+      client_reference_id: MEI.id,
+      subscription: SUB,
+      metadata: { owner_id: MEI.id },
+    });
+    const created = stripe.checkout.sessions.create.mock.calls.length;
+    const again = await call(BILLING_API.checkout, {
+      jar: j,
+      body: { kind: 'subscription', plan: 'studio', interval: 'month' },
+    });
+    expect(again.status).toBe(409);
+    expect(rpcArgs('billing_apply')).toHaveLength(1);
+    expect(stripe.checkout.sessions.create.mock.calls.length).toBe(created);
+  });
+
+  it('never opens Checkout on a customer we didn’t store', async () => {
+    world.rpc.billing_customer_get = () => null;
+    world.rpc.billing_customer_set = () => null; // that customer id belongs to someone else
+    const j = await signedIn();
+    const res = await call(BILLING_API.checkout, {
+      jar: j,
+      body: { kind: 'topup', pack: 'zephyr_topup_500' },
+    });
+    expect(res.status).toBe(409);
+    expect(stripe.checkout.sessions.create).not.toHaveBeenCalled();
   });
 
   it('refuses a second subscription, unknown prices, packs off sale, and works only when configured', async () => {
@@ -632,14 +805,30 @@ describe('checkout', () => {
     expect((await call(BILLING_API.checkoutStatus('cs_live_../x'), { jar: j })).status).toBe(404);
   });
 
+  it('asks Stripe itself at most once per 10 seconds per session', async () => {
+    world.rpc.billing_checkout_status = () => ({
+      state: 'pending',
+      kind: 'subscription',
+      createdAt: new Date(Date.now() - 15_000).toISOString(),
+    });
+    world.rpc.billing_checkout_poll = () => false;
+    const j = await signedIn();
+    const res = await call(BILLING_API.checkoutStatus('cs_test_abcdefghij123'), { jar: j });
+    expect(await read(res)).toEqual({ ok: true, state: 'pending', kind: 'subscription' });
+    expect(stripe.checkout.sessions.retrieve).not.toHaveBeenCalled();
+    expect(rpcArgs('billing_checkout_poll')).toEqual([
+      { p_owner: MEI.id, p_session: 'cs_test_abcdefghij123' },
+    ]);
+  });
+
   it('opens the customer portal only for an existing customer', async () => {
     const j = await signedIn();
     const res = await call(BILLING_API.portal, { jar: j, body: {} });
     expect(res.status).toBe(201);
-    expect(stripe.billingPortal.sessions.create).toHaveBeenCalledWith({
-      customer: CUS,
-      return_url: 'https://zephyrapp.midnightpoetry.studio/settings/billing',
-    });
+    expect(stripe.billingPortal.sessions.create).toHaveBeenCalledWith(
+      { customer: CUS, return_url: 'https://zephyrapp.midnightpoetry.studio/settings/billing' },
+      { idempotencyKey: expect.stringMatching(new RegExp(`^portal:${MEI.id}:\\d+$`)) },
+    );
     world.rpc.billing_customer_get = () => null;
     expect((await call(BILLING_API.portal, { jar: j, body: {} })).status).toBe(409);
   });
@@ -697,8 +886,19 @@ describe('plan changes', () => {
     expect(stripe.invoices.createPreview).not.toHaveBeenCalled();
   });
 
-  it('upgrades now, only if paid, dropping a scheduled downgrade first', async () => {
+  /** A schedule moving Pro monthly to Pro yearly at the period end. */
+  const scheduledToYearly = () => ({
+    id: 'sub_sched_1',
+    status: 'active',
+    phases: [
+      { start_date: NOW - 10 * DAY, items: [{ price: price('price_pro_m2', 'pro', 'month') }] },
+      { start_date: NOW + 20 * DAY, items: [{ price: price('price_pro_y', 'pro', 'year') }] },
+    ],
+  });
+
+  it('upgrades now, only if paid; a scheduled change comes back while the upgrade waits for payment', async () => {
     stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: 'sub_sched_1' }));
+    stripe.subscriptionSchedules.retrieve.mockResolvedValue(scheduledToYearly());
     stripe.subscriptions.update.mockResolvedValue({
       ...subscription(),
       pending_update: { expires_at: NOW + DAY },
@@ -708,7 +908,20 @@ describe('plan changes', () => {
     const res = await call(BILLING_API.change, { jar: j, body: { plan: 'studio', interval: 'month' } });
     expect(res.status).toBe(200);
     expect((await read(res)).actionUrl).toBe('https://invoice.stripe.com/i/x');
-    expect(stripe.subscriptionSchedules.release).toHaveBeenCalledWith('sub_sched_1');
+    expect(stripe.subscriptionSchedules.release).toHaveBeenCalledWith(
+      'sub_sched_1',
+      {},
+      { idempotencyKey: 'release:sub_sched_1' },
+    );
+    // Put back: the current price until the period end, then the scheduled price.
+    expect(stripe.subscriptionSchedules.create.mock.calls[0]?.[0]).toEqual({ from_subscription: SUB });
+    expect(stripe.subscriptionSchedules.update.mock.calls[0]?.[1]).toMatchObject({
+      end_behavior: 'release',
+      phases: [
+        { items: [{ price: 'price_pro_m2', quantity: 1 }], end_date: NOW + 20 * DAY },
+        { items: [{ price: 'price_pro_y', quantity: 1 }], duration: { interval: 'year', interval_count: 1 } },
+      ],
+    });
     const [id, params, opts] = stripe.subscriptions.update.mock.calls[0] as [
       string,
       Record<string, unknown>,
@@ -722,6 +935,27 @@ describe('plan changes', () => {
       expand: ['latest_invoice'],
     });
     expect(opts.idempotencyKey).toMatch(/^change:/);
+  });
+
+  it('puts a scheduled change back when the upgrade fails, and doesn’t touch it when the upgrade is paid', async () => {
+    stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: 'sub_sched_1' }));
+    stripe.subscriptionSchedules.retrieve.mockResolvedValue(scheduledToYearly());
+    stripe.subscriptions.update.mockRejectedValueOnce(
+      new Stripe.errors.StripeCardError({ message: 'declined', type: 'card_error' }),
+    );
+    const j = await signedIn();
+    const failed = await call(BILLING_API.change, { jar: j, body: { plan: 'studio', interval: 'month' } });
+    expect(failed.status).toBe(503);
+    expect(stripe.subscriptionSchedules.create).toHaveBeenCalledTimes(1);
+    expect(stripe.subscriptionSchedules.update.mock.calls[0]?.[1]).toMatchObject({
+      phases: [{}, { items: [{ price: 'price_pro_y', quantity: 1 }] }],
+    });
+    // Paid at once: the upgrade replaces the scheduled change, nothing is put back.
+    stripe.subscriptionSchedules.create.mockClear();
+    const paid = await call(BILLING_API.change, { jar: j, body: { plan: 'studio', interval: 'month' } });
+    expect(paid.status).toBe(200);
+    expect((await read(paid)).actionUrl).toBeNull();
+    expect(stripe.subscriptionSchedules.create).not.toHaveBeenCalled();
   });
 
   it('schedules a downgrade for the period end', async () => {
@@ -756,7 +990,11 @@ describe('plan changes', () => {
     stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: 'sub_sched_1' }));
     const j = await signedIn();
     expect((await call(BILLING_API.change, { jar: j, method: 'DELETE' })).status).toBe(200);
-    expect(stripe.subscriptionSchedules.release).toHaveBeenCalledWith('sub_sched_1');
+    expect(stripe.subscriptionSchedules.release).toHaveBeenCalledWith(
+      'sub_sched_1',
+      {},
+      { idempotencyKey: 'release:sub_sched_1' },
+    );
     world.rpc.billing_subscription = () => null;
     expect(
       (await call(BILLING_API.change, { jar: j, body: { plan: 'studio', interval: 'month' } })).status,
@@ -842,12 +1080,46 @@ describe('price-move cron', () => {
     expect(stripe.subscriptions.update).not.toHaveBeenCalled();
   });
 
-  it('does nothing without Stripe', async () => {
+  it('never marks a notice sent without an address (the move waits, and is skipped at its date)', async () => {
+    const marks: unknown[] = [];
+    world.rpc.price_move_mark = (a) => {
+      marks.push(a);
+      return null;
+    };
+    world.rpc.price_moves_due = () => [move({ email: null })];
+    expect(await runBillingCron(env)).toMatchObject({ notified: 0, unsent: 1 });
+    expect(marks).toEqual([]);
+    expect(world.emails).toHaveLength(0);
+  });
+
+  it('ends plans past due beyond the grace period, and asks again to stop renewals of deleted accounts', async () => {
+    world.rpc.price_moves_due = () => [];
+    world.rpc.billing_past_due_expire = () => [{ ownerId: MEI.id, email: MEI.email }];
+    world.rpc.billing_deletion_cancels_due = () => [{ ownerId: MEI.id, stripeSubscriptionId: SUB }];
+    const counts = await runBillingCron(env);
+    expect(counts).toMatchObject({ plansEnded: 1, deletionCancels: 1 });
+    expect(world.emails.map((e) => e.subject)).toEqual(['Your Zephyr plan has ended']);
+    expect(stripe.subscriptions.update.mock.calls[0]?.[1]).toEqual({
+      cancel_at_period_end: true,
+      metadata: { zephyr_deletion_cancel: '1' },
+    });
+  });
+
+  it('only ends past-due plans without Stripe', async () => {
     delete env.STRIPE_SECRET_KEY;
     world.rpc.price_moves_due = () => {
       throw new Error('should not be called');
     };
-    expect(await runBillingCron(env)).toEqual({ notified: 0, moved: 0, skipped: 0, failed: 0 });
+    expect(await runBillingCron(env)).toEqual({
+      notified: 0,
+      moved: 0,
+      skipped: 0,
+      failed: 0,
+      unsent: 0,
+      plansEnded: 0,
+      deletionCancels: 0,
+    });
+    expect(rpcArgs('billing_past_due_expire')).toHaveLength(1);
   });
 });
 
@@ -875,15 +1147,45 @@ describe('account deletion and the subscription', () => {
       cancel_at_period_end: false,
       metadata: { zephyr_deletion_cancel: '' },
     });
+    expect(stripe.subscriptions.update.mock.calls[1]?.[2]).toMatchObject({
+      idempotencyKey: expect.stringMatching(/^deletion-resume:/),
+    });
   });
 
-  it('cancels at once before a purge, and blocks the purge when Stripe fails', async () => {
+  it('releases a scheduled downgrade before stopping renewal (Stripe refuses it on a scheduled subscription)', async () => {
+    stripe.subscriptions.retrieve.mockResolvedValue(subscription({ schedule: 'sub_sched_1' }));
+    await cancelForDeletion(env, MEI.id, { stripeSubscriptionId: SUB });
+    expect(stripe.subscriptionSchedules.release).toHaveBeenCalledWith(
+      'sub_sched_1',
+      {},
+      { idempotencyKey: 'release:sub_sched_1' },
+    );
+    expect(stripe.subscriptionSchedules.release.mock.invocationCallOrder[0]).toBeLessThan(
+      stripe.subscriptions.update.mock.invocationCallOrder[0] as number,
+    );
+  });
+
+  it('cancels every live subscription at once before a purge, deletes the customer, and blocks the purge when Stripe fails', async () => {
+    const stray = { ...subscription(), id: 'sub_Stray1' };
+    stripe.subscriptions.list.mockReturnValue(
+      listOf([stray, { ...subscription({ status: 'canceled' }), id: 'sub_Old1' }]),
+    );
+    stripe.subscriptions.retrieve.mockImplementation(async (id: string) => ({ ...subscription(), id }));
     await cancelForPurge(env, MEI.id, { stripeSubscriptionId: SUB });
+    expect(stripe.subscriptions.list).toHaveBeenCalledWith({ customer: CUS, status: 'all', limit: 100 });
     expect(stripe.subscriptions.cancel).toHaveBeenCalledWith(
       SUB,
       {},
       { idempotencyKey: `purge-cancel:${SUB}` },
     );
+    expect(stripe.subscriptions.cancel).toHaveBeenCalledWith(
+      'sub_Stray1',
+      {},
+      { idempotencyKey: 'purge-cancel:sub_Stray1' },
+    );
+    expect(stripe.subscriptions.cancel).toHaveBeenCalledTimes(2);
+    expect(stripe.customers.del).toHaveBeenCalledWith(CUS);
+    stripe.subscriptions.list.mockReturnValue(listOf([]));
     stripe.subscriptions.retrieve.mockRejectedValue(
       new Stripe.errors.StripeAPIError({ message: 'down', type: 'api_error' }),
     );
@@ -933,6 +1235,7 @@ describe('admin Plans & billing', () => {
     world.rpc.admin_billing_overview = () => OVERVIEW;
     world.rpc.admin_price_set = () => ({ ok: true });
     world.rpc.admin_pack_set = () => ({ ok: true });
+    world.rpc.admin_price_preview = () => ({ raise: false });
     world.rpc.ai_alert_recipients = () => ['owner@zephyr.test'];
   });
 
@@ -1024,6 +1327,29 @@ describe('admin Plans & billing', () => {
     ).toBe(404);
   });
 
+  it('treats a "cut" that is still above what grandfathered subscribers pay as a rise', async () => {
+    // Current 999 → 899 looks like a cut, but subscribers on an older 799 price would pay more.
+    world.rpc.admin_price_preview = () => ({ from: 999, to: 899, raise: true });
+    const body = { lookupKey: 'zephyr_pro_monthly', amount: 899, reason: 'Simplify' };
+    const stale = await staff('finance@zephyr.test', 'finance', { authAgo: 3600 });
+    const r1 = await call(ADMIN_BILLING_API.prices, { jar: stale.j, access: stale.access, body });
+    expect(r1.status).toBe(403);
+    expect(await read(r1)).toMatchObject({ error: 'reauth_required' });
+    expect(stripe.prices.create).not.toHaveBeenCalled();
+    const fresh = await staff('finance@zephyr.test', 'finance');
+    const r2 = await call(ADMIN_BILLING_API.prices, { jar: fresh.j, access: fresh.access, body });
+    expect(r2.status).toBe(200);
+    expect(world.emails.map((e) => e.subject)).toEqual(['[Zephyr billing] Price changed']);
+    expect(world.emails[0]?.text).toContain('still a rise for subscribers paying less');
+    // The preview says the same.
+    const p = await call(ADMIN_BILLING_API.pricePreview, {
+      jar: fresh.j,
+      access: fresh.access,
+      body: { lookupKey: 'zephyr_pro_monthly', amount: 899 },
+    });
+    expect(await read(p)).toMatchObject({ raise: true });
+  });
+
   it('stops a change and puts applied moves back on the old price', async () => {
     world.rpc.admin_price_change_stop = () => ({
       lookupKey: 'zephyr_pro_monthly',
@@ -1043,6 +1369,7 @@ describe('admin Plans & billing', () => {
       { items: [{ id: 'si_1', price: 'price_pro_m1' }], proration_behavior: 'none' },
       { idempotencyKey: 'revert:mv_1' },
     );
+    expect(rpcArgs('price_move_mark')).toEqual([{ p_id: 'mv_1', p_status: 'reverted' }]);
     expect(world.emails.map((e) => e.subject)).toEqual(['[Zephyr billing] Price change stopped']);
   });
 });
