@@ -123,7 +123,7 @@ to `audit_log` without personal data. It:
 Thumbnails and previews are written to `staging/<ownerId>/<photoId>/<kind>` until their upload completes; only the
 completion that wins the database claim copies them to the photo's own keys. If that copy fails, the photo stays
 marked as pending and the job retries it. R2 lifecycle rules abort incomplete multipart uploads after one day and
-delete anything under `staging/` after two (see setup.md).
+delete anything under `staging/` after two (see DEPLOYMENT.md §4).
 
 ## Security notes
 

@@ -259,7 +259,7 @@ A background scanner (`scanner.ts`) runs while the app is open and idle (request
   - Bindings: `AI` (Workers AI) and `AI_QUEUE`.
   - Vars: `AI_GATEWAY_ACCOUNT_ID` and `AI_GATEWAY_ID`.
   - Secrets: `RUNWARE_API_KEY`, `FAL_KEY` and `AI_GATEWAY_TOKEN`.
-  - `docs/setup.md` §3.6 covers creating the gateway (authenticated, with logs on), the Runware custom provider and the queue.
+  - `docs/DEPLOYMENT.md` §4b covers creating the gateway (authenticated, with logs on), the Runware custom provider and the queue.
 
 ## Admin (`apps/admin`)
 

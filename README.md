@@ -44,7 +44,7 @@ pnpm lint && pnpm typecheck && pnpm test && pnpm build
 supabase/tests/run-local.sh  # migrations + SQL tests on a throwaway Postgres (run as non-root)
 ```
 
-Accounts, keys and the first deploy are described in [docs/setup.md](docs/setup.md).
+Accounts, keys and deploying are described in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Design
 

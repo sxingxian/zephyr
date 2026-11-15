@@ -343,7 +343,7 @@ New pages matching the mockups: Users, Safety, Plan limits, Ads, Storage, Retent
 
 - Put Cloudflare Access in front of `/admin` for every staff email (already required); add each invited staff member's email to the Access policy.
 - For each extra store, follow `docs/setup.md` §3.8 (bucket, keys as secrets, encryption at rest confirmed, `STORAGE_STORES` entry; for on-premises, the Tunnel and Workers VPC service or the Access-protected hostname), then run a health check before switching.
-- Account-change emails: with Resend click and open tracking off (`docs/setup.md` §1), check that passkey and
+- Account-change emails: with Resend click and open tracking off (`docs/DEPLOYMENT.md` §1b), check that passkey and
   deletion links arrive and open `/account-action/<nonce>` on the app host.
 - AdSense (recommended: keep it off at launch; sponsored cards carry no in-page script risk):
   - get the site approved;

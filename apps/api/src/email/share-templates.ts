@@ -120,7 +120,7 @@ export function safetyMatchEmail(e: { photoId: string; galleryId: string; ownerI
   return layout('[Zephyr safety] CSAM scanning match', 'CSAM scanning match: photo held', [
     `Cloudflare blocked a guest rendition. The photo is on a safety hold (never served, shared or purged) and the account’s sharing is suspended.`,
     `Photo ${e.photoId} · gallery ${e.galleryId} · account ${e.ownerId} · ${e.at.toISOString()}`,
-    'Review it in Admin › Safety. Follow the reporting procedure in docs/setup.md.',
+    'Review it in Admin › Safety. Follow the reporting procedure in docs/DEPLOYMENT.md (Child-safety alerts).',
   ]);
 }
 

@@ -82,11 +82,11 @@ guest → /api/v1/g/<token>/m/<photoId>/<size>?e=<exp>&s=<sig>   (API Worker: ve
 
 **The media hostname:**
 - The `zephyr-shared` R2 bucket holds only renditions made for guests, at random keys `o/<ownerId>/g/<galleryId>/<photoId>/<size>-<nonce>` (branding assets under `o/<ownerId>/b/`). The owner prefix lets an account purge delete by prefix. Full-size renders from the member's device go to the photos bucket under `u/<ownerId>/g/…`. Deletions go through a queue drained by the clean-up job, which re-checks key shapes so it can never touch an original.
-- Its custom domain is behind a WAF custom rule (Free plan: 5 rules), set up during deployment (`docs/setup.md`): _block_ when `http.host eq "media.midnightpoetry.studio"` and the `X-Zephyr-Media` header doesn't match a secret. The Worker sends that header; anyone else is blocked.
+- Its custom domain is behind a WAF custom rule (Free plan: 5 rules), set up during deployment (`docs/DEPLOYMENT.md` §4): _block_ when `http.host eq "media.midnightpoetry.studio"` and the `X-Zephyr-Media` header doesn't match a secret. The Worker sends that header; anyone else is blocked.
 - The bucket has no r2.dev URL. Objects carry `Cache-Control: public, max-age=86400`.
 
 **Child-safety scanning.** Content served through the Cloudflare cache is what the CSAM Scanning Tool hashes and checks. It is enabled on the zone at deployment.
-- **Launch gate:** get Cloudflare support to confirm in writing that renditions fetched this way are scanned, and record the answer in `docs/setup.md`. This is the open question behind the Free-plan choice.
+- **Launch gate:** get Cloudflare support to confirm in writing that renditions fetched this way are scanned, and record the answer in `docs/DEPLOYMENT.md` (Child-safety alerts). This is the open question behind the Free-plan choice.
 - **Blocked responses:** when Cloudflare blocks a URL, the media fetch returns a non-success status (451). The Worker then:
   - puts the photo on a safety hold (`photos.safety_hold_at`), which removes it from every gallery and blocks all serving and downloads of it, including to the owner;
   - suspends sharing for the account;
