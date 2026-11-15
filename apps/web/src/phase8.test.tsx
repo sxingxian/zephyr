@@ -28,6 +28,15 @@ import { SHARE_HANDOFF_KEY, SHARE_HANDOFF_PATH, takeShareHandoff } from './lib/s
 import { resetUsage } from './lib/usage';
 import { __resetShareNewForTest } from './routes/ShareNew';
 
+// The browser passkey prompt (WebAuthn) doesn't exist in jsdom: stand in for it.
+const passkeyMock = vi.hoisted(() => ({ create: vi.fn(async () => ({ id: 'cred' })) }));
+vi.mock('./lib/passkey', () => ({
+  passkeysSupported: () => true,
+  createPasskey: passkeyMock.create,
+  getPasskeyAssertion: vi.fn(),
+  isCancelled: () => false,
+}));
+
 const ME = '11111111-1111-4111-8111-111111111111';
 const OWNER = '22222222-2222-4222-8222-222222222222';
 const GID = '7d3f2c4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f';
@@ -822,91 +831,124 @@ describe('team removal: replace links', () => {
   });
 });
 
-// ---------------------------------------------------------------- review round 3: step-up codes and AdSense holds
-describe('step-up codes (account changes while the member may be shown AdSense)', () => {
+// ---------------------------------------------------------------- review round 4: account action links
+describe('account action links (passkeys and deletion are made from an emailed link)', () => {
   const PK = { id: 'pk_1', friendlyName: 'Work laptop', createdAt: '2026-10-28T00:00:00Z', lastUsedAt: null };
-  const deletes = () => calls.filter((c) => c.method === 'DELETE' && c.url.includes('/me/passkeys/'));
-
-  it('asks for the emailed code, then removes the passkey with it', async () => {
-    let wrongOnce = true;
-    mockApi((url, method) => {
-      if (url === '/api/v1/me/passkeys' && method === 'GET') return json(200, { ok: true, passkeys: [PK] });
-      if (url === '/api/v1/me/step-up') return json(202, { ok: true, needed: true });
-      if (url.startsWith('/api/v1/me/passkeys/') && method === 'DELETE') {
-        const last = calls[calls.length - 1];
-        const code = last?.headers.get('X-Zephyr-Step-Up');
-        if (!code) return json(403, { ok: false, error: 'step_up_required' });
-        if (wrongOnce) {
-          wrongOnce = false;
-          return json(403, { ok: false, error: 'step_up_invalid' });
-        }
-        return new Response(null, { status: 204 });
-      }
-      return undefined;
-    });
-    renderAt('/settings/security');
-    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
-    fireEvent.click(
-      within(await screen.findByRole('dialog', { name: 'Remove this passkey?' })).getByRole('button', {
-        name: 'Remove',
-      }),
-    );
-    const dlg = await screen.findByRole('dialog', { name: 'Confirm it’s you' });
-    expect(within(dlg).getByText(/to remove this passkey/)).toBeTruthy();
-    expect(calls.find((c) => c.url === '/api/v1/me/step-up')?.body).toEqual({ op: 'passkey_remove' });
-    const field = within(dlg).getByLabelText('Code');
-    expect(field.getAttribute('autocomplete')).toBe('one-time-code');
-    fireEvent.change(field, { target: { value: '12a3456' } });
-    expect((field as HTMLInputElement).value).toBe('123456');
-    // jsdom doesn't submit a form from a button outside it (its form attribute): submit the form itself.
-    const submit = () => fireEvent.submit(dlg.querySelector('form#step-up-form') as HTMLFormElement);
-    submit();
-    expect(await within(dlg).findByText(/That code didn’t work/)).toBeTruthy();
-    fireEvent.change(within(dlg).getByLabelText('Code'), { target: { value: '654321' } });
-    submit();
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Confirm it’s you' })).toBeNull());
-    expect(deletes().map((c) => c.headers.get('X-Zephyr-Step-Up'))).toEqual([null, '123456', '654321']);
+  const TOKEN = 'T'.repeat(43);
+  const peekWith = (op: string, passkeyId: string | null = null) =>
+    json(200, { ok: true, op, passkeyId, expiresAt: '2026-11-15T12:00:00Z' });
+  const openLink = (hash = `#t=${TOKEN}`) => {
+    window.history.replaceState(null, '', `/account-action${hash}`);
+    return renderAt('/account-action');
+  };
+  beforeEach(() => {
+    passkeyMock.create.mockClear();
   });
 
-  it('a member who doesn’t need a code never sees the dialog', async () => {
+  it('Settings only asks for the email to remove a passkey; nothing is removed there', async () => {
     mockApi((url, method) => {
       if (url === '/api/v1/me/passkeys' && method === 'GET') return json(200, { ok: true, passkeys: [PK] });
-      if (url.startsWith('/api/v1/me/passkeys/') && method === 'DELETE')
+      if (url === '/api/v1/me/account-actions') return json(202, { ok: true });
+      return undefined;
+    });
+    renderAt('/settings/security');
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
+    fireEvent.click(
+      within(await screen.findByRole('dialog', { name: 'Remove this passkey?' })).getByRole('button', {
+        name: 'Email me a link',
+      }),
+    );
+    expect(await screen.findByText(/a link to remove “Work laptop”/)).toBeTruthy();
+    expect(calls.find((c) => c.url === '/api/v1/me/account-actions')?.body).toEqual({
+      op: 'passkey_remove',
+      passkeyId: 'pk_1',
+    });
+    expect(calls.some((c) => c.method === 'DELETE')).toBe(false);
+  });
+
+  it('Settings asks for the email to add a passkey, and never starts the browser prompt', async () => {
+    mockApi((url, method) => {
+      if (url === '/api/v1/me/passkeys' && method === 'GET') return json(200, { ok: true, passkeys: [PK] });
+      if (url === '/api/v1/me/account-actions') return json(202, { ok: true });
+      return undefined;
+    });
+    renderAt('/settings/security');
+    fireEvent.click(await screen.findByRole('button', { name: 'Add a passkey' }));
+    expect(await screen.findByText(/a link to add a passkey/)).toBeTruthy();
+    expect(calls.find((c) => c.url === '/api/v1/me/account-actions')?.body).toEqual({ op: 'passkey_add' });
+    expect(calls.some((c) => c.url.includes('/passkeys/options'))).toBe(false);
+    expect(passkeyMock.create).not.toHaveBeenCalled();
+  });
+
+  it('the link’s page strips the token, shows the change, and removes the passkey with the token', async () => {
+    mockApi((url, method) => {
+      if (url === '/api/v1/me/account-actions/peek') return peekWith('passkey_remove', 'pk_1');
+      if (url === '/api/v1/me/passkeys' && method === 'GET') return json(200, { ok: true, passkeys: [PK] });
+      if (url === '/api/v1/me/passkeys/pk_1' && method === 'DELETE')
         return new Response(null, { status: 204 });
       return undefined;
     });
-    renderAt('/settings/security');
-    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
-    fireEvent.click(
-      within(await screen.findByRole('dialog', { name: 'Remove this passkey?' })).getByRole('button', {
-        name: 'Remove',
-      }),
-    );
-    await waitFor(() => expect(deletes()).toHaveLength(1));
-    expect(calls.some((c) => c.url === '/api/v1/me/step-up')).toBe(false);
-    expect(screen.queryByRole('dialog', { name: 'Confirm it’s you' })).toBeNull();
+    openLink();
+    expect(window.location.hash).toBe('');
+    expect(await screen.findByText('Work laptop')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove passkey' }));
+    expect(await screen.findByText('Passkey removed')).toBeTruthy();
+    const del = calls.find((c) => c.method === 'DELETE');
+    expect(del?.headers.get('X-Zephyr-Account-Action')).toBe(TOKEN);
+    expect(calls.find((c) => c.url.endsWith('/peek'))?.body).toEqual({ token: TOKEN });
   });
 
-  it('cancelling leaves the passkey alone', async () => {
-    mockApi((url, method) => {
-      if (url === '/api/v1/me/passkeys' && method === 'GET') return json(200, { ok: true, passkeys: [PK] });
-      if (url === '/api/v1/me/step-up') return json(202, { ok: true, needed: true });
-      if (url.startsWith('/api/v1/me/passkeys/') && method === 'DELETE')
-        return json(403, { ok: false, error: 'step_up_required' });
+  it('adding a passkey happens on the link’s page: the token goes with the options, then the device saves it', async () => {
+    mockApi((url) => {
+      if (url === '/api/v1/me/account-actions/peek') return peekWith('passkey_add');
+      if (url === '/api/v1/me/passkeys/options')
+        return json(200, { challengeId: 'ch-1', options: { challenge: 'abc' } });
+      if (url === '/api/v1/me/passkeys/verify') return json(201, { ok: true, passkey: PK });
       return undefined;
     });
-    renderAt('/settings/security');
-    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
-    fireEvent.click(
-      within(await screen.findByRole('dialog', { name: 'Remove this passkey?' })).getByRole('button', {
-        name: 'Remove',
-      }),
+    openLink();
+    fireEvent.click(await screen.findByRole('button', { name: 'Add a passkey' }));
+    expect(await screen.findByText('Passkey added')).toBeTruthy();
+    const opt = calls.find((c) => c.url === '/api/v1/me/passkeys/options');
+    expect(opt?.headers.get('X-Zephyr-Account-Action')).toBe(TOKEN);
+    expect(passkeyMock.create).toHaveBeenCalledTimes(1);
+    expect(calls.find((c) => c.url === '/api/v1/me/passkeys/verify')?.body).toEqual({
+      challengeId: 'ch-1',
+      credential: { id: 'cred' },
+    });
+  });
+
+  it('a link for another account, a used link and a broken link each say what to do', async () => {
+    mockApi((url) =>
+      url === '/api/v1/me/account-actions/peek'
+        ? json(403, { ok: false, error: 'account_action_wrong_member' })
+        : undefined,
     );
-    const dlg = await screen.findByRole('dialog', { name: 'Confirm it’s you' });
-    fireEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }));
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Confirm it’s you' })).toBeNull());
-    expect(deletes()).toHaveLength(1);
-    expect(screen.queryByText('Passkey removed')).toBeNull();
+    openLink();
+    expect(await screen.findByText('This link is for another account')).toBeTruthy();
+    cleanup();
+    mockApi((url) =>
+      url === '/api/v1/me/account-actions/peek'
+        ? json(400, { ok: false, error: 'account_action_invalid' })
+        : undefined,
+    );
+    openLink();
+    expect(await screen.findByText('This link doesn’t work any more')).toBeTruthy();
+    cleanup();
+    mockApi();
+    openLink('#t=<script>');
+    expect(await screen.findByText('This link looks incomplete')).toBeTruthy();
+    expect(calls.some((c) => c.url.endsWith('/peek'))).toBe(false);
+  });
+
+  it('signed out: asks to sign in as that account, without checking the link', async () => {
+    mockApi((url) =>
+      url.endsWith('/auth/session') ? json(401, { ok: false, error: 'unauthenticated' }) : undefined,
+    );
+    openLink();
+    expect(await screen.findByText('Sign in to continue')).toBeTruthy();
+    expect(window.location.hash).toBe('');
+    expect(calls.some((c) => c.url.endsWith('/peek'))).toBe(false);
   });
 });
 

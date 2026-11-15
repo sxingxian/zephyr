@@ -133,41 +133,58 @@ export function accountDeletionEmail(e: AccountDeletionEmail): {
   return { subject, html, text };
 }
 
-export interface StepUpEmail {
-  code: string;
+export interface AccountActionEmail {
   op: 'passkey_add' | 'passkey_remove' | 'account_delete';
+  /** The full link, `<app>/account-action#t=<token>`. */
+  link: string;
   minutes: number;
+  /** passkey_remove: the passkey's name, when it has one. */
+  passkeyName?: string | null;
 }
 
-const STEP_UP_WHAT: Record<StepUpEmail['op'], string> = {
-  passkey_add: 'add a passkey to your account',
-  passkey_remove: 'remove a passkey from your account',
-  account_delete: 'delete your account',
+const ACTION_SUBJECT: Record<AccountActionEmail['op'], string> = {
+  passkey_add: 'Add a passkey to your Zephyr account',
+  passkey_remove: 'Remove a passkey from your Zephyr account',
+  account_delete: 'Delete your Zephyr account',
+};
+const ACTION_BUTTON: Record<AccountActionEmail['op'], string> = {
+  passkey_add: 'Add a passkey',
+  passkey_remove: 'Remove the passkey',
+  account_delete: 'Continue to delete',
 };
 
 /**
- * Phase 8: the one-time code that confirms an account-level change (adding or removing a passkey, deleting the
- * account) while the member may be shown ads. Only the six digits and fixed text; nothing user-provided.
+ * Phase 8 (review round 4): the single-use link that completes an account-level change. Zephyr never asks for these
+ * changes anywhere but on the page this link opens, so the email says so. The link (with its token) is only in the
+ * body, never the subject; the passkey name is escaped and kept to one short line.
  */
-export function stepUpEmail(e: StepUpEmail): { subject: string; html: string; text: string } {
-  const code = /^\d{4,10}$/.test(e.code) ? e.code : '';
-  const subject = `${code} is your Zephyr confirmation code`;
-  const what = `Enter this code in Zephyr to ${STEP_UP_WHAT[e.op]}. It works once, for ${e.minutes} minutes.`;
+export function accountActionEmail(e: AccountActionEmail): { subject: string; html: string; text: string } {
+  const subject = ACTION_SUBJECT[e.op];
+  const name = e.passkeyName ? oneLine(e.passkeyName).slice(0, 80) : null;
+  const what =
+    e.op === 'passkey_add'
+      ? 'Someone signed in to your Zephyr account asked to add a passkey. Open this link on the device whose Face ID, Touch ID, Windows Hello or security key you want to use: the passkey is created there.'
+      : e.op === 'passkey_remove'
+        ? `Someone signed in to your Zephyr account asked to remove ${name ? `the passkey “${name}”` : 'a passkey'}. Open this link to confirm.`
+        : 'Someone signed in to your Zephyr account asked to delete it. Open this link to confirm. You can still restore the account for 30 days afterwards.';
+  const rules = `The link works once, only while you’re signed in to this account, for ${e.minutes} minutes. Zephyr only ever asks for this change from a link in an email like this one, never inside your library.`;
   const advice =
-    'Didn’t ask for this? Don’t enter the code anywhere. Your account stays as it is; sign out of Zephyr on any device you don’t recognise and reply to this email so we can help.';
+    'Didn’t ask for this? Ignore this email and nothing changes. If you don’t recognise it, sign out of Zephyr on any device you don’t trust and reply to this email so we can help.';
+  const link = escapeHtml(e.link);
   const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>${escapeHtml(subject)}</title></head>
 <body style="margin:0;padding:0;background:#F4F6F9;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0D1117;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F4F6F9;padding:40px 16px;"><tr><td align="center">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#FFFFFF;border-radius:20px;padding:36px 32px;">
 <tr><td style="font-size:20px;font-weight:600;letter-spacing:-0.02em;padding-bottom:28px;">zephyr</td></tr>
-<tr><td style="font-size:22px;font-weight:600;letter-spacing:-0.03em;line-height:1.25;padding-bottom:12px;">Confirm this change</td></tr>
+<tr><td style="font-size:22px;font-weight:600;letter-spacing:-0.03em;line-height:1.25;padding-bottom:12px;">${escapeHtml(subject)}</td></tr>
 <tr><td style="font-size:15px;line-height:1.55;color:#2A313C;padding-bottom:20px;">${escapeHtml(what)}</td></tr>
-<tr><td style="font-family:'SF Mono',ui-monospace,Menlo,Consolas,monospace;font-size:32px;font-weight:600;letter-spacing:0.18em;padding-bottom:24px;">${escapeHtml(code)}</td></tr>
+<tr><td style="padding-bottom:24px;"><a href="${link}" style="display:inline-block;background:#0D1117;color:#FFFFFF;text-decoration:none;font-size:16px;font-weight:600;border-radius:12px;padding:14px 22px;">${escapeHtml(ACTION_BUTTON[e.op])}</a></td></tr>
+<tr><td style="font-size:13px;line-height:1.55;color:#566070;padding-bottom:12px;">${escapeHtml(rules)}</td></tr>
 <tr><td style="font-size:13px;line-height:1.55;color:#566070;">${escapeHtml(advice)}</td></tr>
 </table>
 <p style="font-size:12px;color:#566070;margin:20px 0 0;">Midnight Poetry Studio · zephyr.midnightpoetry.studio</p>
 </td></tr></table></body></html>`;
-  const text = [subject, '', what, '', code, '', advice].join('\n');
+  const text = [subject, '', what, '', `${ACTION_BUTTON[e.op]}: ${e.link}`, '', rules, '', advice].join('\n');
   return { subject, html, text };
 }

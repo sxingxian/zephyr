@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { escapeHtml, oneLine } from '../src/email/escape';
-import { inviteEmail, passkeyChangeEmail, stepUpEmail } from '../src/email/templates';
+import { accountActionEmail, inviteEmail, passkeyChangeEmail } from '../src/email/templates';
 
 const base = {
   link: 'https://zephyrapp.midnightpoetry.studio/join#t=abc',
@@ -60,14 +60,29 @@ describe('passkey change notice', () => {
   });
 });
 
-describe('step-up code email (phase 8)', () => {
-  it('carries the digits and what they confirm, nothing else', () => {
-    const m = stepUpEmail({ code: '048213', op: 'account_delete', minutes: 10 });
-    expect(m.subject).toBe('048213 is your Zephyr confirmation code');
-    expect(m.text).toContain('delete your account');
-    expect(m.text).toContain('10 minutes');
-    expect(m.html).toContain('048213');
-    // Never anything but digits in the code slot.
-    expect(stepUpEmail({ code: '<b>1</b>', op: 'passkey_add', minutes: 10 }).html).not.toContain('<b>1</b>');
+describe('account action link email (phase 8)', () => {
+  const link = `https://zephyrapp.midnightpoetry.studio/account-action#t=${'A'.repeat(43)}`;
+  it('says what will happen, carries the link only in the body, and says where Zephyr asks', () => {
+    const m = accountActionEmail({ op: 'account_delete', link, minutes: 15 });
+    expect(m.subject).toBe('Delete your Zephyr account');
+    expect(m.subject).not.toContain('A'.repeat(43));
+    expect(m.text).toContain(link);
+    expect(m.html).toContain(link);
+    expect(m.text).toContain('15 minutes');
+    expect(m.text).toContain('never inside your library');
+    expect(m.text).toContain('Ignore this email and nothing changes');
+  });
+  it('escapes the passkey name and keeps it to one line', () => {
+    const m = accountActionEmail({
+      op: 'passkey_remove',
+      link,
+      minutes: 15,
+      passkeyName: '<img src=x onerror=alert(1)>\nWork',
+    });
+    expect(m.html).not.toContain('<img src=x');
+    expect(m.text).toContain('the passkey “');
+    expect(accountActionEmail({ op: 'passkey_add', link, minutes: 15 }).text).toContain(
+      'the passkey is created there',
+    );
   });
 });

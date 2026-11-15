@@ -21,9 +21,9 @@ export const APP_API = {
   signOut: '/api/v1/auth/sign-out', // POST {} → 204
   me: '/api/v1/me', // PATCH ProfilePatchBody → 200 SessionResponse
   myPasskeys: '/api/v1/me/passkeys', // GET → 200 { passkeys: Passkey[] }
-  myPasskeyOptions: '/api/v1/me/passkeys/options', // POST {} → 200 PasskeyOptions (registration) | 403 reauth_required
-  myPasskeyVerify: '/api/v1/me/passkeys/verify', // POST PasskeyVerifyBody → 201 { passkey: Passkey } | 403 reauth_required
-  myPasskey: (id: string) => `/api/v1/me/passkeys/${encodeURIComponent(id)}`, // PATCH {friendlyName} | DELETE → 204 (DELETE: 403 reauth_required)
+  myPasskeyOptions: '/api/v1/me/passkeys/options', // POST {} + ACCOUNT_ACTION_HEADER → 200 PasskeyOptions (registration; spends a passkey_add link) | 403 account_action_*
+  myPasskeyVerify: '/api/v1/me/passkeys/verify', // POST PasskeyVerifyBody → 201 { passkey: Passkey } | 403 account_action_required (no grant for this challenge)
+  myPasskey: (id: string) => `/api/v1/me/passkeys/${encodeURIComponent(id)}`, // PATCH {friendlyName} | DELETE + ACCOUNT_ACTION_HEADER → 204 (DELETE: 403 account_action_*)
   invitePreview: '/api/v1/invites/preview', // POST { token } → 200 InvitePreview | 404 invite_invalid
   inviteRedeem: '/api/v1/invites/redeem', // POST InviteRedeemBody → 200 SessionResponse | 404 invite_invalid
   inviteCode: '/api/v1/invites/code', // POST InviteCodeBody → 202 Accepted (same reply whether or not the code is valid)
@@ -67,8 +67,9 @@ export type ApiErrorCode =
   | 'passkey_failed' // WebAuthn ceremony rejected
   | 'passkey_required' // admin: enrolment session can only add a passkey
   | 'reauth_required' // adding or removing a passkey needs a sign-in in the last 10 minutes
-  | 'step_up_required' // phase 8 (403): also needs the one-time code emailed by POST /me/step-up
-  | 'step_up_invalid' // phase 8 (403): that code is wrong, expired, used or for another change
+  | 'account_action_required' // phase 8 (403): this change is made from the link POST /me/account-actions emails
+  | 'account_action_invalid' // phase 8 (400/403): that link is wrong, expired, used, replaced or for another change
+  | 'account_action_wrong_member' // phase 8 (403): that link was sent to another account
   | 'not_found'
   | 'conflict'
   | 'account_pending_deletion' // scheduled for deletion: only restore, session and sign-out work

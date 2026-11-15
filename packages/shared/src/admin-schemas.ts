@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import {
+  ACCOUNT_ACTION_OPS,
+  ACCOUNT_ACTION_TOKEN_RE,
   AD_LIMITS,
   AD_PLACEMENTS,
   ADMIN_REASON_MAX,
@@ -7,8 +9,6 @@ import {
   CREDIT_GRANT_MAX,
   NOTICE_MESSAGE_MAX,
   RESOLVE_ACTIONS,
-  STEP_UP_CODE_LENGTH,
-  STEP_UP_OPS,
   SUSPEND_CATEGORIES,
 } from './admin-types';
 import { SYSTEM_MAX_BATCH } from './plans';
@@ -165,10 +165,19 @@ export const adminAdsensePatchSchema = z
 export const adEventSchema = z
   .object({ cardId: uuid, kind: z.enum(['impression', 'click']), placement: z.enum(AD_PLACEMENTS) })
   .strict();
-/** POST /api/v1/me/step-up. */
-export const stepUpSchema = z.object({ op: z.enum(STEP_UP_OPS) }).strict();
-/** The code in STEP_UP_HEADER: exactly the emailed digits. */
-export const STEP_UP_CODE_RE = new RegExp(`^\\d{${STEP_UP_CODE_LENGTH}}$`);
+/** Passkey ids as GoTrue issues them (also checked on every passkey route). */
+export const PASSKEY_ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
+/** POST /api/v1/me/account-actions: a passkey id with passkey_remove, and only then. */
+export const accountActionRequestSchema = z
+  .object({ op: z.enum(ACCOUNT_ACTION_OPS), passkeyId: z.string().regex(PASSKEY_ID_RE).optional() })
+  .strict()
+  .refine((b) => (b.op === 'passkey_remove') === (b.passkeyId !== undefined), {
+    message: 'passkeyId goes with passkey_remove only',
+  });
+/** POST /api/v1/me/account-actions/peek. */
+export const accountActionPeekSchema = z
+  .object({ token: z.string().regex(ACCOUNT_ACTION_TOKEN_RE) })
+  .strict();
 /** POST /api/v1/ads/reset: `ifSeen` clears the site's storage only if this browser may have run AdSense. */
 export const adResetSchema = z.object({ ifSeen: z.boolean().optional() }).strict();
 

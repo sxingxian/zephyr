@@ -8,6 +8,9 @@
    tokens against the project's JWKS on every request, and refreshes them server-side. Cookies are never set on
    `.midnightpoetry.studio`. Staff and member accounts are kept apart: each API side rejects the other's users.
    Admin needs Cloudflare Access (JWT verified, email must match the staff account) plus a passkey.
+   Members' passkeys and account deletion change only from a single-use link emailed to the account (phase 8,
+   item 18): asking needs a sign-in in the last 10 minutes; the change itself needs the link, opened while signed
+   in to that account.
 3. **Least privilege in Postgres.** RLS on every table; defaults revoked so new tables start closed; `security
    definer` functions pin `search_path = ''`; `audit_log` is append-only (UPDATE/DELETE/TRUNCATE blocked).
 4. **Invite-only is enforced on the server.** Public sign-up is off in Supabase Auth; accounts are created only by
@@ -204,13 +207,14 @@
         flow runs there. While a create dialog or its one-time passcode is open, the script isn't added at all
         (`holdAdsense`); if it was already there when a gallery is created, the app opens the gallery page
         (no ads) instead of showing the passcode, where a new one can be set.
-      - **Account takeover is closed by a step-up code.** Adding or removing a passkey and deleting the account
-        need, besides a sign-in in the last 10 minutes, a 6-digit code emailed to the account for that very
-        change (single use, 10 minutes, 5 tries, 5 codes an hour, stored only as an HMAC), whenever the member's
-        plan shows ads and AdSense is on or was switched in the last 30 minutes (`step_up_needed`; team
-        membership doesn't lift it). The script acts with the session but can't read the member's email. A new
-        passkey's verify call must present the challenge the code was spent on. The code is entered on Settings ›
-        Security, a page without ads.
+      - **Account takeover is closed by emailed action links.** For every member, adding or removing a passkey
+        and deleting the account are only _requested_ in the app. The API emails the account a single-use link
+        (`/account-action#t=…`: 256-bit token stored only as an HMAC, bound to the member, the change and the
+        passkey, 15 minutes, a newer link replaces older ones, 5 an hour and 10 a day per change), and the change
+        is made on the page that link opens, carrying the token. The script acts with the session but can't read
+        the member's email, can't drive a page it isn't in, and a passkey created on that page comes from the
+        member's own authenticator. A new passkey's verify call must present the challenge the link was spent on.
+        A code typed into the app would not do: the script could draw the prompt itself.
       - The app Worker widens the CSP for Google's hosts only for documents on the library pages, only while
         AdSense is on, and only for requests carrying a valid AdSense cookie (`__Host-zads`): HttpOnly,
         SameSite=Strict, 15 minutes, its value `v1.<expiry>.<member>.<HMAC>` signed with `ADS_COOKIE_SECRET`,
@@ -224,8 +228,11 @@
         app reads it; a Server-Timing entry isn't exposed for navigations a service worker answers in every
         browser). It's also sent `Cross-Origin-Opener-Policy: same-origin-allow-popups`, while every other page
         keeps `same-origin`, so a popup it opens onto another app page lands in a new browsing context group,
-        out of the opener's reach. **Launch gate:** verify this popup isolation in current Chrome, Safari and
-        Firefox before turning AdSense on.
+        out of the opener's reach. `noopener-allow-popups` on the sensitive pages was considered and not used: a
+        browser that doesn't know a COOP value treats it as `unsafe-none`, which would weaken those pages there.
+        The side effect: an advertiser's page opened from an ad keeps `window.opener` to the library tab (it could
+        redirect that tab), which gives nothing Google's script doesn't already have. **Launch gate:** verify this
+        popup isolation in current Chrome, Safari and Firefox before turning AdSense on.
       - The page reloads when the member the script was loaded for is gone (sign-out, an ended session, another
         member) or loses ads. That includes an upgrade or a team joined in this tab, another tab, another device
         or by staff. Tabs tell each other about plan and team changes. A tab holding the script re-reads the
@@ -251,8 +258,9 @@
     - **Residual risk (accepted):** while a Free member is on a library page with the script loaded, Google's
       script can read that page and act as the member through the API. That includes creating share links and
       passcodes (or invites) and sending them elsewhere: such access outlives the page view until the member
-      revokes it (Shared › the gallery › End). Taking over the account (passkeys, deletion) needs the emailed
-      step-up code, and code can't persist through the origin's caches or storage.
+      revokes it (Shared › the gallery › End). It can't add a passkey of its own, remove passkeys or delete the
+      account: those only complete on a page opened from a link emailed to the member, and a passkey created there
+      comes from the member's own authenticator. Its code can't persist through the origin's caches or storage.
     - **Ad events** count at most one impression and one click per member, card and day. Only members who are
       shown ads can send them. The dedup key is pseudonymous, not anonymous: an HMAC of member, day, card and kind
       under its own secret (`AD_DEDUP_SECRET`). Whoever holds that secret and the database could recompute it for a

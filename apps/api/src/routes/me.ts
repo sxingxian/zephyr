@@ -1,20 +1,26 @@
 import {
+  ACCOUNT_ACTION_HEADER,
+  type AccountActionPeek,
+  accountActionPeekSchema,
+  accountActionRequestSchema,
   type DeleteAccountResult,
   deleteAccountSchema,
+  PASSKEY_ID_RE,
   passkeyRenameSchema,
   passkeyVerifySchema,
   profilePatchSchema,
   type SessionResponse,
-  STEP_UP_HEADER,
-  type StepUpOp,
-  type StepUpResult,
-  stepUpSchema,
   type Usage,
 } from '@zephyr/shared';
 import { Hono, type MiddlewareHandler } from 'hono';
+import {
+  issueAccountAction,
+  peekAccountAction,
+  useAccountAction,
+  useAccountActionGrant,
+} from '../auth/account-actions';
 import { gotrue } from '../auth/gotrue';
 import { adsSeenCookie, appendCookies, clearCookies, recentlyAuthenticated } from '../auth/session';
-import { checkStepUp, issueStepUp, stepUpNeeded, useStepUpGrant } from '../auth/step-up';
 import { ceremonyMatches } from '../auth/webauthn';
 import { cancelForDeletion, undoCancelForDeletion } from '../billing/deletion';
 import { notifyAccountDeletion, notifyPasskeyChange } from '../email/notify';
@@ -25,7 +31,7 @@ import { rpc, UpstreamError } from '../supabase';
 import type { HonoEnv } from '../types';
 import { getProfile, requireMember, sessionUser, toPasskey } from './session-helpers';
 
-const PASSKEY_ID = /^[A-Za-z0-9_-]{1,100}$/;
+const PASSKEY_ID = PASSKEY_ID_RE;
 
 /** /api/v1/me/*: the signed-in member's profile, passkeys, storage usage and account deletion. */
 export const meRoutes = new Hono<HonoEnv>();
@@ -36,8 +42,8 @@ meRoutes.use(
 meRoutes.use('*', requireMember);
 
 /**
- * Adding or removing a passkey, or deleting the account, needs a sign-in in the last 10 minutes, so a
- * stolen or left-open session can't quietly add its own key, remove the owner's or delete everything.
+ * Asking for an account-level change (below) needs a sign-in in the last 10 minutes, so a stolen or left-open
+ * session can't even send the emails.
  */
 const requireRecentAuth: MiddlewareHandler<HonoEnv> = async (c, next) => {
   if (!recentlyAuthenticated(c.get('session').claims)) return c.json(fail('reauth_required'), 403);
@@ -45,37 +51,73 @@ const requireRecentAuth: MiddlewareHandler<HonoEnv> = async (c, next) => {
 };
 
 /**
- * Phase 8 (review round 3): while the member may be shown AdSense, Google's script runs with their session, so a
- * recent sign-in isn't enough: these changes also need the one-time code emailed by POST /step-up for this very
- * operation (auth/step-up.ts). Fails closed when the database can't say whether one is needed.
+ * Phase 8 (review round 4): adding or removing a passkey and deleting the account are made only from the page an
+ * emailed link opens (auth/account-actions.ts), for every member. Google's AdSense script runs with Free members'
+ * sessions on library pages, so neither a recent sign-in nor a code typed into the app proves the member asked.
+ * The link's token travels in ACCOUNT_ACTION_HEADER and is spent here; a database failure answers 500.
  */
-const requireStepUp =
-  (op: StepUpOp): MiddlewareHandler<HonoEnv> =>
+const requireAccountAction =
+  (op: 'passkey_remove' | 'account_delete', passkeyId?: (c: Ctx) => string): MiddlewareHandler<HonoEnv> =>
   async (c, next) => {
     try {
-      if (await stepUpNeeded(c)) {
-        const r = await checkStepUp(c, op);
-        if (r === 'missing') return c.json(fail('step_up_required'), 403);
-        if (r === 'invalid') return c.json(fail('step_up_invalid'), 403);
-      }
+      const r = await useAccountAction(c, op, { passkeyId: passkeyId?.(c) });
+      if (r !== 'ok') return actionRefused(c, r);
     } catch (err) {
-      logError(c.get('requestId'), 'step_up_check', err);
+      logError(c.get('requestId'), 'account_action_use', err);
       return c.json(fail('server'), 500);
     }
     await next();
   };
+type Ctx = Parameters<MiddlewareHandler<HonoEnv>>[0];
+const actionRefused = (c: Ctx, r: 'missing' | 'wrong_member' | 'invalid') =>
+  r === 'missing'
+    ? c.json(fail('account_action_required'), 403)
+    : r === 'wrong_member'
+      ? c.json(fail('account_action_wrong_member'), 403)
+      : c.json(fail('account_action_invalid'), 403);
 
-/** Emails a step-up code for one operation, when this member needs one (else says so). */
-meRoutes.post('/step-up', async (c) => {
-  const body = await readBody(c, stepUpSchema);
+/**
+ * Emails the member a single-use link that makes one change (POST { op, passkeyId? }). The response carries
+ * nothing secret: the link is only in the email to the account address.
+ */
+meRoutes.post('/account-actions', requireRecentAuth, async (c) => {
+  const body = await readBody(c, accountActionRequestSchema);
   if (!body) return c.json(fail('invalid'), 400);
-  if (!(await burstOk(c, 'step_up'))) return rateLimited(c, 60);
+  if (!(await burstOk(c, 'account_action'))) return rateLimited(c, 60);
   try {
-    if (!(await stepUpNeeded(c))) return c.json({ ok: true, needed: false } satisfies StepUpResult);
-    if ((await issueStepUp(c, body.op)) === 'rate_limited') return rateLimited(c, 3600);
-    return c.json({ ok: true, needed: true } satisfies StepUpResult, 202);
+    let passkeyName: string | null = null;
+    if (body.op === 'passkey_remove') {
+      const items = await gotrue.listPasskeys(c.env, c.get('session').accessToken);
+      const pk = items.find((p) => p.id === body.passkeyId);
+      if (!pk) return c.json(fail('not_found'), 404);
+      passkeyName = pk.friendly_name ?? null;
+    }
+    const out = await issueAccountAction(c, body.op, body.passkeyId ?? null, passkeyName);
+    if (out === 'rate_limited') return rateLimited(c, 3600);
+    return c.json({ ok: true }, 202);
   } catch (err) {
-    logError(c.get('requestId'), 'step_up_issue', err);
+    logError(c.get('requestId'), 'account_action_issue', err);
+    return c.json(fail('server'), 500);
+  }
+});
+
+/** What a link will do, for the page it opens (the link stays unspent). */
+meRoutes.post('/account-actions/peek', async (c) => {
+  const body = await readBody(c, accountActionPeekSchema);
+  if (!body) return c.json(fail('account_action_invalid'), 400);
+  if (!(await burstOk(c, 'account_action_peek'))) return rateLimited(c, 60);
+  try {
+    const r = await peekAccountAction(c, body.token);
+    if (r.kind === 'wrong_member') return c.json(fail('account_action_wrong_member'), 403);
+    if (r.kind === 'invalid') return c.json(fail('account_action_invalid'), 400);
+    return c.json({
+      ok: true,
+      op: r.op,
+      passkeyId: r.passkeyId,
+      expiresAt: r.expiresAt,
+    } satisfies AccountActionPeek);
+  } catch (err) {
+    logError(c.get('requestId'), 'account_action_peek', err);
     return c.json(fail('server'), 500);
   }
 });
@@ -104,18 +146,15 @@ meRoutes.get('/passkeys', async (c) => {
   }
 });
 
-meRoutes.post('/passkeys/options', requireRecentAuth, async (c) => {
+meRoutes.post('/passkeys/options', async (c) => {
   if (!(await burstOk(c, 'passkey_reg'))) return rateLimited(c, 60);
   try {
-    // Phase 8: a member who may be shown AdSense spends their step-up code here; it leaves a grant for this
-    // challenge only, which the verify call below must present.
-    const needed = await stepUpNeeded(c);
-    if (needed && !c.req.header(STEP_UP_HEADER)) return c.json(fail('step_up_required'), 403);
+    // Phase 8: only from the page an emailed passkey_add link opens. The link is spent here and leaves a grant for
+    // this challenge only, which the verify call below must present.
+    if (!c.req.header(ACCOUNT_ACTION_HEADER)) return c.json(fail('account_action_required'), 403);
     const ch = await gotrue.passkeyRegisterOptions(c.env, c.get('session').accessToken);
-    if (needed) {
-      const r = await checkStepUp(c, 'passkey_add', ch.challenge_id);
-      if (r !== 'ok') return c.json(fail(r === 'missing' ? 'step_up_required' : 'step_up_invalid'), 403);
-    }
+    const r = await useAccountAction(c, 'passkey_add', { challengeId: ch.challenge_id });
+    if (r !== 'ok') return actionRefused(c, r);
     return c.json({ challengeId: ch.challenge_id, options: ch.options });
   } catch (err) {
     logError(c.get('requestId'), 'passkey_reg_options', err);
@@ -123,16 +162,16 @@ meRoutes.post('/passkeys/options', requireRecentAuth, async (c) => {
   }
 });
 
-meRoutes.post('/passkeys/verify', requireRecentAuth, async (c) => {
+meRoutes.post('/passkeys/verify', async (c) => {
   const body = await readBody(c, passkeyVerifySchema);
   if (!body) return c.json(fail('invalid'), 400);
   if (!ceremonyMatches(c, body.credential, 'webauthn.create', list(c.env.APP_ORIGINS))) {
     return c.json(fail('passkey_failed'), 400);
   }
   try {
-    // Phase 8: only a challenge issued after a step-up code (when one is needed) can be completed.
-    if ((await stepUpNeeded(c)) && !(await useStepUpGrant(c, 'passkey_add', body.challengeId)))
-      return c.json(fail('step_up_required'), 403);
+    // Phase 8: only a challenge issued on an emailed passkey_add link's page can be completed.
+    if (!(await useAccountActionGrant(c, body.challengeId)))
+      return c.json(fail('account_action_required'), 403);
     const pk = await gotrue.passkeyRegisterVerify(
       c.env,
       c.get('session').accessToken,
@@ -168,13 +207,12 @@ meRoutes.patch('/passkeys/:id', async (c) => {
 
 meRoutes.delete(
   '/passkeys/:id',
-  requireRecentAuth,
   async (c, next) => {
-    // A malformed id never spends a step-up code.
+    // A malformed id never spends a link.
     if (!PASSKEY_ID.test(c.req.param('id'))) return c.json(fail('invalid'), 400);
     await next();
   },
-  requireStepUp('passkey_remove'),
+  requireAccountAction('passkey_remove', (c) => c.req.param('id') ?? ''),
   async (c) => {
     const id = c.req.param('id');
     try {
@@ -207,9 +245,17 @@ meRoutes.get('/usage', libraryContext, async (c) => {
  * Schedules the account for deletion in 30 days, signs out every session (all devices) and emails the
  * account. Signing in again shows the Restore screen until the purge job runs.
  */
-meRoutes.post('/delete', requireRecentAuth, requireStepUp('account_delete'), async (c) => {
+meRoutes.post('/delete', async (c) => {
+  // The typed confirmation is checked before the link is spent.
   const body = await readBody(c, deleteAccountSchema);
   if (!body) return c.json(fail('invalid'), 400);
+  try {
+    const r = await useAccountAction(c, 'account_delete');
+    if (r !== 'ok') return actionRefused(c, r);
+  } catch (err) {
+    logError(c.get('requestId'), 'account_action_use', err);
+    return c.json(fail('server'), 500);
+  }
   const s = c.get('session');
   try {
     // Phase 7: the answer may also carry the Stripe subscription id (renewal stops while deletion is pending).

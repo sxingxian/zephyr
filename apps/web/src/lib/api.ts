@@ -75,8 +75,9 @@ const KNOWN: ApiErrorCode[] = [
   'passkey_failed',
   'passkey_required',
   'reauth_required',
-  'step_up_required',
-  'step_up_invalid',
+  'account_action_required',
+  'account_action_invalid',
+  'account_action_wrong_member',
   'not_found',
   'conflict',
   'account_pending_deletion',
@@ -188,11 +189,13 @@ export function errorMessage(err: unknown): string {
     case 'passkey_required':
       return 'Add a passkey to continue.';
     case 'reauth_required':
-      return 'For your security, sign in again before changing passkeys.';
-    case 'step_up_required':
-      return 'Enter the code we emailed you to confirm this change.';
-    case 'step_up_invalid':
-      return 'That code didn’t work. Check it, or send a new one.';
+      return 'For your security, sign in again before changing passkeys or deleting your account.';
+    case 'account_action_required':
+      return 'This change is made from the link we email you. Ask for it in Settings › Security.';
+    case 'account_action_invalid':
+      return 'That link doesn’t work any more. It may have expired, been used or been replaced. Ask for a new one.';
+    case 'account_action_wrong_member':
+      return 'That link was sent to another account. Sign in as that account and open it again.';
     case 'unauthenticated':
       return 'Your session ended. Sign in again.';
     case 'forbidden':

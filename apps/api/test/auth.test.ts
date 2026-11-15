@@ -2,6 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { CODE_TIMING } from '../src/auth/code-limits';
 import {
   APP,
+  accountActionToken,
   call,
   credential,
   initKeys,
@@ -27,6 +28,7 @@ afterEach(() => {
 });
 
 const MEI = () => must(world.users.find((u) => u.email === 'mei@example.com'));
+const AH = 'X-Zephyr-Account-Action';
 const start = (email: string, extra: Record<string, unknown> = {}) =>
   call('/api/v1/auth/email/start', { body: { email, turnstileToken: 'tok', ...extra } });
 const gotrueCalls = (path: string) => world.calls.filter((c) => c.url.includes(`/auth/v1${path}`));
@@ -311,7 +313,8 @@ describe('passkeys', () => {
 
   it('a member registers, lists, renames and deletes passkeys', async () => {
     const { j } = await signIn();
-    const opt = await call('/api/v1/me/passkeys/options', { body: {}, jar: j });
+    const add = await accountActionToken(j, 'passkey_add');
+    const opt = await call('/api/v1/me/passkeys/options', { body: {}, jar: j, headers: { [AH]: add } });
     expect((await read(opt)).challengeId).toBe('ch-reg');
     const reg = await call('/api/v1/me/passkeys/verify', {
       body: { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
@@ -327,10 +330,11 @@ describe('passkeys', () => {
       jar: j,
     });
     expect((await read(ren)).passkey.friendlyName).toBe('Work laptop');
+    const remove = await accountActionToken(j, 'passkey_remove', 'pk-0');
     const del = await call('/api/v1/me/passkeys/pk-0', {
       method: 'DELETE',
       jar: j,
-      headers: { 'Content-Length': '0' },
+      headers: { 'Content-Length': '0', [AH]: remove },
     });
     expect(del.status).toBe(204);
     expect((await call('/api/v1/me/passkeys/..%2Fadmin', { method: 'DELETE', jar: j })).status).toBe(400);
@@ -341,101 +345,149 @@ describe('passkeys', () => {
   });
 });
 
-describe('step-up codes (phase 8: account changes while the member may be shown AdSense)', () => {
-  const H = 'X-Zephyr-Step-Up';
-  const lastCode = () =>
-    /^(\d{6}) is your Zephyr confirmation code$/.exec(world.emails.at(-1)?.subject ?? '')?.[1];
-  const askCode = async (j: ReturnType<typeof jar>, op: string) =>
-    call('/api/v1/me/step-up', { body: { op }, jar: j });
-  const del = (j: ReturnType<typeof jar>, code?: string) =>
-    call('/api/v1/me/passkeys/pk-0', {
+describe('account action links (phase 8: account changes only from a link emailed to the account)', () => {
+  const linkIn = (text: string | undefined) =>
+    /\/account-action#t=([A-Za-z0-9_-]{43})(?:\s|$)/.exec(text ?? '')?.[1];
+  const ask = (j: ReturnType<typeof jar>, body: Record<string, unknown>) =>
+    call('/api/v1/me/account-actions', { body, jar: j });
+  const del = (j: ReturnType<typeof jar>, token?: string, id = 'pk-0') =>
+    call(`/api/v1/me/passkeys/${id}`, {
       method: 'DELETE',
       jar: j,
-      headers: { 'Content-Length': '0', ...(code ? { [H]: code } : {}) },
+      headers: { 'Content-Length': '0', ...(token ? { [AH]: token } : {}) },
     });
 
-  it('members who aren’t shown AdSense keep the recent sign-in check alone', async () => {
-    const { j } = await signIn();
-    expect(await read(await askCode(j, 'passkey_remove'))).toEqual({ ok: true, needed: false });
-    expect(world.emails).toHaveLength(0);
-    expect((await del(j)).status).toBe(204);
-  });
-
-  it('without a code: step_up_required; the emailed code works once, for that operation only', async () => {
-    world.stepUp.needed = true;
+  it('every member needs the link: no link, no change', async () => {
     const { j } = await signIn();
     const none = await del(j);
     expect(none.status).toBe(403);
-    expect((await read(none)).error).toBe('step_up_required');
-    const sent = await askCode(j, 'passkey_remove');
-    expect(sent.status).toBe(202);
-    expect(await read(sent)).toEqual({ ok: true, needed: true });
-    const email = world.emails.at(-1);
-    expect(email?.to).toBe('mei@example.com');
-    expect(email?.text).toContain('remove a passkey from your account');
-    const code = lastCode() ?? '';
-    expect(code).toMatch(/^\d{6}$/);
-    // Only a hash is stored, never the code.
-    expect([...world.stepUp.codes.values()].some((r) => String(r.hash).includes(code))).toBe(false);
-    // Not for another operation.
+    expect((await read(none)).error).toBe('account_action_required');
+    const opt = await call('/api/v1/me/passkeys/options', { body: {}, jar: j });
+    expect((await read(opt)).error).toBe('account_action_required');
+    const gone = await call('/api/v1/me/delete', { body: { confirm: 'DELETE' }, jar: j });
+    expect((await read(gone)).error).toBe('account_action_required');
+    expect(gotrueCalls('/passkeys/registration')).toHaveLength(0);
+    expect(world.emails).toHaveLength(0);
+  });
+
+  it('asking emails a link to the account address and returns nothing secret', async () => {
+    const { j } = await signIn();
+    const spy = vi.spyOn(console, 'error');
+    const logSpy = vi.spyOn(console, 'log');
+    const res = await ask(j, { op: 'passkey_remove', passkeyId: 'pk-0' });
+    expect(res.status).toBe(202);
+    const body = await res.text();
+    expect(JSON.parse(body)).toEqual({ ok: true });
+    const email = must(world.emails.at(-1));
+    expect(email.to).toBe('mei@example.com');
+    expect(email.subject).toBe('Remove a passkey from your Zephyr account');
+    const token = must(linkIn(email.text));
+    expect(email.text).toContain(`${APP}/account-action#t=${token}`);
+    expect(email.html).toContain(`/account-action#t=${token}`);
+    expect(email.subject).not.toContain(token);
+    expect(email.text).toContain('never inside your library');
+    // The token is in the email only: not in the response, not stored, not logged.
+    expect(body).not.toContain(token);
+    expect(world.actions.some((r) => r.hash.includes(token))).toBe(false);
+    for (const c of [...spy.mock.calls, ...logSpy.mock.calls]) expect(JSON.stringify(c)).not.toContain(token);
+  });
+
+  it('a link works once, only for its change, passkey and member', async () => {
+    const { j } = await signIn();
+    const token = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    // Not for another change or passkey; malformed tokens are refused without a lookup.
     const wrongOp = await call('/api/v1/me/delete', {
       body: { confirm: 'DELETE' },
       jar: j,
-      headers: { [H]: code },
+      headers: { [AH]: token },
     });
-    expect((await read(wrongOp)).error).toBe('step_up_invalid');
-    const bad = await del(j, code === '000000' ? '000001' : '000000');
-    expect((await read(bad)).error).toBe('step_up_invalid');
-    expect((await read(await del(j, '12ab56'))).error).toBe('step_up_invalid');
-    expect((await del(j, code)).status).toBe(204);
-    const again = await del(j, code);
-    expect((await read(again)).error).toBe('step_up_invalid');
+    expect((await read(wrongOp)).error).toBe('account_action_invalid');
+    expect((await read(await del(j, token, 'pk-1'))).error).toBe('account_action_invalid');
+    expect((await read(await del(j, 'short'))).error).toBe('account_action_invalid');
+    // Another member's session can't use it (and doesn't spend it).
+    world.users.push({ id: '20000000-0000-0000-0000-000000000009', email: 'sam@example.com', passkeys: 1 });
+    const { j: sam } = await signIn('sam@example.com');
+    expect((await read(await del(sam, token))).error).toBe('account_action_wrong_member');
+    expect((await del(j, token)).status).toBe(204);
+    expect((await read(await del(j, token))).error).toBe('account_action_invalid');
   });
 
-  it('expired codes and a fifth wrong try are refused', async () => {
-    world.stepUp.needed = true;
+  it('expired and replaced links are refused', async () => {
     const { j } = await signIn();
-    await askCode(j, 'passkey_remove');
-    const code = lastCode() ?? '';
-    for (const r of world.stepUp.codes.values()) r.expires = Date.now() - 1;
-    expect((await read(await del(j, code))).error).toBe('step_up_invalid');
-    await askCode(j, 'passkey_remove');
-    const fresh = lastCode() ?? '';
-    const wrong = fresh === '999999' ? '999998' : '999999';
-    for (let i = 0; i < 5; i++) await del(j, wrong);
-    expect((await read(await del(j, fresh))).error).toBe('step_up_invalid');
+    const old = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    for (const r of world.actions) r.expires = Date.now() - 1;
+    expect((await read(await del(j, old))).error).toBe('account_action_invalid');
+    const first = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    const second = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    expect((await read(await del(j, first))).error).toBe('account_action_invalid');
+    expect((await del(j, second)).status).toBe(204);
   });
 
-  it('five codes an hour per operation', async () => {
-    world.stepUp.needed = true;
+  it('asking checks the body and the passkey, and is rate limited', async () => {
     const { j } = await signIn();
-    for (let i = 0; i < 5; i++) expect((await askCode(j, 'account_delete')).status).toBe(202);
-    const sixth = await askCode(j, 'account_delete');
+    expect((await ask(j, { op: 'nope' })).status).toBe(400);
+    expect((await ask(j, { op: 'passkey_remove' })).status).toBe(400);
+    expect((await ask(j, { op: 'passkey_add', passkeyId: 'pk-0' })).status).toBe(400);
+    expect((await ask(j, { op: 'passkey_remove', passkeyId: '../admin' })).status).toBe(400);
+    expect((await ask(j, { op: 'passkey_remove', passkeyId: 'pk-404' })).status).toBe(404);
+    expect(world.emails).toHaveLength(0);
+    for (let i = 0; i < 5; i++) expect((await ask(j, { op: 'account_delete' })).status).toBe(202);
+    const sixth = await ask(j, { op: 'account_delete' });
     expect(sixth.status).toBe(429);
     expect(world.emails).toHaveLength(5);
-    expect((await askCode(j, 'nope')).status).toBe(400);
+    expect((await ask(j, { op: 'passkey_add' })).status).toBe(202);
+    const limited = jar();
+    for (const [k, v] of j.cookies) limited.cookies.set(k, v);
+    setLimiter(false);
+    expect((await ask(limited, { op: 'passkey_add' })).status).toBe(429);
   });
 
-  it('adding a passkey: the code is spent on the options, and only that challenge can be completed', async () => {
-    world.stepUp.needed = true;
+  it('asking needs a recent sign-in; making the change needs the link, not a fresh session', async () => {
     const { j } = await signIn();
-    const none = await call('/api/v1/me/passkeys/options', { body: {}, jar: j });
-    expect((await read(none)).error).toBe('step_up_required');
-    // A challenge from options without a code (another route to one) can't be verified.
+    const token = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    j.cookies.set('__Host-zs-at', await sbToken({ sub: MEI().id, email: MEI().email, authAgo: 11 * 60 }));
+    expect(await read(await ask(j, { op: 'account_delete' }))).toEqual({
+      ok: false,
+      error: 'reauth_required',
+    });
+    expect((await del(j, token)).status).toBe(204);
+  });
+
+  it('peeking shows the change without spending the link', async () => {
+    const { j } = await signIn();
+    const token = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    const peek = (k: ReturnType<typeof jar>, t: unknown) =>
+      call('/api/v1/me/account-actions/peek', { body: { token: t }, jar: k });
+    const r = await read(await peek(j, token));
+    expect(r).toMatchObject({ ok: true, op: 'passkey_remove', passkeyId: 'pk-0' });
+    expect(Date.parse(r.expiresAt)).toBeGreaterThan(Date.now());
+    expect((await read(await peek(j, 'x'.repeat(43)))).error).toBe('account_action_invalid');
+    expect((await peek(j, 'short')).status).toBe(400);
+    world.users.push({ id: '20000000-0000-0000-0000-000000000009', email: 'sam@example.com', passkeys: 1 });
+    const { j: sam } = await signIn('sam@example.com');
+    expect((await read(await peek(sam, token))).error).toBe('account_action_wrong_member');
+    expect((await call('/api/v1/me/account-actions/peek', { body: { token } })).status).toBe(401);
+    expect((await del(j, token)).status).toBe(204);
+    expect((await read(await peek(j, token))).error).toBe('account_action_invalid');
+  });
+
+  it('adding a passkey: the link is spent on the options, and only that challenge can be completed', async () => {
+    const { j } = await signIn();
     const sneaky = await call('/api/v1/me/passkeys/verify', {
       body: { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
       jar: j,
     });
-    expect((await read(sneaky)).error).toBe('step_up_required');
-    await askCode(j, 'passkey_add');
-    const code = lastCode() ?? '';
-    const opt = await call('/api/v1/me/passkeys/options', { body: {}, jar: j, headers: { [H]: code } });
+    expect((await read(sneaky)).error).toBe('account_action_required');
+    const token = await accountActionToken(j, 'passkey_add');
+    const opt = await call('/api/v1/me/passkeys/options', { body: {}, jar: j, headers: { [AH]: token } });
     expect((await read(opt)).challengeId).toBe('ch-reg');
+    const twice = await call('/api/v1/me/passkeys/options', { body: {}, jar: j, headers: { [AH]: token } });
+    expect((await read(twice)).error).toBe('account_action_invalid');
     const other = await call('/api/v1/me/passkeys/verify', {
       body: { challengeId: 'ch-other', credential: credential('webauthn.create', APP) },
       jar: j,
     });
-    expect((await read(other)).error).toBe('step_up_required');
+    expect((await read(other)).error).toBe('account_action_required');
     const reg = await call('/api/v1/me/passkeys/verify', {
       body: { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
       jar: j,
@@ -445,20 +497,18 @@ describe('step-up codes (phase 8: account changes while the member may be shown 
       body: { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
       jar: j,
     });
-    expect((await read(replay)).error).toBe('step_up_required');
+    expect((await read(replay)).error).toBe('account_action_required');
   });
 
-  it('a recent sign-in is still checked first, and the check fails closed', async () => {
-    world.stepUp.needed = true;
+  it('the database failing closes the door', async () => {
     const { j } = await signIn();
-    const stale = jar();
-    stale.cookies.set('__Host-zs-at', await sbToken({ sub: MEI().id, email: MEI().email, authAgo: 11 * 60 }));
-    for (const [k, v] of j.cookies) if (k !== '__Host-zs-at') stale.cookies.set(k, v);
-    expect(await read(await del(stale))).toEqual({ ok: false, error: 'reauth_required' });
-    world.rpc.step_up_needed = () => new Response('{}', { status: 500 });
+    const token = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    world.rpc.account_action_use = () => new Response('{}', { status: 500 });
+    world.rpc.account_action_issue = () => new Response('{}', { status: 500 });
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    expect((await del(j)).status).toBe(500);
-    expect((await askCode(j, 'passkey_remove')).status).toBe(500);
+    expect((await del(j, token)).status).toBe(500);
+    expect((await ask(j, { op: 'passkey_add' })).status).toBe(500);
+    for (const c of spy.mock.calls) expect(JSON.stringify(c)).not.toContain(token);
     spy.mockRestore();
   });
 });
@@ -623,38 +673,44 @@ describe('security review fixes (app)', () => {
     expect(gotrueCalls('/passkeys/registration/verify')).toHaveLength(0);
   });
 
-  it('L2: adding or removing a passkey needs a sign-in in the last 10 minutes', async () => {
+  it('L2: asking to add or remove a passkey needs a sign-in in the last 10 minutes', async () => {
     const { j } = await signIn();
     j.cookies.set('__Host-zs-at', await sbToken({ sub: MEI().id, email: MEI().email, authAgo: 11 * 60 }));
-    for (const [path, method, body] of [
-      ['/api/v1/me/passkeys/options', 'POST', {}],
-      [
-        '/api/v1/me/passkeys/verify',
-        'POST',
-        { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
-      ],
-      ['/api/v1/me/passkeys/pk-0', 'DELETE', undefined],
-    ] as const) {
-      const res = await call(path, { method, body, jar: j, headers: { 'Content-Length': '0' } });
+    for (const body of [
+      { op: 'passkey_add' },
+      { op: 'passkey_remove', passkeyId: 'pk-0' },
+      { op: 'account_delete' },
+    ]) {
+      const res = await call('/api/v1/me/account-actions', { body, jar: j });
       expect(res.status).toBe(403);
       expect(await read(res)).toEqual({ ok: false, error: 'reauth_required' });
     }
     // Renaming and listing don't need it.
     expect((await call('/api/v1/me/passkeys', { jar: j })).status).toBe(200);
     expect(gotrueCalls('/passkeys/registration')).toHaveLength(0);
+    expect(world.emails).toHaveLength(0);
   });
 
   it('L2: the account is emailed when a passkey is added or removed', async () => {
     const { j } = await signIn();
+    const add = await accountActionToken(j, 'passkey_add');
+    await call('/api/v1/me/passkeys/options', { body: {}, jar: j, headers: { [AH]: add } });
     await call('/api/v1/me/passkeys/verify', {
       body: { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
       jar: j,
     });
-    await call('/api/v1/me/passkeys/pk-0', { method: 'DELETE', jar: j, headers: { 'Content-Length': '0' } });
+    const remove = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    await call('/api/v1/me/passkeys/pk-0', {
+      method: 'DELETE',
+      jar: j,
+      headers: { 'Content-Length': '0', [AH]: remove },
+    });
     expect(world.emails.map((e) => [e.to, e.subject])).toEqual([
+      ['mei@example.com', 'Add a passkey to your Zephyr account'],
       ['mei@example.com', 'A passkey was added to your Zephyr account'],
+      ['mei@example.com', 'Remove a passkey from your Zephyr account'],
       ['mei@example.com', 'A passkey was removed from your Zephyr account'],
     ]);
-    expect(world.emails[0]?.html).toContain('iCloud Keychain');
+    expect(world.emails[1]?.html).toContain('iCloud Keychain');
   });
 });

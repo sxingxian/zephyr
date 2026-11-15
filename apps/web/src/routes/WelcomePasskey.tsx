@@ -1,18 +1,23 @@
-import { APP_API, type PasskeyOptions } from '@zephyr/shared/client';
+import { ACCOUNT_ACTION_MINUTES } from '@zephyr/shared/client';
 import { Button, Chip, Icon, Note } from '@zephyr/ui';
 import { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { AuthHead, AuthLayout } from '../components/AuthLayout';
-import { ApiFailure, api, errorMessage } from '../lib/api';
-import { createPasskey, isCancelled, passkeysSupported } from '../lib/passkey';
+import { requestAccountAction } from '../lib/accountActions';
+import { errorMessage } from '../lib/api';
+import { passkeysSupported } from '../lib/passkey';
 import { useSession } from '../lib/session';
 
-/** Shown once after joining: offer a passkey so future sign-ins skip email codes. */
+/**
+ * Shown once after joining: offer a passkey so future sign-ins skip email codes. Phase 8: like every passkey
+ * change, it's made from a link we email (routes/AccountAction.tsx), so this asks for that link.
+ */
 export function WelcomePasskey() {
   const nav = useNavigate();
-  const { user, refresh } = useSession();
+  const { user } = useSession();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sent, setSent] = useState(false);
   const first = user?.displayName?.split(' ')[0];
   const supported = passkeysSupported();
 
@@ -20,21 +25,10 @@ export function WelcomePasskey() {
     setBusy(true);
     setError(null);
     try {
-      const opts = await api<PasskeyOptions>(APP_API.myPasskeyOptions, { method: 'POST', body: {} });
-      const credential = await createPasskey(opts);
-      await api(APP_API.myPasskeyVerify, {
-        method: 'POST',
-        body: { challengeId: opts.challengeId, credential },
-      });
-      await refresh();
-      nav('/', { replace: true });
+      await requestAccountAction('passkey_add');
+      setSent(true);
     } catch (e) {
-      if (!isCancelled(e))
-        setError(
-          e instanceof ApiFailure
-            ? errorMessage(e)
-            : 'Your device couldn’t save the passkey. Try again, or skip for now.',
-        );
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -61,7 +55,12 @@ export function WelcomePasskey() {
           <span className="z-muted">Synced passkeys work on your other devices too.</span>
         </span>
       </div>
-      {supported ? (
+      {sent ? (
+        <Note tone="neutral" icon="mail" role="status">
+          We emailed {user?.email ?? 'you'} a link to add your passkey. Open it on this device; it works for{' '}
+          {ACCOUNT_ACTION_MINUTES} minutes.
+        </Note>
+      ) : supported ? (
         <Button kind="primary" size="lg" full icon="passkey" busy={busy} onClick={add}>
           Add a passkey
         </Button>
@@ -77,7 +76,7 @@ export function WelcomePasskey() {
         </Note>
       )}
       <Button kind="ghost" size="lg" full onClick={() => nav('/', { replace: true })}>
-        Not now, I’ll use email codes
+        {sent ? 'Continue to my library' : 'Not now, I’ll use email codes'}
       </Button>
       <span className="z-hint">You can add or remove passkeys any time in Settings › Security.</span>
     </AuthLayout>
