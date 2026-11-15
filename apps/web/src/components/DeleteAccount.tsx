@@ -1,17 +1,20 @@
-import { ACCOUNT_DELETION_DAYS } from '@zephyr/shared/client';
+import { ACCOUNT_ACTION_MINUTES, ACCOUNT_DELETION_DAYS } from '@zephyr/shared/client';
 import { Button, Card, Field, Icon, useToast } from '@zephyr/ui';
 import { type FormEvent, useEffect, useId, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
+import { requestAccountAction } from '../lib/accountActions';
 import { ApiFailure, errorMessage } from '../lib/api';
-import { deleteAccount } from '../lib/library';
-import { browser, endSession } from '../lib/sessionGuard';
+import { useSession } from '../lib/session';
 import { useUsage } from '../lib/usage';
-import { useStepUp } from './StepUp';
 
 const RETURN = '/settings/security?delete=1';
 
-/** Settings › Delete account: a danger card and a type-DELETE confirmation. */
+/**
+ * Settings › Delete account: a danger card and a type-DELETE confirmation. Phase 8: confirming emails the member a
+ * link; the account is deleted on the page that link opens (routes/AccountAction.tsx), never from here.
+ */
 export function DeleteAccountCard() {
+  const { user } = useSession();
   const usage = useUsage();
   const toast = useToast();
   const nav = useNavigate();
@@ -22,8 +25,7 @@ export function DeleteAccountCard() {
   const [error, setError] = useState<string | null>(null);
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
-  // Phase 8: while the member may be shown ads, deleting the account also needs an emailed code.
-  const stepUp = useStepUp();
+  const [sent, setSent] = useState(false);
 
   // Back from the security sign-in: reopen the dialog.
   useEffect(() => {
@@ -40,6 +42,7 @@ export function DeleteAccountCard() {
     if (open && !d.open) {
       setTyped('');
       setError(null);
+      setSent(false);
       d.showModal?.();
     }
     if (!open && d.open) d.close();
@@ -52,22 +55,8 @@ export function DeleteAccountCard() {
     setBusy(true);
     setError(null);
     try {
-      // When a code is needed, the step-up dialog opens on top of this one.
-      const r = await stepUp.run('account_delete', (headers) => deleteAccount(headers));
-      if (!r) return;
-      try {
-        sessionStorage.setItem('zephyr.purgeAt', r.purgeAt);
-      } catch {
-        // storage unavailable: the confirmation page falls back to "30 days"
-      }
-      // The server has already signed out every session: stop this member's uploads (nothing is sent),
-      // then load the confirmation page afresh so no photo data stays in memory.
-      await endSession('deleted', false);
-      setOpen(false);
-      // The confirmation page forgets the session once it's showing, so the sign-in guard on this page
-      // doesn't redirect first.
-      nav('/account-deleted', { replace: true, state: { deleted: true } });
-      browser.assign('/account-deleted');
+      await requestAccountAction('account_delete');
+      setSent(true);
     } catch (err) {
       if (err instanceof ApiFailure && err.code === 'reauth_required') {
         toast.show('For your security, sign in again to delete your account.', 'bad');
@@ -108,44 +97,65 @@ export function DeleteAccountCard() {
           if (!busy) setOpen(false);
         }}
       >
-        <form className="del-dialog__body" onSubmit={submit}>
-          <span className="del-dialog__icon">
-            <Icon name="alert" size={24} />
-          </span>
-          <h2 id={titleId} className="del-dialog__title">
-            Delete your Zephyr account?
-          </h2>
-          <p className="del-dialog__text">
-            Your account is closed straight away and you’re signed out everywhere. For{' '}
-            <strong>{ACCOUNT_DELETION_DAYS} days</strong> you can sign in and restore everything. After that,
-            {photos ? ` all ${photos} photos,` : ' all your photos,'} your albums and edits are deleted for
-            good.
-          </p>
-          <p className="z-hint">
-            Want copies first? Open any photo and choose Download to save the original.
-          </p>
-          <Field
-            label="Type DELETE to confirm"
-            placeholder="DELETE"
-            mono
-            autoComplete="off"
-            autoCapitalize="characters"
-            spellCheck={false}
-            value={typed}
-            onChange={(e) => setTyped(e.target.value)}
-            error={error}
-          />
-          <div className="del-dialog__foot">
-            <Button kind="ghost" onClick={() => setOpen(false)} disabled={busy}>
-              Cancel
-            </Button>
-            <Button kind="danger" type="submit" icon="trash" busy={busy} disabled={typed !== 'DELETE'}>
-              Delete account
-            </Button>
+        {sent ? (
+          <div className="del-dialog__body">
+            <span className="del-dialog__icon">
+              <Icon name="mail" size={24} />
+            </span>
+            <h2 id={titleId} className="del-dialog__title">
+              Check your email
+            </h2>
+            <p className="del-dialog__text">
+              We emailed {user?.email ?? 'you'} a link that deletes your account. Open it to finish; it works
+              for {ACCOUNT_ACTION_MINUTES} minutes. Nothing changes until you do.
+            </p>
+            <div className="del-dialog__foot">
+              <Button kind="ghost" onClick={() => setOpen(false)}>
+                Close
+              </Button>
+            </div>
           </div>
-        </form>
+        ) : (
+          <form className="del-dialog__body" onSubmit={submit}>
+            <span className="del-dialog__icon">
+              <Icon name="alert" size={24} />
+            </span>
+            <h2 id={titleId} className="del-dialog__title">
+              Delete your Zephyr account?
+            </h2>
+            <p className="del-dialog__text">
+              Your account is closed straight away and you’re signed out everywhere. For{' '}
+              <strong>{ACCOUNT_DELETION_DAYS} days</strong> you can sign in and restore everything. After
+              that,
+              {photos ? ` all ${photos} photos,` : ' all your photos,'} your albums and edits are deleted for
+              good.
+            </p>
+            <p className="z-hint">
+              Want copies first? Open any photo and choose Download to save the original. To keep your account
+              safe, we email you a link that makes the deletion.
+            </p>
+            <Field
+              label="Type DELETE to confirm"
+              placeholder="DELETE"
+              mono
+              autoComplete="off"
+              autoCapitalize="characters"
+              spellCheck={false}
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+              error={error}
+            />
+            <div className="del-dialog__foot">
+              <Button kind="ghost" onClick={() => setOpen(false)} disabled={busy}>
+                Cancel
+              </Button>
+              <Button kind="danger" type="submit" icon="mail" busy={busy} disabled={typed !== 'DELETE'}>
+                Email me the link
+              </Button>
+            </div>
+          </form>
+        )}
       </dialog>
-      {stepUp.dialog}
     </>
   );
 }

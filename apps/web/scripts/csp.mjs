@@ -140,6 +140,7 @@ function checkAdPages() {
     '/settings/billing',
     '/settings/team',
     '/share/new',
+    '/account-action',
     '/settings/ai',
     '/settings/invites',
     '/settings/about',

@@ -257,24 +257,20 @@ export interface World {
   /** Phase 8: what the default app_status returns. */
   appStatus?: { readOnly: { on: boolean; message: string } | null; maintenance: unknown };
   /**
-   * Phase 8 (review round 3): step-up codes, mirroring supabase/migrations/20261115100200_step_up.sql. `needed`
-   * is what step_up_needed answers; `codes` holds "member|op" → the stored row.
+   * Phase 8 (review round 4): account action links, mirroring
+   * supabase/migrations/20261115100200_account_actions.sql. Rows in issue order.
    */
-  stepUp: {
-    needed: boolean;
-    codes: Map<
-      string,
-      {
-        hash: string | null;
-        expires: number;
-        attempts: number;
-        sends: number;
-        windowStart: number;
-        grant: string | null;
-        grantExpires: number;
-      }
-    >;
-  };
+  actions: {
+    user: string;
+    op: string;
+    passkey: string | null;
+    hash: string;
+    created: number;
+    expires: number;
+    used: boolean;
+    grant: string | null;
+    grantExpires: number;
+  }[];
 }
 export const world: World = {} as World;
 
@@ -315,7 +311,7 @@ export function resetWorld() {
     onUserDeleted: undefined,
     globalLogouts: [],
     media: { blocked: new Set(), down: false, fetched: [] },
-    stepUp: { needed: false, codes: new Map() },
+    actions: [],
     external: undefined,
     teams: {},
     libraryState: 'active',
@@ -370,64 +366,57 @@ export async function sessionFor(u: User, amr: string[] = ['otp']) {
 }
 
 // Default RPC behaviour, close enough to the SQL for routing tests. Tests override as needed.
-const STEP_UP_OPS = ['passkey_add', 'passkey_remove', 'account_delete'];
-const stepUpRow = (user: string, op: string) => {
-  const key = `${user}|${op}`;
-  let r = world.stepUp.codes.get(key);
-  if (!r) {
-    r = {
-      hash: null,
-      expires: 0,
-      attempts: 0,
-      sends: 0,
-      windowStart: Date.now(),
+const ACTION_OPS = ['passkey_add', 'passkey_remove', 'account_delete'];
+const defaultRpc: Record<string, (a: Record<string, unknown>) => unknown> = {
+  // Account action links (phase 8, review round 4), the same rules as the SQL.
+  account_action_issue: (a) => {
+    const user = String(a.p_user);
+    const op = String(a.p_op);
+    const passkey = typeof a.p_passkey === 'string' ? a.p_passkey : null;
+    if (!ACTION_OPS.includes(op) || (op === 'passkey_remove') !== (passkey !== null)) return 'invalid';
+    const now = Date.now();
+    const mine = world.actions.filter((r) => r.user === user && r.op === op);
+    if (
+      mine.filter((r) => r.created > now - 3600_000).length >= 5 ||
+      mine.filter((r) => r.created > now - 86400_000).length >= 10
+    )
+      return 'rate_limited';
+    for (const r of mine) if (!r.used && r.expires > now) r.expires = now;
+    world.actions.push({
+      user,
+      op,
+      passkey,
+      hash: String(a.p_hash),
+      created: now,
+      expires: now + 15 * 60_000,
+      used: false,
       grant: null,
       grantExpires: 0,
-    };
-    world.stepUp.codes.set(key, r);
-  }
-  return r;
-};
-const defaultRpc: Record<string, (a: Record<string, unknown>) => unknown> = {
-  // Step-up codes (phase 8, review round 3), the same rules as the SQL.
-  step_up_needed: () => world.stepUp.needed,
-  step_up_issue: (a) => {
-    if (!STEP_UP_OPS.includes(String(a.p_op))) return 'invalid';
-    const r = stepUpRow(String(a.p_user), String(a.p_op));
-    if (r.windowStart < Date.now() - 3600_000) {
-      r.sends = 0;
-      r.windowStart = Date.now();
-    }
-    if (r.sends >= 5) return 'rate_limited';
-    Object.assign(r, {
-      hash: String(a.p_hash),
-      expires: Date.now() + 600_000,
-      attempts: 0,
-      sends: r.sends + 1,
     });
     return 'ok';
   },
-  step_up_check: (a) => {
-    const r = world.stepUp.codes.get(`${a.p_user}|${a.p_op}`);
-    if (!r || r.hash === null) return 'invalid';
-    if (r.expires <= Date.now()) {
-      r.hash = null;
-      return 'invalid';
-    }
-    if (r.hash !== a.p_hash) {
-      r.attempts += 1;
-      if (r.attempts >= 5) r.hash = null;
-      return 'invalid';
-    }
-    r.hash = null;
-    r.attempts = 0;
+  account_action_peek: (a) => {
+    const r = world.actions.find((x) => x.hash === a.p_hash && !x.used && x.expires > Date.now());
+    if (!r) return null;
+    if (r.user !== a.p_user) return { error: 'wrong_member' };
+    return { op: r.op, passkeyId: r.passkey, expiresAt: new Date(r.expires).toISOString() };
+  },
+  account_action_use: (a) => {
+    const r = world.actions.find((x) => x.hash === a.p_hash);
+    if (!r || r.used || r.expires <= Date.now()) return 'invalid';
+    if (r.user !== a.p_user) return 'wrong_member';
+    if (r.op !== a.p_op || r.passkey !== (a.p_passkey ?? null)) return 'invalid';
+    r.used = true;
     r.grant = typeof a.p_grant === 'string' ? a.p_grant : null;
     r.grantExpires = r.grant ? Date.now() + 600_000 : 0;
     return 'ok';
   },
-  step_up_grant_use: (a) => {
-    const r = world.stepUp.codes.get(`${a.p_user}|${a.p_op}`);
-    if (!r || r.grant === null || r.grant !== a.p_grant || r.grantExpires <= Date.now()) return false;
+  account_action_grant_use: (a) => {
+    const r = world.actions.find(
+      (x) =>
+        x.user === a.p_user && x.op === 'passkey_add' && x.grant === a.p_grant && x.grantExpires > Date.now(),
+    );
+    if (!r) return false;
     r.grant = null;
     return true;
   },
@@ -768,6 +757,21 @@ export async function call(path: string, o: ReqOpts = {}): Promise<Response> {
 /** Response JSON for assertions. */
 // biome-ignore lint/suspicious/noExplicitAny: test assertions read arbitrary JSON shapes
 export const read = async (r: Response): Promise<any> => r.json();
+
+/**
+ * Phase 8 (review round 4): asks for an account action link the way Settings does and returns the token from the
+ * email it sends (the only place it appears). Needs a recent sign-in in `jar`.
+ */
+export async function accountActionToken(jar: Jar, op: string, passkeyId?: string): Promise<string> {
+  const res = await call('/api/v1/me/account-actions', {
+    body: passkeyId ? { op, passkeyId } : { op },
+    jar,
+  });
+  if (res.status !== 202) throw new Error(`account action request answered ${res.status}`);
+  const m = /\/account-action#t=([A-Za-z0-9_-]{43})(?:\s|$)/.exec(world.emails.at(-1)?.text ?? '');
+  if (!m?.[1]) throw new Error('no account action link in the last email');
+  return m[1];
+}
 
 /** Narrows away null/undefined in tests, failing loudly. */
 export function must<T>(v: T | null | undefined): T {

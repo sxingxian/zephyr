@@ -14,6 +14,7 @@ import { safeReturnPath } from './lib/returnPath';
 import { SessionProvider, useSession } from './lib/session';
 import { browser, onOtherTabLibrariesChange } from './lib/sessionGuard';
 import { About } from './routes/About';
+import { AccountActionPage } from './routes/AccountAction';
 import { AccountDeleted } from './routes/AccountScheduled';
 import { AlbumsPage } from './routes/Albums';
 import { GalleriesPage } from './routes/Galleries';
@@ -167,6 +168,9 @@ export const routes: RouteObject[] = [
       { path: '/shared', element: auth(<GalleriesPage />) },
       { path: '/shared/:galleryId', element: auth(<GalleryPage />) },
       { path: '/shared/:galleryId/:tab', element: auth(<GalleryPage />) },
+      // Phase 8: the page an emailed account action link opens (passkeys, deletion). Never an ad page; it says
+      // what to do when nobody, or someone else, is signed in.
+      { path: '/account-action', element: <AccountActionPage /> },
       { path: '/account-deleted', element: <AccountDeleted /> },
       // Phase 8: a suspended account (from any call, sign-in included). No session by then.
       { path: '/suspended', element: <SuspendedPage /> },

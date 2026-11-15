@@ -18,7 +18,7 @@ export const LIBRARY_API = {
   album: (id: string) => `/api/v1/albums/${encodeURIComponent(id)}`, // GET → { ok, album } | PATCH AlbumPatchBody | DELETE → 204
   trashEmpty: '/api/v1/trash/empty', // POST {} → 200 { ok, deleted: number }
   usage: '/api/v1/me/usage', // GET → Usage
-  deleteAccount: '/api/v1/me/delete', // POST DeleteAccountBody → 200 DeleteAccountResult (signs out everywhere)
+  deleteAccount: '/api/v1/me/delete', // POST DeleteAccountBody + ACCOUNT_ACTION_HEADER → 200 DeleteAccountResult (signs out everywhere) | 403 account_action_*
   restoreAccount: '/api/v1/me/restore', // POST {} → 200 SessionResponse
 } as const;
 

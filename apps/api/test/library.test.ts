@@ -6,6 +6,7 @@ import worker from '../src/index';
 import { runCleanup } from '../src/jobs';
 import {
   APP,
+  accountActionToken,
   call,
   env,
   initKeys,
@@ -33,6 +34,7 @@ import {
   seedPhoto,
 } from './library-db';
 
+const AH = 'X-Zephyr-Account-Action';
 const MEI: User = { id: '20000000-0000-0000-0000-000000000001', email: 'mei@example.com', passkeys: 1 };
 const WEI: User = { id: '20000000-0000-0000-0000-000000000002', email: 'wei@example.com', passkeys: 1 };
 
@@ -763,20 +765,45 @@ describe('usage and account deletion', () => {
     });
   });
 
-  it('needs a recent sign-in and the typed confirmation', async () => {
+  it('asks with a recent sign-in, then needs the emailed link and the typed confirmation', async () => {
     const stale = await signedIn(MEI, 11 * 60);
-    expect((await call(LIBRARY_API.deleteAccount, { jar: stale, body: { confirm: 'DELETE' } })).status).toBe(
-      403,
-    );
+    expect(
+      (await call('/api/v1/me/account-actions', { jar: stale, body: { op: 'account_delete' } })).status,
+    ).toBe(403);
     const j = await signedIn(MEI);
-    expect((await call(LIBRARY_API.deleteAccount, { jar: j, body: { confirm: 'delete' } })).status).toBe(400);
+    const none = await call(LIBRARY_API.deleteAccount, { jar: j, body: { confirm: 'DELETE' } });
+    expect(none.status).toBe(403);
+    expect((await read(none)).error).toBe('account_action_required');
+    const token = await accountActionToken(j, 'account_delete');
+    const typo = await call(LIBRARY_API.deleteAccount, {
+      jar: j,
+      body: { confirm: 'delete' },
+      headers: { [AH]: token },
+    });
+    expect(typo.status).toBe(400);
     expect(must(db.profiles.get(MEI.id)).deletionDue).toBeNull();
+    // The typo didn't spend the link.
+    expect(
+      (
+        await call(LIBRARY_API.deleteAccount, {
+          jar: j,
+          body: { confirm: 'DELETE' },
+          headers: { [AH]: token },
+        })
+      ).status,
+    ).toBe(200);
   });
 
   it('schedules deletion, signs out everywhere, emails, gates the app, and restores', async () => {
     const j = await signedIn(MEI);
     const token = must(j.cookies.get('__Host-zs-at'));
-    const res = await call(LIBRARY_API.deleteAccount, { jar: j, body: { confirm: 'DELETE' } });
+    const link = await accountActionToken(j, 'account_delete');
+    world.emails.length = 0;
+    const res = await call(LIBRARY_API.deleteAccount, {
+      jar: j,
+      body: { confirm: 'DELETE' },
+      headers: { [AH]: link },
+    });
     expect(res.status).toBe(200);
     const body = await read(res);
     expect(Date.parse(body.purgeAt)).toBeGreaterThan(Date.now() + 29 * 86400_000);
@@ -1017,7 +1044,11 @@ describe('cached images and sign-out (MEDIUM-2)', () => {
     expect(out.status).toBe(204);
     expect(out.headers.get('Clear-Site-Data')).toBe('"cache", "storage"');
     const k = await signedIn(MEI);
-    const del = await call(LIBRARY_API.deleteAccount, { jar: k, body: { confirm: 'DELETE' } });
+    const del = await call(LIBRARY_API.deleteAccount, {
+      jar: k,
+      body: { confirm: 'DELETE' },
+      headers: { [AH]: await accountActionToken(k, 'account_delete') },
+    });
     expect(del.status).toBe(200);
     expect(del.headers.get('Clear-Site-Data')).toBe('"cache", "storage"');
   });

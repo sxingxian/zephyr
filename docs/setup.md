@@ -240,11 +240,14 @@ it on:
 6. Give both Workers the same `ADS_COOKIE_SECRET` (step 3 for the API; for the app, `cd apps/web && pnpm exec
    wrangler secret put ADS_COOKIE_SECRET`). It signs the AdSense cookie, and the app Worker widens a page's CSP only
    for a valid one. Without it on either side, AdSense never loads (the strict policy everywhere).
-7. Members who may be shown ads confirm passkey changes and account deletion with a code emailed through Resend
-   (`docs/phase-8.md`, step-up codes): check that those emails arrive before turning AdSense on.
+7. Every member adds or removes passkeys and deletes their account from a link emailed through Resend
+   (`docs/phase-8.md`, "Account changes only from an emailed link"): check that those emails arrive and that the link
+   opens `/account-action` on the app host (`APP_URL`), before launch and before turning AdSense on.
 8. **Launch gate:** in current Chrome, Safari and Firefox, check that a library page served with the AdSense policy
    (`Cross-Origin-Opener-Policy: same-origin-allow-popups`) can't read a same-origin popup it opens onto another app
    page (`same-origin`): `window.open('/settings')` from the console, then `w.document` must throw or be null.
+   Also check `/account-action`, `/settings/security`, `/settings/billing` and `/share/new` are served with
+   `same-origin`. (`noopener-allow-popups` isn't used: browsers that don't know it fall back to `unsafe-none`.)
 
 ## 4. GitHub (Settings › Environments › production)
 

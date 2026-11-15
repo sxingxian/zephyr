@@ -1,13 +1,13 @@
-import { APP_API, type Passkey, type PasskeyOptions, type SessionResponse } from '@zephyr/shared/client';
+import { ACCOUNT_ACTION_MINUTES, APP_API, type Passkey, type SessionResponse } from '@zephyr/shared/client';
 import { Button, Card, CardHead, Chip, Dialog, Field, Icon, Note, Spinner, useToast } from '@zephyr/ui';
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { DeleteAccountCard } from '../components/DeleteAccount';
 import { SettingsNav } from '../components/SettingsNav';
 import { Shell } from '../components/Shell';
-import { useStepUp } from '../components/StepUp';
+import { requestAccountAction } from '../lib/accountActions';
 import { ApiFailure, api, errorMessage } from '../lib/api';
-import { createPasskey, isCancelled, passkeysSupported } from '../lib/passkey';
+import { passkeysSupported } from '../lib/passkey';
 import { useSession } from '../lib/session';
 
 const fmt = (iso: string | null) =>
@@ -39,7 +39,7 @@ function Row({
 }
 
 export function Security() {
-  const { user, setUser, refresh, signOut } = useSession();
+  const { user, setUser, signOut } = useSession();
   const toast = useToast();
   const nav = useNavigate();
   const [passkeys, setPasskeys] = useState<Passkey[] | null>(null);
@@ -50,8 +50,8 @@ export function Security() {
   const [name, setName] = useState(user?.displayName ?? '');
   const [savingName, setSavingName] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Phase 8: while the member may be shown ads, passkey changes also need an emailed code.
-  const stepUp = useStepUp();
+  // Phase 8: passkey changes are made from a link we email (routes/AccountAction.tsx); this says it's on its way.
+  const [sent, setSent] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -67,7 +67,7 @@ export function Security() {
   }, [load]);
 
   const navigate = useNavigate();
-  /** Changing passkeys needs a recent sign-in; send the member to sign in and bring them back here. */
+  /** Asking to change passkeys needs a recent sign-in; send the member to sign in and bring them back here. */
   const reauth = (e: unknown) => {
     if (e instanceof ApiFailure && e.code === 'reauth_required') {
       toast.show(errorMessage(e), 'bad');
@@ -80,27 +80,15 @@ export function Security() {
   const add = async () => {
     setAdding(true);
     setError(null);
+    setSent(null);
     try {
-      const done = await stepUp.run('passkey_add', async (headers) => {
-        const opts = await api<PasskeyOptions>(APP_API.myPasskeyOptions, {
-          method: 'POST',
-          body: {},
-          headers,
-        });
-        const credential = await createPasskey(opts);
-        await api(APP_API.myPasskeyVerify, {
-          method: 'POST',
-          body: { challengeId: opts.challengeId, credential },
-        });
-        return true;
-      });
-      if (!done) return;
-      toast.show('Passkey added', 'good');
-      await Promise.all([load(), refresh()]);
+      await requestAccountAction('passkey_add');
+      setSent(
+        `We emailed ${user?.email ?? 'you'} a link to add a passkey. Open it on the device you want to use; it works for ${ACCOUNT_ACTION_MINUTES} minutes.`,
+      );
     } catch (e) {
       if (reauth(e)) return;
-      if (!isCancelled(e))
-        setError(e instanceof ApiFailure ? errorMessage(e) : 'Your device couldn’t save the passkey.');
+      setError(errorMessage(e));
     } finally {
       setAdding(false);
     }
@@ -122,17 +110,15 @@ export function Security() {
   const remove = async () => {
     if (!removing) return;
     const target = removing;
+    setRemoving(null);
+    setError(null);
+    setSent(null);
     try {
-      setRemoving(null);
-      const done = await stepUp.run('passkey_remove', async (headers) => {
-        await api(APP_API.myPasskey(target.id), { method: 'DELETE', headers });
-        return true;
-      });
-      if (!done) return;
-      toast.show('Passkey removed', 'good');
-      await Promise.all([load(), refresh()]);
+      await requestAccountAction('passkey_remove', target.id);
+      setSent(
+        `We emailed ${user?.email ?? 'you'} a link to remove “${target.friendlyName || 'this passkey'}”. Open it to confirm; it works for ${ACCOUNT_ACTION_MINUTES} minutes.`,
+      );
     } catch (err) {
-      setRemoving(null);
       if (reauth(err)) return;
       toast.show(errorMessage(err), 'bad');
     }
@@ -202,6 +188,11 @@ export function Security() {
             <p className="z-hint">
               Sign in with Face ID, Touch ID, Windows Hello or a security key. Nothing to type or phish.
             </p>
+            {sent && (
+              <Note tone="neutral" icon="mail" role="status">
+                {sent}
+              </Note>
+            )}
             {error && (
               <Note tone="warn" icon="alert" role="alert">
                 {error}
@@ -288,17 +279,16 @@ export function Security() {
               Keep it
             </Button>
             <Button kind="danger" onClick={remove}>
-              Remove
+              Email me a link
             </Button>
           </>
         }
       >
         <p>
           You won’t be able to sign in with <strong>{removing?.friendlyName || 'this passkey'}</strong> any
-          more. Email codes still work.
+          more. Email codes still work. To keep your account safe, we email you a link that makes the change.
         </p>
       </Dialog>
-      {stepUp.dialog}
     </Shell>
   );
 }

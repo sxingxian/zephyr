@@ -52,7 +52,7 @@ const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
 type Handler = (url: string, method: string, body: unknown) => Response | undefined;
-let calls: { url: string; method: string; body: unknown }[] = [];
+let calls: { url: string; method: string; body: unknown; headers: Headers }[] = [];
 function mockApi(handler: Handler) {
   calls = [];
   vi.stubGlobal(
@@ -60,7 +60,7 @@ function mockApi(handler: Handler) {
     vi.fn(async (url: string, init?: RequestInit) => {
       const method = init?.method ?? 'GET';
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-      calls.push({ url, method, body });
+      calls.push({ url, method, body, headers: new Headers(init?.headers) });
       const r = handler(url, method, body);
       if (r) return r;
       if (url.endsWith('/auth/session')) return json(200, { ok: true, user: USER });
@@ -251,18 +251,19 @@ describe('pending deletion', () => {
 });
 
 describe('delete account', () => {
-  it('needs DELETE typed, then signs out to the confirmation', async () => {
-    mockApi((url, method) => {
+  const TOKEN = 'D'.repeat(43);
+  it('needs DELETE typed, then emails the link (nothing is deleted from Settings)', async () => {
+    mockApi((url) => {
       if (url.endsWith('/me/passkeys')) return json(200, { passkeys: [] });
-      if (url.endsWith('/me/delete') && method === 'POST')
-        return json(200, { ok: true, purgeAt: '2026-11-27T00:00:00Z' });
+      if (url.endsWith('/me/account-actions')) return json(202, { ok: true });
       return undefined;
     });
-    const router = renderAt('/settings/security');
+    renderAt('/settings/security');
     fireEvent.click(await screen.findByRole('button', { name: 'Delete account' }));
-    const confirm = screen
-      .getAllByRole('button', { name: 'Delete account', hidden: true })
-      .at(-1) as HTMLButtonElement;
+    const confirm = screen.getByRole('button', {
+      name: 'Email me the link',
+      hidden: true,
+    }) as HTMLButtonElement;
     expect(confirm.disabled).toBe(true);
     fireEvent.change(screen.getByLabelText('Type DELETE to confirm'), { target: { value: 'delete' } });
     expect(confirm.disabled).toBe(true);
@@ -271,24 +272,25 @@ describe('delete account', () => {
     await act(async () => {
       fireEvent.click(confirm);
     });
-    await waitFor(() => expect(router.state.location.pathname).toBe('/account-deleted'));
-    expect(calls.find((c) => c.url.endsWith('/me/delete'))?.body).toEqual({ confirm: 'DELETE' });
-    expect(assigned).toEqual(['/account-deleted']);
-    expect(await screen.findByText('Your account is closed')).toBeTruthy();
+    expect(await screen.findByText('Check your email')).toBeTruthy();
+    expect(calls.find((c) => c.url.endsWith('/me/account-actions'))?.body).toEqual({ op: 'account_delete' });
+    expect(calls.some((c) => c.url.endsWith('/me/delete'))).toBe(false);
+    expect(assigned).toEqual([]);
   });
 
   it('sends a stale sign-in to sign in again and back to this dialog', async () => {
     mockApi((url) => {
       if (url.endsWith('/me/passkeys')) return json(200, { passkeys: [] });
-      if (url.endsWith('/me/delete')) return json(403, { ok: false, error: 'reauth_required' });
+      if (url.endsWith('/me/account-actions')) return json(403, { ok: false, error: 'reauth_required' });
       return undefined;
     });
     const router = renderAt('/settings/security');
     fireEvent.click(await screen.findByRole('button', { name: 'Delete account' }));
     fireEvent.change(screen.getByLabelText('Type DELETE to confirm'), { target: { value: 'DELETE' } });
-    const confirm = screen
-      .getAllByRole('button', { name: 'Delete account', hidden: true })
-      .at(-1) as HTMLButtonElement;
+    const confirm = screen.getByRole('button', {
+      name: 'Email me the link',
+      hidden: true,
+    }) as HTMLButtonElement;
     await act(async () => {
       fireEvent.click(confirm);
     });
@@ -298,6 +300,35 @@ describe('delete account', () => {
     );
     // The sign-in form shows even though there's still a session.
     expect(await screen.findByText('Sign in to Zephyr')).toBeTruthy();
+  });
+
+  it('the emailed link’s page deletes, sending the link’s token, then signs out to the confirmation', async () => {
+    mockApi((url, method) => {
+      if (url.endsWith('/me/account-actions/peek'))
+        return json(200, {
+          ok: true,
+          op: 'account_delete',
+          passkeyId: null,
+          expiresAt: '2026-11-15T12:00:00Z',
+        });
+      if (url.endsWith('/me/delete') && method === 'POST')
+        return json(200, { ok: true, purgeAt: '2026-11-27T00:00:00Z' });
+      return undefined;
+    });
+    window.history.replaceState(null, '', `/account-action#t=${TOKEN}`);
+    const router = renderAt('/account-action');
+    // The token leaves the address bar at once.
+    expect(window.location.hash).toBe('');
+    const go = await screen.findByRole('button', { name: 'Delete my account' });
+    expect(calls.find((c) => c.url.endsWith('/peek'))?.body).toEqual({ token: TOKEN });
+    await act(async () => {
+      fireEvent.click(go);
+    });
+    await waitFor(() => expect(router.state.location.pathname).toBe('/account-deleted'));
+    const del = calls.find((c) => c.url.endsWith('/me/delete'));
+    expect(del?.body).toEqual({ confirm: 'DELETE' });
+    expect(del?.headers.get('X-Zephyr-Account-Action')).toBe(TOKEN);
+    expect(assigned).toEqual(['/account-deleted']);
   });
 });
 

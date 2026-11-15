@@ -171,12 +171,17 @@ export const MEMBER8_API = {
    */
   adReset: '/api/v1/ads/reset',
   /**
-   * POST StepUpBody → 202 { ok, needed: true } (a one-time code was emailed) | 200 { ok, needed: false } (this
-   * member doesn't need one right now) | 429. Phase 8: account-level changes (adding or removing a passkey,
-   * deleting the account) by a member who may be shown AdSense need that code in STEP_UP_HEADER, as well as a
-   * recent sign-in: Google's script runs with the member's session, but can't read their email.
+   * POST AccountActionRequestBody → 202 { ok: true } | 403 reauth_required | 404 (passkey not found) | 429. Phase 8
+   * (review round 4): adding or removing a passkey and deleting the account only *start* here. The API emails the
+   * member's account address a single-use link (`/account-action#t=…`, 15 minutes); the change itself is made on
+   * that page, carrying the link's token in ACCOUNT_ACTION_HEADER. Nothing secret is in the response.
    */
-  stepUp: '/api/v1/me/step-up',
+  accountActions: '/api/v1/me/account-actions',
+  /**
+   * POST { token } → AccountActionPeek (session; the token must be for the signed-in member) | 400
+   * account_action_invalid | 403 account_action_wrong_member. Reads what a link will do without spending it.
+   */
+  accountActionPeek: '/api/v1/me/account-actions/peek',
   /** GET → image (public, immutable; the URL carries the image version) */
   adImage: (cardId: string, version: number) =>
     `/api/v1/ads/cards/${encodeURIComponent(cardId)}/image?v=${version}`,
@@ -199,22 +204,35 @@ export const ADS_DOC_COOKIE_MAX_AGE = 15 * 60;
  */
 export const ADS_SEEN_COOKIE = '__Host-zseen';
 export const ADS_SEEN_COOKIE_MAX_AGE = 30 * 24 * 60 * 60;
-/** Account-level changes that need a step-up code while the member may be shown AdSense. */
-export const STEP_UP_OPS = ['passkey_add', 'passkey_remove', 'account_delete'] as const;
-export type StepUpOp = (typeof STEP_UP_OPS)[number];
-/** Request header carrying the emailed step-up code (6 digits). */
-export const STEP_UP_HEADER = 'X-Zephyr-Step-Up';
-export const STEP_UP_CODE_LENGTH = 6;
-/** A code works once, for this long, for one operation; 5 wrong tries burn it; 5 codes per operation an hour. */
-export const STEP_UP_CODE_MINUTES = 10;
-export const STEP_UP_MAX_ATTEMPTS = 5;
-export const STEP_UP_SENDS_PER_HOUR = 5;
-export interface StepUpBody {
-  op: StepUpOp;
+/**
+ * Phase 8 (review round 4): account-level changes that only complete on a page opened from an emailed link, for
+ * every member. Google's AdSense script runs inside Free members' library pages with their session, so neither a
+ * recent sign-in nor a code typed into the app proves the member asked; a link opened from their email does, and
+ * a passkey created on that page comes from the member's own authenticator.
+ */
+export const ACCOUNT_ACTION_OPS = ['passkey_add', 'passkey_remove', 'account_delete'] as const;
+export type AccountActionOp = (typeof ACCOUNT_ACTION_OPS)[number];
+/** Request header carrying the link's token on the call that makes the change. */
+export const ACCOUNT_ACTION_HEADER = 'X-Zephyr-Account-Action';
+/** The link's token: 32 random bytes, base64url (43 characters). */
+export const ACCOUNT_ACTION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+/** A link works once, for 15 minutes, only for the member and change it was sent for. A newer link replaces it. */
+export const ACCOUNT_ACTION_MINUTES = 15;
+/** Links per member and change: 5 an hour, 10 a day (plus the per-network burst limit). */
+export const ACCOUNT_ACTION_PER_HOUR = 5;
+export const ACCOUNT_ACTION_PER_DAY = 10;
+/** The page the emailed link opens (never an ad page). */
+export const ACCOUNT_ACTION_PATH = '/account-action';
+export interface AccountActionRequestBody {
+  op: AccountActionOp;
+  /** passkey_remove only: the passkey to remove. */
+  passkeyId?: string;
 }
-export interface StepUpResult {
+export interface AccountActionPeek {
   ok: true;
-  needed: boolean;
+  op: AccountActionOp;
+  passkeyId: string | null;
+  expiresAt: string;
 }
 /** TEAM_API.member DELETE accepts ?replaceLinks=1: replaces the links of every live gallery in that library. */
 export const TEAM_REMOVE_REPLACE_LINKS_PARAM = 'replaceLinks';
