@@ -176,19 +176,27 @@ All new tables: RLS on, no grants to anon or authenticated, SECURITY DEFINER fun
 ## Ads (member app)
 
 - Free members only: the effective plan has `ads` and the library is their own. A team library never shows ads (Studio).
-- **Placements:** Library grid (after the first 24 tiles, then every 48), sidebar card, batch queue. Never in the editor, sharing, billing, settings, sign-in or guest galleries.
-- **Sponsored cards:** rendered by the app from `/api/v1/ads`, labelled "Sponsored". Links open in a new tab with `rel="noopener noreferrer sponsored"`. Impressions are sent once per card per page view when 50% visible for 1 s; clicks on activation.
+- **AdSense never goes to a member of any team library** (`ads_for_member`, mirrored in the app), even in their own library. Their session reaches every library they're in, through `X-Zephyr-Library`, and the team's owner didn't accept the risk. They still get sponsored cards.
+- **Placements:** Library grid (after the first 24 tiles, then every 48), sidebar card, batch queue. Only on the library pages listed in `apps/web/worker/adPages.js` (Library, Favourites, Albums, People, Scenes, AI queue). Never in the editor, viewer, sharing, billing, settings, sign-in or guest galleries.
+- **Sponsored cards:**
+  - Rendered by the app from `/api/v1/ads` and labelled "Sponsored". Links open in a new tab with `rel="noopener noreferrer sponsored"`.
+  - Impressions are sent once per card per page view when 50% visible for 1 s; clicks on activation.
+  - The database counts at most one impression and one click per member, card and UTC day, and only from members who are shown ads. The dedup key is HMAC(member, day, card, kind) in `ad_event_seen`, kept for two days and never joined to the stats.
 - **AdSense, only when `adsense` is present in `/api/v1/ads`:**
-  - The app loads Google's CMP (Privacy & messaging, through the AdSense tag's built-in consent message) and `adsbygoogle.js?client=<publisherId>`.
-  - It renders `<ins class="adsbygoogle">` units only in the placements above, and only on pages where they're allowed.
-  - Navigating to a page where ads aren't allowed (editor, sharing, billing, settings) unmounts the ad units. The script stays loaded for that page view. A sign-out, an account change or an upgrade to a paid plan does a full reload (already true for sign-out and account change via `sessionGuard`; add it for plan changes).
+  - The app loads `adsbygoogle.js?client=<publisherId>`, whose built-in consent message is Google's certified CMP (Privacy & messaging).
+  - It renders `<ins class="adsbygoogle">` units only in the placements above.
+  - **Once the script is loaded, a page without ads is never rendered in that document.** The route gate opens it with a full page load instead, which drops the script, and the Worker serves it with the strict CSP.
+  - A document first loaded on a page without ads (strict CSP) reloads when the member arrives on an ad page with AdSense to show, for example after signing in.
+  - The page reloads when the member the script was loaded for is gone (sign-out, an ended session, another member) or no longer gets ads. That includes an upgrade or a staff override made in this tab, another tab or another device: tabs broadcast plan changes, and a tab holding the script re-reads the session every 2 minutes and on focus.
+  - Any 401, or a session found ended, goes to sign-in with a full page load.
+  - Auto ads, anchor and vignette ads must stay off in the AdSense console (`docs/setup.md` §3.9). The code can't enforce this.
 - **CSP:**
   - The app Worker serves HTML responses (`run_worker_first: true`; static files still come from ASSETS untouched).
-  - When AdSense is enabled, it adds Google's ad and consent hosts to `script-src`, `frame-src`, `img-src` and `connect-src`. While AdSense is off, the CSP stays as strict as today.
-  - The config is read from the API with a 60-second cache.
-  - `scripts/csp.mjs` is updated to check both variants.
+  - It adds Google's ad and consent hosts to `script-src`, `frame-src`, `img-src` and `connect-src` only for documents on the ad pages, and only while AdSense is enabled. Every other document gets the strict policy. So does `/index.html`, which is served directly rather than redirected to `/`, because the service worker precaches it as the offline fallback.
+  - The config is read from the API with a 60-second cache in both Workers, and the public endpoints are rate-limited per client network.
+  - `scripts/csp.mjs` checks both variants, and that the ad pages are anchored and cover no sensitive page.
   - `/ads.txt` is served by the app Worker from the configured publisher id; it 404s when AdSense is off.
-- **Residual risk (accepted, see Decisions):** Google's script runs with the Free member's privileges for the page views where it's loaded. `docs/security.md` records this.
+- **Residual risk (accepted, see Decisions):** Google's script runs with the Free member's privileges on the library pages of the page loads where it's loaded. `docs/security.md` item 18 records this.
 
 ## Admin app (`apps/admin`)
 
@@ -206,7 +214,7 @@ New pages matching the mockups: Users, Safety, Plan limits, Ads, Storage, Retent
 - **Status banner:** read-only and maintenance notices from `/api/v1/status`, polled every 2 minutes and on `read_only_mode` errors. Write entry points are disabled while read-only.
 - **Ads:** as above.
 - **Gallery settings:** Replace link (dialog), shows the new link once.
-- **Team:** the removal dialog with "Replace the links of N galleries" (on by default when N > 0).
+- **Team:** the removal dialog with "Replace the links of N galleries" (on by default when N > 0). The API replaces every live or paused gallery's link, in chunks of 500 (`GALLERY_LINKS_REPLACE_MAX`), before removing the member. If any chunk fails, the member stays.
 - **Suspended:** `account_suspended` from any call ends the session and shows the suspended screen (sign-in too).
 - **Retention notice:** the Library shows the "moved to Trash" banner when the member's own library had a retention batch in the last 30 days (`/me` gains `retention: { trashedAt, photos, restoreBy } | null`).
 

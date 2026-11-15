@@ -1,12 +1,13 @@
 import type { AdPlacement } from '@zephyr/shared/client';
-import { useEffect, useRef } from 'react';
+import { type ReactNode, useEffect, useRef } from 'react';
 import { Link, useLocation } from 'react-router';
 import {
   type Ads,
   adsAllowedOn,
-  adsenseLoaded,
+  adsenseUser,
   clearAds,
   countImpression,
+  documentAllowsAdsense,
   hasAdsFor,
   loadAds,
   loadAdsense,
@@ -16,8 +17,10 @@ import {
   sendAdEvent,
   slotContent,
   useAdsData,
+  useAdsenseLoaded,
 } from '../../lib/ads';
-import { useActiveLibrary } from '../../lib/libraryContext';
+import { STATUS_POLL_MS } from '../../lib/appStatus';
+import { useActiveLibrary, useLibraries } from '../../lib/libraryContext';
 import { useSession } from '../../lib/session';
 import { browser } from '../../lib/sessionGuard';
 
@@ -28,45 +31,108 @@ function useAdsAccount(): boolean {
   return Boolean(user && !user.pendingDeletion && planHasAds(user.plan) && lib.self);
 }
 
+/**
+ * The ads this member may see in this document. AdSense is dropped unless the member belongs to no team library
+ * (their session reaches every library they're in; the API already leaves it out, this mirrors it) and this
+ * document was loaded on an ad page (the only documents the Worker gives the AdSense CSP).
+ */
+function useSoloLibrary(): boolean {
+  const libs = useLibraries();
+  return libs !== null && libs.length === 1;
+}
+function useVisibleAds(): Ads | null {
+  const ads = useAdsData();
+  const solo = useSoloLibrary();
+  if (!ads?.adsense) return ads;
+  return solo && documentAllowsAdsense() ? ads : { ...ads, adsense: null };
+}
+
 /** The member's ads when this page may show them, else null (unmounts every unit on other pages). */
 export function useAds(): Ads | null {
   const account = useAdsAccount();
   const { pathname } = useLocation();
-  const ads = useAdsData();
+  const ads = useVisibleAds();
   return account && adsAllowedOn(pathname) ? ads : null;
 }
 /** True when the member has ads for this placement, whatever the page (keeps grid layout stable). */
 export function useAdsReady(placement: AdPlacement): boolean {
   const account = useAdsAccount();
-  const ads = useAdsData();
+  const ads = useVisibleAds();
   return account && hasAdsFor(ads, placement);
 }
 
 /**
- * Mounted once under the session: loads ads for a Free member's own library, starts a new "page view" on each
- * navigation (impressions count again), and reloads the page when the member is no longer eligible after the
- * AdSense script was loaded (an upgrade to a paid plan), so Google's script doesn't stay in the page.
- * Sign-out, an account change and a library switch already reload (sessionGuard / switchLibrary).
+ * Mounted once under the session: loads ads for a Free member's own library and starts a new "page view" on
+ * each navigation (impressions count again). Once Google's AdSense script is in the page it reloads the page as
+ * soon as the member it was loaded for is gone (signed out, session ended, another member) or no longer gets ads
+ * (an upgrade here, in another tab or by staff, or a team library), so the script never carries over. While the
+ * script is loaded it also re-reads the session every 2 minutes and when the tab comes back, to notice a plan
+ * change made elsewhere.
  */
 export function AdsBoot() {
-  const { user } = useSession();
+  const { user, refresh } = useSession();
   const account = useAdsAccount();
+  const ads = useVisibleAds();
+  const raw = useAdsData();
+  const solo = useSoloLibrary();
+  const loaded = useAdsenseLoaded();
   const { pathname } = useLocation();
   const userId = user?.id ?? null;
   useEffect(() => {
     if (account && userId) void loadAds(userId);
     else clearAds();
   }, [account, userId]);
-  // Only while still signed in: sign-out and suspension navigate away themselves.
-  const signedIn = Boolean(user);
+  // undefined: the first session check is still in flight.
+  const known = user !== undefined;
   useEffect(() => {
-    if (signedIn && !account && adsenseLoaded()) browser.reload();
-  }, [signedIn, account]);
+    if (!loaded || !known) return;
+    if (!account || userId === null || userId !== adsenseUser()) browser.reload();
+  }, [loaded, known, account, userId]);
+  // The script was dropped from the page for any reason (AdSense turned off for this member, a team joined).
+  useEffect(() => {
+    if (loaded && ads && !ads.adsense) browser.reload();
+  }, [loaded, ads]);
+  // A plan change made elsewhere (another device, staff): re-read the session while the script is loaded.
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setInterval(() => void refresh(), STATUS_POLL_MS);
+    const vis = () => {
+      if (document.visibilityState === 'visible') void refresh();
+    };
+    document.addEventListener('visibilitychange', vis);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', vis);
+    };
+  }, [loaded, refresh]);
+  // This document was loaded on a page without ads (the strict CSP), and the member just arrived on an ad page
+  // with AdSense to show: load the page fresh, so the Worker can send the AdSense policy for it.
+  const adsenseHere = Boolean(account && solo && raw?.adsense && adsAllowedOn(pathname));
+  useEffect(() => {
+    if (!loaded && adsenseHere && !documentAllowsAdsense()) browser.reload();
+  }, [loaded, adsenseHere]);
   // biome-ignore lint/correctness/useExhaustiveDependencies: a new page view on every navigation
   useEffect(() => {
     newAdPageView();
   }, [pathname]);
   return null;
+}
+
+/**
+ * Wraps the routed pages. While Google's AdSense script is in the page, a page without ads (editor, viewer,
+ * sharing, billing, settings, sign-in…) is never rendered in this document: it's opened with a full page load
+ * instead, which drops the script, and the Worker serves it with the strict CSP.
+ */
+export function AdsRouteGate({ children }: { children: ReactNode }) {
+  const loaded = useAdsenseLoaded();
+  const loc = useLocation();
+  const leave = loaded && !adsAllowedOn(loc.pathname);
+  const to = `${loc.pathname}${loc.search}${loc.hash}`;
+  useEffect(() => {
+    if (leave) browser.assign(to);
+  }, [leave, to]);
+  if (leave) return <div className="page-loading" aria-busy="true" />;
+  return <>{children}</>;
 }
 
 /** Sends one impression per card per page view once at least half of it has been visible for a second. */

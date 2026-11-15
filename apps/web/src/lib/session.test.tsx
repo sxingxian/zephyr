@@ -110,6 +110,40 @@ describe('session end clean-up', () => {
     expect(sessionUserId()).toBeNull();
   });
 
+  it('a session found ended by a later check leaves like a 401; the first check doesn’t', async () => {
+    const onUnauthenticated = vi.fn();
+    let user: unknown = A;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) =>
+        url.endsWith('/auth/session') && user
+          ? json(200, { ok: true, user })
+          : json(401, { ok: false, error: 'unauthenticated' }),
+      ),
+    );
+    render(
+      <SessionProvider onUnauthenticated={onUnauthenticated}>
+        <Probe />
+      </SessionProvider>,
+    );
+    await waitFor(() => expect(session?.user?.id).toBe('u1'));
+    user = null;
+    await act(async () => {
+      await session?.refresh();
+    });
+    expect(session?.user).toBeNull();
+    expect(onUnauthenticated).toHaveBeenCalledTimes(1);
+    cleanup();
+    const first = vi.fn();
+    render(
+      <SessionProvider onUnauthenticated={first}>
+        <Probe />
+      </SessionProvider>,
+    );
+    await waitFor(() => expect(session?.user).toBeNull());
+    expect(first).not.toHaveBeenCalled();
+  });
+
   it('another tab signing in as someone else stops this tab and reloads it', async () => {
     mount(A);
     await waitFor(() => expect(session?.user?.id).toBe('u1'));

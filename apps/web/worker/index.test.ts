@@ -162,6 +162,43 @@ describe('app Worker · HTML pages and AdSense', () => {
     expect(wide['frame-ancestors']).toEqual(["'none'"]);
   });
 
+  it('gives the AdSense policy only to documents on ad pages; everything else (and /index.html) stays strict', async () => {
+    const e = htmlEnv({ enabled: true, publisherId: PUB });
+    const wide = appCsp([HASH], { adsense: true });
+    for (const p of ['/', '/favourites', '/albums/abc', '/people', '/scenes/beach', '/ai/queue']) {
+      const res = await worker.fetch(new Request(`https://x${p}?x=1`), e);
+      expect(res.headers.get('Content-Security-Policy'), p).toBe(wide);
+    }
+    for (const p of [
+      '/index.html',
+      '/index.html?__WB_REVISION__=abc',
+      '/settings',
+      '/settings/security',
+      '/billing',
+      '/plans',
+      '/team',
+      '/sign-in',
+      '/photo/abc',
+      '/galleries/abc',
+      '/albums/abc/edit',
+      '/suspended',
+    ]) {
+      const res = await worker.fetch(new Request(`https://x${p}`), e);
+      expect(res.headers.get('Content-Security-Policy'), p).toBe(appCsp([HASH]));
+    }
+  });
+
+  it('serves /index.html itself (never the redirect to /) with the strict policy, for the offline fallback', async () => {
+    const e = htmlEnv({ enabled: true, publisherId: PUB });
+    const res = await worker.fetch(new Request('https://x/index.html?__WB_REVISION__=abc'), e);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Security-Policy')).toBe(appCsp([HASH]));
+    expect(e.assets.mock.calls.map((c) => new URL((c[0] as Request).url).pathname)).toContain('/');
+    expect(e.assets.mock.calls.map((c) => new URL((c[0] as Request).url).pathname)).not.toContain(
+      '/index.html',
+    );
+  });
+
   it('caches the config for 60 seconds and falls back to the strict policy when the API fails', async () => {
     const on = htmlEnv({ enabled: true, publisherId: PUB });
     const t0 = 1_000_000;

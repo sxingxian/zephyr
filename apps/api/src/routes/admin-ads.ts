@@ -40,6 +40,7 @@ import {
   staffId,
   tellOwners,
 } from './admin-common';
+import { resetAdsConfigCache } from './ads';
 import { asStream, sniff } from './branding';
 
 export const AD_IMAGE = { width: 1200, height: 628, maxSourceEdge: 12000, prefix: 'ads/' } as const;
@@ -220,6 +221,7 @@ export function registerAdminAdsRoutes(router: AdminRouter, requireStaff: Requir
         p_reason: reason,
       });
       if (isDbError(out)) return dbError(c, out);
+      resetAdsConfigCache();
       if (!offOnly) await tellOwners(c, { kind: 'adsense', enabled: out?.enabled === true, changed }, reason);
       return await adsView(c);
     } catch (err) {

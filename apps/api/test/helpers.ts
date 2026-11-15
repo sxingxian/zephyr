@@ -8,6 +8,7 @@ import { resetAppStatusCache } from '../src/admin/app-status';
 import { app } from '../src/app';
 import { CODE_TIMING } from '../src/auth/code-limits';
 import type { Env } from '../src/env';
+import { resetAdsConfigCache } from '../src/routes/ads';
 import { images, imagesBinding } from './images';
 import { MockR2 } from './r2';
 
@@ -308,6 +309,7 @@ export function resetWorld() {
   aiReadLimiter.ok = true;
   aiReadLimiter.keys.length = 0;
   resetAppStatusCache();
+  resetAdsConfigCache();
   for (const l of [billingLimiter, teamInviteLimiter, adminLimiter, adsLimiter]) {
     l.ok = true;
     l.keys.length = 0;

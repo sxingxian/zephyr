@@ -345,9 +345,21 @@ select pg_temp.ok((select e ->> 'status' = 'live' from jsonb_array_elements(publ
   and public.ads_for_member(:jun) -> 'cards' -> 0 ->> 'id' = :'card' and public.ads_for_member(:jun) -> 'adsense' = 'null'::jsonb,
   'a card in its window is live for Free members');
 select pg_temp.ok(public.ads_for_member(:mei) -> 'cards' = '[]'::jsonb, 'plans without ads see none');
-select pg_temp.ok(public.ad_event(:'card', 'impression', 'library') and public.ad_event(:'card', 'click', 'library')
-  and not public.ad_event(:'card', 'impression', 'batch') and not public.ad_event(:'card', 'view', 'library'),
+select pg_temp.ok(public.ad_event(:adsu, pg_temp.h('seen-i'), :'card', 'impression', 'library')
+  and public.ad_event(:adsu, pg_temp.h('seen-c'), :'card', 'click', 'library')
+  and not public.ad_event(:adsu, pg_temp.h('seen-b'), :'card', 'impression', 'batch')
+  and not public.ad_event(:adsu, pg_temp.h('seen-v'), :'card', 'view', 'library'),
   'events count only for a live card''s placements');
+select pg_temp.ok(not public.ad_event(:adsu, pg_temp.h('seen-i'), :'card', 'impression', 'library')
+  and not public.ad_event(:adsu, pg_temp.h('seen-c'), :'card', 'click', 'library'),
+  'one impression and one click per member, card and day (the same key counts once)');
+select pg_temp.ok(not public.ad_event(:mei, pg_temp.h('seen-mei'), :'card', 'impression', 'library')
+  and not public.ad_event(:adsu, substr(pg_temp.h('short'), 1, 16), :'card', 'impression', 'library')
+  and not public.ad_event('a9000000-0000-0000-0000-0000000000ff', pg_temp.h('seen-nobody'), :'card', 'impression', 'library'),
+  'members without ads (and unknown members or malformed keys) can''t count events');
+select pg_temp.ok((select count(*) = 2 from public.ad_event_seen) and not exists (
+    select 1 from information_schema.columns where table_schema = 'public' and table_name = 'ad_event_seen' and column_name not in ('h', 'day')),
+  'the dedup table holds only keyed hashes and a day, never a member id');
 select pg_temp.ok((select e -> 'stats7d' = '{"impressions": 1, "clicks": 1}'::jsonb from jsonb_array_elements(public.admin_ads(:adm) -> 'cards') e where e ->> 'id' = :'card'),
   'seven-day stats per card');
 select pg_temp.ok(public.ad_image_key(:'card', 1) is null, 'no image key before an image is set');
@@ -366,12 +378,18 @@ select public.admin_adsense_set(:adm, '{"publisherId": "ca-pub-1234567890123456"
 select public.admin_adsense_set(:own, '{"enabled": true}', 'Risk accepted') as r \gset
 select pg_temp.ok(:'r'::jsonb ->> 'enabled' = 'true'
   and public.admin_ads(:own) -> 'adsense' ->> 'enabledBy' = 'Olivia Owner'
-  and public.ads_for_member(:jun) -> 'adsense' = '{"publisherId": "ca-pub-1234567890123456", "slots": {"library": "1234567890"}}'::jsonb
+  and public.ads_for_member(:adsu) -> 'adsense' = '{"publisherId": "ca-pub-1234567890123456", "slots": {"library": "1234567890"}}'::jsonb
   and (public.adsense_public() ->> 'enabled')::boolean, 'an Owner turns AdSense on; Free members get it');
+select pg_temp.ok(public.ads_for_member(:jun) -> 'adsense' = 'null'::jsonb and jsonb_array_length(public.ads_for_member(:jun) -> 'cards') = 1,
+  'a Free member of any team library gets sponsored cards but never AdSense');
 select pg_temp.ok((public.admin_adsense_set(:adm, '{"enabled": false}', 'Pause AdSense') -> 'adsense' ->> 'enabled')::boolean = false, 'turning it off saves at once (Admin)');
 select pg_temp.ok(exists (select 1 from public.audit_log where action = 'ads.adsense' and kind = 'ads'), 'AdSense changes are audited');
 update public.ad_cards set ends_at = now() - interval '1 second' where id = :'card';
+insert into public.ad_event_seen (h, day) values (pg_temp.h('old-day'), (now() at time zone 'utc')::date - 2),
+  (pg_temp.h('yesterday'), (now() at time zone 'utc')::date - 1);
 select public.ad_status_tick() as n \gset
+select pg_temp.ok(not exists (select 1 from public.ad_event_seen where h = pg_temp.h('old-day'))
+  and exists (select 1 from public.ad_event_seen where h = pg_temp.h('yesterday')), 'the daily tick forgets dedup keys after two days');
 select pg_temp.ok(:n = 1 and public.ads_for_member(:jun) -> 'cards' = '[]'::jsonb, 'ended cards stop showing');
 select pg_temp.ok(public.admin_ad_card_delete(:adm, :'card') ->> 'imageKey' = 'ads/' || :'card' || '/b2.jpg', 'deleting a card returns its image key for clean-up');
 
@@ -556,11 +574,11 @@ end $$;
 
 -- ---- Privileges --------------------------------------------------------------------------------------------
 select pg_temp.ok(not exists (
-  select 1 from unnest(array['safety_hold_reports', 'reveal_grants', 'limits_notices', 'ad_cards', 'ad_stats_daily', 'retention_items', 'staff_invites']) t
+  select 1 from unnest(array['safety_hold_reports', 'reveal_grants', 'limits_notices', 'ad_cards', 'ad_stats_daily', 'ad_event_seen', 'retention_items', 'staff_invites']) t
    where has_table_privilege('anon', 'public.' || t, 'select') or has_table_privilege('authenticated', 'public.' || t, 'select')
       or has_table_privilege('authenticated', 'public.' || t, 'insert')), 'anon and authenticated can''t read or write the new tables');
 select pg_temp.ok((select bool_and(c.relrowsecurity) from pg_class c where c.relnamespace = 'public'::regnamespace
-                    and c.relname in ('safety_hold_reports', 'reveal_grants', 'limits_notices', 'ad_cards', 'ad_stats_daily', 'retention_items', 'staff_invites')),
+                    and c.relname in ('safety_hold_reports', 'reveal_grants', 'limits_notices', 'ad_cards', 'ad_stats_daily', 'ad_event_seen', 'retention_items', 'staff_invites')),
   'RLS is on for every new table');
 select pg_temp.ok(not has_function_privilege('authenticated', 'public.admin_users(uuid, text, text, text, text, text)', 'execute')
   and not has_function_privilege('anon', 'public.app_status()', 'execute')
@@ -576,6 +594,22 @@ do $$ begin
     perform 1 from public.staff_invites;
     raise exception 'FAILED: authenticated read staff_invites';
   exception when insufficient_privilege then raise notice 'ok - authenticated can''t select staff_invites';
+  end;
+end $$;
+do $$ begin
+  begin
+    perform 1 from public.ad_event_seen;
+    raise exception 'FAILED: authenticated read ad_event_seen';
+  exception when insufficient_privilege then raise notice 'ok - authenticated can''t select ad_event_seen';
+  end;
+end $$;
+reset role;
+set local role anon;
+do $$ begin
+  begin
+    perform 1 from public.ad_event_seen;
+    raise exception 'FAILED: anon read ad_event_seen';
+  exception when insufficient_privilege then raise notice 'ok - anon can''t select ad_event_seen';
   end;
 end $$;
 reset role;

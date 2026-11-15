@@ -321,6 +321,16 @@ create table public.ad_stats_daily (
 );
 alter table public.ad_stats_daily enable row level security;
 
+-- One impression and one click per member, card and UTC day (review fix: events couldn't be inflated in a loop).
+-- h = HMAC(server secret, member|day|card|kind), computed by the API: no member id is stored, and rows go after
+-- two days (ad_status_tick). Never joined to the stats.
+create table public.ad_event_seen (
+  h bytea primary key check (length(h) = 32),
+  day date not null
+);
+create index ad_event_seen_day on public.ad_event_seen (day);
+alter table public.ad_event_seen enable row level security;
+
 -- ---------------------------------------------------------------------------------------------
 -- Retention
 -- ---------------------------------------------------------------------------------------------
@@ -1481,6 +1491,8 @@ $$;
 
 -- AdsResult without ok: live cards and AdSense, only when the member's effective plan has ads and the account
 -- isn't suspended. Cards carry imageVersion (the API builds imageUrl).
+-- AdSense runs with the member's privileges, which reach every library they belong to (X-Zephyr-Library), so a
+-- member of any team library never gets AdSense (the team's owner didn't accept that risk); cards are fine.
 create function public.ads_for_member(p_user uuid) returns jsonb
 language sql stable security definer set search_path = '' as $$
   with ok as (
@@ -1496,6 +1508,7 @@ language sql stable security definer set search_path = '' as $$
                                   'placements', to_jsonb(c.placements), 'weight', c.weight) order by c.created_at)
                            from public.ad_cards c where public._ad_status(c) = 'live'), '[]'::jsonb),
       'adsense', (select case when coalesce((s.adsense ->> 'enabled')::boolean, false) and s.adsense ->> 'publisherId' is not null
+                                   and not exists (select 1 from public.library_members m where m.member_id = p_user)
                               then jsonb_build_object('publisherId', s.adsense ->> 'publisherId', 'slots', coalesce(s.adsense -> 'slots', '{}'::jsonb)) end
                     from public.app_settings s where s.id = 1)) end
     from ok;
@@ -1509,14 +1522,30 @@ language sql stable security definer set search_path = '' as $$
     from public.app_settings s where s.id = 1;
 $$;
 
--- Counts an impression or click on a live card. Counts only, never who.
-create function public.ad_event(p_card uuid, p_kind text, p_placement text) returns boolean
+-- Counts an impression or click on a live card. Counts only, never who: p_user is used only to check the member
+-- is shown ads (effective plan has ads, not suspended or deleted), and p_seen (see ad_event_seen) allows one
+-- impression and one click per member, card and day. Returns false when nothing was counted.
+create function public.ad_event(p_user uuid, p_seen bytea, p_card uuid, p_kind text, p_placement text) returns boolean
 language plpgsql volatile security definer set search_path = '' as $$
+declare
+  n integer;
 begin
-  if p_kind not in ('impression', 'click') or p_placement not in ('library', 'sidebar', 'batch') then return false; end if;
+  if p_kind not in ('impression', 'click') or p_placement not in ('library', 'sidebar', 'batch')
+     or p_seen is null or length(p_seen) <> 32 then
+    return false;
+  end if;
+  if not exists (select 1 from public.profiles pr
+                   join public.plan_limits pl on pl.plan_id = pr.plan_id
+                   join public.plan_limit_versions v on v.id = pl.version_id and v.status = 'active'
+                  where pr.id = p_user and pr.deleted_at is null and pr.suspended_at is null and pl.ads) then
+    return false;
+  end if;
   if not exists (select 1 from public.ad_cards c where c.id = p_card and public._ad_status(c) = 'live' and p_placement = any (c.placements)) then
     return false;
   end if;
+  insert into public.ad_event_seen (h, day) values (p_seen, (now() at time zone 'utc')::date) on conflict (h) do nothing;
+  get diagnostics n = row_count;
+  if n = 0 then return false; end if;
   insert into public.ad_stats_daily (card_id, day, placement, impressions, clicks)
   values (p_card, (now() at time zone 'utc')::date, p_placement, (p_kind = 'impression')::integer, (p_kind = 'click')::integer)
   on conflict (card_id, day, placement) do update
@@ -1527,10 +1556,17 @@ end;
 $$;
 
 -- Cron: cards past their end date become 'ended'. Returns how many.
+-- Also forgets the event dedup keys older than yesterday (UTC).
 create function public.ad_status_tick() returns integer
-language sql volatile security definer set search_path = '' as $$
-  with u as (update public.ad_cards set status = 'ended', updated_at = now() where status = 'scheduled' and ends_at <= now() returning 1)
-  select count(*)::integer from u;
+language plpgsql volatile security definer set search_path = '' as $$
+declare
+  n integer;
+begin
+  update public.ad_cards set status = 'ended', updated_at = now() where status = 'scheduled' and ends_at <= now();
+  get diagnostics n = row_count;
+  delete from public.ad_event_seen where day < (now() at time zone 'utc')::date - 1;
+  return n;
+end;
 $$;
 
 -- ---------------------------------------------------------------------------------------------
@@ -2167,6 +2203,7 @@ $$;
 -- Team removal with ?replaceLinks=1: rotates several galleries in one transaction. p_links:
 -- [{ id, tokenHash, linkHint, ciphertext, iv }] (bytea values as '\x…' hex). Returns how many were rotated
 -- (ended or unknown galleries are skipped); a malformed entry raises invalid_parameter_value and rotates none.
+-- At most 500 per call (GALLERY_LINKS_REPLACE_MAX in packages/shared): the API pages through larger libraries.
 create function public.gallery_links_replace(p_owner uuid, p_actor uuid, p_links jsonb) returns integer
 language plpgsql volatile security definer set search_path = '' as $$
 declare
@@ -2203,6 +2240,7 @@ $$;
 -- ---------------------------------------------------------------------------------------------
 revoke all on public.safety_hold_reports, public.reveal_grants, public.limits_notices, public.ad_cards,
   public.ad_stats_daily, public.retention_items, public.staff_invites from anon, authenticated;
+revoke all on public.ad_event_seen from anon, authenticated;
 revoke execute on all functions in schema public from public, anon, authenticated;
 revoke execute on function
   public._staff_role_of(uuid), public._staff_can(uuid, text), public._staff_name(uuid), public._mask_email(text),
@@ -2261,7 +2299,7 @@ grant execute on function
   public.admin_adsense_set(uuid, jsonb, text),
   public.ads_for_member(uuid),
   public.adsense_public(),
-  public.ad_event(uuid, text, text),
+  public.ad_event(uuid, bytea, uuid, text, text),
   public.ad_status_tick(),
   public.retention_sweep(),
   public.retention_notices_due(integer),

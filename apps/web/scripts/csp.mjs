@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { AD_PAGE_PATTERNS, adsAllowedOn } from '../worker/adPages.js';
 import { ADSENSE_SOURCES, APP_HEADERS, APP_HEADERS_FILE, appCsp } from '../worker/appHeaders.js';
 import { GUEST_HEADERS } from '../worker/guestHeaders.js';
 
@@ -35,6 +36,7 @@ const hashList = [...hashes];
 const csp = appCsp(hashList);
 const adsenseCsp = appCsp(hashList, { adsense: true });
 checkPolicies(csp, adsenseCsp);
+checkAdPages();
 writeFileSync(join(dist, APP_HEADERS_FILE.slice(1)), `${JSON.stringify({ hashes: hashList })}\n`);
 
 // The guest page (served for /g/* by the Worker, which sets these same headers) replaces the app's policy.
@@ -115,6 +117,48 @@ function checkPolicies(strict, widened) {
     if (list.some((s) => !/^https:\/\/[a-z0-9.-]+$/.test(s)))
       fail('AdSense sources must be exact https hosts');
 }
+// The Worker gives the AdSense policy only to documents on these pages, and the app keeps Google's script only
+// on them. They must stay anchored, and never cover a page with secrets or member actions.
+function checkAdPages() {
+  const fail = (m) => {
+    throw new Error(`Ad pages check failed: ${m}`);
+  };
+  for (const re of AD_PAGE_PATTERNS)
+    if (!re.source.startsWith('^\\/') || !re.source.endsWith('$') || re.flags) fail(`${re} must be anchored`);
+  const sensitive = [
+    '/index.html',
+    '/sign-in',
+    '/sign-in/code',
+    '/sign-up',
+    '/join',
+    '/welcome/passkey',
+    '/settings',
+    '/settings/security',
+    '/settings/sharing',
+    '/settings/billing',
+    '/settings/team',
+    '/settings/ai',
+    '/settings/invites',
+    '/settings/about',
+    '/billing/return',
+    '/plans',
+    '/team/accept',
+    '/shared',
+    '/shared/abc',
+    '/shared/abc/settings',
+    '/photo/abc',
+    '/edit/abc',
+    '/cleanup',
+    '/trash',
+    '/you',
+    '/suspended',
+    '/account-deleted',
+    '/g/abc',
+  ];
+  for (const p of sensitive) if (adsAllowedOn(p)) fail(`${p} must not be an ad page`);
+  if (!adsAllowedOn('/')) fail('the Library must be an ad page');
+}
+
 console.log(
-  `_headers written · ${pages.length} page(s) · ${hashes.size} inline script hash(es) · CSP variants checked (default, AdSense)`,
+  `_headers written · ${pages.length} page(s) · ${hashes.size} inline script hash(es) · CSP variants and ad pages checked (default, AdSense)`,
 );

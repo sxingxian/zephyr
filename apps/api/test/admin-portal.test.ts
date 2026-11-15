@@ -4,6 +4,7 @@
  * replacement and the team's replaceLinks. The database is mocked: these tests pin the HTTP contract and which
  * functions are called with what.
  */
+
 import {
   ADMIN8_API,
   MEMBER8_API,
@@ -18,6 +19,7 @@ import { app } from '../src/app';
 import { sha256, toPgBytea } from '../src/crypto';
 import { auditCsv, csvCell } from '../src/routes/admin-audit';
 import { newRevealToken } from '../src/routes/admin-safety';
+import { resetAdsConfigCache } from '../src/routes/ads';
 import {
   accessToken,
   adminLimiter,
@@ -952,7 +954,29 @@ describe('member ads', () => {
       body: { cardId: CARD, kind: 'impression', placement: 'sidebar' },
     });
     expect(ok.status).toBe(204);
-    expect(rpcCalls('ad_event')[0]).toEqual({ p_card: CARD, p_kind: 'impression', p_placement: 'sidebar' });
+    const sent = must(rpcCalls('ad_event')[0]);
+    expect(sent).toMatchObject({
+      p_user: MEI.id,
+      p_card: CARD,
+      p_kind: 'impression',
+      p_placement: 'sidebar',
+    });
+    // A keyed hash (32 bytes) of member, day, card and kind: never the member id itself.
+    expect(sent.p_seen).toMatch(/^\\x[0-9a-f]{64}$/);
+    expect(String(sent.p_seen)).not.toContain(MEI.id.replace(/-/g, ''));
+    await call(MEMBER8_API.adEvent, {
+      jar: j,
+      body: { cardId: CARD, kind: 'impression', placement: 'library' },
+    });
+    await call(MEMBER8_API.adEvent, {
+      jar: j,
+      body: { cardId: CARD.toUpperCase(), kind: 'impression', placement: 'batch' },
+    });
+    await call(MEMBER8_API.adEvent, { jar: j, body: { cardId: CARD, kind: 'click', placement: 'library' } });
+    const keys = rpcCalls('ad_event').map((c) => c.p_seen);
+    expect(keys[1]).toBe(keys[0]);
+    expect(keys[2]).toBe(keys[0]);
+    expect(keys[3]).not.toBe(keys[0]);
     expect(
       (await call(MEMBER8_API.adEvent, { jar: j, body: { cardId: CARD, kind: 'view', placement: 'x' } }))
         .status,
@@ -987,13 +1011,29 @@ describe('public AdSense switch for the app Worker', () => {
     expect(res.headers.get('Cache-Control')).toBe('public, max-age=60');
     expect(await read(res)).toEqual({ ok: true, enabled: true, publisherId: 'ca-pub-1234567890123456' });
     world.rpc.adsense_public = () => ({ enabled: true, publisherId: 'ca-pub-123' });
+    resetAdsConfigCache();
     expect(await read(await call('/api/v1/ads/config-public'))).toEqual({
       ok: true,
       enabled: false,
       publisherId: null,
     });
     world.rpc.adsense_public = () => ({ enabled: false, publisherId: 'ca-pub-1234567890123456' });
+    resetAdsConfigCache();
     expect((await read(await call('/api/v1/ads/config-public'))).enabled).toBe(false);
+  });
+
+  it('caches the answer for 60 s in the isolate and rate-limits callers by network', async () => {
+    world.rpc.adsense_public = () => ({ enabled: true, publisherId: 'ca-pub-1234567890123456' });
+    for (let i = 0; i < 5; i++) await call('/api/v1/ads/config-public');
+    expect(rpcCalls('adsense_public')).toHaveLength(1);
+    expect(adsLimiter.keys.filter((k) => k.startsWith('adspub:'))).toHaveLength(5);
+    adsLimiter.ok = false;
+    expect((await call('/api/v1/ads/config-public')).status).toBe(429);
+    expect((await call(MEMBER8_API.adImage(CARD, 3))).status).toBe(429);
+    // The app Worker's own fetch (service binding, no client address) isn't limited.
+    expect((await call('/api/v1/ads/config-public', { headers: { 'CF-Connecting-IP': '' } })).status).toBe(
+      200,
+    );
   });
 
   it('fails closed, uncached, when the database is down', async () => {
@@ -1082,6 +1122,38 @@ describe('team removal with replaceLinks=1', () => {
     expect(new Set(links.map((l) => l.tokenHash)).size).toBe(2);
     const order = world.calls.map((c) => c.url.split('/rpc/')[1]).filter(Boolean);
     expect(order.indexOf('gallery_links_replace')).toBeLessThan(order.indexOf('team_member_remove'));
+  });
+
+  it('pages through more than 500 galleries in chunks, and removes nobody if a later chunk fails', async () => {
+    const ids = Array.from(
+      { length: 1201 },
+      (_, i) => `80000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+    );
+    world.rpc.live_gallery_ids = () => ids;
+    world.rpc.gallery_links_replace = () => 500;
+    const res = await call(`/api/v1/team/members/${JUN.id}?replaceLinks=1`, {
+      jar: await member(MEI),
+      method: 'DELETE',
+    });
+    expect(res.status).toBe(200);
+    const chunks = rpcCalls('gallery_links_replace').map((c) =>
+      (c.p_links as { id: string }[]).map((l) => l.id),
+    );
+    expect(chunks.map((c) => c.length)).toEqual([500, 500, 201]);
+    expect(chunks.flat()).toEqual(ids);
+    expect(rpcCalls('team_member_remove')).toHaveLength(1);
+
+    world.calls.length = 0;
+    let n = 0;
+    world.rpc.gallery_links_replace = () =>
+      ++n === 2 ? new Response('{"message":"boom"}', { status: 500 }) : 500;
+    const failed = await call(`/api/v1/team/members/${JUN.id}?replaceLinks=1`, {
+      jar: await member(MEI),
+      method: 'DELETE',
+    });
+    expect(failed.status).toBe(500);
+    expect(rpcCalls('gallery_links_replace')).toHaveLength(2);
+    expect(rpcCalls('team_member_remove')).toHaveLength(0);
   });
 
   it('leaves links alone without the flag, and keeps the member when replacing fails', async () => {

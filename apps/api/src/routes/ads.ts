@@ -2,16 +2,22 @@
  * Ads for Free members (docs/phase-8.md › Ads, MEMBER8_API):
  *   GET  /api/v1/ads                      session; cards live now plus the AdSense config, only when the effective
  *                                         plan has `ads` (ads_for_member) and the open library is the member's own
- *   POST /api/v1/ads/events               session; an impression or click, counted per card/day/placement only
+ *   POST /api/v1/ads/events               session; an impression or click, counted per card/day/placement only,
+ *                                         at most one of each per member, card and day, and only for members
+ *                                         who are shown ads (ad_event)
  *   GET  /api/v1/ads/cards/:id/image?v=   public, immutable (the URL carries the image version)
- *   GET  /api/v1/ads/config-public        public: { enabled, publisherId } for the app Worker (CSP, ads.txt)
- * ADS_LIMITER: 120 a minute per member on the first two. A team library never shows ads.
+ *   GET  /api/v1/ads/config-public        public: { enabled, publisherId } for the app Worker (CSP, ads.txt),
+ *                                         cached 60 s in the isolate
+ * ADS_LIMITER: 120 a minute per member on the first two, and per client network on the two public ones (the app
+ * Worker's own config fetch carries no client address and is bounded by the isolate cache). A team library never
+ * shows ads.
  */
 import { type AdPlacement, type AdsResult, adEventSchema, LIBRARY_HEADER, MEMBER8_API } from '@zephyr/shared';
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { except } from 'hono/combine';
+import { hmac, toPgBytea } from '../crypto';
 import { list } from '../env';
-import { fail, guardWrite, logError, rateLimited, readBody } from '../http';
+import { clientIp, clientNetwork, fail, guardWrite, logError, rateLimited, readBody } from '../http';
 import { stores } from '../library/objects';
 import { mediaHeaders } from '../share/media';
 import { rpc } from '../supabase';
@@ -60,8 +66,24 @@ const adsLimit: MiddlewareHandler<HonoEnv> = async (c, next) => {
     return rateLimited(c, 60);
   await next();
 };
-// The image and the public AdSense switch need no session (no limiter); everything else needs a member.
+/** Public endpoints: per client network. Requests with no client address come from the app Worker itself. */
+const publicLimit: MiddlewareHandler<HonoEnv> = async (c, next) => {
+  if (clientIp(c) && !(await c.env.ADS_LIMITER.limit({ key: `adspub:${clientNetwork(c)}` })).success)
+    return rateLimited(c, 60);
+  await next();
+};
+// The image and the public AdSense switch need no session; everything else needs a member.
 adsRoutes.use('*', except(isPublic, json, requireMember, adsLimit));
+adsRoutes.use('*', async (c, next) => (isPublic(c) ? publicLimit(c, next) : next()));
+
+// ---------------------------------------------------------------- public config cache (per isolate)
+export const ADS_CONFIG_TTL_MS = 60_000;
+const ADS_CONFIG_FAIL_TTL_MS = 10_000;
+let configCache: { at: number; ttl: number; value: AdsPublicConfig; ok: boolean } | null = null;
+/** Forget the cached public config (after an AdSense change in this isolate, and in tests). */
+export function resetAdsConfigCache(): void {
+  configCache = null;
+}
 
 /**
  * For the app Worker (service binding): whether to serve the AdSense CSP variant and ads.txt. Public data only:
@@ -69,21 +91,22 @@ adsRoutes.use('*', except(isPublic, json, requireMember, adsLimit));
  */
 adsRoutes.get('/config-public', async (c) => {
   const headers = { 'Cache-Control': 'public, max-age=60' };
+  const now = Date.now();
+  if (configCache && now - configCache.at < configCache.ttl)
+    return c.json(configCache.value, 200, configCache.ok ? headers : { 'Cache-Control': 'no-store' });
   try {
     const cfg = await rpc<{ enabled?: unknown; publisherId?: unknown } | null>(c.env, 'adsense_public', {});
     const id =
       typeof cfg?.publisherId === 'string' && PUBLISHER_ID.test(cfg.publisherId) ? cfg.publisherId : null;
     const enabled = cfg?.enabled === true && id !== null;
-    return c.json(
-      { ok: true, enabled, publisherId: enabled ? id : null } satisfies AdsPublicConfig,
-      200,
-      headers,
-    );
+    const value: AdsPublicConfig = { ok: true, enabled, publisherId: enabled ? id : null };
+    configCache = { at: now, ttl: ADS_CONFIG_TTL_MS, value, ok: true };
+    return c.json(value, 200, headers);
   } catch (err) {
     logError(c.get('requestId'), 'adsense_public', err);
-    return c.json({ ok: true, enabled: false, publisherId: null } satisfies AdsPublicConfig, 200, {
-      'Cache-Control': 'no-store',
-    });
+    const value: AdsPublicConfig = { ok: true, enabled: false, publisherId: null };
+    configCache = { at: now, ttl: ADS_CONFIG_FAIL_TTL_MS, value, ok: false };
+    return c.json(value, 200, { 'Cache-Control': 'no-store' });
   }
 });
 
@@ -109,11 +132,24 @@ adsRoutes.get('/', async (c) => {
 adsRoutes.post('/events', async (c) => {
   const body = await readBody(c, adEventSchema);
   if (!body) return c.json(fail('invalid'), 400);
-  // Nothing about the member is sent: the database counts per card, day and placement, and ignores cards that
-  // aren't live. Team libraries never show ads, so their events aren't counted.
+  // The database counts per card, day and placement only, and ignores cards that aren't live. The member id is
+  // passed only to check they're shown ads; `p_seen` (a keyed hash of member, UTC day, card and kind) lets each
+  // member count one impression and one click per card a day, without storing who. Team libraries never show
+  // ads, so their events aren't counted.
   if (!ownLibrary(c)) return c.body(null, 204);
   try {
-    await rpc(c.env, 'ad_event', { p_card: body.cardId, p_kind: body.kind, p_placement: body.placement });
+    const userId = c.get('session').userId;
+    const day = new Date().toISOString().slice(0, 10);
+    const seen = toPgBytea(
+      await hmac(`ad:${userId}|${day}|${body.cardId.toLowerCase()}|${body.kind}`, c.env.IP_HASH_SECRET),
+    );
+    await rpc(c.env, 'ad_event', {
+      p_user: userId,
+      p_seen: seen,
+      p_card: body.cardId,
+      p_kind: body.kind,
+      p_placement: body.placement,
+    });
   } catch (err) {
     logError(c.get('requestId'), 'ad_event', err);
   }

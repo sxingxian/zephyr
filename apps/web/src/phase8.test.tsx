@@ -447,25 +447,91 @@ describe('AdSense', () => {
       await act(() => router.navigate(path));
       await waitFor(() => expect(document.querySelector('ins.adsbygoogle, [data-ad-card]')).toBeNull());
     }
+    // Only sponsored cards here (Google's script never loaded): no full page loads needed.
+    expect(assign).not.toHaveBeenCalled();
     await act(() => router.navigate('/'));
     await waitFor(() => expect(document.querySelector('ins.adsbygoogle, [data-ad-card]')).not.toBeNull());
   });
 
-  it('reloads the page after an upgrade once Google’s script was loaded', async () => {
+  it('never renders a page without ads in a document holding Google’s script: a full page load instead', async () => {
     const SID = 'cs_test_abcdefghij1234';
-    mockApi((url) => {
-      if (url === '/api/v1/ads') return adsResponse(config, []);
-      if (url === `/api/v1/billing/checkout/${SID}`)
-        return json(200, { ok: true, state: 'done', plan: 'pro' });
-      return undefined;
-    });
+    mockApi((url) => (url === '/api/v1/ads' ? adsResponse(config, []) : undefined));
     const router = renderAt('/');
     await waitFor(() => expect(adsenseScript()).not.toBeNull());
+    calls = [];
+    await act(() => router.navigate(`/billing/return?session_id=${SID}#x`));
+    await waitFor(() => expect(assign).toHaveBeenCalledWith(`/billing/return?session_id=${SID}#x`));
+    // The page never mounted, so it asked the API for nothing.
+    expect(calls.some((c) => c.url.includes('/billing/'))).toBe(false);
+    expect(screen.queryByRole('heading', { name: /payment|billing/i })).toBeNull();
+  });
+
+  it('reloads once Google’s script was loaded and the plan changes elsewhere (tab focus, another tab)', async () => {
+    mockApi((url) => (url === '/api/v1/ads' ? adsResponse(config, []) : undefined));
+    renderAt('/');
+    await waitFor(() => expect(adsenseScript()).not.toBeNull());
     expect(reload).not.toHaveBeenCalled();
-    // Back from Stripe: the payment is confirmed and the session now says Pro.
+    // Upgraded on another device: the tab comes back into view and re-reads the session.
     currentUser = user('pro');
-    await act(() => router.navigate(`/billing/return?session_id=${SID}`));
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
     await waitFor(() => expect(reload).toHaveBeenCalled());
+  });
+
+  it('re-reads the session when another tab reports a plan change', async () => {
+    mockApi((url) => (url === '/api/v1/ads' ? adsResponse(config, []) : undefined));
+    renderAt('/');
+    await waitFor(() => expect(adsenseScript()).not.toBeNull());
+    const before = calls.filter((c) => c.url.endsWith('/auth/session')).length;
+    currentUser = user('pro');
+    const other = new BroadcastChannel('zephyr-session');
+    other.postMessage({ type: 'plan-changed', id: ME });
+    await waitFor(() =>
+      expect(calls.filter((c) => c.url.endsWith('/auth/session')).length).toBeGreaterThan(before),
+    );
+    await waitFor(() => expect(reload).toHaveBeenCalled());
+    other.close();
+  });
+
+  it('a session that ends while Google’s script is loaded leaves with a full page load to sign-in', async () => {
+    mockApi((url) => {
+      if (url === '/api/v1/ads') return adsResponse(config, []);
+      if (url.startsWith('/api/v1/photos?')) return json(401, { ok: false, error: 'unauthenticated' });
+      return undefined;
+    });
+    renderAt('/favourites');
+    await waitFor(() => expect(assign).toHaveBeenCalledWith('/sign-in?next=%2Ffavourites'));
+  });
+
+  it('reloads when the member the script was loaded for is replaced', async () => {
+    mockApi((url) => (url === '/api/v1/ads' ? adsResponse(config, []) : undefined));
+    renderAt('/');
+    await waitFor(() => expect(adsenseScript()).not.toBeNull());
+    expect(reload).not.toHaveBeenCalled();
+    const other = '33333333-3333-4333-8333-333333333333';
+    currentUser = { ...user('free'), id: other };
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => expect(reload).toHaveBeenCalled());
+  });
+
+  it('never for a member of any team library, even in their own library (cards still show)', async () => {
+    mockApi((url) => (url === '/api/v1/ads' ? adsResponse(config) : undefined), [OWN, TEAM_LIB]);
+    renderAt('/');
+    expect(await screen.findAllByRole('complementary', { name: 'Sponsored' })).not.toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(adsenseScript()).toBeNull();
+    expect(document.querySelector('ins.adsbygoogle')).toBeNull();
+  });
+
+  it('a document first loaded on a page without ads reloads on arriving at an ad page, instead of loading the script', async () => {
+    __resetAdsForTest('/settings/security');
+    mockApi((url) => (url === '/api/v1/ads' ? adsResponse(config, []) : undefined));
+    renderAt('/');
+    await waitFor(() => expect(reload).toHaveBeenCalled());
+    expect(adsenseScript()).toBeNull();
   });
 });
 

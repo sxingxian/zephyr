@@ -7,8 +7,11 @@
  *   files      → static files (anything with an extension but .html) come straight from ASSETS, untouched,
  *                with their headers from dist/_headers;
  *   HTML       → phase 8: the PWA's pages (index.html, the SPA fallback) get the app's security headers here,
- *                with the AdSense CSP variant only while the API says AdSense is on (cached 60 s).
+ *                with the AdSense CSP variant only for documents on ad pages (worker/adPages.js) and only while
+ *                the API says AdSense is on (cached 60 s). Every other document, and /index.html itself (the
+ *                service worker's precached offline fallback), always gets the strict policy.
  */
+import { adsAllowedOn } from './adPages.js';
 import { APP_HEADERS, APP_HEADERS_FILE, appCsp } from './appHeaders.js';
 import { GUEST_HEADERS } from './guestHeaders.js';
 
@@ -138,16 +141,38 @@ export async function serveAdsTxt(request: Request, env: Pick<Env, 'API'>): Prom
   return new Response(request.method === 'HEAD' ? null : line, { status: 200, headers });
 }
 
+/**
+ * Whether a document at this path may get the AdSense policy: only the ad pages. `/index.html` (any query) is
+ * never one: the service worker precaches it as the offline fallback for every page, so it must stay strict.
+ */
+export function adsenseDocument(pathname: string): boolean {
+  return pathname !== '/index.html' && adsAllowedOn(pathname);
+}
+
+/**
+ * The app shell at /index.html, always with the strict policy. Served directly (ASSETS would redirect it to
+ * `/`, an ad page, and the service worker would then precache the AdSense policy as its offline fallback).
+ */
+export async function serveShell(request: Request, env: Env): Promise<Response> {
+  const shell = new Request(new URL('/', request.url), { method: request.method, headers: request.headers });
+  return serveHtml(shell, env, { adPage: false });
+}
+
 /** An HTML page from ASSETS, re-sent with the app's headers and the CSP variant AdSense calls for. */
-export async function serveHtml(request: Request, env: Env): Promise<Response> {
+export async function serveHtml(request: Request, env: Env, o: { adPage?: boolean } = {}): Promise<Response> {
   const res = await env.ASSETS.fetch(request);
   const type = res.headers.get('content-type') ?? '';
   if (!type.toLowerCase().includes('text/html')) return res;
-  const origin = new URL(request.url).origin;
-  const [state, list] = await Promise.all([adsenseState(env, origin), scriptHashes(env, origin)]);
+  const url = new URL(request.url);
+  const origin = url.origin;
+  const adPage = o.adPage ?? adsenseDocument(url.pathname);
+  const [state, list] = await Promise.all([
+    adPage ? adsenseState(env, origin) : Promise.resolve(OFF),
+    scriptHashes(env, origin),
+  ]);
   const headers = new Headers(res.headers);
   for (const [k, v] of Object.entries(APP_HEADERS)) headers.set(k, v);
-  headers.set('Content-Security-Policy', appCsp(list, { adsense: state.enabled }));
+  headers.set('Content-Security-Policy', appCsp(list, { adsense: adPage && state.enabled }));
   headers.set('Cache-Control', 'no-cache');
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
@@ -160,6 +185,7 @@ export default {
     if (pathname === '/ads.txt') return serveAdsTxt(request, env);
     if (pathname === APP_HEADERS_FILE || isStaticFile(pathname)) return env.ASSETS.fetch(request);
     if (request.method !== 'GET' && request.method !== 'HEAD') return env.ASSETS.fetch(request);
+    if (pathname === '/index.html') return serveShell(request, env);
     return serveHtml(request, env);
   },
 } satisfies ExportedHandler<Env>;

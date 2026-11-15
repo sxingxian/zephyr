@@ -56,15 +56,28 @@ export function endSession(reason: EndReason, server: boolean, waitMs = 3000): P
 }
 
 /** Full page load: drops every bit of in-memory state (photo data, queues, caches) for good. */
+let leaving = false;
 export const browser = {
   assign(path: string): void {
+    leaving = true;
     window.location.assign(path);
   },
-  /** Reloads the current page (phase 8: drops a loaded AdSense script after a plan upgrade). */
+  /**
+   * Reloads the current page (phase 8: drops a loaded AdSense script after a plan or account change). Skipped
+   * when a full navigation is already under way, so it can't cancel that navigation.
+   */
   reload(): void {
+    if (leaving) return;
+    leaving = true;
     window.location.reload();
   },
 };
+/** True once a full page load has been started (nothing else should navigate). */
+export const isLeaving = (): boolean => leaving;
+/** Test helper. */
+export function __resetLeavingForTest(): void {
+  leaving = false;
+}
 
 // ------------------------------------------------------------ other tabs
 // The session cookie is shared by every tab. When another tab signs out or signs in as someone else, this
@@ -88,6 +101,26 @@ function announce(id: string | null) {
   } catch {
     // Best effort.
   }
+}
+
+/** Phase 8: this tab saw the member's plan change (upgrade, downgrade, staff override): other tabs re-read it. */
+export function announcePlanChange(): void {
+  try {
+    getChannel()?.postMessage({ type: 'plan-changed', id: currentId });
+  } catch {
+    // Best effort.
+  }
+}
+/** Calls `fn` when another tab reports a plan change for the member signed in here. */
+export function onOtherTabPlanChange(fn: () => void): () => void {
+  const ch = getChannel();
+  if (!ch) return () => {};
+  const h = (e: MessageEvent) => {
+    const d = e.data as { type?: unknown; id?: unknown } | null;
+    if (d?.type === 'plan-changed' && currentId !== null && d.id === currentId) fn();
+  };
+  ch.addEventListener('message', h);
+  return () => ch.removeEventListener('message', h);
 }
 
 /** Calls `fn` when another tab reports a different signed-in member (or none) than this tab has. */

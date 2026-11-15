@@ -12,6 +12,7 @@
  * library, so an Editor can never manage the team they belong to. The database checks seats under a lock.
  */
 import {
+  GALLERY_LINKS_REPLACE_MAX,
   type LibrariesResult,
   type LibrarySummary,
   TEAM_REMOVE_REPLACE_LINKS_PARAM,
@@ -334,24 +335,25 @@ teamRoutes.patch('/members/:memberId', async (c) => {
 });
 
 /**
- * Phase 8: `?replaceLinks=1` also replaces the link of every live gallery in the library (the removed member may
- * have copied them). The links are replaced first, in one transaction (`gallery_links_replace`), so a failure
- * leaves the member in place to retry; a removal that then fails has only cost the old links.
+ * Phase 8: `?replaceLinks=1` also replaces the link of every live or paused gallery in the library (the removed
+ * member may have copied them). All of them, in chunks of GALLERY_LINKS_REPLACE_MAX (one transaction each,
+ * `gallery_links_replace`), before the removal: if any chunk fails the member stays in place to retry (the chunks
+ * already done have only cost their old links). Nothing is ever skipped silently.
  */
 async function replaceLiveLinks(c: Ctx) {
   const owner = self(c);
   const ids = (await rpc<string[] | null>(c.env, 'live_gallery_ids', { p_owner: owner })) ?? [];
-  if (!ids.length) return;
-  const links = await Promise.all(
-    ids.slice(0, REPLACE_LINKS_MAX).map(async (id) => {
-      const { token, hash } = await newGalleryToken();
-      const link = await encryptLink(c.env, id, token);
-      return { id, tokenHash: hash, linkHint: token.slice(0, 8), ciphertext: link.ciphertext, iv: link.iv };
-    }),
-  );
-  await rpc(c.env, 'gallery_links_replace', { p_owner: owner, p_actor: owner, p_links: links });
+  for (let at = 0; at < ids.length; at += GALLERY_LINKS_REPLACE_MAX) {
+    const links = await Promise.all(
+      ids.slice(at, at + GALLERY_LINKS_REPLACE_MAX).map(async (id) => {
+        const { token, hash } = await newGalleryToken();
+        const link = await encryptLink(c.env, id, token);
+        return { id, tokenHash: hash, linkHint: token.slice(0, 8), ciphertext: link.ciphertext, iv: link.iv };
+      }),
+    );
+    await rpc(c.env, 'gallery_links_replace', { p_owner: owner, p_actor: owner, p_links: links });
+  }
 }
-const REPLACE_LINKS_MAX = 1000;
 
 teamRoutes.delete('/members/:memberId', async (c) => {
   const member = (c.req.param('memberId') ?? '').toLowerCase();
