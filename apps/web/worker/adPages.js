@@ -17,3 +17,15 @@ export const AD_PAGE_PATTERNS = Object.freeze([
 export function adsAllowedOn(pathname) {
   return typeof pathname === 'string' && AD_PAGE_PATTERNS.some((re) => re.test(pathname));
 }
+
+/**
+ * The AdSense cookie (packages/shared ADS_DOC_COOKIE): set by the API's GET /api/v1/ads only for a member shown
+ * AdSense (HttpOnly, 15 minutes). The Worker widens a document's CSP only when the request carries it.
+ */
+export const ADS_DOC_COOKIE = '__Host-zads';
+/**
+ * Server-Timing entry the Worker adds to a document it served with the AdSense CSP. The app reads it from its own
+ * navigation entry (`performance.getEntriesByType('navigation')[0].serverTiming`) to know whether Google's script
+ * may load in this document.
+ */
+export const ADS_DOC_TIMING = 'zads';

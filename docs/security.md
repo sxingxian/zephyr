@@ -192,26 +192,43 @@
       can read what a Free member sees (their private photos, file names) and act as them. httpOnly cookies and CSP
       cannot stop that. **The Owner accepted this risk on 15 November 2026** after professional advice against it.
     - **Mitigations:**
-      - Free members, in their own library, only, and never a member of any team library. Their session reaches
-        every library they belong to, and the team's owner didn't accept the risk. They still get sponsored cards.
+      - Free members, in their own library, only. Never a member of any team library, nor a member whose own
+        library still has teammates (a lapsed Studio owner): their session reaches every library they're in, and
+        those teams didn't accept the risk. They still get sponsored cards.
       - Only on the Library grid, sidebar and batch queue, on the library pages (`apps/web/worker/adPages.js`).
       - Once the script is loaded, every other page (editor, viewer, sharing, billing, settings, sign-in) opens
         with a full page load, so the script is never in a document showing those pages.
-      - The app Worker widens the CSP for Google's hosts only for documents on the library pages, and only while
-        AdSense is on. Every other document, and the service worker's offline fallback (`/index.html`), gets the
-        strict policy. `scripts/csp.mjs` checks both variants and that the ad pages stay narrow.
+      - **Nothing secret is ever shown in a document holding the script.** A new gallery's link and passcode,
+        copy buttons and anything shown once render nothing there (`NoAdsSurface`). Share from a library page
+        hands the selection to `/share/new`, a page without ads opened with a full page load, and the create
+        flow runs there.
+      - The app Worker widens the CSP for Google's hosts only for documents on the library pages, only while
+        AdSense is on, and only for requests carrying the AdSense cookie (`__Host-zads`). The API sets that
+        HttpOnly, SameSite=Strict cookie for 15 minutes only when it shows the member AdSense, and clears it
+        otherwise and on sign-out. Every other document, including `/index.html`, gets the strict policy.
+        `scripts/csp.mjs` checks both variants and that the ad pages stay narrow.
       - The page reloads when the member the script was loaded for is gone (sign-out, an ended session, another
-        member) or loses ads. That includes an upgrade in this tab, another tab, another device or by staff. Tabs
-        tell each other about plan changes, and a tab holding the script re-reads the session every 2 minutes
-        and on focus.
+        member) or loses ads. That includes an upgrade or a team joined in this tab, another tab, another device
+        or by staff. Tabs tell each other about plan and team changes. A tab holding the script re-reads the
+        session, the member's libraries and their ads every 2 minutes and on focus.
+      - **Nothing the script writes can outlive it.** The service worker serves nothing from Cache Storage: no
+        precache, and the offline page is built into `sw.js`. Scripts, styles and WebAssembly come from the HTTP
+        cache, which page script can't write. `scripts/csp.mjs` fails the build if `sw.js` reads a cache.
+        Sign-out, account deletion and every reload off the script answer `Clear-Site-Data: "cache",
+        "storage"`, which wipes Cache Storage, local and session storage, IndexedDB and the service worker.
+        Values the app reads back from storage are validated, never used as markup, script or a navigation
+        target as they are.
+      - App pages are sent `no-store`, and a page restored from the back/forward cache reloads.
       - Google's certified consent message runs for the EEA, UK and Switzerland. Auto ads and other formats that
         Google places itself stay off in the AdSense console (`docs/setup.md` §3.9).
-      - AdSense stays off until an Owner turns it on with a recent passkey. Turning it off applies to page loads
-        within 60 seconds and needs no passkey.
-
-    - **Ad events** count at most one impression and one click per member, card and day. Only members who are
-      shown ads can send them. The dedup key is a keyed hash kept for two days, never the member id.
-    - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
-      Turnstile.
+      - AdSense stays off until an Owner turns it on with a recent passkey. Turning it off needs no passkey and
+        reaches new page loads within 75 seconds (15 s API cache plus the app Worker's 60 s). Members stop
+        loading the script at once, because `/api/v1/ads` isn't cached. - **Residual risk (accepted):** while a Free member is on a library page with the script loaded, Google's
+        script can read that page and act as the member through the API. Persistence through the origin's
+        caches and storage, and exposure on any other page, are closed. - **Ad events** count at most one impression and one click per member, card and day. Only members who are
+        shown ads can send them. The dedup key is pseudonymous, not anonymous: an HMAC of member, day, card and
+        kind under its own secret (`AD_DEDUP_SECRET`). Whoever holds that secret and the database could recompute
+        it for a given member, so it's kept for two days and never joined to the stats. - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
+        Turnstile.
 
 See the design decisions doc and `docs/phase-8.md` for the details.

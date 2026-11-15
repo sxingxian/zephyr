@@ -22,6 +22,9 @@ export function safeReturnPath(
     return '/';
   }
   if (url.origin !== origin) return '/';
+  // A path that resolves to `//host…` (e.g. `/.//evil.com`) would read as protocol-relative wherever it's used
+  // as a URL later.
+  if (url.pathname.startsWith('//')) return '/';
   if (AUTH_PATHS.some((p) => url.pathname === p || url.pathname.startsWith(`${p}/`))) return '/';
   if (url.pathname.startsWith('/api')) return '/';
   return `${url.pathname}${url.search}${url.hash}`;

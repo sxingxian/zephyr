@@ -2,6 +2,7 @@ import type { GallerySummary } from '@zephyr/shared/client';
 import { Button, Chip, type ChipTone, Icon, type IconName, useToast } from '@zephyr/ui';
 import type { ReactNode } from 'react';
 import { expiryLabel } from '../../lib/share';
+import { useSecretsAllowed } from '../ads/NoAdsSurface';
 
 /** Copies text to the clipboard; falls back to a hidden textarea where the async API isn't allowed. */
 export async function copyText(text: string): Promise<boolean> {
@@ -31,6 +32,8 @@ export async function copyText(text: string): Promise<boolean> {
 
 export function CopyButton({ text, label = 'Copy', what }: { text: string; label?: string; what: string }) {
   const toast = useToast();
+  // Phase 8: what's copied is a secret (a link, a passcode): never in a document holding Google's AdSense script.
+  if (!useSecretsAllowed()) return null;
   return (
     <Button
       size="sm"
@@ -64,6 +67,8 @@ export function PasscodeDigits({ code }: { code: string }) {
 
 /** Passcode shown once, with copy and the advice to send it separately. */
 export function PasscodeReveal({ code }: { code: string }) {
+  // Phase 8: never in a document holding Google's AdSense script.
+  if (!useSecretsAllowed()) return null;
   return (
     <div className="sh-field">
       <span className="sh-label">Passcode</span>

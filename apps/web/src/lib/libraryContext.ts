@@ -10,7 +10,7 @@ import {
 import { useEffect, useSyncExternalStore } from 'react';
 import { api } from './api';
 import { isAppReadOnly, useAppReadOnly } from './appStatus';
-import { browser, endSession, onSessionEnd, sessionUserId } from './sessionGuard';
+import { announceLibrariesChange, browser, endSession, onSessionEnd, sessionUserId } from './sessionGuard';
 
 /**
  * Phase 7: which library this tab works in (the member's own, or a Studio team library they belong to).
@@ -111,10 +111,11 @@ export function refreshLibraries(): Promise<void> {
     });
   return inflight;
 }
-/** Replace the list after a team change (accepting an invite, leaving a team). */
+/** Replace the list after a team change (accepting an invite, leaving a team). Other tabs re-read theirs. */
 export function setLibraries(next: LibrarySummary[]): void {
   list = next;
   emit();
+  announceLibrariesChange();
 }
 export function getLibraries(): LibrarySummary[] | null {
   return list;

@@ -13,6 +13,7 @@
  * 30 idle minutes.
  */
 
+import { ADS_DOC_COOKIE } from '@zephyr/shared';
 import type { Context, MiddlewareHandler } from 'hono';
 import { getCookie } from 'hono/cookie';
 import { createRemoteJWKSet, type JWTPayload, jwtVerify } from 'jose';
@@ -82,6 +83,8 @@ export function clearCookies(realm: Realm): string[] {
   const r = REALMS[realm];
   const out = [cookie(r.at, '', r.path, r.sameSite, 0), cookie(r.rt, '', r.path, r.sameSite, 0)];
   if (realm === 'admin') out.push(cookie(ADMIN_SEEN_COOKIE, '', r.path, r.sameSite, 0));
+  // Phase 8: the AdSense cookie goes with the member's session (the next document gets the strict CSP).
+  if (realm === 'app') out.push(cookie(ADS_DOC_COOKIE, '', '/', 'Strict', 0));
   return out;
 }
 

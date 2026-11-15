@@ -1563,7 +1563,8 @@ $$;
 -- AdsResult without ok: live cards and AdSense, only when the member's effective plan has ads and the account
 -- isn't suspended. Cards carry imageVersion (the API builds imageUrl).
 -- AdSense runs with the member's privileges, which reach every library they belong to (X-Zephyr-Library), so a
--- member of any team library never gets AdSense (the team's owner didn't accept that risk); cards are fine.
+-- member of any team library never gets AdSense (the team's owner didn't accept that risk); cards are fine. Nor
+-- does a member whose own library still has teammates (a lapsed Studio owner): their uploads would be in reach.
 create function public.ads_for_member(p_user uuid) returns jsonb
 language sql stable security definer set search_path = '' as $$
   with ok as (
@@ -1579,7 +1580,8 @@ language sql stable security definer set search_path = '' as $$
                                   'placements', to_jsonb(c.placements), 'weight', c.weight) order by c.created_at)
                            from public.ad_cards c where public._ad_status(c) = 'live'), '[]'::jsonb),
       'adsense', (select case when coalesce((s.adsense ->> 'enabled')::boolean, false) and s.adsense ->> 'publisherId' is not null
-                                   and not exists (select 1 from public.library_members m where m.member_id = p_user)
+                                   and not exists (select 1 from public.library_members m
+                                                    where m.member_id = p_user or m.owner_id = p_user)
                               then jsonb_build_object('publisherId', s.adsense ->> 'publisherId', 'slots', coalesce(s.adsense -> 'slots', '{}'::jsonb)) end
                     from public.app_settings s where s.id = 1)) end
     from ok;

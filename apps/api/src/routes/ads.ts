@@ -5,14 +5,26 @@
  *   POST /api/v1/ads/events               session; an impression or click, counted per card/day/placement only,
  *                                         at most one of each per member, card and day, and only for members
  *                                         who are shown ads (ad_event)
+ *   POST /api/v1/ads/reset                no session, same-origin only: Clear-Site-Data "cache", "storage" and the
+ *                                         AdSense cookie cleared (before the app reloads off Google's script)
  *   GET  /api/v1/ads/cards/:id/image?v=   public, immutable (the URL carries the image version)
  *   GET  /api/v1/ads/config-public        public: { enabled, publisherId } for the app Worker (CSP, ads.txt),
- *                                         cached 60 s in the isolate
- * ADS_LIMITER: 120 a minute per member on the first two, and per client network on the two public ones (the app
+ *                                         cached 15 s in the isolate (the Worker caches it 60 s more)
+ * GET /ads also sets the AdSense cookie (ADS_DOC_COOKIE) when AdSense is returned and clears it otherwise: the app
+ * Worker widens the CSP only for documents whose request carries it.
+ * ADS_LIMITER: 120 a minute per member on the first two, and per client network on the public ones (the app
  * Worker's own config fetch carries no client address and is bounded by the isolate cache). A team library never
  * shows ads.
  */
-import { type AdPlacement, type AdsResult, adEventSchema, LIBRARY_HEADER, MEMBER8_API } from '@zephyr/shared';
+import {
+  ADS_DOC_COOKIE,
+  ADS_DOC_COOKIE_MAX_AGE,
+  type AdPlacement,
+  type AdsResult,
+  adEventSchema,
+  LIBRARY_HEADER,
+  MEMBER8_API,
+} from '@zephyr/shared';
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { except } from 'hono/combine';
 import { hmac, toPgBytea } from '../crypto';
@@ -58,7 +70,8 @@ const ownLibrary = (c: Ctx) => {
 
 const isImage = (c: Ctx) => c.req.method === 'GET' && /\/cards\/[^/]+\/image$/.test(c.req.path);
 const isPublicConfig = (c: Ctx) => c.req.method === 'GET' && c.req.path.endsWith('/ads/config-public');
-const isPublic = (c: Ctx) => isImage(c) || isPublicConfig(c);
+const isReset = (c: Ctx) => c.req.method === 'POST' && c.req.path.endsWith('/ads/reset');
+const isPublic = (c: Ctx) => isImage(c) || isPublicConfig(c) || isReset(c);
 const PUBLISHER_ID = /^ca-pub-\d{16}$/;
 const json = guardWrite((env) => list(env.APP_ORIGINS), 1024);
 const adsLimit: MiddlewareHandler<HonoEnv> = async (c, next) => {
@@ -72,12 +85,32 @@ const publicLimit: MiddlewareHandler<HonoEnv> = async (c, next) => {
     return rateLimited(c, 60);
   await next();
 };
-// The image and the public AdSense switch need no session; everything else needs a member.
+// The image, the public AdSense switch and the reset need no session; everything else needs a member.
 adsRoutes.use('*', except(isPublic, json, requireMember, adsLimit));
 adsRoutes.use('*', async (c, next) => (isPublic(c) ? publicLimit(c, next) : next()));
 
+// ---------------------------------------------------------------- AdSense cookie
+/** The cookie the app Worker looks for before it widens a document's CSP (HttpOnly: page script can't read it). */
+export function adsDocCookie(on: boolean): string {
+  return `${ADS_DOC_COOKIE}=${on ? '1' : ''}; Path=/; Max-Age=${on ? ADS_DOC_COOKIE_MAX_AGE : 0}; HttpOnly; Secure; SameSite=Strict`;
+}
+const sendAdsCookie = (c: Ctx, on: boolean) => c.header('Set-Cookie', adsDocCookie(on), { append: true });
+
+/**
+ * Before the app reloads off Google's AdSense script (the member it was loaded for is gone, changed or lost ads):
+ * drop everything the script could have written to this origin (Cache Storage, local and session storage,
+ * IndexedDB, the service worker) and the AdSense cookie. Same-origin only (the write guard), so another site
+ * can't wipe a member's storage; no session needed, since it runs after one ended too.
+ */
+adsRoutes.post('/reset', json, async (c) => {
+  c.header('Clear-Site-Data', '"cache", "storage"');
+  sendAdsCookie(c, false);
+  return c.body(null, 204);
+});
+
 // ---------------------------------------------------------------- public config cache (per isolate)
-export const ADS_CONFIG_TTL_MS = 60_000;
+/** Short, so turning AdSense off reaches the app Worker's 60 s cache quickly (≤ 75 s in all for new pages). */
+export const ADS_CONFIG_TTL_MS = 15_000;
 const ADS_CONFIG_FAIL_TTL_MS = 10_000;
 let configCache: { at: number; ttl: number; value: AdsPublicConfig; ok: boolean } | null = null;
 /** Forget the cached public config (after an AdSense change in this isolate, and in tests). */
@@ -90,7 +123,7 @@ export function resetAdsConfigCache(): void {
  * on only when AdSense is enabled and a valid publisher id is set. Fails closed (off) if the database can't answer.
  */
 adsRoutes.get('/config-public', async (c) => {
-  const headers = { 'Cache-Control': 'public, max-age=60' };
+  const headers = { 'Cache-Control': 'public, max-age=15' };
   const now = Date.now();
   if (configCache && now - configCache.at < configCache.ttl)
     return c.json(configCache.value, 200, configCache.ok ? headers : { 'Cache-Control': 'no-store' });
@@ -111,9 +144,14 @@ adsRoutes.get('/config-public', async (c) => {
 });
 
 adsRoutes.get('/', async (c) => {
-  if (!ownLibrary(c)) return c.json(EMPTY);
+  // The AdSense cookie follows the answer: set only when AdSense is returned, cleared otherwise.
+  if (!ownLibrary(c)) {
+    sendAdsCookie(c, false);
+    return c.json(EMPTY);
+  }
   try {
     const out = await rpc<MemberAds | null>(c.env, 'ads_for_member', { p_user: c.get('session').userId });
+    sendAdsCookie(c, Boolean(out?.adsense));
     if (!out) return c.json(EMPTY);
     return c.json({
       ok: true,
@@ -125,6 +163,7 @@ adsRoutes.get('/', async (c) => {
     } satisfies AdsResult);
   } catch (err) {
     logError(c.get('requestId'), 'ads_for_member', err);
+    sendAdsCookie(c, false);
     return c.json(EMPTY);
   }
 });
@@ -134,14 +173,16 @@ adsRoutes.post('/events', async (c) => {
   if (!body) return c.json(fail('invalid'), 400);
   // The database counts per card, day and placement only, and ignores cards that aren't live. The member id is
   // passed only to check they're shown ads; `p_seen` (a keyed hash of member, UTC day, card and kind) lets each
-  // member count one impression and one click per card a day, without storing who. Team libraries never show
-  // ads, so their events aren't counted.
+  // member count one impression and one click per card a day without storing the member id. It's pseudonymous,
+  // not anonymous: whoever holds AD_DEDUP_SECRET and the database could recompute it for a given member, so its
+  // rows are deleted after two days and never joined to the stats. Team libraries never show ads, so their
+  // events aren't counted.
   if (!ownLibrary(c)) return c.body(null, 204);
   try {
     const userId = c.get('session').userId;
     const day = new Date().toISOString().slice(0, 10);
     const seen = toPgBytea(
-      await hmac(`ad:${userId}|${day}|${body.cardId.toLowerCase()}|${body.kind}`, c.env.IP_HASH_SECRET),
+      await hmac(`ad:${userId}|${day}|${body.cardId.toLowerCase()}|${body.kind}`, c.env.AD_DEDUP_SECRET),
     );
     await rpc(c.env, 'ad_event', {
       p_user: userId,

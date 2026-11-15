@@ -37,6 +37,7 @@ const csp = appCsp(hashList);
 const adsenseCsp = appCsp(hashList, { adsense: true });
 checkPolicies(csp, adsenseCsp);
 checkAdPages();
+checkServiceWorker();
 writeFileSync(join(dist, APP_HEADERS_FILE.slice(1)), `${JSON.stringify({ hashes: hashList })}\n`);
 
 // The guest page (served for /g/* by the Worker, which sets these same headers) replaces the app's policy.
@@ -66,7 +67,7 @@ ${Object.entries(APP_HEADERS)
   Cache-Control: no-cache, no-store, must-revalidate
 
 /index.html
-  Cache-Control: no-cache
+  Cache-Control: no-store
 ${guestBlock('/guest')}${guestBlock('/guest.html')}`;
 writeFileSync(join(dist, '_headers'), headers);
 
@@ -137,6 +138,7 @@ function checkAdPages() {
     '/settings/sharing',
     '/settings/billing',
     '/settings/team',
+    '/share/new',
     '/settings/ai',
     '/settings/invites',
     '/settings/about',
@@ -160,5 +162,24 @@ function checkAdPages() {
 }
 
 console.log(
-  `_headers written · ${pages.length} page(s) · ${hashes.size} inline script hash(es) · CSP variants and ad pages checked (default, AdSense)`,
+  `_headers written · ${pages.length} page(s) · ${hashes.size} inline script hash(es) · CSP variants, ad pages and service worker checked (default, AdSense; no cache reads)`,
 );
+
+// Phase 8: Google's AdSense script runs in Free members' library pages with this origin, and Cache Storage is
+// writable from there. The service worker must never serve anything from it: no precache list, no cache reads,
+// no Workbox runtime (only deleting old caches is allowed).
+function checkServiceWorker() {
+  const fail = (m) => {
+    throw new Error(`Service worker check failed: ${m}`);
+  };
+  const files = walk(dist).map((f) => f.slice(dist.length + 1));
+  const sw = readFileSync(join(dist, 'sw.js'), 'utf8');
+  if (/__WB_MANIFEST|precache|workbox-(core|precaching|routing|strategies)/i.test(sw))
+    fail('sw.js carries a precache list or Workbox runtime');
+  const cacheCalls = [...sw.matchAll(/\bcaches\.(\w+)/g)].map((m) => m[1]);
+  if (cacheCalls.some((c) => c !== 'keys' && c !== 'delete'))
+    fail(`sw.js uses caches.${cacheCalls.join(', caches.')}`);
+  if (/\.match\(|\.matchAll\(|cache\.put|\.addAll\(/.test(sw)) fail('sw.js reads or fills a cache');
+  if (/\bimport\s*\(|importScripts|^\s*import\s|\bexport\s/m.test(sw)) fail('sw.js loads other code');
+  if (files.some((f) => /^workbox-.*\.js$/.test(f))) fail('a Workbox runtime file was emitted');
+}

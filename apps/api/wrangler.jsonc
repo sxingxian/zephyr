@@ -194,7 +194,7 @@
     // ]
   }
   // Secrets (wrangler secret put …): SUPABASE_SECRET_KEY, TURNSTILE_SECRET_KEY, IP_HASH_SECRET,
-  // SESSION_HMAC_SECRET, RESEND_API_KEY. (SUPABASE_SERVICE_ROLE_KEY is still read if the new name
+  // SESSION_HMAC_SECRET, RESEND_API_KEY, AD_DEDUP_SECRET (phase 8: the ad event dedup hash). (SUPABASE_SERVICE_ROLE_KEY is still read if the new name
   // isn't set.)
   // Phase 5 secrets (each 32+ random bytes; GALLERY_LINK_KEY exactly 32 bytes, base64):
   //   GALLERY_PEPPER       keys passcode HMACs (changing it invalidates every passcode)

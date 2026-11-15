@@ -55,12 +55,70 @@ export function endSession(reason: EndReason, server: boolean, waitMs = 3000): P
   ]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * Phase 8: something to do before a full page load that ends what this document was doing for the member (a
+ * sign-out, a session that ended, another member, losing ads). The ads module uses it, while Google's AdSense
+ * script is in the page, to have the server answer `Clear-Site-Data: "cache", "storage"` first, so nothing the
+ * script wrote to this origin survives. Returns null when there's nothing to do (then the load starts at once).
+ */
+type BeforeFullLoad = () => Promise<void> | null;
+let beforeFullLoad: BeforeFullLoad | null = null;
+export function setBeforeFullLoad(fn: BeforeFullLoad | null): void {
+  beforeFullLoad = fn;
+}
+/** The most a full page load waits for that clean-up. */
+export const BEFORE_FULL_LOAD_MAX_MS = 1500;
+/**
+ * A full page load that hasn't happened this long after it started was cancelled (the "Leave site?" prompt
+ * answered Stay): the latch comes off, so a later reload (a plan change, AdSense dropped) still works.
+ */
+export const LEAVING_RESET_MS = 5000;
+
 /** Full page load: drops every bit of in-memory state (photo data, queues, caches) for good. */
 let leaving = false;
+let latchTimer: ReturnType<typeof setTimeout> | null = null;
+function armLatchReset(): void {
+  if (latchTimer) clearTimeout(latchTimer);
+  latchTimer = setTimeout(() => {
+    latchTimer = null;
+    const release = () => {
+      leaving = false;
+    };
+    // Still here and in front: the load was cancelled. In the background, wait until the tab is shown again.
+    if (typeof document === 'undefined' || document.visibilityState === 'visible') release();
+    else
+      document.addEventListener('visibilitychange', function once() {
+        if (document.visibilityState !== 'visible') return;
+        document.removeEventListener('visibilitychange', once);
+        release();
+      });
+  }, LEAVING_RESET_MS);
+}
+function go(load: () => void, o: { keepStorage?: boolean }): void {
+  leaving = true;
+  const pending = o.keepStorage ? null : beforeFullLoad?.();
+  if (!pending) {
+    load();
+    armLatchReset();
+    return;
+  }
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    load();
+    armLatchReset();
+  };
+  setTimeout(finish, BEFORE_FULL_LOAD_MAX_MS);
+  void pending.catch(() => undefined).then(finish);
+}
 export const browser = {
-  assign(path: string): void {
-    leaving = true;
-    window.location.assign(path);
+  /**
+   * `keepStorage`: the same member goes on in the next document (AdsRouteGate leaving the ad pages), so the
+   * storage clean-up isn't needed.
+   */
+  assign(path: string, o: { keepStorage?: boolean } = {}): void {
+    go(() => window.location.assign(path), o);
   },
   /**
    * Reloads the current page (phase 8: drops a loaded AdSense script after a plan or account change). Skipped
@@ -68,8 +126,7 @@ export const browser = {
    */
   reload(): void {
     if (leaving) return;
-    leaving = true;
-    window.location.reload();
+    go(() => window.location.reload(), {});
   },
 };
 /** True once a full page load has been started (nothing else should navigate). */
@@ -77,6 +134,25 @@ export const isLeaving = (): boolean => leaving;
 /** Test helper. */
 export function __resetLeavingForTest(): void {
   leaving = false;
+  if (latchTimer) clearTimeout(latchTimer);
+  latchTimer = null;
+  beforeFullLoad = null;
+}
+
+/**
+ * Phase 8: a page restored from the back/forward cache could hold another member's state (or Google's script
+ * loaded for them) while the cookie now belongs to someone else: load it fresh instead. App pages are also sent
+ * `no-store`, which keeps most browsers from keeping them there at all.
+ */
+export function reloadWhenRestored(): () => void {
+  if (typeof window === 'undefined') return () => {};
+  const h = (e: PageTransitionEvent) => {
+    if (!e.persisted) return;
+    leaving = true;
+    window.location.reload();
+  };
+  window.addEventListener('pageshow', h);
+  return () => window.removeEventListener('pageshow', h);
 }
 
 // ------------------------------------------------------------ other tabs
@@ -118,6 +194,26 @@ export function onOtherTabPlanChange(fn: () => void): () => void {
   const h = (e: MessageEvent) => {
     const d = e.data as { type?: unknown; id?: unknown } | null;
     if (d?.type === 'plan-changed' && currentId !== null && d.id === currentId) fn();
+  };
+  ch.addEventListener('message', h);
+  return () => ch.removeEventListener('message', h);
+}
+
+/** Phase 8: this tab saw the member's libraries change (joined or left a team): other tabs re-read them. */
+export function announceLibrariesChange(): void {
+  try {
+    getChannel()?.postMessage({ type: 'libraries-changed', id: currentId });
+  } catch {
+    // Best effort.
+  }
+}
+/** Calls `fn` when another tab reports a library change for the member signed in here. */
+export function onOtherTabLibrariesChange(fn: () => void): () => void {
+  const ch = getChannel();
+  if (!ch) return () => {};
+  const h = (e: MessageEvent) => {
+    const d = e.data as { type?: unknown; id?: unknown } | null;
+    if (d?.type === 'libraries-changed' && currentId !== null && d.id === currentId) fn();
   };
   ch.addEventListener('message', h);
   return () => ch.removeEventListener('message', h);

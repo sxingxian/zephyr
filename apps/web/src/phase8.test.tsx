@@ -3,15 +3,20 @@ import type { AdsResult, LibrarySummary, PhotoItem } from '@zephyr/shared/client
 import { createMemoryRouter, RouterProvider } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { routes } from './App';
+import { NoAdsSurface } from './components/ads/NoAdsSurface';
 import { AD_EVERY, AD_FIRST, buildRows } from './components/PhotoGrid';
-import { __resetAdsForTest, ADSENSE_SRC, adsAllowedOn, safeAdUrl } from './lib/ads';
+import { CopyButton, PasscodeReveal } from './components/share/ShareBits';
+import { useShareGallery } from './components/share/ShareDialogs';
+import { __resetAdsForTest, ADSENSE_SRC, adsAllowedOn, loadAdsense, safeAdUrl } from './lib/ads';
 import { resetAiStatus } from './lib/aiClient';
 import { api } from './lib/api';
 import { resetAppStatus, STATUS_POLL_MS, useAppStatusPolling } from './lib/appStatus';
 import { resetPrices } from './lib/billing';
 import { __setActiveForTest, resetLibraryContext } from './lib/libraryContext';
 import { browser, setSessionUserId } from './lib/sessionGuard';
+import { SHARE_HANDOFF_KEY, SHARE_HANDOFF_PATH, takeShareHandoff } from './lib/shareHandoff';
 import { resetUsage } from './lib/usage';
+import { __resetShareNewForTest } from './routes/ShareNew';
 
 const ME = '11111111-1111-4111-8111-111111111111';
 const OWNER = '22222222-2222-4222-8222-222222222222';
@@ -390,6 +395,25 @@ describe('sponsored cards', () => {
 });
 
 // ---------------------------------------------------------------- AdSense gating
+/** Share and secret-bearing bits on an ad page (phase 8 test). */
+function SecretProbe() {
+  const sharing = useShareGallery();
+  return (
+    <div>
+      <h1>Probe</h1>
+      <button type="button" onClick={() => sharing.open([GID], 'Beach day')}>
+        Share now
+      </button>
+      <PasscodeReveal code="482915" />
+      <CopyButton text="https://zephyrapp.midnightpoetry.studio/g/secret" what="Link" />
+      <NoAdsSurface>
+        <p>Secret surface</p>
+      </NoAdsSurface>
+      {sharing.dialogs}
+    </div>
+  );
+}
+
 describe('AdSense', () => {
   const adsenseScript = () => document.querySelector<HTMLScriptElement>(`script[src^="${ADSENSE_SRC}"]`);
   const config = { publisherId: PUB, slots: { sidebar: '1234567890', library: '2345678901' } };
@@ -460,7 +484,9 @@ describe('AdSense', () => {
     await waitFor(() => expect(adsenseScript()).not.toBeNull());
     calls = [];
     await act(() => router.navigate(`/billing/return?session_id=${SID}#x`));
-    await waitFor(() => expect(assign).toHaveBeenCalledWith(`/billing/return?session_id=${SID}#x`));
+    await waitFor(() =>
+      expect(assign).toHaveBeenCalledWith(`/billing/return?session_id=${SID}#x`, { keepStorage: true }),
+    );
     // The page never mounted, so it asked the API for nothing.
     expect(calls.some((c) => c.url.includes('/billing/'))).toBe(false);
     expect(screen.queryByRole('heading', { name: /payment|billing/i })).toBeNull();
@@ -532,6 +558,115 @@ describe('AdSense', () => {
     renderAt('/');
     await waitFor(() => expect(reload).toHaveBeenCalled());
     expect(adsenseScript()).toBeNull();
+  });
+
+  it('a document the Worker served with the strict policy never loads the script, and reloads for it once at most', async () => {
+    __resetAdsForTest('/', false);
+    mockApi((url) => (url === '/api/v1/ads' ? adsResponse(config, []) : undefined));
+    renderAt('/');
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(adsenseScript()).toBeNull();
+    expect(document.querySelector('ins.adsbygoogle')).toBeNull();
+    // The cookie didn't stick (the reload brought the strict policy again): no second reload, no loop.
+    cleanup();
+    renderAt('/');
+    await screen.findByRole('heading', { name: 'Library' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(adsenseScript()).toBeNull();
+  });
+
+  it('re-reads the libraries and ads while the script is loaded: a team joined elsewhere reloads the page', async () => {
+    let libs: LibrarySummary[] = [OWN];
+    mockApi((url) => {
+      if (url === '/api/v1/ads') return adsResponse(config, []);
+      if (url === '/api/v1/libraries') return json(200, { ok: true, libraries: libs });
+      return undefined;
+    });
+    renderAt('/');
+    await waitFor(() => expect(adsenseScript()).not.toBeNull());
+    const adsCalls = () => calls.filter((c) => c.url === '/api/v1/ads').length;
+    const before = adsCalls();
+    // Joined a team on the phone: the plan is the same, the libraries aren't.
+    libs = [OWN, TEAM_LIB];
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => expect(reload).toHaveBeenCalled());
+    expect(adsCalls()).toBeGreaterThan(before);
+  });
+
+  it('re-checks when another tab reports a team change, and reloads when AdSense is dropped for the member', async () => {
+    let adsense: AdsResult['adsense'] = config;
+    mockApi((url) => (url === '/api/v1/ads' ? adsResponse(adsense, []) : undefined));
+    renderAt('/');
+    await waitFor(() => expect(adsenseScript()).not.toBeNull());
+    adsense = null;
+    const other = new BroadcastChannel('zephyr-session');
+    other.postMessage({ type: 'libraries-changed', id: ME });
+    await waitFor(() => expect(reload).toHaveBeenCalled());
+    other.close();
+  });
+
+  it('never shows a secret in a document holding the script: Share continues on /share/new with a full page load', async () => {
+    mockApi((url) => (url === '/api/v1/ads' ? adsResponse(config, []) : undefined));
+    const router = createMemoryRouter(
+      [{ element: routes[0]?.element, children: [{ path: '/', element: <SecretProbe /> }] }],
+      { initialEntries: ['/'] },
+    );
+    render(<RouterProvider router={router} />);
+    await screen.findByRole('heading', { name: 'Probe' });
+    expect(screen.getByLabelText(/Passcode 4 8 2 9 1 5/)).toBeTruthy();
+    expect(screen.getByText('Secret surface')).toBeTruthy();
+    act(() => {
+      loadAdsense(PUB);
+    });
+    await waitFor(() => expect(screen.queryByLabelText(/Passcode/)).toBeNull());
+    expect(screen.queryByRole('button', { name: 'Copy' })).toBeNull();
+    expect(screen.queryByText('Secret surface')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Share now' }));
+    expect(assign).toHaveBeenCalledWith(SHARE_HANDOFF_PATH, { keepStorage: true });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    const saved = JSON.parse(sessionStorage.getItem(SHARE_HANDOFF_KEY) ?? 'null');
+    expect(saved).toMatchObject({ user: ME, ids: [GID], name: 'Beach day' });
+    // /share/new is never an ad page, so the Worker gives it the strict policy.
+    expect(adsAllowedOn(SHARE_HANDOFF_PATH)).toBe(false);
+  });
+
+  it('/share/new runs the create flow for a fresh hand-off, and nothing for a stale or another member’s', async () => {
+    mockApi();
+    __resetShareNewForTest();
+    sessionStorage.setItem(
+      SHARE_HANDOFF_KEY,
+      JSON.stringify({ user: ME, ids: [GID.toUpperCase()], name: 'Beach\u0007 day', at: Date.now() }),
+    );
+    renderAt(SHARE_HANDOFF_PATH);
+    expect(await screen.findByText('Share 1 photo')).toBeTruthy();
+    expect(sessionStorage.getItem(SHARE_HANDOFF_KEY)).toBeNull();
+    cleanup();
+    for (const bad of [
+      { user: OWNER, ids: [GID], name: '', at: Date.now() },
+      { user: ME, ids: [GID], name: '', at: Date.now() - 11 * 60_000 },
+      { user: ME, ids: ['../../x'], name: '', at: Date.now() },
+      { user: ME, ids: [], name: '', at: Date.now() },
+    ]) {
+      __resetShareNewForTest();
+      sessionStorage.setItem(SHARE_HANDOFF_KEY, JSON.stringify(bad));
+      renderAt(SHARE_HANDOFF_PATH);
+      expect(await screen.findByText(/nothing to share here/)).toBeTruthy();
+      expect(screen.queryByText('Share 1 photo')).toBeNull();
+      cleanup();
+    }
+  });
+
+  it('takeShareHandoff cleans the name and lower-cases ids', () => {
+    sessionStorage.setItem(
+      SHARE_HANDOFF_KEY,
+      JSON.stringify({ user: ME, ids: [GID.toUpperCase(), GID], name: 'A\u0000B', at: 1000 }),
+    );
+    expect(takeShareHandoff(2000)).toEqual({ ids: [GID], name: 'AB' });
+    expect(takeShareHandoff(2000)).toBeNull();
   });
 });
 

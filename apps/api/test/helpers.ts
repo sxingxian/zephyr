@@ -79,6 +79,7 @@ export const env: Env = {
   RESEND_API_KEY: 're_test',
   TURNSTILE_SECRET_KEY: 'turnstile-secret',
   IP_HASH_SECRET: 'ip-hash-secret',
+  AD_DEDUP_SECRET: 'ad-dedup-secret',
   SESSION_HMAC_SECRET: 'session-hmac-secret',
   BURST_LIMITER: {
     limit: async ({ key }: { key: string }) => {

@@ -7,11 +7,13 @@
  *   files      → static files (anything with an extension but .html) come straight from ASSETS, untouched,
  *                with their headers from dist/_headers;
  *   HTML       → phase 8: the PWA's pages (index.html, the SPA fallback) get the app's security headers here,
- *                with the AdSense CSP variant only for documents on ad pages (worker/adPages.js) and only while
- *                the API says AdSense is on (cached 60 s). Every other document, and /index.html itself (the
- *                service worker's precached offline fallback), always gets the strict policy.
+ *                never stored by the browser (`no-store`, which also keeps them out of the back/forward cache).
+ *                The AdSense CSP variant goes only to documents on ad pages (worker/adPages.js), only while the
+ *                API says AdSense is on (cached 60 s), and only when the request carries the AdSense cookie,
+ *                which the API sets only for a member it shows AdSense. Every other document, and /index.html
+ *                itself, always gets the strict policy.
  */
-import { adsAllowedOn } from './adPages.js';
+import { ADS_DOC_COOKIE, ADS_DOC_TIMING, adsAllowedOn } from './adPages.js';
 import { APP_HEADERS, APP_HEADERS_FILE, appCsp } from './appHeaders.js';
 import { GUEST_HEADERS } from './guestHeaders.js';
 
@@ -141,17 +143,21 @@ export async function serveAdsTxt(request: Request, env: Pick<Env, 'API'>): Prom
   return new Response(request.method === 'HEAD' ? null : line, { status: 200, headers });
 }
 
-/**
- * Whether a document at this path may get the AdSense policy: only the ad pages. `/index.html` (any query) is
- * never one: the service worker precaches it as the offline fallback for every page, so it must stay strict.
- */
+/** Whether a document at this path may get the AdSense policy: only the ad pages, never `/index.html`. */
 export function adsenseDocument(pathname: string): boolean {
   return pathname !== '/index.html' && adsAllowedOn(pathname);
 }
 
+/** True when the request carries the AdSense cookie (set by the API only for a member it shows AdSense). */
+export function hasAdsCookie(request: Request): boolean {
+  const header = request.headers.get('cookie');
+  if (!header) return false;
+  return header.split(';').some((part) => part.trim() === `${ADS_DOC_COOKIE}=1`);
+}
+
 /**
  * The app shell at /index.html, always with the strict policy. Served directly (ASSETS would redirect it to
- * `/`, an ad page, and the service worker would then precache the AdSense policy as its offline fallback).
+ * `/`, an ad page, which can get the AdSense policy).
  */
 export async function serveShell(request: Request, env: Env): Promise<Response> {
   const shell = new Request(new URL('/', request.url), { method: request.method, headers: request.headers });
@@ -165,15 +171,21 @@ export async function serveHtml(request: Request, env: Env, o: { adPage?: boolea
   if (!type.toLowerCase().includes('text/html')) return res;
   const url = new URL(request.url);
   const origin = url.origin;
-  const adPage = o.adPage ?? adsenseDocument(url.pathname);
+  const adPage = (o.adPage ?? adsenseDocument(url.pathname)) && hasAdsCookie(request);
   const [state, list] = await Promise.all([
     adPage ? adsenseState(env, origin) : Promise.resolve(OFF),
     scriptHashes(env, origin),
   ]);
+  const wide = adPage && state.enabled;
   const headers = new Headers(res.headers);
   for (const [k, v] of Object.entries(APP_HEADERS)) headers.set(k, v);
-  headers.set('Content-Security-Policy', appCsp(list, { adsense: adPage && state.enabled }));
-  headers.set('Cache-Control', 'no-cache');
+  headers.set('Content-Security-Policy', appCsp(list, { adsense: wide }));
+  // The app reads this from its own navigation entry to know whether Google's script may load here.
+  if (wide) headers.set('Server-Timing', ADS_DOC_TIMING);
+  else headers.delete('Server-Timing');
+  // Never stored: a page restored from the back/forward cache or the HTTP cache could carry another member's
+  // state, or an old, wider policy.
+  headers.set('Cache-Control', 'no-store');
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 

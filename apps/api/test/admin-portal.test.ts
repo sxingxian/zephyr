@@ -7,6 +7,7 @@
 
 import {
   ADMIN8_API,
+  ADS_DOC_COOKIE,
   MEMBER8_API,
   STAFF_CAN,
   type StaffAction,
@@ -16,7 +17,7 @@ import {
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runAdminCron, runAdminDailyCron } from '../src/admin/cron';
 import { app } from '../src/app';
-import { sha256, toPgBytea } from '../src/crypto';
+import { hmac, sha256, toPgBytea } from '../src/crypto';
 import { readOnlyBlocks } from '../src/library/read-only-gate';
 import { auditCsv, csvCell } from '../src/routes/admin-audit';
 import { newRevealToken } from '../src/routes/admin-safety';
@@ -1106,6 +1107,44 @@ describe('member ads', () => {
     expect(adsLimiter.keys).toEqual([`ads:${MEI.id}`]);
   });
 
+  it('sets the AdSense cookie only when AdSense is returned, and clears it otherwise', async () => {
+    const cookieOf = (r: Response) =>
+      (r.headers.get('Set-Cookie') ?? '')
+        .split(/,(?=\s*[A-Za-z_-]+=)/)
+        .find((c) => c.trim().startsWith(ADS_DOC_COOKIE));
+    world.rpc.ads_for_member = () => live;
+    const on = cookieOf(await call(MEMBER8_API.ads, { jar: await member(MEI) }));
+    expect(on).toContain(`${ADS_DOC_COOKIE}=1`);
+    for (const attr of ['Path=/', 'Max-Age=900', 'HttpOnly', 'Secure', 'SameSite=Strict'])
+      expect(on).toContain(attr);
+    expect(on).not.toMatch(/Domain=/i);
+    world.rpc.ads_for_member = () => ({ ...live, adsense: null });
+    const off = cookieOf(await call(MEMBER8_API.ads, { jar: await member(MEI) }));
+    expect(off).toContain(`${ADS_DOC_COOKIE}=;`);
+    expect(off).toContain('Max-Age=0');
+    // A team library: cleared too.
+    const team = cookieOf(
+      await call(MEMBER8_API.ads, { jar: await member(MEI), headers: { 'X-Zephyr-Library': JUN.id } }),
+    );
+    expect(team).toContain('Max-Age=0');
+  });
+
+  it('reset: clears the site’s storage and the AdSense cookie, same-origin only, no session needed', async () => {
+    const res = await call(MEMBER8_API.adReset, { body: {} });
+    expect(res.status).toBe(204);
+    expect(res.headers.get('Clear-Site-Data')).toBe('"cache", "storage"');
+    expect(res.headers.get('Set-Cookie')).toContain(`${ADS_DOC_COOKIE}=;`);
+    const cross = await call(MEMBER8_API.adReset, { body: {}, origin: 'https://evil.example' });
+    expect(cross.status).toBe(403);
+    expect(cross.headers.get('Clear-Site-Data')).toBeNull();
+    expect((await call(MEMBER8_API.adReset, { method: 'GET' })).status).toBe(401);
+  });
+
+  it('sign-out clears the AdSense cookie with the session', async () => {
+    const res = await call('/api/v1/auth/sign-out', { jar: await member(MEI), body: {} });
+    expect(res.headers.get('Set-Cookie')).toContain(`${ADS_DOC_COOKIE}=;`);
+  });
+
   it('plans without ads get nothing (the database decides by the effective plan)', async () => {
     world.rpc.ads_for_member = () => ({ cards: [], adsense: null });
     expect(await read(await call(MEMBER8_API.ads, { jar: await member(MEI) }))).toEqual({
@@ -1146,8 +1185,13 @@ describe('member ads', () => {
       p_kind: 'impression',
       p_placement: 'sidebar',
     });
-    // A keyed hash (32 bytes) of member, day, card and kind: never the member id itself.
+    // A keyed hash (32 bytes) of member, day, card and kind: never the member id itself. Keyed with its own
+    // secret (AD_DEDUP_SECRET), never IP_HASH_SECRET.
     expect(sent.p_seen).toMatch(/^\\x[0-9a-f]{64}$/);
+    const day = new Date().toISOString().slice(0, 10);
+    const msg = `ad:${MEI.id}|${day}|${CARD}|impression`;
+    expect(sent.p_seen).toBe(toPgBytea(await hmac(msg, env.AD_DEDUP_SECRET)));
+    expect(sent.p_seen).not.toBe(toPgBytea(await hmac(msg, env.IP_HASH_SECRET)));
     expect(String(sent.p_seen)).not.toContain(MEI.id.replace(/-/g, ''));
     await call(MEMBER8_API.adEvent, {
       jar: j,
@@ -1189,11 +1233,11 @@ describe('member ads', () => {
 });
 
 describe('public AdSense switch for the app Worker', () => {
-  it('is on only with AdSense enabled and a valid publisher id; public, 60 s', async () => {
+  it('is on only with AdSense enabled and a valid publisher id; public, 15 s', async () => {
     world.rpc.adsense_public = () => ({ enabled: true, publisherId: 'ca-pub-1234567890123456' });
     const res = await call('/api/v1/ads/config-public');
     expect(res.status).toBe(200);
-    expect(res.headers.get('Cache-Control')).toBe('public, max-age=60');
+    expect(res.headers.get('Cache-Control')).toBe('public, max-age=15');
     expect(await read(res)).toEqual({ ok: true, enabled: true, publisherId: 'ca-pub-1234567890123456' });
     world.rpc.adsense_public = () => ({ enabled: true, publisherId: 'ca-pub-123' });
     resetAdsConfigCache();
@@ -1207,7 +1251,7 @@ describe('public AdSense switch for the app Worker', () => {
     expect((await read(await call('/api/v1/ads/config-public'))).enabled).toBe(false);
   });
 
-  it('caches the answer for 60 s in the isolate and rate-limits callers by network', async () => {
+  it('caches the answer for 15 s in the isolate and rate-limits callers by network', async () => {
     world.rpc.adsense_public = () => ({ enabled: true, publisherId: 'ca-pub-1234567890123456' });
     for (let i = 0; i < 5; i++) await call('/api/v1/ads/config-public');
     expect(rpcCalls('adsense_public')).toHaveLength(1);
