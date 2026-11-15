@@ -1,8 +1,8 @@
 # Security baseline
 
 1. **/admin shares the landing origin.** The landing site therefore loads no third-party scripts except Turnstile,
-   ships a strict CSP (`apps/landing/scripts/csp.mjs`), and /admin (next phase) will sit behind Cloudflare Access
-   with passkeys and an httpOnly cookie scoped to /admin.
+   ships a strict CSP (`apps/landing/scripts/csp.mjs`), and /admin sits behind Cloudflare Access with passkeys
+   and an httpOnly cookie scoped to /admin.
 2. **Sessions never reach JavaScript.** The API keeps Supabase tokens in httpOnly, Secure, host-only cookies
    (`__Host-` cookies with `Path=/`; app SameSite=Lax; admin SameSite=Strict with a 30-minute idle lock), verifies access
    tokens against the project's JWKS on every request, and refreshes them server-side. Cookies are never set on
@@ -145,4 +145,56 @@
       backfill and the queue consumer skip the account. A background removal already running when deletion is
       scheduled attaches nothing and is refunded; its stored mask has no row, so the sweep removes it.
 
-Later phases add ads isolation and the admin Safety queue. See the design decisions doc.
+15. **Billing and teams (phase 7):**
+    - **Library context:** every library-scoped query uses the owner id from `library_access`, never from the
+      request header directly; every write checks the role, and a removed member loses access on their next request.
+    - **Prices:** come only from our table by lookup key; the client never sends a price id or amount. Top-up credits
+      come from our price table and are granted once per Checkout session.
+    - **Webhooks:** signature checked with a tolerance, raw body read once with a size cap, idempotent and
+      order-independent; no payload is stored or logged, and no Stripe ids or emails go to logs.
+    - **Team invites:** ≥ 256-bit tokens, hashed, single use, 7 days, email-bound; seats re-checked under a lock.
+    - **No double billing:** a second live subscription is cancelled and refunded; open Checkouts are expired first.
+    - **Admin price raises** need a recent passkey, are audited and email every Owner.
+
+16. **Admin portal (phase 8):**
+    - **Roles:** Owner, Admin, Finance, Safety, Support (`STAFF_CAN` in `packages/shared/src/admin-types.ts`). Every
+      admin route checks the role, and every staff SQL function checks it again. There is always at least one Owner.
+    - **High-risk changes** (plan limits, storage switch, staff roles, plan overrides, unsuspending, releasing a hold,
+      turning AdSense on, retention approvals) need a passkey sign-in in the last 10 minutes and email every Owner.
+      Changes that only lower risk save at once, so one Owner can always pull a kill switch. All are audit-logged.
+    - **Members' privacy:** lists mask emails and opening a member's detail is logged. Staff never see photo bytes
+      except through a Safety reveal grant: one staff member, 10 minutes, a re-encoded `no-store` preview with the
+      reviewer's name over it, logged with a reason.
+    - **Suspension** ends sessions in Supabase Auth, not only the cookie; teammates and guests lose access at once.
+    - **Staff invites:** email-bound, single use, hashed, 72 hours, and still behind Cloudflare Access.
+    - **Audit log:** append-only, kept indefinitely; exports are role-limited and logged.
+
+17. **Storage switch (phase 8):**
+    - Store credentials live only in Worker secrets and the deployment config, never in the database or admin UI.
+    - S3 requests are SigV4-signed. A Tunnel hostname also needs a Cloudflare Access service token; a Workers VPC
+      binding has no public hostname at all.
+    - Only the photo library moves. Guest renditions and branding stay on R2 behind the media host's cache, so CSAM
+      scanning still covers everything guests see.
+    - Each photo records its store. It flips only after its copy is verified by a SHA-256 read-back, and old copies
+      are deleted only after a 7-day hold. Purges cover every store. Members never see endpoints, keys or bucket
+      names, and store error bodies are never logged.
+
+18. **Ads (phase 8) and the accepted AdSense risk:**
+    - **Sponsored cards** are rendered by the app: https links only, no credentials or IP hosts, re-encoded images,
+      `rel="noopener noreferrer sponsored"`, and stats with no identities.
+    - **AdSense runs in the app's own page.** Google's policy forbids putting ads in a frame. That means Google's script
+      can read what a Free member sees (their private photos, file names) and act as them. httpOnly cookies and CSP
+      cannot stop that. **The Owner accepted this risk on 15 November 2026** after professional advice against it.
+    - **Mitigations:**
+      - Free members, in their own library, only.
+      - Only on the Library grid, sidebar and batch queue. Units are unmounted on the editor, sharing, billing,
+        settings and sign-in pages.
+      - An upgrade, sign-out or account change reloads the page, so the script doesn't carry over.
+      - The CSP is widened for Google's hosts only while AdSense is on, and `scripts/csp.mjs` checks both variants.
+      - Google's certified consent message runs for the EEA, UK and Switzerland.
+      - AdSense stays off until an Owner turns it on with a recent passkey. Turning it off applies to page loads within
+        60 seconds and needs no passkey.
+    - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
+      Turnstile.
+
+See the design decisions doc and `docs/phase-8.md` for the details.

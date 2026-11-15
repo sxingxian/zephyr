@@ -199,7 +199,7 @@ New pages matching the mockups: Users, Safety, Plan limits, Ads, Storage, Retent
   - Images are fetched with the grant token and shown blurred until the reviewer clicks each one.
   - The reviewer's name and the expiry time are overlaid.
   - Images are removed from the DOM and their object URLs revoked at expiry or on navigation, and never kept in a cache (`no-store`, `cache: 'no-store'`).
-- **Staff invite accept:** `/admin/invite#token=…` (fragment, stripped on load), then the existing email-code → passkey enrolment.
+- **Staff invite accept:** `/admin/staff-invite#t=…` (fragment, stripped on load), then the existing email-code → passkey enrolment.
 
 ## Web app (`apps/web`)
 
