@@ -1,8 +1,9 @@
 -- Assertions for the storage migration (phase 8): per-photo stores, the write store for new uploads, switching
 -- (claims with leases and tokens, lease renewal, verified copies flip the store, stamps, retries, failures,
 -- holding), old copies only after every photo is verified plus the hold (claimed first, which closes rollback),
--- rollback (and retrying a failed rollback), late arrivals, photos still publishing, usage, health checks, storeId
--- in existing functions' results (masks and permanent deletes included), and privileges. Run with
+-- rollback (and retrying a failed rollback), uploads in progress and photos still publishing (queued, waited for,
+-- never finished around), late arrivals, done without a hold when nothing is held, follow-up copies, usage, health
+-- checks, storeId in existing functions' results (masks and permanent deletes included), and privileges. Run with
 -- supabase/tests/run-local.sh.
 \set ON_ERROR_STOP on
 begin;
@@ -73,9 +74,9 @@ select (:'sw'::jsonb ->> 'migrationId') as m \gset
 select pg_temp.ok(public.storage_status() = jsonb_build_object('writeStore', 'nas', 'migration', jsonb_build_object('id', :'m', 'state', 'copying'),
                                                                 'cleanupPending', false),
   'new uploads go to the new store at once');
-select pg_temp.ok((select count(*) = 3 from public.storage_migration_items where migration_id = :'m'::uuid)
-  and not exists (select 1 from public.storage_migration_items where migration_id = :'m'::uuid and photo_id = (:'up0'::jsonb ->> 'photoId')::uuid),
-  'ready and trashed photos are queued; an upload in progress isn''t');
+select pg_temp.ok((select count(*) = 4 from public.storage_migration_items where migration_id = :'m'::uuid)
+  and exists (select 1 from public.storage_migration_items where migration_id = :'m'::uuid and photo_id = (:'up0'::jsonb ->> 'photoId')::uuid and state = 'pending'),
+  'ready and trashed photos are queued, and so is the upload in progress (copied once it''s ready)');
 select pg_temp.ok(public.storage_switch(:own, 's3', 'Another') ->> 'error' = 'conflict', 'one migration at a time');
 select public.create_uploads(:mei, jsonb_build_array(pg_temp.file('new.jpg'))) -> 'results' -> 0 as up1 \gset
 select pg_temp.ok((select u.store_id = 'nas' and p.store_id = 'nas' from public.uploads u join public.photos p on p.id = u.photo_id
@@ -83,7 +84,8 @@ select pg_temp.ok((select u.store_id = 'nas' and p.store_id = 'nas' from public.
   and public.get_upload(:mei, (:'up1'::jsonb ->> 'uploadId')::uuid) ->> 'storeId' = 'nas'
   and public.get_upload(:mei, (:'up0'::jsonb ->> 'uploadId')::uuid) ->> 'storeId' = 'r2', 'uploads after the switch go to the new store; get_upload says which');
 select pg_temp.ok(public.admin_storage(:fin) is null and public.admin_storage(:own) ->> 'writeStore' = 'nas'
-  and (public.admin_storage(:own) -> 'migration' -> 'photos' ->> 'total')::int = 3
+  and (public.admin_storage(:own) -> 'migration' -> 'photos' ->> 'total')::int = 4
+  and (public.admin_storage(:own) -> 'migration' -> 'photos' ->> 'waiting')::int = 1
   and public.admin_storage(:own) -> 'migration' ->> 'startedBy' = 'owner95@zephyr.test'
   and public.admin_storage(:own) -> 'migration' ->> 'direction' = 'forward'
   and (public.admin_storage(:own) -> 'migration' ->> 'canRollBack')::boolean, 'admin_storage (null for roles without Storage)');
@@ -94,8 +96,11 @@ select pg_temp.ok(jsonb_array_length(:'b1'::jsonb) = 2 and (select bool_and(e ->
                                                                             and (e ->> 'token')::uuid is not null)
                                                             from jsonb_array_elements(:'b1'::jsonb) e), 'a batch claims items with from, to, attempts and a token');
 select public.storage_migration_batch(:'m'::uuid, 10) as b2 \gset
-select pg_temp.ok(jsonb_array_length(:'b2'::jsonb) = 1 and not (:'b1'::jsonb @> jsonb_build_array(jsonb_build_object('photoId', :'b2'::jsonb -> 0 ->> 'photoId'))),
-  'leased items aren''t handed out again');
+select pg_temp.ok(jsonb_array_length(:'b2'::jsonb) = 1 and not (:'b1'::jsonb @> jsonb_build_array(jsonb_build_object('photoId', :'b2'::jsonb -> 0 ->> 'photoId')))
+  and not (:'b1'::jsonb || :'b2'::jsonb) @> jsonb_build_array(jsonb_build_object('photoId', :'up0'::jsonb ->> 'photoId'))
+  and (select attempts = 0 and lease_until > now() from public.storage_migration_items
+        where migration_id = :'m'::uuid and photo_id = (:'up0'::jsonb ->> 'photoId')::uuid),
+  'leased items aren''t handed out again; the upload in progress is put back without counting an attempt');
 select pg_temp.ok(public.storage_migration_batch(:'m'::uuid, 10) = '[]'::jsonb, 'nothing left while every lease runs');
 select (:'b2'::jsonb -> 0 ->> 'photoId') as p2, (:'b2'::jsonb -> 0 ->> 'token') as t2 \gset
 update public.storage_migration_items set lease_until = now() - interval '1 second' where migration_id = :'m'::uuid and photo_id = :'p2'::uuid;
@@ -150,6 +155,14 @@ select pg_temp.ok(public.storage_item_mark(:'m'::uuid, :'pc'::uuid, 'failed', nu
 update public.storage_migration_items set lease_until = null where migration_id = :'m'::uuid and photo_id = :'pb'::uuid;
 select public.storage_migration_batch(:'m'::uuid, 10);
 select public.storage_item_mark(:'m'::uuid, :'pb'::uuid, 'verified', 1300, null, null, pg_temp.tok(:'m', :'pb'));
+select pg_temp.ok((select state = 'copying' from public.storage_migrations where id = :'m'::uuid)
+  and (public.admin_storage(:own) -> 'migration' -> 'photos' ->> 'waiting')::int = 1,
+  'the migration doesn''t finish (or fail) while a queued upload is still in progress');
+update public.photos set status = 'ready' where id = (:'up0'::jsonb ->> 'photoId')::uuid;
+update public.storage_migration_items set lease_until = null where migration_id = :'m'::uuid and photo_id = (:'up0'::jsonb ->> 'photoId')::uuid;
+select public.storage_migration_batch(:'m'::uuid, 10) as bu \gset
+select pg_temp.ok(jsonb_array_length(:'bu'::jsonb) = 1 and :'bu'::jsonb -> 0 ->> 'photoId' = :'up0'::jsonb ->> 'photoId', 'once the upload is ready it''s claimed');
+select public.storage_item_mark(:'m'::uuid, (:'up0'::jsonb ->> 'photoId')::uuid, 'verified', 2000, null, null, pg_temp.tok(:'m', (:'up0'::jsonb ->> 'photoId')::uuid));
 select pg_temp.ok((select state = 'failed' and direction = 'forward' and last_error = 'hash_mismatch' from public.storage_migrations where id = :'m'::uuid)
   and (public.admin_storage(:own) -> 'migration' -> 'photos' ->> 'failed')::int = 1, 'with only failures left the migration is failed');
 select pg_temp.ok(public.storage_old_copies_due(100) = '[]'::jsonb, 'no old copy is deleted while an item failed');
@@ -162,24 +175,31 @@ select pg_temp.ok((select state = 'holding' and delete_old_after between now() +
 select pg_temp.ok(public.storage_old_copies_due(100) = '[]'::jsonb and (public.storage_status() ->> 'cleanupPending')::boolean,
   'old copies wait for the hold (and the sweep knows they''re held)');
 
--- A late arrival on the old store (the upload in progress at the switch finished) reopens the migration. Batches
--- look for late arrivals at most every 2 minutes; a photo still publishing its variants waits.
-update public.photos set status = 'ready' where id = (:'up0'::jsonb ->> 'photoId')::uuid;
+-- A late arrival on the old store (a photo whose insert read the write store just before the switch committed)
+-- reopens the migration. Batches look for late arrivals at most every 2 minutes, among recent photos; a photo
+-- still publishing its variants is queued but waits.
+select pg_temp.photo(:mei, 'late.jpg') as pl \gset
+update public.photos set store_id = 'r2' where id = :'pl'::uuid;
 select pg_temp.photo(:mei, 'publishing.jpg') as pp \gset
 update public.photos set store_id = 'r2', publish_pending = true where id = :'pp'::uuid;
 select pg_temp.ok(public.storage_migration_batch(:'m'::uuid, 10) = '[]'::jsonb
   and (select state = 'holding' from public.storage_migrations where id = :'m'::uuid), 'late arrivals are looked for at most every 2 minutes');
 update public.storage_migrations set topped_up_at = null where id = :'m'::uuid;
 select public.storage_migration_batch(:'m'::uuid, 10) as b3 \gset
-select pg_temp.ok(:'b3'::jsonb -> 0 ->> 'photoId' = :'up0'::jsonb ->> 'photoId' and jsonb_array_length(:'b3'::jsonb) = 1
+select pg_temp.ok(:'b3'::jsonb -> 0 ->> 'photoId' = :'pl' and jsonb_array_length(:'b3'::jsonb) = 1
   and (select state = 'copying' and delete_old_after is null from public.storage_migrations where id = :'m'::uuid), 'late arrivals are queued and reopen a holding migration');
-select pg_temp.ok(not exists (select 1 from public.storage_migration_items where migration_id = :'m'::uuid and photo_id = :'pp'::uuid),
-  'a photo still publishing its variants (staging copies on its store) isn''t moved yet');
+select pg_temp.ok((select state = 'pending' and attempts = 0 from public.storage_migration_items where migration_id = :'m'::uuid and photo_id = :'pp'::uuid),
+  'a photo still publishing its variants (staging copies on its store) is queued but not copied yet');
+select public.storage_item_mark(:'m'::uuid, :'pl'::uuid, 'verified', 1300, null, null, pg_temp.tok(:'m', :'pl'));
+select pg_temp.ok((select state = 'copying' from public.storage_migrations where id = :'m'::uuid), 'and the migration waits for it');
 delete from public.photos where id = :'pp'::uuid;
-select public.storage_item_mark(:'m'::uuid, (:'up0'::jsonb ->> 'photoId')::uuid, 'verified', 2000, null, null, pg_temp.tok(:'m', (:'up0'::jsonb ->> 'photoId')::uuid));
+update public.storage_migration_items set lease_until = null where migration_id = :'m'::uuid and photo_id = :'pp'::uuid;
+select public.storage_migration_batch(:'m'::uuid, 10);
+select pg_temp.ok((select state = 'skipped' and cleanup_store is null from public.storage_migration_items where migration_id = :'m'::uuid and photo_id = :'pp'::uuid)
+  and (select state = 'holding' from public.storage_migrations where id = :'m'::uuid), 'a queued photo that went away is skipped (nothing was copied, nothing to clean)');
 select pg_temp.ok((public.admin_storage(:own) -> 'migration' ->> 'canRollBack')::boolean, 'a holding migration can still be rolled back');
 update public.storage_migrations set delete_old_after = now() - interval '1 second' where id = :'m'::uuid;
-select pg_temp.ok((select count(*) = 4 and bool_and(e ->> 'from' = 'r2' and e ->> 'to' = 'nas') from jsonb_array_elements(public.storage_old_copies_due(100)) e),
+select pg_temp.ok((select count(*) = 5 and bool_and(e ->> 'from' = 'r2' and e ->> 'to' = 'nas') from jsonb_array_elements(public.storage_old_copies_due(100)) e),
   'after the hold, every old copy on R2 is due');
 -- A photo that went back to R2 by other means must never lose its R2 copy.
 update public.photos set store_id = 'r2' where id = :'pa'::uuid;
@@ -200,7 +220,8 @@ select public.storage_old_copy_claim(:'m'::uuid, (e.value ->> 'photoId')::uuid, 
 select public.storage_item_mark(:'m'::uuid, (e.value ->> 'photoId')::uuid, 'deleted', null, null, null, null, e.value ->> 'from') from due1 e;
 select pg_temp.ok((select state = 'done' and finished_at is not null from public.storage_migrations where id = :'m'::uuid)
   and public.storage_status() -> 'migration' = 'null'::jsonb and not (public.storage_status() ->> 'cleanupPending')::boolean
-  and (select bool_and(state = 'deleted') from public.storage_migration_items where migration_id = :'m'::uuid), 'all old copies deleted: done');
+  and (select bool_and(state = 'deleted') from public.storage_migration_items where migration_id = :'m'::uuid and photo_id <> :'pp'::uuid),
+  'all old copies deleted: done');
 select pg_temp.ok(exists (select 1 from public.audit_log where action = 'storage.switch' and kind = 'storage' and details ->> 'reason' = 'Move to the NAS'),
   'the switch is audited');
 
@@ -271,6 +292,11 @@ select pg_temp.ok(public.storage_switch(:own, 's3', 'Again') ->> 'error' = 'conf
 update public.storage_migrations set delete_old_after = now() - interval '1 second' where id = :'m2'::uuid;
 select pg_temp.ok((select bool_and(e ->> 'from' = 'cold' and e ->> 'to' = 'nas') and count(*) = 3 from jsonb_array_elements(public.storage_old_copies_due(100)) e),
   'after the hold, the copies on the abandoned store are due');
+savepoint purging_claim;
+update public.photos set status = 'purging', trashed_at = now(), purge_after = now() where id = :'first'::uuid;
+select pg_temp.ok(public.storage_old_copy_claim(:'m2'::uuid, :'first'::uuid, 'cold') = '{"copyTo": null}'::jsonb,
+  'the old copy of a photo being purged is just deleted, never copied back');
+rollback to savepoint purging_claim;
 select pg_temp.ok(public.storage_old_copy_claim(:'m2'::uuid, :'second'::uuid, 'cold') = '{"copyTo": null}'::jsonb
   and public.storage_old_copy_claim(:'m2'::uuid, :'first'::uuid, 'cold') = '{"copyTo": "nas"}'::jsonb,
   'a partial copy that was never used is just deleted; a copied-back photo''s missing objects go to its store first');
@@ -279,6 +305,64 @@ select public.storage_old_copy_claim(:'m2'::uuid, (e.value ->> 'photoId')::uuid,
 select public.storage_item_mark(:'m2'::uuid, (e.value ->> 'photoId')::uuid, 'deleted', null, null, null, null, e.value ->> 'from') from due2 e;
 select pg_temp.ok((select state = 'rolled_back' and finished_at is not null from public.storage_migrations where id = :'m2'::uuid)
   and not (public.storage_status() ->> 'cleanupPending')::boolean, 'clean-up finishes the rollback');
+
+-- ---- A switch with nothing to move but an upload in progress; done when nothing is held -----------------------------
+savepoint only_upload;
+update public.photos set store_id = 'cold' where store_id = 'nas' and status <> 'uploading';
+select public.storage_switch(:own, 's3', 'Only an upload left') ->> 'migrationId' as m5 \gset
+select pg_temp.ok((select state = 'copying' from public.storage_migrations where id = :'m5'::uuid)
+  and (select count(*) = 1 from public.storage_migration_items where migration_id = :'m5'::uuid and photo_id = (:'up1'::jsonb ->> 'photoId')::uuid),
+  'a switch with nothing to move but an upload in progress isn''t done: it waits for the upload');
+select pg_temp.ok(public.storage_migration_batch(:'m5'::uuid, 10) = '[]'::jsonb
+  and (select state = 'copying' from public.storage_migrations where id = :'m5'::uuid), 'nor is it claimed while uploading');
+update public.photos set status = 'purging', trashed_at = now(), purge_after = now() where id = (:'up1'::jsonb ->> 'photoId')::uuid;
+update public.storage_migration_items set lease_until = null where migration_id = :'m5'::uuid;
+select public.storage_migration_batch(:'m5'::uuid, 10);
+select pg_temp.ok((select state = 'done' and finished_at is not null and delete_old_after is null from public.storage_migrations where id = :'m5'::uuid)
+  and public.storage_status() -> 'migration' = 'null'::jsonb and not (public.storage_status() ->> 'cleanupPending')::boolean,
+  'the upload expired: with no old copy to delete the move is done, not stuck holding');
+select pg_temp.ok(public.storage_switch(:own, 'nas', 'And back') ->> 'migrationId' is not null, 'so the next switch can start');
+rollback to savepoint only_upload;
+
+-- ---- A rollback with an upload in progress on the new store ------------------------------------------------------
+savepoint rollback_upload;
+select public.storage_switch(:own, 's3', 'Try S3') ->> 'migrationId' as m6 \gset
+select public.create_uploads(:mei, jsonb_build_array(pg_temp.file('mid.jpg'))) -> 'results' -> 0 ->> 'photoId' as mid \gset
+select public.storage_migration_action(:own, 'rollback', 'Not now');
+select pg_temp.ok((select state = 'rolling_back' from public.storage_migrations where id = :'m6'::uuid)
+  and (select src = 's3' and dst = 'nas' and state = 'pending' from public.storage_migration_items where migration_id = :'m6'::uuid and photo_id = :'mid'::uuid),
+  'a rollback queues the upload in progress on the new store and doesn''t finish around it');
+select pg_temp.ok(public.storage_migration_batch(:'m6'::uuid, 10) = '[]'::jsonb
+  and (select state = 'rolling_back' from public.storage_migrations where id = :'m6'::uuid), 'it waits while the upload runs');
+update public.photos set status = 'ready' where id = :'mid'::uuid;
+update public.storage_migration_items set lease_until = null where migration_id = :'m6'::uuid and photo_id = :'mid'::uuid;
+select public.storage_migration_batch(:'m6'::uuid, 10) as b6 \gset
+select pg_temp.ok(jsonb_array_length(:'b6'::jsonb) = 1 and :'b6'::jsonb -> 0 ->> 'photoId' = :'mid' and :'b6'::jsonb -> 0 ->> 'from' = 's3',
+  'once it''s ready it''s copied back');
+select public.storage_item_mark(:'m6'::uuid, :'mid'::uuid, 'verified', 2000, null, null, pg_temp.tok(:'m6', :'mid'::uuid));
+select pg_temp.ok((select state = 'rolled_back' from public.storage_migrations where id = :'m6'::uuid)
+  and (select store_id = 'nas' from public.photos where id = :'mid'::uuid), 'then the rollback finishes, with nothing left on the abandoned store');
+rollback to savepoint rollback_upload;
+
+-- ---- Follow-up copies (followMove couldn't copy an object to the photo's new store) ---------------------------------
+select ('u/' || :mei || '/p/' || :'pa' || '/e/v1-thumb.jpg') as fk \gset
+select pg_temp.ok(public.storage_followup_add(:'pa'::uuid, 'r2', array[:'fk']) = 1, 'a failed follow-up copy is recorded');
+select pg_temp.ok((public.storage_status() ->> 'cleanupPending')::boolean, 'and the sweep leaves copies away from their photo''s store alone meanwhile');
+select pg_temp.ok(public.storage_followups_due(10) = jsonb_build_array(jsonb_build_object('photoId', :'pa', 'key', :'fk', 'from', 'r2', 'to', 'nas')),
+  'due follow-ups name the photo''s store now');
+do $$ begin
+  begin
+    perform public.storage_followup_add((select id from public.photos where filename = 'a.jpg'), 'r2', array['u/someone-else/p/x/original']);
+    raise exception 'FAILED: a key outside the photo accepted';
+  exception when invalid_parameter_value then raise notice 'ok - follow-ups only take keys under the photo''s prefix';
+  end;
+end $$;
+select pg_temp.ok(public.storage_followup_add('95000000-0000-0000-0000-00000000ffff', 'r2', array['u/x/p/y/original']) = 0, 'a photo that''s gone records nothing');
+select public.storage_followup_done(:'pa'::uuid, :'fk', 'r2', false);
+select pg_temp.ok(public.storage_followups_due(10) = '[]'::jsonb
+  and (select attempts = 1 and next_at > now() from public.storage_followups where photo_id = :'pa'::uuid), 'a failed retry backs off');
+select public.storage_followup_done(:'pa'::uuid, :'fk', 'r2', true);
+select pg_temp.ok(not exists (select 1 from public.storage_followups) and not (public.storage_status() ->> 'cleanupPending')::boolean, 'a done follow-up goes');
 
 -- ---- A photo purged mid-migration -------------------------------------------------------------------------
 select pg_temp.photo(:mei, 'gone.jpg') as pe \gset
@@ -352,16 +436,20 @@ select pg_temp.ok(public.get_upload(:mei, '95000000-0000-0000-0000-00000000ffff'
 
 -- ---- Privileges ----------------------------------------------------------------------------------------------------
 select pg_temp.ok(not exists (
-  select 1 from unnest(array['storage_state', 'storage_checks', 'storage_migrations', 'storage_migration_items']) t
+  select 1 from unnest(array['storage_state', 'storage_checks', 'storage_migrations', 'storage_migration_items', 'storage_followups']) t
    where has_table_privilege('anon', 'public.' || t, 'select') or has_table_privilege('authenticated', 'public.' || t, 'select')
       or has_table_privilege('authenticated', 'public.' || t, 'insert'))
   and (select bool_and(c.relrowsecurity) from pg_class c where c.relnamespace = 'public'::regnamespace
-         and c.relname in ('storage_state', 'storage_checks', 'storage_migrations', 'storage_migration_items')),
+         and c.relname in ('storage_state', 'storage_checks', 'storage_migrations', 'storage_migration_items', 'storage_followups')),
   'the storage tables have RLS and nothing for anon or authenticated');
 select pg_temp.ok(not has_function_privilege('service_role', 'public._v7_get_upload(uuid, uuid)', 'execute')
   and has_function_privilege('service_role', 'public.get_upload(uuid, uuid)', 'execute')
   and not has_function_privilege('authenticated', 'public.storage_switch(uuid, text, text)', 'execute')
   and not has_function_privilege('service_role', 'public._migration_progress(uuid)', 'execute')
+  and not has_function_privilege('service_role', 'public._migration_top_up(public.storage_migrations, boolean)', 'execute')
+  and has_function_privilege('service_role', 'public.storage_followup_add(uuid, text, text[])', 'execute')
+  and not has_function_privilege('authenticated', 'public.storage_followup_add(uuid, text, text[])', 'execute')
+  and not has_function_privilege('anon', 'public.storage_followups_due(integer)', 'execute')
   and has_function_privilege('service_role', 'public.storage_item_touch(uuid, uuid, uuid)', 'execute')
   and has_function_privilege('service_role', 'public.storage_old_copy_claim(uuid, uuid, text)', 'execute')
   and not has_function_privilege('authenticated', 'public.storage_old_copy_claim(uuid, uuid, text)', 'execute')

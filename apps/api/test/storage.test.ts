@@ -17,6 +17,7 @@ import {
   handleStorageBatch,
   type MigrationItem,
   migrateItem,
+  runFollowups,
   runMigrationBatch,
   runMigrationCron,
 } from '../src/storage/migrate';
@@ -762,7 +763,7 @@ describe('migration copy and verify', () => {
       marks.push(a);
       return null;
     };
-    expect(await runMigrationCron(menv)).toEqual({ enqueued: true, oldCopiesDeleted: 2 });
+    expect(await runMigrationCron(menv)).toEqual({ enqueued: true, oldCopiesDeleted: 2, followupsCopied: 0 });
     expect(storageQueue.sent).toEqual([{ t: 'migrate', migration: MIGRATION }]);
     expect(marks[0]).toMatchObject({ p_state: 'deleted', p_photo: PHOTO, p_store: 'r2', p_token: null });
     expect(r2b.objects.has(`${prefix}thumb`)).toBe(false);
@@ -773,12 +774,90 @@ describe('migration copy and verify', () => {
     world.rpc.storage_photo_store = (a) => (a.p_photo === PHOTO ? 'b2-eu' : null);
     await followMove(menv, PHOTO, 'r2', [`${prefix}thumb`]);
     expect(mocks.b2.objects.has(`${prefix}thumb`)).toBe(true);
-    // Not moved (or gone): nothing to do.
+    // Recorded first, cleared once copied.
+    expect(rpcCalls('storage_followup_add')[0]?.body).toEqual({
+      p_photo: PHOTO,
+      p_from: 'r2',
+      p_keys: [`${prefix}thumb`],
+    });
+    expect(rpcCalls('storage_followup_done')[0]?.body).toEqual({
+      p_photo: PHOTO,
+      p_key: `${prefix}thumb`,
+      p_from: 'r2',
+      p_ok: true,
+    });
+    // Not moved (or gone): nothing to do, nothing recorded.
     mocks.b2.objects.clear();
     await followMove(menv, PHOTO, 'b2-eu', [`${prefix}thumb`]);
     world.rpc.storage_photo_store = () => null;
     await followMove(menv, PHOTO, 'r2', [`${prefix}thumb`]);
     expect(mocks.b2.objects.size).toBe(0);
+    expect(rpcCalls('storage_followup_add')).toHaveLength(1);
+  });
+
+  it('a followMove copy that fails stays recorded, and the cron copies it to wherever the photo is then', async () => {
+    await seed();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    world.rpc.storage_photo_store = () => 'b2-eu';
+    mocks.b2.next = { status: 503, body: '' };
+    await followMove(menv, PHOTO, 'r2', [`${prefix}thumb`]);
+    expect(rpcCalls('storage_followup_add')).toHaveLength(1);
+    expect(rpcCalls('storage_followup_done')).toHaveLength(0);
+    expect(mocks.b2.objects.has(`${prefix}thumb`)).toBe(false);
+    // The cron's retry.
+    world.rpc.storage_followups_due = () => [
+      { photoId: PHOTO, key: `${prefix}thumb`, from: 'r2', to: 'b2-eu' },
+    ];
+    expect(await runFollowups(menv)).toBe(1);
+    expect(mocks.b2.objects.has(`${prefix}thumb`)).toBe(true);
+    expect(rpcCalls('storage_followup_done').at(-1)?.body).toMatchObject({ p_ok: true });
+    // Already there, the photo gone, or back on the store it was written to: just cleared.
+    world.rpc.storage_followups_due = () => [
+      { photoId: PHOTO, key: `${prefix}thumb`, from: 'r2', to: 'b2-eu' },
+      { photoId: PHOTO, key: `${prefix}original`, from: 'r2', to: null },
+      { photoId: PHOTO, key: `${prefix}original`, from: 'r2', to: 'r2' },
+    ];
+    expect(await runFollowups(menv)).toBe(0);
+    expect(mocks.b2.objects.has(`${prefix}original`)).toBe(false);
+    expect(
+      rpcCalls('storage_followup_done')
+        .slice(-3)
+        .map((c) => (c.body as { p_ok: boolean }).p_ok),
+    ).toEqual([true, true, true]);
+    // A failed retry backs off.
+    mocks.b2.objects.clear();
+    mocks.b2.next = { status: 503, body: '' };
+    world.rpc.storage_followups_due = () => [
+      { photoId: PHOTO, key: `${prefix}thumb`, from: 'r2', to: 'b2-eu' },
+    ];
+    expect(await runFollowups(menv)).toBe(0);
+    expect(rpcCalls('storage_followup_done').at(-1)?.body).toMatchObject({ p_ok: false });
+  });
+
+  it('a rollback accepts a recorded key that is already on the destination (a follow-up copy that never reached the new store)', async () => {
+    await seed();
+    const marks: Record<string, unknown>[] = [];
+    world.rpc.storage_item_mark = (a) => {
+      marks.push(a);
+      return null;
+    };
+    // The edited preview was written to R2 (the destination of the copy back) and never reached b2-eu.
+    const edited = `${prefix}edit-1-preview-${'a'.repeat(32)}`;
+    await r2b.put(edited, bytes('edited'));
+    await copyVerified(r2Store(r2b as unknown as R2Bucket), storeFor(menv, 'b2-eu'), `${prefix}original`);
+    await copyVerified(r2Store(r2b as unknown as R2Bucket), storeFor(menv, 'b2-eu'), `${prefix}thumb`);
+    world.rpc.storage_item_touch = () => ({
+      keys: [`${prefix}original`, `${prefix}thumb`, edited],
+      minBytes: 18,
+    });
+    expect(await migrateItem(menv, MIGRATION, item({ from: 'b2-eu', to: 'r2' }))).toBe('verified');
+    expect(marks[0]).toMatchObject({
+      p_state: 'verified',
+      p_bytes: 'the original bytes'.length + 'thumb'.length + 'edited'.length,
+    });
+    // Missing on both: still not a copy.
+    r2b.objects.delete(edited);
+    expect(await migrateItem(menv, MIGRATION, item({ from: 'b2-eu', to: 'r2' }))).toBe('pending');
   });
 
   it('a truncated S3 listing with no continuation token is an error, never a complete list', async () => {
