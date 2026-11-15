@@ -12,7 +12,7 @@ import { useAppStatusPolling } from './lib/appStatus';
 import { refreshLibraries, takeLibraryNotice, useCan } from './lib/libraryContext';
 import { safeReturnPath } from './lib/returnPath';
 import { SessionProvider, useSession } from './lib/session';
-import { browser } from './lib/sessionGuard';
+import { browser, onOtherTabLibrariesChange } from './lib/sessionGuard';
 import { About } from './routes/About';
 import { AccountDeleted } from './routes/AccountScheduled';
 import { AlbumsPage } from './routes/Albums';
@@ -22,6 +22,7 @@ import { InviteFriends } from './routes/Invites';
 import { Join } from './routes/Join';
 import { NotFound } from './routes/NotFound';
 import { Security } from './routes/Security';
+import { ShareNewPage } from './routes/ShareNew';
 import { SharingSettings } from './routes/SharingSettings';
 import { SignIn } from './routes/SignIn';
 import { SignInCode } from './routes/SignInCode';
@@ -58,6 +59,8 @@ function LibraryBoot() {
   const toastRef = useRef(toast);
   toastRef.current = toast;
   const id = user && !user.pendingDeletion ? user.id : null;
+  // Phase 8: another tab joined or left a team: re-read the libraries here too.
+  useEffect(() => (id ? onOtherTabLibrariesChange(() => void refreshLibraries()) : undefined), [id]);
   useEffect(() => {
     if (!id) return;
     void refreshLibraries();
@@ -159,6 +162,8 @@ export const routes: RouteObject[] = [
       { path: '/team/accept', element: page(<TeamAcceptPage />) },
       { path: '/albums', element: auth(<AlbumsPage />) },
       { path: '/trash', element: auth(<TrashPage />) },
+      // Phase 8: Share continued from a page that held Google's AdSense script (never an ad page).
+      { path: '/share/new', element: auth(<ShareNewPage />) },
       { path: '/shared', element: auth(<GalleriesPage />) },
       { path: '/shared/:galleryId', element: auth(<GalleryPage />) },
       { path: '/shared/:galleryId/:tab', element: auth(<GalleryPage />) },

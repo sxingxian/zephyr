@@ -11,6 +11,7 @@ import {
   hasAdsFor,
   loadAds,
   loadAdsense,
+  mayReloadForAdsense,
   newAdPageView,
   planHasAds,
   type SponsoredCard,
@@ -20,9 +21,9 @@ import {
   useAdsenseLoaded,
 } from '../../lib/ads';
 import { STATUS_POLL_MS } from '../../lib/appStatus';
-import { useActiveLibrary, useLibraries } from '../../lib/libraryContext';
+import { refreshLibraries, useActiveLibrary, useLibraries } from '../../lib/libraryContext';
 import { useSession } from '../../lib/session';
-import { browser } from '../../lib/sessionGuard';
+import { browser, onOtherTabLibrariesChange } from '../../lib/sessionGuard';
 
 /** Free member in their own library (not a team library, not pending deletion). */
 function useAdsAccount(): boolean {
@@ -65,9 +66,10 @@ export function useAdsReady(placement: AdPlacement): boolean {
  * Mounted once under the session: loads ads for a Free member's own library and starts a new "page view" on
  * each navigation (impressions count again). Once Google's AdSense script is in the page it reloads the page as
  * soon as the member it was loaded for is gone (signed out, session ended, another member) or no longer gets ads
- * (an upgrade here, in another tab or by staff, or a team library), so the script never carries over. While the
- * script is loaded it also re-reads the session every 2 minutes and when the tab comes back, to notice a plan
- * change made elsewhere.
+ * (an upgrade here, in another tab or by staff, or a team library), so the script never carries over; the reload
+ * first has the server clear the site's storage (sessionGuard's before-full-load hook). While the script is
+ * loaded it also re-reads the session, the member's libraries and their ads every 2 minutes, when the tab comes
+ * back and when another tab reports a team change, to notice a plan change or a team joined elsewhere.
  */
 export function AdsBoot() {
   const { user, refresh } = useSession();
@@ -92,24 +94,33 @@ export function AdsBoot() {
   useEffect(() => {
     if (loaded && ads && !ads.adsense) browser.reload();
   }, [loaded, ads]);
-  // A plan change made elsewhere (another device, staff): re-read the session while the script is loaded.
+  // A plan change or a team joined elsewhere (another tab or device, staff): while the script is loaded, re-read
+  // the session, the libraries and the ads (fresh, not the copy loaded with the page). Any of them can drop
+  // AdSense, which reloads the page above.
   useEffect(() => {
-    if (!loaded) return;
-    const t = setInterval(() => void refresh(), STATUS_POLL_MS);
+    if (!loaded || !userId) return;
+    const recheck = () => {
+      void refresh();
+      void refreshLibraries();
+      void loadAds(userId, true);
+    };
+    const t = setInterval(recheck, STATUS_POLL_MS);
     const vis = () => {
-      if (document.visibilityState === 'visible') void refresh();
+      if (document.visibilityState === 'visible') recheck();
     };
     document.addEventListener('visibilitychange', vis);
+    const off = onOtherTabLibrariesChange(recheck);
     return () => {
       clearInterval(t);
       document.removeEventListener('visibilitychange', vis);
+      off();
     };
-  }, [loaded, refresh]);
-  // This document was loaded on a page without ads (the strict CSP), and the member just arrived on an ad page
-  // with AdSense to show: load the page fresh, so the Worker can send the AdSense policy for it.
+  }, [loaded, userId, refresh]);
+  // This document was loaded on an ad page with the strict policy (the AdSense cookie came with this page's first
+  // ads request), and there's AdSense to show: load the page fresh once, so the Worker can send the AdSense policy.
   const adsenseHere = Boolean(account && solo && raw?.adsense && adsAllowedOn(pathname));
   useEffect(() => {
-    if (!loaded && adsenseHere && !documentAllowsAdsense()) browser.reload();
+    if (!loaded && adsenseHere && !documentAllowsAdsense() && mayReloadForAdsense()) browser.reload();
   }, [loaded, adsenseHere]);
   // biome-ignore lint/correctness/useExhaustiveDependencies: a new page view on every navigation
   useEffect(() => {
@@ -128,8 +139,9 @@ export function AdsRouteGate({ children }: { children: ReactNode }) {
   const loc = useLocation();
   const leave = loaded && !adsAllowedOn(loc.pathname);
   const to = `${loc.pathname}${loc.search}${loc.hash}`;
+  // The same member goes on in the next document, so the site's storage isn't cleared for this one.
   useEffect(() => {
-    if (leave) browser.assign(to);
+    if (leave) browser.assign(to, { keepStorage: true });
   }, [leave, to]);
   if (leave) return <div className="page-loading" aria-busy="true" />;
   return <>{children}</>;

@@ -1,10 +1,13 @@
+import { ADS_DOC_COOKIE as SHARED_ADS_DOC_COOKIE } from '@zephyr/shared/client';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ADS_DOC_COOKIE, ADS_DOC_TIMING } from './adPages.js';
 import { ADSENSE_SOURCES, APP_HEADERS, APP_HEADERS_FILE, appCsp } from './appHeaders.js';
 import { GUEST_CSP, GUEST_HEADERS } from './guestHeaders.js';
 import worker, {
   __resetForTest,
   ADS_CONFIG_PATH,
   adsenseState,
+  hasAdsCookie,
   isGuestPath,
   isStaticFile,
   serveGuest,
@@ -117,6 +120,8 @@ function htmlEnv(adsense: { enabled: boolean; publisherId: string | null } | 'er
     api,
   };
 }
+/** A member the API shows AdSense (its cookie). */
+const ADS = { cookie: `${ADS_DOC_COOKIE}=1` };
 const directivesOf = (csp: string) =>
   Object.fromEntries(
     csp.split(';').map((d) => {
@@ -136,12 +141,15 @@ describe('app Worker · HTML pages and AdSense', () => {
     expect(csp).toBe(appCsp([HASH]));
     expect(csp).not.toMatch(/google|doubleclick|evil/);
     for (const [k, v] of Object.entries(APP_HEADERS)) expect(res.headers.get(k)).toBe(v);
-    expect(res.headers.get('Cache-Control')).toBe('no-cache');
+    expect(res.headers.get('Cache-Control')).toBe('no-store');
+    expect(res.headers.get('Server-Timing')).toBeNull();
   });
 
   it('adds Google’s hosts to exactly four directives while AdSense is on', async () => {
     const e = htmlEnv({ enabled: true, publisherId: PUB });
-    const res = await worker.fetch(new Request('https://x/'), e);
+    const res = await worker.fetch(new Request('https://x/', { headers: ADS }), e);
+    expect(res.headers.get('Server-Timing')).toBe(ADS_DOC_TIMING);
+    expect(res.headers.get('Cache-Control')).toBe('no-store');
     const csp = res.headers.get('Content-Security-Policy') ?? '';
     expect(csp).toBe(appCsp([HASH], { adsense: true }));
     const wide = directivesOf(csp);
@@ -166,7 +174,7 @@ describe('app Worker · HTML pages and AdSense', () => {
     const e = htmlEnv({ enabled: true, publisherId: PUB });
     const wide = appCsp([HASH], { adsense: true });
     for (const p of ['/', '/favourites', '/albums/abc', '/people', '/scenes/beach', '/ai/queue']) {
-      const res = await worker.fetch(new Request(`https://x${p}?x=1`), e);
+      const res = await worker.fetch(new Request(`https://x${p}?x=1`, { headers: ADS }), e);
       expect(res.headers.get('Content-Security-Policy'), p).toBe(wide);
     }
     for (const p of [
@@ -183,14 +191,46 @@ describe('app Worker · HTML pages and AdSense', () => {
       '/albums/abc/edit',
       '/suspended',
     ]) {
-      const res = await worker.fetch(new Request(`https://x${p}`), e);
+      const res = await worker.fetch(new Request(`https://x${p}`, { headers: ADS }), e);
       expect(res.headers.get('Content-Security-Policy'), p).toBe(appCsp([HASH]));
+      expect(res.headers.get('Server-Timing'), p).toBeNull();
     }
   });
 
-  it('serves /index.html itself (never the redirect to /) with the strict policy, for the offline fallback', async () => {
+  it('widens the policy only for a request carrying the AdSense cookie (a member the API shows AdSense)', async () => {
     const e = htmlEnv({ enabled: true, publisherId: PUB });
-    const res = await worker.fetch(new Request('https://x/index.html?__WB_REVISION__=abc'), e);
+    const wide = appCsp([HASH], { adsense: true });
+    for (const cookie of [
+      undefined,
+      'sid=1',
+      `${ADS_DOC_COOKIE}=`,
+      `${ADS_DOC_COOKIE}=0`,
+      `x${ADS_DOC_COOKIE}=1`,
+    ]) {
+      const res = await worker.fetch(new Request('https://x/', cookie ? { headers: { cookie } } : {}), e);
+      expect(res.headers.get('Content-Security-Policy'), String(cookie)).toBe(appCsp([HASH]));
+    }
+    expect(e.api).not.toHaveBeenCalled();
+    const res = await worker.fetch(
+      new Request('https://x/', { headers: { cookie: `sid=1; ${ADS_DOC_COOKIE}=1` } }),
+      e,
+    );
+    expect(res.headers.get('Content-Security-Policy')).toBe(wide);
+    expect(hasAdsCookie(new Request('https://x/', { headers: { cookie: `${ADS_DOC_COOKIE}=1` } }))).toBe(
+      true,
+    );
+  });
+
+  it('names the same AdSense cookie as the API', () => {
+    expect(ADS_DOC_COOKIE).toBe(SHARED_ADS_DOC_COOKIE);
+  });
+
+  it('serves /index.html itself (never the redirect to /) with the strict policy', async () => {
+    const e = htmlEnv({ enabled: true, publisherId: PUB });
+    const res = await worker.fetch(
+      new Request('https://x/index.html?__WB_REVISION__=abc', { headers: ADS }),
+      e,
+    );
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Security-Policy')).toBe(appCsp([HASH]));
     expect(e.assets.mock.calls.map((c) => new URL((c[0] as Request).url).pathname)).toContain('/');
@@ -207,7 +247,7 @@ describe('app Worker · HTML pages and AdSense', () => {
     expect(on.api).toHaveBeenCalledTimes(1);
     __resetForTest();
     const down = htmlEnv('error');
-    const res = await worker.fetch(new Request('https://x/'), down);
+    const res = await worker.fetch(new Request('https://x/', { headers: ADS }), down);
     expect(res.headers.get('Content-Security-Policy')).toBe(appCsp([HASH]));
     __resetForTest();
     const bad = htmlEnv({ enabled: true, publisherId: 'pub-123; script-src *' });

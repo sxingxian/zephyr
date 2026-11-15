@@ -162,6 +162,12 @@ export const MEMBER8_API = {
   ads: '/api/v1/ads',
   /** POST AdEventBody → 204 (counted, never tied to the member) */
   adEvent: '/api/v1/ads/events',
+  /**
+   * POST {} → 204 (no session needed; same-origin only). Sent before the page reloads off Google's AdSense script
+   * (the member it was loaded for is gone or lost ads): answers `Clear-Site-Data: "cache", "storage"` and clears
+   * the AdSense cookie, so nothing the script could have written survives.
+   */
+  adReset: '/api/v1/ads/reset',
   /** GET → image (public, immutable; the URL carries the image version) */
   adImage: (cardId: string, version: number) =>
     `/api/v1/ads/cards/${encodeURIComponent(cardId)}/image?v=${version}`,
@@ -169,6 +175,14 @@ export const MEMBER8_API = {
   galleryLinkReplace: (galleryId: string) =>
     `/api/v1/galleries/${encodeURIComponent(galleryId)}/link/replace`,
 } as const;
+/**
+ * Phase 8: set by GET /api/v1/ads (HttpOnly, Secure, SameSite=Strict, host-only, 15 minutes) only when the member
+ * is shown AdSense, and cleared otherwise and on sign-out. The app Worker sends the AdSense CSP variant only for
+ * documents whose request carries it (and only on ad pages, while AdSense is on), so a visitor who isn't shown
+ * AdSense never gets the wider policy. Mirrored in apps/web/worker/adPages.js.
+ */
+export const ADS_DOC_COOKIE = '__Host-zads';
+export const ADS_DOC_COOKIE_MAX_AGE = 15 * 60;
 /** TEAM_API.member DELETE accepts ?replaceLinks=1: replaces the links of every live gallery in that library. */
 export const TEAM_REMOVE_REPLACE_LINKS_PARAM = 'replaceLinks';
 /** Most links `gallery_links_replace` rotates in one call (one transaction); the API pages through more. */

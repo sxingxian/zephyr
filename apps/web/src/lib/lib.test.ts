@@ -10,6 +10,8 @@ describe('safeReturnPath', () => {
     ['', '/'],
     ['https://evil.example/x', '/'],
     ['//evil.example/x', '/'],
+    ['/.//evil.com', '/'],
+    ['/a/..//evil.com/x', '/'],
     ['/\\evil.example', '/'],
     ['\\\\evil.example', '/'],
     ['javascript:alert(1)', '/'],

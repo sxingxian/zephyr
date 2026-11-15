@@ -28,6 +28,8 @@ export interface Env {
   RESEND_API_KEY: string;
   TURNSTILE_SECRET_KEY: string;
   IP_HASH_SECRET: string;
+  /** Phase 8: keys the per-member, per-day ad event dedup hash (its own secret, never IP_HASH_SECRET). */
+  AD_DEDUP_SECRET: string;
   /** Signs the admin idle-timeout cookie. 32+ random bytes. */
   SESSION_HMAC_SECRET: string;
   BURST_LIMITER: RateLimit;

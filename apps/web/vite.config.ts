@@ -50,7 +50,6 @@ export default defineConfig(({ mode, command }) => {
       VitePWA({
         registerType: 'autoUpdate',
         injectRegister: 'script-defer',
-        includeAssets: ['favicon.svg', 'icons/apple-touch-icon.png'],
         manifest: {
           name: 'Zephyr',
           short_name: 'Zephyr',
@@ -66,39 +65,19 @@ export default defineConfig(({ mode, command }) => {
             { src: '/icons/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
           ],
         },
-        workbox: {
-          // Precache the app shell only. Nothing under /api is ever cached by the service worker.
-          globPatterns: ['**/*.{js,css,html,svg,png,woff2}'],
-          // Latin fonts only; other scripts load on demand if a page ever needs them. The guest gallery page
-          // and its own files aren't part of the member app and are never precached.
-          globIgnores: [
-            '**/*cyrillic*',
-            '**/*vietnamese*',
-            '**/*greek*',
-            '**/*symbols*',
-            'guest.html',
-            'assets/guest-*',
-            // Zephyr AI's face engine loads on demand (onnxruntime and its worker): never precached for everyone.
-            // Its models are kept in Cache Storage once used; the hashed WebAssembly file in the HTTP cache.
-            'assets/ort.*',
-            'assets/faces.worker-*',
-          ],
-          // Phase 8: pages come from the network first (the app Worker sets their CSP, which changes with the
-          // AdSense setting), with the precached shell as the offline fallback. A cached page must never keep
-          // an old, wider policy after AdSense is turned off.
-          navigateFallback: null,
-          runtimeCaching: [
-            {
-              urlPattern: ({ request, url }) =>
-                request.mode === 'navigate' && !/^\/(api|g)(\/|$)/.test(url.pathname),
-              handler: 'NetworkOnly',
-              options: {
-                precacheFallback: { fallbackURL: '/index.html' },
-              },
-            },
-          ],
-          cleanupOutdatedCaches: true,
-          clientsClaim: true,
+        // Phase 8: our own service worker (src/sw.ts), with no precache and nothing served from Cache Storage.
+        // Google's AdSense script runs in Free members' library pages with this origin and could rewrite any
+        // cached file, which would then run as 'self' in every later document. Scripts, styles and WebAssembly
+        // come from the HTTP cache (hashed, immutable), which page script can't write; the offline page is built
+        // inside sw.js. scripts/csp.mjs fails the build if sw.js ever reads a cache or carries a precache list.
+        strategies: 'injectManifest',
+        srcDir: 'src',
+        filename: 'sw.ts',
+        injectManifest: {
+          // No precache manifest at all (nothing is injected into sw.js).
+          injectionPoint: undefined,
+          // A classic script: no module syntax left in sw.js.
+          rollupFormat: 'iife',
         },
       }),
       guestWithoutServiceWorker(),

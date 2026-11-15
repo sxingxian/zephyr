@@ -196,8 +196,10 @@ appAuthRoutes.get('/session', requireMember, async (c) => {
 appAuthRoutes.post('/sign-out', async (c) => {
   const s = await resolveSession(c, 'app');
   await endSession(c, 'app', s?.accessToken);
-  // Private images may sit in the browser cache (revalidated, but still stored): drop them.
-  c.header('Clear-Site-Data', '"cache"');
+  // Private images may sit in the browser cache (revalidated, but still stored): drop them. Phase 8: also every
+  // storage area (local and session storage, IndexedDB, Cache Storage, the service worker), so nothing a page
+  // script wrote (Google's AdSense script runs in Free members' library pages) survives into the next session.
+  c.header('Clear-Site-Data', '"cache", "storage"');
   return c.body(null, 204);
 });
 

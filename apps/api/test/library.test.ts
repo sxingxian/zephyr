@@ -1015,11 +1015,11 @@ describe('cached images and sign-out (MEDIUM-2)', () => {
     const j = await signedIn(MEI);
     const out = await call('/api/v1/auth/sign-out', { jar: j, body: {} });
     expect(out.status).toBe(204);
-    expect(out.headers.get('Clear-Site-Data')).toBe('"cache"');
+    expect(out.headers.get('Clear-Site-Data')).toBe('"cache", "storage"');
     const k = await signedIn(MEI);
     const del = await call(LIBRARY_API.deleteAccount, { jar: k, body: { confirm: 'DELETE' } });
     expect(del.status).toBe(200);
-    expect(del.headers.get('Clear-Site-Data')).toBe('"cache"');
+    expect(del.headers.get('Clear-Site-Data')).toBe('"cache", "storage"');
   });
 
   it('a revalidation after sign-out is refused, never answered from the session-less cache', async () => {

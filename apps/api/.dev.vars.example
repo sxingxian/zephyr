@@ -14,6 +14,7 @@ TURNSTILE_EXPECTED_HOSTNAMES=localhost
 TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
 # 32+ random bytes each, e.g. `openssl rand -base64 48`
 IP_HASH_SECRET=
+AD_DEDUP_SECRET=
 SESSION_HMAC_SECRET=
 # Local admin without Cloudflare Access: honoured only when ENVIRONMENT=development and the request
 # is to localhost. Use a staff member's email.

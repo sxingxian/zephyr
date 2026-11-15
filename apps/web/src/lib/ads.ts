@@ -7,9 +7,9 @@ import {
   type PlanId,
 } from '@zephyr/shared/client';
 import { useSyncExternalStore } from 'react';
-import { adsAllowedOn } from '../../worker/adPages.js';
+import { ADS_DOC_TIMING, adsAllowedOn } from '../../worker/adPages.js';
 import { api } from './api';
-import { sessionUserId } from './sessionGuard';
+import { sessionUserId, setBeforeFullLoad } from './sessionGuard';
 
 /**
  * Phase 8: ads for Free members, in their own library only (a team library never shows ads).
@@ -21,8 +21,11 @@ import { sessionUserId } from './sessionGuard';
  * - Ads are never shown in the editor, the photo viewer, sharing, billing, settings, team or sign-in pages
  *   (`worker/adPages.js`, shared with the app Worker). Once Google's script is in the page, leaving the ad pages
  *   is a full page load (AdsRouteGate), so the script never sees those pages; the Worker sends the AdSense CSP
- *   only for documents on ad pages. A plan upgrade (here, in another tab or by staff), a sign-out, an account
- *   change or a library change also reloads, and a member of any team library never gets AdSense.
+ *   only for documents on ad pages, and only to members the API shows AdSense (its cookie). A plan upgrade (here,
+ *   in another tab or by staff), joining a team, a sign-out, an account change or a library change also
+ *   reloads, after the server clears the site's storage; a member of any team library never gets AdSense.
+ * - Nothing secret (a new gallery's link and passcode, invite links) is ever shown in a document holding the
+ *   script (NoAdsSurface); Share from an ad page continues on /share/new with a full page load.
  */
 export type SponsoredCard = AdsResult['cards'][number];
 export interface Ads {
@@ -33,12 +36,43 @@ export interface Ads {
 export { adsAllowedOn };
 
 /**
- * Whether this document was loaded on an ad page, so the Worker may have sent the AdSense CSP. AdSense units
- * mount only in such documents (elsewhere the CSP would block Google's script anyway); other page loads show
- * sponsored cards only.
+ * Whether the Worker served this document with the AdSense CSP: it says so with a Server-Timing entry, read from
+ * this document's own navigation entry. AdSense units mount only in such documents (elsewhere the CSP would block
+ * Google's script anyway); other page loads show sponsored cards only. A browser that doesn't expose Server-Timing
+ * never loads AdSense.
  */
+export function navigationTiming(): { supported: boolean; wide: boolean } {
+  try {
+    const nav = performance.getEntriesByType('navigation')[0] as
+      | (PerformanceEntry & { serverTiming?: { name: string }[] })
+      | undefined;
+    if (!nav || !Array.isArray(nav.serverTiming)) return { supported: false, wide: false };
+    return { supported: true, wide: nav.serverTiming.some((t) => t?.name === ADS_DOC_TIMING) };
+  } catch {
+    return { supported: false, wide: false };
+  }
+}
 let docPath = typeof window === 'undefined' ? '' : window.location.pathname;
-export const documentAllowsAdsense = (): boolean => adsAllowedOn(docPath);
+let docTiming = typeof window === 'undefined' ? { supported: false, wide: false } : navigationTiming();
+export const documentAllowsAdsense = (): boolean => adsAllowedOn(docPath) && docTiming.wide;
+/**
+ * This document got the strict policy (loaded on a page without ads, or before the AdSense cookie was set) and
+ * the member is now on an ad page with AdSense to show: it may reload once to get the AdSense policy. Never when
+ * the browser can't tell (no Server-Timing), and at most once a minute per tab, so a cookie that doesn't stick
+ * can't cause a reload loop.
+ */
+const RELOAD_KEY = 'zephyr.adsReload';
+export function mayReloadForAdsense(now = Date.now()): boolean {
+  if (!docTiming.supported || documentAllowsAdsense()) return false;
+  try {
+    const last = Number(sessionStorage.getItem(RELOAD_KEY));
+    if (Number.isFinite(last) && last > 0 && now - last < 60_000) return false;
+    sessionStorage.setItem(RELOAD_KEY, String(now));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function planHasAds(plan: PlanId | undefined): boolean {
   return Boolean(plan && PLANS.find((p) => p.id === plan)?.limits.ads);
@@ -91,9 +125,9 @@ const emit = () => {
   for (const s of subs) s();
 };
 
-/** Loads the member's ads (once per member and page load). */
-export async function loadAds(userId: string): Promise<void> {
-  if (loadedFor === userId) return;
+/** Loads the member's ads (once per member and page load; `force`: again, for the re-check). */
+export async function loadAds(userId: string, force = false): Promise<void> {
+  if (loadedFor === userId && !force) return;
   loadedFor = userId;
   try {
     const r = await api<AdsResult>(MEMBER8_API.ads);
@@ -211,6 +245,31 @@ export function loadAdsense(publisherId: string): boolean {
   return true;
 }
 export const adsenseLoaded = (): boolean => scriptFor !== null;
+
+/**
+ * Before any full page load that ends this document's session while Google's script is in it: ask the server to
+ * clear the site's storage (`Clear-Site-Data: "cache", "storage"`) and the AdSense cookie, so nothing the script
+ * wrote (Cache Storage, local or session storage, IndexedDB) survives. Same-origin POST; best effort, and the
+ * page load goes ahead after at most a second and a half either way.
+ */
+export function resetSiteForAdsense(): Promise<void> | null {
+  if (!adsenseLoaded() || typeof fetch === 'undefined') return null;
+  try {
+    return fetch(MEMBER8_API.adReset, {
+      method: 'POST',
+      credentials: 'same-origin',
+      keepalive: true,
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: '{}',
+    }).then(
+      () => undefined,
+      () => undefined,
+    );
+  } catch {
+    return null;
+  }
+}
+setBeforeFullLoad(resetSiteForAdsense);
 /** The member Google's script was loaded for (null if not loaded). */
 export const adsenseUser = (): string | null => scriptUser;
 export function useAdsenseLoaded(): boolean {
@@ -224,13 +283,15 @@ export function useAdsenseLoaded(): boolean {
   );
 }
 
-/** Test helper. */
-export function __resetAdsForTest(path = '/'): void {
+/** Test helper. `wide`: whether this document got the AdSense CSP (its Server-Timing entry). */
+export function __resetAdsForTest(path = '/', wide = true): void {
   ads = null;
   loadedFor = null;
   scriptFor = null;
   scriptUser = null;
   docPath = path;
+  docTiming = { supported: true, wide };
+  setBeforeFullLoad(resetSiteForAdsense);
   for (const cb of scriptSubs) cb();
   newAdPageView();
   for (const el of document.querySelectorAll('script[data-zephyr="adsense"]')) el.remove();

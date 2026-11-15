@@ -207,27 +207,44 @@ All new tables: RLS on, no grants to anon or authenticated, SECURITY DEFINER fun
 ## Ads (member app)
 
 - Free members only: the effective plan has `ads` and the library is their own. A team library never shows ads (Studio).
-- **AdSense never goes to a member of any team library** (`ads_for_member`, mirrored in the app), even in their own library. Their session reaches every library they're in, through `X-Zephyr-Library`, and the team's owner didn't accept the risk. They still get sponsored cards.
+- **AdSense never goes to a member of any team library** (`ads_for_member`, mirrored in the app), even in their own library. Their session reaches every library they're in, through `X-Zephyr-Library`, and the team's owner didn't accept the risk. Nor does it go to a member whose own library still has teammates (a lapsed Studio owner). Both still get sponsored cards.
 - **Placements:** Library grid (after the first 24 tiles, then every 48), sidebar card, batch queue. Only on the library pages listed in `apps/web/worker/adPages.js` (Library, Favourites, Albums, People, Scenes, AI queue). Never in the editor, viewer, sharing, billing, settings, sign-in or guest galleries.
 - **Sponsored cards:**
   - Rendered by the app from `/api/v1/ads` and labelled "Sponsored". Links open in a new tab with `rel="noopener noreferrer sponsored"`.
   - Impressions are sent once per card per page view when 50% visible for 1 s; clicks on activation.
-  - The database counts at most one impression and one click per member, card and UTC day, and only from members who are shown ads. The dedup key is HMAC(member, day, card, kind) in `ad_event_seen`, kept for two days and never joined to the stats.
+  - The database counts at most one impression and one click per member, card and UTC day, and only from members who are shown ads.
+  - The dedup key in `ad_event_seen` is HMAC(member, day, card, kind) under its own secret, `AD_DEDUP_SECRET`. It's pseudonymous, not anonymous, so it's kept for two days and never joined to the stats.
 - **AdSense, only when `adsense` is present in `/api/v1/ads`:**
   - The app loads `adsbygoogle.js?client=<publisherId>`, whose built-in consent message is Google's certified CMP (Privacy & messaging).
-  - It renders `<ins class="adsbygoogle">` units only in the placements above.
+  - It renders `<ins class="adsbygoogle">` units only in the placements above, and only in a document the Worker served with the AdSense CSP. The Worker marks those with a `Server-Timing: zads` entry, which the app reads from its own navigation entry. A browser that doesn't expose it never loads AdSense.
   - **Once the script is loaded, a page without ads is never rendered in that document.** The route gate opens it with a full page load instead, which drops the script, and the Worker serves it with the strict CSP.
-  - A document first loaded on a page without ads (strict CSP) reloads when the member arrives on an ad page with AdSense to show, for example after signing in.
-  - The page reloads when the member the script was loaded for is gone (sign-out, an ended session, another member) or no longer gets ads. That includes an upgrade or a staff override made in this tab, another tab or another device: tabs broadcast plan changes, and a tab holding the script re-reads the session every 2 minutes and on focus.
+  - **No secret is shown in a document holding the script.** The share dialogs, `PasscodeReveal` and `CopyButton` render nothing there (`NoAdsSurface` / `useSecretsAllowed`). Share from an ad page saves the selection in this tab's sessionStorage and opens `/share/new` with a full page load. That page isn't an ad page; it re-checks the hand-off (same member, ≤ 10 minutes, UUIDs only, read once) and runs the create flow.
+  - A document served with the strict policy reloads once when the member is on an ad page with AdSense to show, for example after signing in, or before the AdSense cookie was set. It reloads at most once a minute per tab, so it can't loop.
+  - The page reloads when the member the script was loaded for is gone (sign-out, an ended session, another member) or no longer gets ads. That includes an upgrade, a staff override or a team joined, in this tab, another tab or another device.
+    - Tabs broadcast plan and library changes.
+    - A tab holding the script re-reads the session, the libraries and `/api/v1/ads` every 2 minutes and on focus.
+    - Before that reload, and before any other full page load that ends the member's session, the app posts `/api/v1/ads/reset`. The server answers `Clear-Site-Data: "cache", "storage"` and clears the AdSense cookie. Sign-out and account deletion answer the same.
   - Any 401, or a session found ended, goes to sign-in with a full page load.
+  - A page restored from the back/forward cache reloads. App HTML is sent `no-store`.
   - Auto ads, anchor and vignette ads must stay off in the AdSense console (`docs/setup.md` §3.9). The code can't enforce this.
+- **Service worker (no script-writable cache serves code):**
+  - The app's service worker (`src/sw.ts`) has no precache and never reads Cache Storage. Google's script runs in this origin and could otherwise rewrite a cached script that every later document would run as `'self'`.
+  - Page loads go to the network. When offline, the worker answers with an offline page built into `sw.js`, under a policy that allows no script.
+  - Scripts, styles and WebAssembly come from the HTTP cache (hashed and immutable), which page script can't write.
+  - Workbox caches from earlier versions are deleted when the worker activates.
+  - `scripts/csp.mjs` fails the build if `sw.js` carries a precache list, reads or fills a cache, or loads other code.
+  - **Trade-off:** the app no longer opens offline. It shows the offline page instead.
 - **CSP:**
-  - The app Worker serves HTML responses (`run_worker_first: true`; static files still come from ASSETS untouched).
-  - It adds Google's ad and consent hosts to `script-src`, `frame-src`, `img-src` and `connect-src` only for documents on the ad pages, and only while AdSense is enabled. Every other document gets the strict policy. So does `/index.html`, which is served directly rather than redirected to `/`, because the service worker precaches it as the offline fallback.
-  - The config is read from the API with a 60-second cache in both Workers, and the public endpoints are rate-limited per client network.
+  - The app Worker serves HTML responses (`run_worker_first: true`; static files still come from ASSETS untouched), always `no-store`.
+  - It adds Google's ad and consent hosts to `script-src`, `frame-src`, `img-src` and `connect-src` only when three things hold:
+    - the document is on an ad page;
+    - AdSense is enabled;
+    - the request carries the AdSense cookie: `__Host-zads`, HttpOnly, Secure, SameSite=Strict, 15 minutes. `GET /api/v1/ads` sets it only when it returns AdSense and clears it otherwise; sign-out clears it too.
+  - Every other document gets the strict policy, including `/index.html` (served directly, never redirected to `/`).
+  - The config is read from the API with a 15-second cache in the API isolate and a 60-second cache in the app Worker, so turning AdSense off reaches new page loads within 75 seconds. Members stop loading the script at once, because `/api/v1/ads` isn't cached. The public endpoints are rate-limited per client network.
   - `scripts/csp.mjs` checks both variants, and that the ad pages are anchored and cover no sensitive page.
   - `/ads.txt` is served by the app Worker from the configured publisher id; it 404s when AdSense is off.
-- **Residual risk (accepted, see Decisions):** Google's script runs with the Free member's privileges on the library pages of the page loads where it's loaded. `docs/security.md` item 18 records this.
+- **Residual risk (accepted, see Decisions):** while a Free member is on a library page where the script is loaded, Google's script runs with that member's privileges. Persistence through the origin's caches and storage, and exposure on any other page, are closed. `docs/security.md` item 18 records this.
 
 ## Admin app (`apps/admin`)
 

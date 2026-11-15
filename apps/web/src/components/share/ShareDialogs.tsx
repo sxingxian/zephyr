@@ -10,6 +10,7 @@ import {
 import { Button, Dialog, Field, Icon, Note, Switch } from '@zephyr/ui';
 import { type FormEvent, useEffect, useId, useMemo, useState, useSyncExternalStore } from 'react';
 import { Link, useNavigate } from 'react-router';
+import { adsenseLoaded } from '../../lib/ads';
 import { ApiFailure, errorMessage } from '../../lib/api';
 import { useSession } from '../../lib/session';
 import { sessionUserId } from '../../lib/sessionGuard';
@@ -24,8 +25,10 @@ import {
   sharingLimits,
   watermarkReady,
 } from '../../lib/share';
+import { startShareHandoff } from '../../lib/shareHandoff';
 import { shareRenders } from '../../lib/shareRenders';
 import { useUsage } from '../../lib/usage';
+import { useSecretsAllowed } from '../ads/NoAdsSurface';
 import { CopyButton, PasscodeReveal, PlanBadge, photosLabel, ShNote } from './ShareBits';
 
 export const EXTRA_ROWS: {
@@ -186,9 +189,13 @@ export function useBranding(limits: SharingLimits): Branding | null {
 
 /**
  * Create a gallery from photos. On success the gallery-live dialog takes over; the link and passcode exist
- * only there, once.
+ * only there, once. Phase 8: never rendered in a document holding Google's AdSense script (Share from an ad page
+ * continues on /share/new instead).
  */
-export function CreateGalleryDialog({
+export function CreateGalleryDialog(props: Parameters<typeof CreateGalleryDialogInner>[0]) {
+  return useSecretsAllowed() ? <CreateGalleryDialogInner {...props} /> : null;
+}
+function CreateGalleryDialogInner({
   open,
   photoIds,
   defaultName = '',
@@ -450,8 +457,14 @@ export function GalleryRenderProgress({ galleryId }: { galleryId: string }) {
   );
 }
 
-/** Shown after creating: the link (copyable again later from the gallery page) and the one-time passcode. */
-export function GalleryLiveDialog({
+/**
+ * Shown after creating: the link (copyable again later from the gallery page) and the one-time passcode. Phase 8:
+ * never rendered in a document holding Google's AdSense script.
+ */
+export function GalleryLiveDialog(props: Parameters<typeof GalleryLiveDialogInner>[0]) {
+  return useSecretsAllowed() ? <GalleryLiveDialogInner {...props} /> : null;
+}
+function GalleryLiveDialogInner({
   created,
   onClose,
 }: {
@@ -533,8 +546,13 @@ export function GalleryLiveDialog({
   );
 }
 
-/** The Share action for a selection or an album: create dialog, then the one-time live dialog. */
-export function useShareGallery() {
+/**
+ * The Share action for a selection or an album: create dialog, then the one-time live dialog. Phase 8: while
+ * Google's AdSense script is in the page, Share hands the selection to /share/new instead (a full page load to a
+ * page without ads), so the link and passcode are never shown in a document holding the script.
+ */
+export function useShareGallery(o: { onDone?: () => void } = {}) {
+  const { onDone } = o;
   const owner = useSession().user?.id ?? null;
   const [req, setReq] = useState<{ ids: string[]; name: string } | null>(null);
   const [created, setCreated] = useState<GalleryCreated | null>(null);
@@ -551,16 +569,29 @@ export function useShareGallery() {
           open={Boolean(req)}
           photoIds={req?.ids ?? []}
           defaultName={req?.name ?? ''}
-          onClose={() => setReq(null)}
+          onClose={() => {
+            setReq(null);
+            onDone?.();
+          }}
           onCreated={(r) => {
             setReq(null);
             setCreated(r);
           }}
         />
-        <GalleryLiveDialog created={created} onClose={() => setCreated(null)} />
+        <GalleryLiveDialog
+          created={created}
+          onClose={() => {
+            setCreated(null);
+            onDone?.();
+          }}
+        />
       </>
     ),
-    [req, created],
+    [req, created, onDone],
   );
-  return { open: (ids: string[], name = '') => setReq({ ids, name }), dialogs };
+  const open = (ids: string[], name = '') => {
+    if (adsenseLoaded()) startShareHandoff(ids, name);
+    else setReq({ ids, name });
+  };
+  return { open, dialogs };
 }

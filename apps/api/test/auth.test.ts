@@ -455,7 +455,11 @@ describe('security review fixes (app)', () => {
     });
     expect(res.status).toBe(401);
     const cleared = res.headers.getSetCookie();
-    expect(cleared.map((c) => c.split('=')[0]).sort()).toEqual(['__Host-zs-at', '__Host-zs-rt']);
+    expect(cleared.map((c) => c.split('=')[0]).sort()).toEqual([
+      '__Host-zads',
+      '__Host-zs-at',
+      '__Host-zs-rt',
+    ]);
     for (const c of cleared) expect(c).toContain('Max-Age=0');
     // Writes too (sign-out with a planted refresh cookie).
     const out = await call('/api/v1/auth/sign-out', {

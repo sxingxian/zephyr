@@ -23,6 +23,7 @@ import {
   endSession,
   onOtherTabPlanChange,
   onOtherTabSession,
+  reloadWhenRestored,
   setSessionUserId,
 } from './sessionGuard';
 import { resetUsage } from './usage';
@@ -110,6 +111,10 @@ export function SessionProvider({
 
   // Phase 8: another tab saw this member's plan change: re-read it here too.
   useEffect(() => onOtherTabPlanChange(() => void refresh()), [refresh]);
+
+  // Phase 8: a page restored from the back/forward cache is loaded fresh instead (it could belong to another
+  // member, or hold Google's AdSense script loaded for them).
+  useEffect(() => reloadWhenRestored(), []);
 
   // An upload call found the cookie now belongs to someone else (a tab that missed the broadcast): same
   // as above, stop everything and reload.

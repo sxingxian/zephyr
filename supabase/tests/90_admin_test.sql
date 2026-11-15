@@ -452,6 +452,11 @@ select public.admin_adsense_set(:own, '{"enabled": true, "slots": {"library": "1
 select pg_temp.ok((:'r'::jsonb ->> 'changed')::boolean = false and (:'r'::jsonb ->> 'enabled')::boolean
   and (select count(*) from public.audit_log where action = 'ads.adsense') = :audits,
   'turning AdSense on when it''s already on, with the same slots, changes nothing and isn''t audited');
+insert into public.library_members (owner_id, member_id, role) values (:adsu, :mei, 'viewer');
+select pg_temp.ok(public.ads_for_member(:adsu) -> 'adsense' = 'null'::jsonb and jsonb_array_length(public.ads_for_member(:adsu) -> 'cards') = 1,
+  'a Free member whose own library still has teammates (a lapsed Studio owner) never gets AdSense either');
+delete from public.library_members where owner_id = :adsu and member_id = :mei;
+select pg_temp.ok(public.ads_for_member(:adsu) -> 'adsense' ->> 'publisherId' = 'ca-pub-1234567890123456', 'and gets it again once the team is gone');
 select pg_temp.ok((public.admin_adsense_set(:adm, '{"enabled": false}', 'Pause AdSense') -> 'adsense' ->> 'enabled')::boolean = false, 'turning it off saves at once (Admin)');
 select count(*) as audits from public.audit_log where action = 'ads.adsense' \gset
 select pg_temp.ok((public.admin_adsense_set(:adm, '{"enabled": false}', 'Pause again') ->> 'changed')::boolean = false
