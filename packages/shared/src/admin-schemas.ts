@@ -165,7 +165,9 @@ export const adEventSchema = z
   .strict();
 
 /** Store ids come from the deployment config: lower-case slug. */
-export const storeIdSchema = z.string().regex(/^[a-z][a-z0-9-]{1,31}$/);
+/** Store ids: the same rule as public._store_id_ok (the API tests compare them); secrets map dashes to underscores. */
+export const STORE_ID_RE = /^[a-z][a-z0-9-]{1,31}$/;
+export const storeIdSchema = z.string().regex(STORE_ID_RE);
 export const adminStorageSwitchSchema = z.object({ to: storeIdSchema, reason }).strict();
 export const adminStorageMigrationSchema = z
   .object({ action: z.enum(['pause', 'resume', 'rollback']), reason })

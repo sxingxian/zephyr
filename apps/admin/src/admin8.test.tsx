@@ -331,6 +331,8 @@ const MOVING: AdminStorageResult = {
     from: 'r2',
     to: 'b2',
     state: 'copying',
+    direction: 'forward',
+    canRollBack: true,
     startedAt: '2026-11-14T01:12:00Z',
     startedBy: 'Jason L.',
     photos: { total: 9_800_000, copied: 6_100_000, verified: 6_000_000, failed: 12 },
@@ -404,6 +406,21 @@ describe('Storage', () => {
       T,
     );
     expect(await screen.findByRole('button', { name: 'Resume copying' }, T)).toBeTruthy();
+  });
+
+  it('hides rollback once old copies are being deleted, and offers a retry when photos failed', async () => {
+    mock('admin', (c) => {
+      if (c.url.endsWith('/storage') && c.method === 'GET')
+        return json(200, {
+          ...MOVING,
+          migration: { ...MOVING.migration, state: 'failed', canRollBack: false },
+        });
+      return undefined;
+    });
+    renderAt('/storage');
+    expect(await screen.findByRole('button', { name: 'Retry failed photos' }, T)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Roll back/ })).toBeNull();
+    expect(screen.getByText(/can no longer be rolled back/)).toBeTruthy();
   });
 });
 

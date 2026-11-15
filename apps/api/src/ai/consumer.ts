@@ -20,6 +20,7 @@ import { imageInfo } from '../library/files';
 import { photoKey } from '../library/storage';
 import { deleteEverywhere } from '../storage';
 import { photoStore, storeIdOf } from '../storage/config';
+import { followMove } from '../storage/migrate';
 import { rpc } from '../supabase';
 import { encodeMask, MaskError, readMask, resizeMask } from './png';
 import {
@@ -193,6 +194,8 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
         p_calls: calls,
         p_attempt: attempt,
       });
+      // Phase 8: the photo may have moved to another store while the provider ran.
+      if (done.status === 'ok') await followMove(env, photoId, store.id, [key]);
       const drop = (done.deleteKeys ?? []).filter(
         (k) => typeof k === 'string' && k.startsWith(`u/${ownerId}/p/`),
       );

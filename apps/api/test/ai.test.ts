@@ -674,7 +674,9 @@ describe('member AI routes', () => {
     const mask = '60000000-0000-4000-8000-000000000001';
     const key = `u/${MEI.id}/p/${PHOTO}/m/${mask}.png`;
     await r2.put(key, encodeMask({ width: 2, height: 2, data: new Uint8Array(4) }));
-    world.rpc.ai_mask_key = (a) => (a.p_owner === MEI.id && a.p_mask === mask ? key : null);
+    // Phase 8: { key, storeId } (masks are read from their photo's store).
+    world.rpc.ai_mask_key = (a) =>
+      a.p_owner === MEI.id && a.p_mask === mask ? { key, storeId: 'r2' } : null;
     const res = await call(AI_API.mask(PHOTO, mask), { jar: j });
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toBe('image/png');

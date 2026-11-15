@@ -242,6 +242,8 @@ export function s3Store(config: S3Config, creds: S3Credentials, fetcher: Fetcher
       const res = await send('GET', url(null, query));
       if (!res.ok) throw await failure(res);
       const parsed = parseList(await res.text());
+      // A truncated listing without a token to continue from can't be trusted to be complete.
+      if (parsed.truncated && !parsed.next) throw new StoreError('bad_response', res.status);
       return {
         objects: parsed.objects.map((o) => ({
           key: o.key,

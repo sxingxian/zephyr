@@ -18,7 +18,7 @@ import { useAdminSession } from '../lib/session';
 
 /** How often the page refreshes while photos are moving. */
 export const STORAGE_POLL_MS = 10_000;
-const ACTIVE: MigrationState[] = ['copying', 'verifying', 'holding', 'rolling_back', 'paused'];
+const ACTIVE: MigrationState[] = ['copying', 'verifying', 'holding', 'rolling_back', 'paused', 'failed'];
 const MOVING: MigrationState[] = ['copying', 'verifying', 'rolling_back'];
 const HEALTH: Record<StoreHealth, [string, ChipTone]> = {
   healthy: ['Healthy', 'good'],
@@ -396,28 +396,33 @@ export function Storage() {
                     Last error: <span className="z-mono">{mig.lastError}</span>
                   </Note>
                 )}
-                {migActive && mig.state !== 'rolling_back' && (
+                {migActive && (
                   <div className="btn-row">
-                    {mig.state === 'paused' ? (
+                    {mig.state === 'paused' || mig.state === 'failed' ? (
                       <Button icon="play" onClick={() => setMigAction('resume')}>
-                        Resume copying
+                        {mig.state === 'failed' ? 'Retry failed photos' : 'Resume copying'}
                       </Button>
                     ) : (
-                      mig.state === 'copying' && (
+                      (mig.state === 'copying' || mig.state === 'rolling_back') && (
                         <Button icon="pause" onClick={() => setMigAction('pause')}>
                           Pause copying
                         </Button>
                       )
                     )}
-                    <Button kind="danger" icon="undo" onClick={() => setMigAction('rollback')}>
-                      Roll back to {byId(mig.from)?.name ?? mig.from}…
-                    </Button>
+                    {mig.canRollBack && (
+                      <Button kind="danger" icon="undo" onClick={() => setMigAction('rollback')}>
+                        Roll back to {byId(mig.from)?.name ?? mig.from}…
+                      </Button>
+                    )}
                   </div>
                 )}
                 <p className="z-hint">
-                  Rolling back sends new uploads to {byId(mig.from)?.name ?? mig.from} again and copies
-                  anything stored only on {byId(mig.to)?.name ?? mig.to} back first. Photos keep working
-                  during every step: each one is read from whichever store holds it.
+                  {mig.direction === 'back'
+                    ? `Rolling back: new uploads go to ${byId(mig.from)?.name ?? mig.from}, and photos stored on ${byId(mig.to)?.name ?? mig.to} are copied back. A rollback can't itself be rolled back.`
+                    : mig.canRollBack
+                      ? `Rolling back sends new uploads to ${byId(mig.from)?.name ?? mig.from} again and copies anything stored only on ${byId(mig.to)?.name ?? mig.to} back first.`
+                      : `Old copies on ${byId(mig.from)?.name ?? mig.from} are being deleted, so this move can no longer be rolled back.`}{' '}
+                  Photos keep working during every step: each one is read from whichever store holds it.
                 </p>
               </Card>
             )}

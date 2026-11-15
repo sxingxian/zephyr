@@ -2,16 +2,20 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ADMIN8_API } from '@zephyr/shared';
+import { ADMIN8_API, STORE_ID_RE } from '@zephyr/shared';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env';
+import { sweepOrphans } from '../src/jobs';
+import { purgeNow } from '../src/library/storage';
 import { secretName, storeConfigError, storeConfigs, storeFor } from '../src/storage/config';
 import { checkStore, recordCheck, runHealthCron } from '../src/storage/health';
 import { md5 } from '../src/storage/md5';
 import {
   copyVerified,
   deleteOldCopy,
+  followMove,
   handleStorageBatch,
+  type MigrationItem,
   migrateItem,
   runMigrationBatch,
   runMigrationCron,
@@ -470,6 +474,17 @@ describe('store config and connections', () => {
     routeS3();
   });
 
+  it('the database accepts exactly the store ids the config does (one rule: dashes, mapped to underscores in secrets)', () => {
+    const sql = readFileSync(
+      fileURLToPath(new URL('../../../supabase/migrations/20261115100100_storage.sql', import.meta.url).href),
+      'utf8',
+    );
+    const m = /_store_id_ok\(p text\)[\s\S]*?select p ~ '([^']+)'/.exec(sql);
+    expect(m?.[1]).toBe(STORE_ID_RE.source);
+    expect(STORE_ID_RE.test('studio-nas')).toBe(true);
+    expect(STORE_ID_RE.test('studio_nas')).toBe(false);
+    expect(secretName('studio-nas', 'SECRET')).toBe('STORE_STUDIO_NAS_SECRET');
+  });
   it("always has 'r2', and names secrets after the store id", () => {
     expect(storeConfigs({ ...env } as Env).map((s) => s.id)).toEqual(['r2']);
     expect(storeConfigs(storageEnv()).map((s) => s.id)).toEqual(['r2', 'b2-eu', 'studio-nas', 'tunnel-nas']);
@@ -545,16 +560,30 @@ describe('store config and connections', () => {
 const OWNER = '20000000-0000-0000-0000-000000000001';
 const PHOTO = '30000000-0000-0000-0000-000000000001';
 const MIGRATION = '40000000-0000-0000-0000-000000000001';
+const PHOTO2 = '30000000-0000-0000-0000-000000000002';
 const prefix = `u/${OWNER}/p/${PHOTO}/`;
 
 describe('migration copy and verify', () => {
   let r2b: MockR2;
   let menv: Env;
+  const TOKEN = '50000000-0000-0000-0000-000000000001';
+  const item = (over: Partial<MigrationItem> = {}): MigrationItem => ({
+    photoId: PHOTO,
+    ownerId: OWNER,
+    from: 'r2',
+    to: 'b2-eu',
+    attempts: 1,
+    token: TOKEN,
+    ...over,
+  });
   beforeEach(() => {
     mocks.b2 = new MockS3();
     routeS3();
     r2b = new MockR2();
     menv = storageEnv({ PHOTOS: r2b });
+    // The lease renewal: the keys the database records for the photo and the original's size.
+    world.rpc.storage_item_touch = (a) =>
+      a.p_token === TOKEN ? { keys: [`${prefix}original`, `${prefix}thumb`], minBytes: 18 } : null;
   });
 
   async function seed() {
@@ -565,21 +594,19 @@ describe('migration copy and verify', () => {
     await r2b.put(`u/${OWNER}/p/other/original`, bytes('not this photo'));
   }
 
-  it('streams every object under the photo prefix, verifies its SHA-256 and marks the item verified', async () => {
+  it('renews the lease, streams every object under the photo prefix, verifies its SHA-256 and marks the item verified with its token', async () => {
     await seed();
     const marks: Record<string, unknown>[] = [];
     world.rpc.storage_item_mark = (a) => {
       marks.push(a);
       return null;
     };
-    const state = await migrateItem(menv, MIGRATION, {
-      photoId: PHOTO,
-      ownerId: OWNER,
-      from: 'r2',
-      to: 'b2-eu',
-      attempts: 0,
+    expect(await migrateItem(menv, MIGRATION, item())).toBe('verified');
+    expect(rpcCalls('storage_item_touch')[0]?.body).toEqual({
+      p_migration: MIGRATION,
+      p_photo: PHOTO,
+      p_token: TOKEN,
     });
-    expect(state).toBe('verified');
     expect([...mocks.b2.objects.keys()].sort()).toEqual([`${prefix}original`, `${prefix}thumb`]);
     expect(mocks.b2.objects.get(`${prefix}original`)?.type).toBe('image/jpeg');
     expect(marks).toEqual([
@@ -590,13 +617,53 @@ describe('migration copy and verify', () => {
         p_bytes: 'the original bytes'.length + 'thumb'.length,
         p_error: null,
         p_retry_after_s: null,
+        p_token: TOKEN,
+        p_store: null,
       },
     ]);
     // The old copy stays until the hold has passed.
     expect(r2b.objects.has(`${prefix}original`)).toBe(true);
   });
 
-  it('a hash mismatch on read-back retries with a backoff, then fails on the last attempt', async () => {
+  it('a lease that was taken over is skipped: nothing is copied or reported', async () => {
+    await seed();
+    world.rpc.storage_item_mark = () => {
+      throw new Error('must not report');
+    };
+    expect(await migrateItem(menv, MIGRATION, item({ token: '50000000-0000-0000-0000-0000000000ff' }))).toBe(
+      'skipped',
+    );
+    expect(mocks.b2.objects.size).toBe(0);
+  });
+
+  it('a copy missing a recorded key, or with nothing in it, never counts as verified', async () => {
+    await seed();
+    const marks: Record<string, unknown>[] = [];
+    world.rpc.storage_item_mark = (a) => {
+      marks.push(a);
+      return null;
+    };
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    // The database records an edited preview the source doesn't have.
+    world.rpc.storage_item_touch = () => ({
+      keys: [`${prefix}original`, `${prefix}thumb`, `${prefix}edit-1-preview-${'a'.repeat(32)}`],
+      minBytes: 18,
+    });
+    expect(await migrateItem(menv, MIGRATION, item())).toBe('pending');
+    expect(marks[0]).toMatchObject({ p_state: 'pending', p_error: 'source_incomplete', p_token: TOKEN });
+    // An empty listing (the source lost everything): not a copy either, even if no keys were listed.
+    r2b.objects.clear();
+    world.rpc.storage_item_touch = () => ({ keys: [], minBytes: 0 });
+    expect(await migrateItem(menv, MIGRATION, item())).toBe('pending');
+    expect(marks[1]).toMatchObject({ p_state: 'pending', p_error: 'source_incomplete' });
+    // A copy lighter than the original.
+    await seed();
+    world.rpc.storage_item_touch = () => ({ keys: [`${prefix}original`], minBytes: 10_000 });
+    expect(await migrateItem(menv, MIGRATION, item())).toBe('pending');
+    expect(marks[2]).toMatchObject({ p_state: 'pending', p_error: 'source_incomplete' });
+  });
+
+  it('a hash mismatch on read-back retries with a backoff, then fails on the fifth attempt (attempts come from the claim)', async () => {
     await seed();
     mocks.b2.corrupt = true;
     const marks: Record<string, unknown>[] = [];
@@ -605,11 +672,16 @@ describe('migration copy and verify', () => {
       return null;
     };
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    const item = { photoId: PHOTO, ownerId: OWNER, from: 'r2', to: 'b2-eu', attempts: 0 };
-    expect(await migrateItem(menv, MIGRATION, item)).toBe('pending');
+    expect(await migrateItem(menv, MIGRATION, item({ attempts: 1 }))).toBe('pending');
     expect(marks[0]).toMatchObject({ p_state: 'pending', p_error: 'hash_mismatch', p_retry_after_s: 60 });
-    expect(await migrateItem(menv, MIGRATION, { ...item, attempts: 4 })).toBe('failed');
-    expect(marks[1]).toMatchObject({ p_state: 'failed', p_error: 'hash_mismatch', p_bytes: 0 });
+    expect(await migrateItem(menv, MIGRATION, item({ attempts: 4 }))).toBe('pending');
+    expect(await migrateItem(menv, MIGRATION, item({ attempts: 5 }))).toBe('failed');
+    expect(marks[2]).toMatchObject({
+      p_state: 'failed',
+      p_error: 'hash_mismatch',
+      p_bytes: 0,
+      p_token: TOKEN,
+    });
     await expect(
       copyVerified(r2Store(r2b as unknown as R2Bucket), storeFor(menv, 'b2-eu'), `${prefix}thumb`),
     ).rejects.toMatchObject({
@@ -619,13 +691,7 @@ describe('migration copy and verify', () => {
 
   it('claims batches of 20, queues the next batch when full, and acks the message', async () => {
     await seed();
-    const items = Array.from({ length: 20 }, () => ({
-      photoId: PHOTO,
-      ownerId: OWNER,
-      from: 'r2',
-      to: 'b2-eu',
-      attempts: 0,
-    }));
+    const items = Array.from({ length: 20 }, () => item());
     world.rpc.storage_migration_batch = (a) => {
       expect(a).toEqual({ p_migration: MIGRATION, p_limit: 20 });
       return items;
@@ -648,35 +714,49 @@ describe('migration copy and verify', () => {
     expect(storageQueue.sent).toHaveLength(1);
   });
 
-  it('old copies: late writes are copied over first, then the old store is emptied for that photo only', async () => {
+  const due = { migrationId: MIGRATION, photoId: PHOTO, ownerId: OWNER, from: 'r2', to: 'b2-eu' };
+
+  it("old copies: claimed first; late writes are copied to the photo's store, then the old store is emptied for that photo only", async () => {
     await seed();
     const from = r2Store(r2b as unknown as R2Bucket);
     const to = storeFor(menv, 'b2-eu');
     await copyVerified(from, to, `${prefix}original`); // thumb never reached the new store
-    const n = await deleteOldCopy(menv, {
-      migrationId: MIGRATION,
-      photoId: PHOTO,
-      ownerId: OWNER,
-      from: 'r2',
-      to: 'b2-eu',
-    });
-    expect(n).toBe(2);
+    world.rpc.storage_old_copy_claim = (a) => {
+      expect(a).toEqual({ p_migration: MIGRATION, p_photo: PHOTO, p_store: 'r2' });
+      return { copyTo: 'b2-eu' };
+    };
+    expect(await deleteOldCopy(menv, due)).toBe(2);
     expect(mocks.b2.objects.has(`${prefix}thumb`)).toBe(true);
     expect(r2b.objects.has(`${prefix}original`)).toBe(false);
     expect(r2b.objects.has(`u/${OWNER}/p/other/original`)).toBe(true);
   });
 
-  it('the cron keeps a copying migration moving and deletes old copies once due', async () => {
+  it("old copies of a photo that's gone (or a partial copy never used) are deleted without copying anything back", async () => {
+    await seed();
+    world.rpc.storage_old_copy_claim = () => ({ copyTo: null });
+    expect(await deleteOldCopy(menv, due)).toBe(2);
+    expect(mocks.b2.objects.size).toBe(0);
+    expect(r2b.objects.has(`${prefix}original`)).toBe(false);
+  });
+
+  it("an old copy the database won't let go of (a rollback, the photo back on that store) is left alone", async () => {
+    await seed();
+    world.rpc.storage_old_copy_claim = () => null;
+    expect(await deleteOldCopy(menv, due)).toBeNull();
+    expect(r2b.objects.has(`${prefix}original`)).toBe(true);
+  });
+
+  it('the cron keeps a migration moving (holding included) and deletes old copies once due, reporting the store', async () => {
     await seed();
     await copyVerified(r2Store(r2b as unknown as R2Bucket), storeFor(menv, 'b2-eu'), `${prefix}original`);
     await copyVerified(r2Store(r2b as unknown as R2Bucket), storeFor(menv, 'b2-eu'), `${prefix}thumb`);
     world.rpc.storage_status = () => ({
       writeStore: 'b2-eu',
-      migration: { id: MIGRATION, state: 'copying' },
+      migration: { id: MIGRATION, state: 'holding' },
+      cleanupPending: true,
     });
-    world.rpc.storage_old_copies_due = () => [
-      { migrationId: MIGRATION, photoId: PHOTO, ownerId: OWNER, from: 'r2', to: 'b2-eu' },
-    ];
+    world.rpc.storage_old_copies_due = () => [due];
+    world.rpc.storage_old_copy_claim = () => ({ copyTo: 'b2-eu' });
     const marks: Record<string, unknown>[] = [];
     world.rpc.storage_item_mark = (a) => {
       marks.push(a);
@@ -684,8 +764,73 @@ describe('migration copy and verify', () => {
     };
     expect(await runMigrationCron(menv)).toEqual({ enqueued: true, oldCopiesDeleted: 2 });
     expect(storageQueue.sent).toEqual([{ t: 'migrate', migration: MIGRATION }]);
-    expect(marks[0]).toMatchObject({ p_state: 'deleted', p_photo: PHOTO });
+    expect(marks[0]).toMatchObject({ p_state: 'deleted', p_photo: PHOTO, p_store: 'r2', p_token: null });
     expect(r2b.objects.has(`${prefix}thumb`)).toBe(false);
+  });
+
+  it('followMove copies an object written to the old store after its photo moved', async () => {
+    await seed();
+    world.rpc.storage_photo_store = (a) => (a.p_photo === PHOTO ? 'b2-eu' : null);
+    await followMove(menv, PHOTO, 'r2', [`${prefix}thumb`]);
+    expect(mocks.b2.objects.has(`${prefix}thumb`)).toBe(true);
+    // Not moved (or gone): nothing to do.
+    mocks.b2.objects.clear();
+    await followMove(menv, PHOTO, 'b2-eu', [`${prefix}thumb`]);
+    world.rpc.storage_photo_store = () => null;
+    await followMove(menv, PHOTO, 'r2', [`${prefix}thumb`]);
+    expect(mocks.b2.objects.size).toBe(0);
+  });
+
+  it('a truncated S3 listing with no continuation token is an error, never a complete list', async () => {
+    mocks.b2.next = {
+      status: 200,
+      body: '<?xml version="1.0"?><ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>',
+    };
+    await expect(storeFor(menv, 'b2-eu').list(prefix, { limit: 10 })).rejects.toMatchObject({
+      code: 'bad_response',
+    });
+  });
+});
+
+describe('photos on another store: purges and the orphan sweep', () => {
+  let r2b: MockR2;
+  let menv: Env;
+  beforeEach(() => {
+    mocks.b2 = new MockS3();
+    routeS3();
+    r2b = new MockR2();
+    menv = storageEnv({ PHOTOS: r2b });
+  });
+
+  it("permanent deletes remove the objects on each photo's own store", async () => {
+    await r2b.put(`${prefix}original`, bytes('on r2'));
+    await storeFor(menv, 'b2-eu').put(`u/${OWNER}/p/${PHOTO2}/original`, bytes('on b2'), {
+      contentType: 'image/jpeg',
+    });
+    world.rpc.confirm_photo_purges = (a) => (a.p_ids as string[]).length;
+    await purgeNow(menv, [
+      { photoId: PHOTO, keys: [`${prefix}original`], storeId: 'r2' },
+      { photoId: PHOTO2, keys: [`u/${OWNER}/p/${PHOTO2}/original`], storeId: 'b2-eu' },
+    ]);
+    expect(r2b.objects.has(`${prefix}original`)).toBe(false);
+    expect(mocks.b2.objects.has(`u/${OWNER}/p/${PHOTO2}/original`)).toBe(false);
+    expect(rpcCalls('confirm_photo_purges')[0]?.body).toEqual({ p_ids: [PHOTO, PHOTO2] });
+  });
+
+  it("a copy away from its photo's store is kept while a finished or rolled-back migration still holds old copies", async () => {
+    await r2b.put(`${prefix}original`, bytes('old copy'));
+    world.rpc.get_job_state = () => null;
+    world.rpc.set_job_state = () => null;
+    world.rpc.sweep_photo_rows = () => [
+      { id: PHOTO, ownerId: OWNER, status: 'ready', activeUpload: false, storeId: 'b2-eu', maskKeys: [] },
+    ];
+    const later = Date.now() + 3 * 60 * 60 * 1000;
+    world.rpc.storage_status = () => ({ writeStore: 'r2', migration: null, cleanupPending: true });
+    await sweepOrphans(menv, later);
+    expect(r2b.objects.has(`${prefix}original`)).toBe(true);
+    world.rpc.storage_status = () => ({ writeStore: 'r2', migration: null, cleanupPending: false });
+    await sweepOrphans(menv, later);
+    expect(r2b.objects.has(`${prefix}original`)).toBe(false);
   });
 });
 
