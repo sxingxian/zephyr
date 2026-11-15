@@ -18,6 +18,7 @@ import {
   sendAdEvent,
   slotContent,
   useAdsData,
+  useAdsenseHeld,
   useAdsenseLoaded,
 } from '../../lib/ads';
 import { STATUS_POLL_MS } from '../../lib/appStatus';
@@ -237,15 +238,17 @@ declare global {
 /** One AdSense unit. Loads Google's tag (with its consent message) the first time a unit is shown. */
 export function AdsenseUnit({ publisherId, slot }: { publisherId: string; slot: string }) {
   const ins = useRef<HTMLModElement>(null);
+  // Phase 8: while a gallery is being created (holdAdsense), the script waits; the unit tries again after.
+  const held = useAdsenseHeld();
   useEffect(() => {
-    if (!loadAdsense(publisherId) || !ins.current) return;
+    if (held || !loadAdsense(publisherId) || !ins.current) return;
     try {
       window.adsbygoogle = window.adsbygoogle ?? [];
       window.adsbygoogle.push({});
     } catch {
       // Blocked or not ready: the unit stays empty.
     }
-  }, [publisherId]);
+  }, [publisherId, held]);
   return (
     <aside className="adsense" aria-label="Advertisement">
       <span className="adsense__head">

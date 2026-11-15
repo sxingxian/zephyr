@@ -59,9 +59,11 @@ export function endSession(reason: EndReason, server: boolean, waitMs = 3000): P
  * Phase 8: something to do before a full page load that ends what this document was doing for the member (a
  * sign-out, a session that ended, another member, losing ads). The ads module uses it, while Google's AdSense
  * script is in the page, to have the server answer `Clear-Site-Data: "cache", "storage"` first, so nothing the
- * script wrote to this origin survives. Returns null when there's nothing to do (then the load starts at once).
+ * script wrote to this origin survives; and, when a session ends in a document without the script
+ * (`sessionEnd`), to ask the same only if this browser may have run it (the server knows from a cookie).
+ * Returns null when there's nothing to do (then the load starts at once).
  */
-type BeforeFullLoad = () => Promise<void> | null;
+type BeforeFullLoad = (o: { sessionEnd: boolean }) => Promise<void> | null;
 let beforeFullLoad: BeforeFullLoad | null = null;
 export function setBeforeFullLoad(fn: BeforeFullLoad | null): void {
   beforeFullLoad = fn;
@@ -94,9 +96,9 @@ function armLatchReset(): void {
       });
   }, LEAVING_RESET_MS);
 }
-function go(load: () => void, o: { keepStorage?: boolean }): void {
+function go(load: () => void, o: { keepStorage?: boolean; sessionEnd?: boolean }): void {
   leaving = true;
-  const pending = o.keepStorage ? null : beforeFullLoad?.();
+  const pending = o.keepStorage ? null : (beforeFullLoad?.({ sessionEnd: o.sessionEnd === true }) ?? null);
   if (!pending) {
     load();
     armLatchReset();
@@ -115,9 +117,11 @@ function go(load: () => void, o: { keepStorage?: boolean }): void {
 export const browser = {
   /**
    * `keepStorage`: the same member goes on in the next document (AdsRouteGate leaving the ad pages), so the
-   * storage clean-up isn't needed.
+   * storage clean-up isn't needed. `sessionEnd`: this load ends the member's session here (signed out, session
+   * ended, another member, suspended), so the clean-up runs even without the script in this document, when the
+   * server says this browser may have run it.
    */
-  assign(path: string, o: { keepStorage?: boolean } = {}): void {
+  assign(path: string, o: { keepStorage?: boolean; sessionEnd?: boolean } = {}): void {
     go(() => window.location.assign(path), o);
   },
   /**

@@ -6,6 +6,7 @@ import { ApiFailure, errorMessage } from '../lib/api';
 import { deleteAccount } from '../lib/library';
 import { browser, endSession } from '../lib/sessionGuard';
 import { useUsage } from '../lib/usage';
+import { useStepUp } from './StepUp';
 
 const RETURN = '/settings/security?delete=1';
 
@@ -21,6 +22,8 @@ export function DeleteAccountCard() {
   const [error, setError] = useState<string | null>(null);
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
+  // Phase 8: while the member may be shown ads, deleting the account also needs an emailed code.
+  const stepUp = useStepUp();
 
   // Back from the security sign-in: reopen the dialog.
   useEffect(() => {
@@ -49,7 +52,9 @@ export function DeleteAccountCard() {
     setBusy(true);
     setError(null);
     try {
-      const r = await deleteAccount();
+      // When a code is needed, the step-up dialog opens on top of this one.
+      const r = await stepUp.run('account_delete', (headers) => deleteAccount(headers));
+      if (!r) return;
       try {
         sessionStorage.setItem('zephyr.purgeAt', r.purgeAt);
       } catch {
@@ -140,6 +145,7 @@ export function DeleteAccountCard() {
           </div>
         </form>
       </dialog>
+      {stepUp.dialog}
     </>
   );
 }

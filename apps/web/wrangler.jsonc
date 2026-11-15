@@ -16,5 +16,7 @@
     "run_worker_first": true
   },
   "services": [{ "binding": "API", "service": "zephyr-api" }],
+  // Secret (wrangler secret put ADS_COOKIE_SECRET): phase 8, the same value as the API Worker's. The Worker widens a
+  // document's CSP for AdSense only when the request carries an AdSense cookie signed with it; without it, never.
   "observability": { "enabled": true, "logs": { "invocation_logs": false } }
 }

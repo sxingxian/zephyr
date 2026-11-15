@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { escapeHtml, oneLine } from '../src/email/escape';
-import { inviteEmail, passkeyChangeEmail } from '../src/email/templates';
+import { inviteEmail, passkeyChangeEmail, stepUpEmail } from '../src/email/templates';
 
 const base = {
   link: 'https://zephyrapp.midnightpoetry.studio/join#t=abc',
@@ -57,5 +57,17 @@ describe('passkey change notice', () => {
     expect(m.html).toContain('&lt;img');
     expect(m.text).not.toMatch(/\r|\nBcc/);
     expect(m.text).toContain('28 October 2026');
+  });
+});
+
+describe('step-up code email (phase 8)', () => {
+  it('carries the digits and what they confirm, nothing else', () => {
+    const m = stepUpEmail({ code: '048213', op: 'account_delete', minutes: 10 });
+    expect(m.subject).toBe('048213 is your Zephyr confirmation code');
+    expect(m.text).toContain('delete your account');
+    expect(m.text).toContain('10 minutes');
+    expect(m.html).toContain('048213');
+    // Never anything but digits in the code slot.
+    expect(stepUpEmail({ code: '<b>1</b>', op: 'passkey_add', minutes: 10 }).html).not.toContain('<b>1</b>');
   });
 });

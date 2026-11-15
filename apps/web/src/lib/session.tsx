@@ -104,7 +104,7 @@ export function SessionProvider({
     () =>
       onOtherTabSession(() => {
         void endSession('switched', false);
-        browser.assign('/');
+        browser.assign('/', { sessionEnd: true });
       }),
     [],
   );
@@ -121,7 +121,7 @@ export function SessionProvider({
   useEffect(() => {
     setSessionChangedHandler(() => {
       void endSession('switched', false);
-      browser.assign('/');
+      browser.assign('/', { sessionEnd: true });
     });
     return () => setSessionChangedHandler(null);
   }, []);
@@ -132,7 +132,7 @@ export function SessionProvider({
     setSuspendedHandler(() => {
       setUser(null);
       // Already there (the session probe on that page can answer the same): no reload loop.
-      if (window.location.pathname !== '/suspended') browser.assign('/suspended');
+      if (window.location.pathname !== '/suspended') browser.assign('/suspended', { sessionEnd: true });
     });
     return () => setSuspendedHandler(null);
   }, [setUser]);
@@ -152,7 +152,7 @@ export function SessionProvider({
       // Signed out here regardless; the reload below re-reads the session from the server.
     } finally {
       setUser(null);
-      browser.assign('/sign-in');
+      browser.assign('/sign-in', { sessionEnd: true });
     }
   }, [setUser]);
 

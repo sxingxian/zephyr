@@ -9,17 +9,23 @@
  *   HTML       → phase 8: the PWA's pages (index.html, the SPA fallback) get the app's security headers here,
  *                never stored by the browser (`no-store`, which also keeps them out of the back/forward cache).
  *                The AdSense CSP variant goes only to documents on ad pages (worker/adPages.js), only while the
- *                API says AdSense is on (cached 60 s), and only when the request carries the AdSense cookie,
- *                which the API sets only for a member it shows AdSense. Every other document, and /index.html
- *                itself, always gets the strict policy.
+ *                API says AdSense is on (cached 60 s), and only when the request carries a valid AdSense cookie
+ *                (signed with ADS_COOKIE_SECRET for a member the API shows AdSense, unexpired). Such a document
+ *                is marked with ADS_DOC_META in its <head> (the app reads it to know Google's script may load)
+ *                and gets COOP `same-origin-allow-popups`, so a popup it opens onto any other page (which keeps
+ *                `same-origin`) lands in a new browsing context group, out of the opener's reach. Every other
+ *                document, and /index.html itself, always gets the strict policy.
  */
-import { ADS_DOC_COOKIE, ADS_DOC_TIMING, adsAllowedOn } from './adPages.js';
+import { readCookie, verifyAdsCookie } from '@zephyr/shared/ads-cookie';
+import { ADS_DOC_COOKIE, ADS_DOC_META, adsAllowedOn } from './adPages.js';
 import { APP_HEADERS, APP_HEADERS_FILE, appCsp } from './appHeaders.js';
 import { GUEST_HEADERS } from './guestHeaders.js';
 
 interface Env {
   API: Fetcher;
   ASSETS: Fetcher;
+  /** Phase 8: the API's AdSense cookie signing secret (wrangler secret). Missing: never widen. */
+  ADS_COOKIE_SECRET?: string;
 }
 
 export function isGuestPath(pathname: string): boolean {
@@ -148,11 +154,22 @@ export function adsenseDocument(pathname: string): boolean {
   return pathname !== '/index.html' && adsAllowedOn(pathname);
 }
 
-/** True when the request carries the AdSense cookie (set by the API only for a member it shows AdSense). */
-export function hasAdsCookie(request: Request): boolean {
-  const header = request.headers.get('cookie');
-  if (!header) return false;
-  return header.split(';').some((part) => part.trim() === `${ADS_DOC_COOKIE}=1`);
+/**
+ * True when the request carries a valid AdSense cookie: signed with ADS_COOKIE_SECRET (by the API, for a member it
+ * shows AdSense) and unexpired. Page script can set a cookie of that name, but not a valid value.
+ */
+export async function hasAdsCookie(request: Request, env: Pick<Env, 'ADS_COOKIE_SECRET'>): Promise<boolean> {
+  const value = readCookie(request.headers.get('cookie'), ADS_DOC_COOKIE);
+  return (await verifyAdsCookie(env.ADS_COOKIE_SECRET, value)) !== null;
+}
+
+/** The marker the app looks for (ads.ts documentAllowsAdsense), as the first thing in <head>. */
+export const ADS_META_TAG = `<meta name="${ADS_DOC_META}" content="1">`;
+export function markAdsDocument(html: string): string {
+  const m = /<head(\s[^>]*)?>/i.exec(html);
+  if (!m) return `${ADS_META_TAG}${html}`;
+  const at = m.index + m[0].length;
+  return `${html.slice(0, at)}${ADS_META_TAG}${html.slice(at)}`;
 }
 
 /**
@@ -171,7 +188,7 @@ export async function serveHtml(request: Request, env: Env, o: { adPage?: boolea
   if (!type.toLowerCase().includes('text/html')) return res;
   const url = new URL(request.url);
   const origin = url.origin;
-  const adPage = (o.adPage ?? adsenseDocument(url.pathname)) && hasAdsCookie(request);
+  const adPage = (o.adPage ?? adsenseDocument(url.pathname)) && (await hasAdsCookie(request, env));
   const [state, list] = await Promise.all([
     adPage ? adsenseState(env, origin) : Promise.resolve(OFF),
     scriptHashes(env, origin),
@@ -180,13 +197,27 @@ export async function serveHtml(request: Request, env: Env, o: { adPage?: boolea
   const headers = new Headers(res.headers);
   for (const [k, v] of Object.entries(APP_HEADERS)) headers.set(k, v);
   headers.set('Content-Security-Policy', appCsp(list, { adsense: wide }));
-  // The app reads this from its own navigation entry to know whether Google's script may load here.
-  if (wide) headers.set('Server-Timing', ADS_DOC_TIMING);
-  else headers.delete('Server-Timing');
+  // A popup opened from a document holding Google's script onto any other page (COOP same-origin) is moved to a
+  // new browsing context group, so the opener can't reach into it.
+  if (wide) headers.set('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+  headers.delete('Server-Timing');
   // Never stored: a page restored from the back/forward cache or the HTTP cache could carry another member's
   // state, or an old, wider policy.
   headers.set('Cache-Control', 'no-store');
-  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  if (!wide || request.method === 'HEAD')
+    return new Response(request.method === 'HEAD' ? null : res.body, {
+      status: res.status,
+      statusText: res.statusText,
+      headers,
+    });
+  // The app reads this marker from its own document to know Google's script may load here (a Server-Timing
+  // entry isn't exposed for navigations a service worker answers in every browser).
+  headers.delete('Content-Length');
+  return new Response(markAdsDocument(await res.text()), {
+    status: res.status,
+    statusText: res.statusText,
+    headers,
+  });
 }
 
 export default {

@@ -7,6 +7,8 @@ import {
   CREDIT_GRANT_MAX,
   NOTICE_MESSAGE_MAX,
   RESOLVE_ACTIONS,
+  STEP_UP_CODE_LENGTH,
+  STEP_UP_OPS,
   SUSPEND_CATEGORIES,
 } from './admin-types';
 import { SYSTEM_MAX_BATCH } from './plans';
@@ -163,6 +165,12 @@ export const adminAdsensePatchSchema = z
 export const adEventSchema = z
   .object({ cardId: uuid, kind: z.enum(['impression', 'click']), placement: z.enum(AD_PLACEMENTS) })
   .strict();
+/** POST /api/v1/me/step-up. */
+export const stepUpSchema = z.object({ op: z.enum(STEP_UP_OPS) }).strict();
+/** The code in STEP_UP_HEADER: exactly the emailed digits. */
+export const STEP_UP_CODE_RE = new RegExp(`^\\d{${STEP_UP_CODE_LENGTH}}$`);
+/** POST /api/v1/ads/reset: `ifSeen` clears the site's storage only if this browser may have run AdSense. */
+export const adResetSchema = z.object({ ifSeen: z.boolean().optional() }).strict();
 
 /** Store ids come from the deployment config: lower-case slug. */
 /** Store ids: the same rule as public._store_id_ok (the API tests compare them); secrets map dashes to underscores. */

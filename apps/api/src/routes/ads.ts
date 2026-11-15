@@ -6,27 +6,32 @@
  *                                         at most one of each per member, card and day, and only for members
  *                                         who are shown ads (ad_event)
  *   POST /api/v1/ads/reset                no session, same-origin only: Clear-Site-Data "cache", "storage" and the
- *                                         AdSense cookie cleared (before the app reloads off Google's script)
+ *                                         AdSense cookies cleared (before the app reloads off Google's script).
+ *                                         `{ ifSeen: true }` (a session ending in a document without the script):
+ *                                         only when this browser may have run it (ADS_SEEN_COOKIE)
  *   GET  /api/v1/ads/cards/:id/image?v=   public, immutable (the URL carries the image version)
  *   GET  /api/v1/ads/config-public        public: { enabled, publisherId } for the app Worker (CSP, ads.txt),
  *                                         cached 15 s in the isolate (the Worker caches it 60 s more)
- * GET /ads also sets the AdSense cookie (ADS_DOC_COOKIE) when AdSense is returned and clears it otherwise: the app
- * Worker widens the CSP only for documents whose request carries it.
+ * GET /ads also sets the AdSense cookie (ADS_DOC_COOKIE, a signed 15-minute value, packages/shared ads-cookie.ts)
+ * when AdSense is returned and clears it otherwise: the app Worker widens the CSP only for documents whose request
+ * carries a valid one. It also sets ADS_SEEN_COOKIE (30 days) then, for the conditional reset.
  * ADS_LIMITER: 120 a minute per member on the first two, and per client network on the public ones (the app
  * Worker's own config fetch carries no client address and is bounded by the isolate cache). A team library never
  * shows ads.
  */
 import {
-  ADS_DOC_COOKIE,
-  ADS_DOC_COOKIE_MAX_AGE,
+  ADS_SEEN_COOKIE,
   type AdPlacement,
   type AdsResult,
   adEventSchema,
+  adResetSchema,
   LIBRARY_HEADER,
   MEMBER8_API,
 } from '@zephyr/shared';
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
 import { except } from 'hono/combine';
+import { getCookie } from 'hono/cookie';
+import { adsDocCookie, adsSeenCookie } from '../auth/session';
 import { hmac, toPgBytea } from '../crypto';
 import { list } from '../env';
 import { clientIp, clientNetwork, fail, guardWrite, logError, rateLimited, readBody } from '../http';
@@ -89,22 +94,35 @@ const publicLimit: MiddlewareHandler<HonoEnv> = async (c, next) => {
 adsRoutes.use('*', except(isPublic, json, requireMember, adsLimit));
 adsRoutes.use('*', async (c, next) => (isPublic(c) ? publicLimit(c, next) : next()));
 
-// ---------------------------------------------------------------- AdSense cookie
-/** The cookie the app Worker looks for before it widens a document's CSP (HttpOnly: page script can't read it). */
-export function adsDocCookie(on: boolean): string {
-  return `${ADS_DOC_COOKIE}=${on ? '1' : ''}; Path=/; Max-Age=${on ? ADS_DOC_COOKIE_MAX_AGE : 0}; HttpOnly; Secure; SameSite=Strict`;
-}
-const sendAdsCookie = (c: Ctx, on: boolean) => c.header('Set-Cookie', adsDocCookie(on), { append: true });
+// ---------------------------------------------------------------- AdSense cookies
+/**
+ * The cookie the app Worker checks before it widens a document's CSP: HttpOnly, and its value signed for this
+ * member with an expiry (auth/session.ts adsDocCookie), so page script can't forge one that sticks. While on, it
+ * also marks the browser as one that may have run Google's script (ADS_SEEN_COOKIE, 30 days).
+ */
+const sendAdsCookie = async (c: Ctx, on: boolean) => {
+  const signed = on && Boolean(c.env.ADS_COOKIE_SECRET);
+  c.header('Set-Cookie', await adsDocCookie(c.env, signed ? c.get('session').userId : null), {
+    append: true,
+  });
+  if (signed) c.header('Set-Cookie', adsSeenCookie(true), { append: true });
+};
 
 /**
  * Before the app reloads off Google's AdSense script (the member it was loaded for is gone, changed or lost ads):
  * drop everything the script could have written to this origin (Cache Storage, local and session storage,
- * IndexedDB, the service worker) and the AdSense cookie. Same-origin only (the write guard), so another site
- * can't wipe a member's storage; no session needed, since it runs after one ended too.
+ * IndexedDB, the service worker) and the AdSense cookies. `{ ifSeen: true }` comes from a session ending in a
+ * document without the script: then only when this browser may have run it (ADS_SEEN_COOKIE), so a member who
+ * never saw AdSense keeps their storage. Same-origin only (the write guard), so another site can't wipe a
+ * member's storage; no session needed, since it runs after one ended too.
  */
 adsRoutes.post('/reset', json, async (c) => {
+  const body = await readBody(c, adResetSchema);
+  if (!body) return c.json(fail('invalid'), 400);
+  c.header('Set-Cookie', await adsDocCookie(c.env, null), { append: true });
+  if (body.ifSeen && getCookie(c, ADS_SEEN_COOKIE) === undefined) return c.body(null, 204);
   c.header('Clear-Site-Data', '"cache", "storage"');
-  sendAdsCookie(c, false);
+  c.header('Set-Cookie', adsSeenCookie(false), { append: true });
   return c.body(null, 204);
 });
 
@@ -146,12 +164,12 @@ adsRoutes.get('/config-public', async (c) => {
 adsRoutes.get('/', async (c) => {
   // The AdSense cookie follows the answer: set only when AdSense is returned, cleared otherwise.
   if (!ownLibrary(c)) {
-    sendAdsCookie(c, false);
+    await sendAdsCookie(c, false);
     return c.json(EMPTY);
   }
   try {
     const out = await rpc<MemberAds | null>(c.env, 'ads_for_member', { p_user: c.get('session').userId });
-    sendAdsCookie(c, Boolean(out?.adsense));
+    await sendAdsCookie(c, Boolean(out?.adsense));
     if (!out) return c.json(EMPTY);
     return c.json({
       ok: true,
@@ -163,7 +181,7 @@ adsRoutes.get('/', async (c) => {
     } satisfies AdsResult);
   } catch (err) {
     logError(c.get('requestId'), 'ads_for_member', err);
-    sendAdsCookie(c, false);
+    await sendAdsCookie(c, false);
     return c.json(EMPTY);
   }
 });

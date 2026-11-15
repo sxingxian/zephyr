@@ -7,7 +7,17 @@ import { NoAdsSurface } from './components/ads/NoAdsSurface';
 import { AD_EVERY, AD_FIRST, buildRows } from './components/PhotoGrid';
 import { CopyButton, PasscodeReveal } from './components/share/ShareBits';
 import { useShareGallery } from './components/share/ShareDialogs';
-import { __resetAdsForTest, ADSENSE_SRC, adsAllowedOn, loadAdsense, safeAdUrl } from './lib/ads';
+import {
+  __resetAdsForTest,
+  ADSENSE_SRC,
+  adsAllowedOn,
+  adsenseHeld,
+  documentMarker,
+  holdAdsense,
+  loadAdsense,
+  resetSiteForAdsense,
+  safeAdUrl,
+} from './lib/ads';
 import { resetAiStatus } from './lib/aiClient';
 import { api } from './lib/api';
 import { resetAppStatus, STATUS_POLL_MS, useAppStatusPolling } from './lib/appStatus';
@@ -62,7 +72,7 @@ const CARD = {
 
 const json = (code: number, body: unknown) =>
   new Response(JSON.stringify(body), { status: code, headers: { 'content-type': 'application/json' } });
-type Call = { url: string; method: string; body: unknown };
+type Call = { url: string; method: string; body: unknown; headers: Headers };
 let calls: Call[] = [];
 type Handler = (url: string, method: string, body: unknown) => Response | undefined;
 let currentUser: ReturnType<typeof user> = user();
@@ -73,7 +83,7 @@ function mockApi(handler: Handler = () => undefined, libraries: LibrarySummary[]
     vi.fn(async (url: string, init?: RequestInit) => {
       const method = init?.method ?? 'GET';
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-      calls.push({ url, method, body });
+      calls.push({ url, method, body, headers: new Headers(init?.headers) });
       const r = handler(url, method, body);
       if (r) return r;
       if (url.endsWith('/auth/session')) return json(200, { ok: true, user: currentUser });
@@ -250,7 +260,7 @@ describe('suspended account', () => {
       url.endsWith('/auth/session') ? json(403, { ok: false, error: 'account_suspended' }) : undefined,
     );
     renderAt('/');
-    await waitFor(() => expect(assign).toHaveBeenCalledWith('/suspended'));
+    await waitFor(() => expect(assign).toHaveBeenCalledWith('/suspended', { sessionEnd: true }));
   });
 
   it('does the same for any other call (sign-in included)', async () => {
@@ -262,7 +272,7 @@ describe('suspended account', () => {
     renderAt('/sign-in');
     await waitFor(() => expect(calls.some((c) => c.url.endsWith('/auth/session'))).toBe(true));
     await act(() => api('/api/v1/auth/passkey/verify', { body: {} }).catch(() => undefined));
-    expect(assign).toHaveBeenCalledWith('/suspended');
+    expect(assign).toHaveBeenCalledWith('/suspended', { sessionEnd: true });
   });
 
   it('the suspended screen offers support and another account, and never loops', async () => {
@@ -275,9 +285,9 @@ describe('suspended account', () => {
     const mail = screen.getByRole('link', { name: 'Email support' });
     expect(mail.getAttribute('href')).toMatch(/^mailto:support@midnightpoetry\.studio/);
     await waitFor(() => expect(calls.some((c) => c.url.endsWith('/auth/session'))).toBe(true));
-    expect(assign).not.toHaveBeenCalledWith('/suspended');
+    expect(assign.mock.calls.map((c: unknown[]) => c[0])).not.toContain('/suspended');
     fireEvent.click(screen.getByRole('button', { name: 'Use a different account' }));
-    expect(assign).toHaveBeenCalledWith('/sign-in');
+    expect(assign).toHaveBeenCalledWith('/sign-in', { sessionEnd: true });
   });
 });
 
@@ -329,7 +339,8 @@ describe('sponsored cards', () => {
     expect(link.getAttribute('rel')).toBe('noopener noreferrer sponsored');
     expect(card.querySelector('img')?.getAttribute('src')).toBe('/api/v1/ads/cards/card-1/image?v=2');
 
-    const events = () => calls.filter((c) => c.url === '/api/v1/ads/events');
+    const events = () =>
+      calls.filter((c) => c.url === '/api/v1/ads/events').map(({ headers: _h, ...rest }) => rest);
     // Less than half visible, or not for a full second: nothing.
     act(() => setVisible(0.3));
     await act(async () => {
@@ -527,7 +538,9 @@ describe('AdSense', () => {
       return undefined;
     });
     renderAt('/favourites');
-    await waitFor(() => expect(assign).toHaveBeenCalledWith('/sign-in?next=%2Ffavourites'));
+    await waitFor(() =>
+      expect(assign).toHaveBeenCalledWith('/sign-in?next=%2Ffavourites', { sessionEnd: true }),
+    );
   });
 
   it('reloads when the member the script was loaded for is replaced', async () => {
@@ -806,5 +819,149 @@ describe('team removal: replace links', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Remove from team' }));
     await waitFor(() => expect(removeCalls()).toHaveLength(1));
     expect(removeCalls()[0]?.url).not.toContain('replaceLinks');
+  });
+});
+
+// ---------------------------------------------------------------- review round 3: step-up codes and AdSense holds
+describe('step-up codes (account changes while the member may be shown AdSense)', () => {
+  const PK = { id: 'pk_1', friendlyName: 'Work laptop', createdAt: '2026-10-28T00:00:00Z', lastUsedAt: null };
+  const deletes = () => calls.filter((c) => c.method === 'DELETE' && c.url.includes('/me/passkeys/'));
+
+  it('asks for the emailed code, then removes the passkey with it', async () => {
+    let wrongOnce = true;
+    mockApi((url, method) => {
+      if (url === '/api/v1/me/passkeys' && method === 'GET') return json(200, { ok: true, passkeys: [PK] });
+      if (url === '/api/v1/me/step-up') return json(202, { ok: true, needed: true });
+      if (url.startsWith('/api/v1/me/passkeys/') && method === 'DELETE') {
+        const last = calls[calls.length - 1];
+        const code = last?.headers.get('X-Zephyr-Step-Up');
+        if (!code) return json(403, { ok: false, error: 'step_up_required' });
+        if (wrongOnce) {
+          wrongOnce = false;
+          return json(403, { ok: false, error: 'step_up_invalid' });
+        }
+        return new Response(null, { status: 204 });
+      }
+      return undefined;
+    });
+    renderAt('/settings/security');
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
+    fireEvent.click(
+      within(await screen.findByRole('dialog', { name: 'Remove this passkey?' })).getByRole('button', {
+        name: 'Remove',
+      }),
+    );
+    const dlg = await screen.findByRole('dialog', { name: 'Confirm it’s you' });
+    expect(within(dlg).getByText(/to remove this passkey/)).toBeTruthy();
+    expect(calls.find((c) => c.url === '/api/v1/me/step-up')?.body).toEqual({ op: 'passkey_remove' });
+    const field = within(dlg).getByLabelText('Code');
+    expect(field.getAttribute('autocomplete')).toBe('one-time-code');
+    fireEvent.change(field, { target: { value: '12a3456' } });
+    expect((field as HTMLInputElement).value).toBe('123456');
+    // jsdom doesn't submit a form from a button outside it (its form attribute): submit the form itself.
+    const submit = () => fireEvent.submit(dlg.querySelector('form#step-up-form') as HTMLFormElement);
+    submit();
+    expect(await within(dlg).findByText(/That code didn’t work/)).toBeTruthy();
+    fireEvent.change(within(dlg).getByLabelText('Code'), { target: { value: '654321' } });
+    submit();
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Confirm it’s you' })).toBeNull());
+    expect(deletes().map((c) => c.headers.get('X-Zephyr-Step-Up'))).toEqual([null, '123456', '654321']);
+  });
+
+  it('a member who doesn’t need a code never sees the dialog', async () => {
+    mockApi((url, method) => {
+      if (url === '/api/v1/me/passkeys' && method === 'GET') return json(200, { ok: true, passkeys: [PK] });
+      if (url.startsWith('/api/v1/me/passkeys/') && method === 'DELETE')
+        return new Response(null, { status: 204 });
+      return undefined;
+    });
+    renderAt('/settings/security');
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
+    fireEvent.click(
+      within(await screen.findByRole('dialog', { name: 'Remove this passkey?' })).getByRole('button', {
+        name: 'Remove',
+      }),
+    );
+    await waitFor(() => expect(deletes()).toHaveLength(1));
+    expect(calls.some((c) => c.url === '/api/v1/me/step-up')).toBe(false);
+    expect(screen.queryByRole('dialog', { name: 'Confirm it’s you' })).toBeNull();
+  });
+
+  it('cancelling leaves the passkey alone', async () => {
+    mockApi((url, method) => {
+      if (url === '/api/v1/me/passkeys' && method === 'GET') return json(200, { ok: true, passkeys: [PK] });
+      if (url === '/api/v1/me/step-up') return json(202, { ok: true, needed: true });
+      if (url.startsWith('/api/v1/me/passkeys/') && method === 'DELETE')
+        return json(403, { ok: false, error: 'step_up_required' });
+      return undefined;
+    });
+    renderAt('/settings/security');
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
+    fireEvent.click(
+      within(await screen.findByRole('dialog', { name: 'Remove this passkey?' })).getByRole('button', {
+        name: 'Remove',
+      }),
+    );
+    const dlg = await screen.findByRole('dialog', { name: 'Confirm it’s you' });
+    fireEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Confirm it’s you' })).toBeNull());
+    expect(deletes()).toHaveLength(1);
+    expect(screen.queryByText('Passkey removed')).toBeNull();
+  });
+});
+
+describe('AdSense: holds, the document marker and the storage reset', () => {
+  it('reads the Worker’s marker from <head>', () => {
+    expect(documentMarker().wide).toBe(false);
+    const meta = document.createElement('meta');
+    meta.name = 'zephyr-ads';
+    meta.content = '1';
+    document.head.prepend(meta);
+    try {
+      expect(documentMarker().wide).toBe(true);
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it('never adds Google’s script while something holds it (a gallery being created or just created)', () => {
+    __resetAdsForTest('/', true);
+    const release = holdAdsense();
+    const second = holdAdsense();
+    expect(adsenseHeld()).toBe(true);
+    expect(loadAdsense(PUB)).toBe(false);
+    release();
+    release();
+    expect(loadAdsense(PUB)).toBe(false);
+    second();
+    expect(adsenseHeld()).toBe(false);
+    expect(loadAdsense(PUB)).toBe(true);
+  });
+
+  it('holds the script while the create dialog is open', async () => {
+    mockApi();
+    const router = createMemoryRouter(
+      [{ element: routes[0]?.element, children: [{ path: '/', element: <SecretProbe /> }] }],
+      { initialEntries: ['/'] },
+    );
+    render(<RouterProvider router={router} />);
+    await screen.findByRole('heading', { name: 'Probe' });
+    fireEvent.click(screen.getByRole('button', { name: 'Share now' }));
+    await screen.findByRole('dialog');
+    expect(adsenseHeld()).toBe(true);
+    expect(loadAdsense(PUB)).toBe(false);
+    cleanup();
+    expect(adsenseHeld()).toBe(false);
+  });
+
+  it('asks the server to clear the site’s storage: always with the script, and on a session end only if it ever ran', async () => {
+    mockApi((url) => (url === '/api/v1/ads/reset' ? new Response(null, { status: 204 }) : undefined));
+    __resetAdsForTest('/', true);
+    expect(resetSiteForAdsense({ sessionEnd: false })).toBeNull();
+    await resetSiteForAdsense({ sessionEnd: true });
+    expect(calls.at(-1)).toMatchObject({ url: '/api/v1/ads/reset', method: 'POST', body: { ifSeen: true } });
+    loadAdsense(PUB);
+    await resetSiteForAdsense({ sessionEnd: false });
+    expect(calls.at(-1)).toMatchObject({ url: '/api/v1/ads/reset', method: 'POST', body: {} });
   });
 });

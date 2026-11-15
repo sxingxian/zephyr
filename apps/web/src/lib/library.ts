@@ -93,8 +93,9 @@ export const deleteAlbum = (id: string) => api<void>(LIBRARY_API.album(id), { me
 export const emptyTrash = () =>
   api<{ ok: true; deleted: number }>(LIBRARY_API.trashEmpty, { body: {} }).then((r) => r.deleted);
 export const fetchUsage = (signal?: AbortSignal) => api<Usage>(LIBRARY_API.usage, { signal });
-export const deleteAccount = () =>
-  api<DeleteAccountResult>(LIBRARY_API.deleteAccount, { body: { confirm: 'DELETE' } });
+/** `headers`: phase 8, the step-up code when one is needed (components/StepUp.tsx). */
+export const deleteAccount = (headers?: Record<string, string>) =>
+  api<DeleteAccountResult>(LIBRARY_API.deleteAccount, { body: { confirm: 'DELETE' }, headers });
 export const restoreAccount = () => api<SessionResponse>(LIBRARY_API.restoreAccount, { body: {} });
 
 // ---------------------------------------------------------------- uploads
