@@ -208,9 +208,10 @@
         Google places itself stay off in the AdSense console (`docs/setup.md` §3.9).
       - AdSense stays off until an Owner turns it on with a recent passkey. Turning it off applies to page loads
         within 60 seconds and needs no passkey.
-    - **Ad events** count at most one impression and one click per member, card and day. Only members who are shown
-        ads can send them. The dedup key is a keyed hash kept for two days, never the member id.
+
+    - **Ad events** count at most one impression and one click per member, card and day. Only members who are
+      shown ads can send them. The dedup key is a keyed hash kept for two days, never the member id.
     - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
-        Turnstile.
+      Turnstile.
 
 See the design decisions doc and `docs/phase-8.md` for the details.
