@@ -343,9 +343,15 @@ New pages matching the mockups: Users, Safety, Plan limits, Ads, Storage, Retent
 
 - Put Cloudflare Access in front of `/admin` for every staff email (already required); add each invited staff member's email to the Access policy.
 - For each extra store, follow `docs/setup.md` §3.8 (bucket, keys as secrets, encryption at rest confirmed, `STORAGE_STORES` entry; for on-premises, the Tunnel and Workers VPC service or the Access-protected hostname), then run a health check before switching.
-- AdSense:
+- Account-change emails: with Resend click and open tracking off (`docs/setup.md` §1), check that passkey and
+  deletion links arrive and open `/account-action/<nonce>` on the app host.
+- AdSense (recommended: keep it off at launch; sponsored cards carry no in-page script risk):
   - get the site approved;
   - set up the European regulations message in AdSense › Privacy & messaging;
-  - have counsel review the privacy notice for ads and the accepted script risk;
-  - keep AdSense off until then.
+  - keep Auto ads, anchor, vignette and side-rail ads off in the AdSense console;
+  - set `AD_DEDUP_SECRET` on the API and the same `ADS_COOKIE_SECRET` on both Workers;
+  - run the real-browser COOP check in `docs/setup.md` §3.9 step 8 in Chrome, Safari and Firefox;
+  - have counsel review the privacy notice for ads and the accepted script risk (`docs/security.md` item 18);
+  - keep AdSense off until all of these are done. The full fix for the residual risk is serving ad pages from a
+    separate origin with a restricted session; revisit before turning AdSense on.
 - Have counsel approve the CSAM reporting process recorded on holds.
