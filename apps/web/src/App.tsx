@@ -1,7 +1,7 @@
 import { Spinner, ToastProvider, useToast } from '@zephyr/ui';
 import { lazy, Suspense, useCallback, useEffect, useRef } from 'react';
 import { createBrowserRouter, Outlet, type RouteObject, useLocation, useNavigate } from 'react-router';
-import { AdsBoot } from './components/ads/Ads';
+import { AdsBoot, AdsRouteGate } from './components/ads/Ads';
 import { AiHost } from './components/ai/AiHost';
 import { EditTray } from './components/editor/EditTray';
 import { PublicOnly, RequireAuth } from './components/Guards';
@@ -12,6 +12,7 @@ import { useAppStatusPolling } from './lib/appStatus';
 import { refreshLibraries, takeLibraryNotice, useCan } from './lib/libraryContext';
 import { safeReturnPath } from './lib/returnPath';
 import { SessionProvider, useSession } from './lib/session';
+import { browser } from './lib/sessionGuard';
 import { About } from './routes/About';
 import { AccountDeleted } from './routes/AccountScheduled';
 import { AlbumsPage } from './routes/Albums';
@@ -74,10 +75,14 @@ function Root() {
   useAppStatusPolling();
   const nav = useNavigate();
   const loc = useLocation();
-  // A 401 from any call: back to sign-in, remembering where the visitor was.
+  // A 401 from any call (or a session found ended): back to sign-in, remembering where the visitor was. A full
+  // page load (phase 8), so nothing from the ended session stays in memory: photo data, or Google's AdSense
+  // script, which would otherwise watch the sign-in form and carry over into the next member's session.
   const onUnauthenticated = useCallback(() => {
     const next = safeReturnPath(`${loc.pathname}${loc.search}`);
-    nav(next === '/' ? '/sign-in' : `/sign-in?next=${encodeURIComponent(next)}`, { replace: true });
+    const to = next === '/' ? '/sign-in' : `/sign-in?next=${encodeURIComponent(next)}`;
+    if (loc.pathname.startsWith('/sign-in')) nav(to, { replace: true });
+    else browser.assign(to);
   }, [nav, loc.pathname, loc.search]);
   return (
     <SessionProvider onUnauthenticated={onUnauthenticated}>
@@ -85,7 +90,9 @@ function Root() {
         <LibraryBoot />
         <AdsBoot />
         <Uploads>
-          <Outlet />
+          <AdsRouteGate>
+            <Outlet />
+          </AdsRouteGate>
         </Uploads>
       </ToastProvider>
     </SessionProvider>

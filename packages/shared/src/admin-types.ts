@@ -171,6 +171,8 @@ export const MEMBER8_API = {
 } as const;
 /** TEAM_API.member DELETE accepts ?replaceLinks=1: replaces the links of every live gallery in that library. */
 export const TEAM_REMOVE_REPLACE_LINKS_PARAM = 'replaceLinks';
+/** Most links `gallery_links_replace` rotates in one call (one transaction); the API pages through more. */
+export const GALLERY_LINKS_REPLACE_MAX = 500;
 
 // ================================================================ common
 export interface AdminReasonBody {

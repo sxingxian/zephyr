@@ -7,7 +7,9 @@ import {
   type PlanId,
 } from '@zephyr/shared/client';
 import { useSyncExternalStore } from 'react';
+import { adsAllowedOn } from '../../worker/adPages.js';
 import { api } from './api';
+import { sessionUserId } from './sessionGuard';
 
 /**
  * Phase 8: ads for Free members, in their own library only (a team library never shows ads).
@@ -16,9 +18,11 @@ import { api } from './api';
  * - Google AdSense loads only when the API says so (`adsense` present), and only once a unit is actually shown
  *   on a page where ads are allowed. The AdSense tag brings Google's own consent message (Privacy & messaging);
  *   no other consent script is loaded. The app Worker widens the CSP for Google's hosts only while AdSense is on.
- * - Ads are never shown in the editor, the photo viewer, sharing, billing, settings, team or sign-in pages.
- *   Navigating there unmounts every ad unit; the script itself stays loaded for that page view, so a plan
- *   upgrade (or an account or library change) does a full reload to drop it.
+ * - Ads are never shown in the editor, the photo viewer, sharing, billing, settings, team or sign-in pages
+ *   (`worker/adPages.js`, shared with the app Worker). Once Google's script is in the page, leaving the ad pages
+ *   is a full page load (AdsRouteGate), so the script never sees those pages; the Worker sends the AdSense CSP
+ *   only for documents on ad pages. A plan upgrade (here, in another tab or by staff), a sign-out, an account
+ *   change or a library change also reloads, and a member of any team library never gets AdSense.
  */
 export type SponsoredCard = AdsResult['cards'][number];
 export interface Ads {
@@ -26,18 +30,15 @@ export interface Ads {
   adsense: AdsResult['adsense'];
 }
 
-/** Pages that browse the library. Everything else (editor, viewer, sharing, billing, settings…) has no ads. */
-const ALLOWED: readonly RegExp[] = [
-  /^\/$/,
-  /^\/favourites$/,
-  /^\/albums(\/[^/]+)?$/,
-  /^\/people(\/[^/]+)?$/,
-  /^\/scenes(\/[^/]+)?$/,
-  /^\/ai\/queue$/,
-];
-export function adsAllowedOn(pathname: string): boolean {
-  return ALLOWED.some((re) => re.test(pathname));
-}
+export { adsAllowedOn };
+
+/**
+ * Whether this document was loaded on an ad page, so the Worker may have sent the AdSense CSP. AdSense units
+ * mount only in such documents (elsewhere the CSP would block Google's script anyway); other page loads show
+ * sponsored cards only.
+ */
+let docPath = typeof window === 'undefined' ? '' : window.location.pathname;
+export const documentAllowsAdsense = (): boolean => adsAllowedOn(docPath);
 
 export function planHasAds(plan: PlanId | undefined): boolean {
   return Boolean(plan && PLANS.find((p) => p.id === plan)?.limits.ads);
@@ -187,13 +188,17 @@ export function countImpression(cardId: string, placement: AdPlacement): void {
 // ---------------------------------------------------------------- AdSense script
 export const ADSENSE_SRC = 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js';
 let scriptFor: string | null = null;
+/** The member signed in when Google's script was added (it acts with that member's session). */
+let scriptUser: string | null = null;
+const scriptSubs = new Set<() => void>();
 /**
  * Adds Google's AdSense tag once per page load. The tag shows Google's consent message (Privacy & messaging)
  * before any personalised ad; nothing else from Google is loaded by the app.
  */
 export function loadAdsense(publisherId: string): boolean {
   if (scriptFor) return scriptFor === publisherId;
-  if (!PUBLISHER.test(publisherId) || typeof document === 'undefined') return false;
+  if (!PUBLISHER.test(publisherId) || typeof document === 'undefined' || !documentAllowsAdsense())
+    return false;
   const s = document.createElement('script');
   s.async = true;
   s.crossOrigin = 'anonymous';
@@ -201,15 +206,32 @@ export function loadAdsense(publisherId: string): boolean {
   s.dataset.zephyr = 'adsense';
   document.head.appendChild(s);
   scriptFor = publisherId;
+  scriptUser = sessionUserId();
+  for (const cb of scriptSubs) cb();
   return true;
 }
 export const adsenseLoaded = (): boolean => scriptFor !== null;
+/** The member Google's script was loaded for (null if not loaded). */
+export const adsenseUser = (): string | null => scriptUser;
+export function useAdsenseLoaded(): boolean {
+  return useSyncExternalStore(
+    (cb) => {
+      scriptSubs.add(cb);
+      return () => scriptSubs.delete(cb);
+    },
+    adsenseLoaded,
+    adsenseLoaded,
+  );
+}
 
 /** Test helper. */
-export function __resetAdsForTest(): void {
+export function __resetAdsForTest(path = '/'): void {
   ads = null;
   loadedFor = null;
   scriptFor = null;
+  scriptUser = null;
+  docPath = path;
+  for (const cb of scriptSubs) cb();
   newAdPageView();
   for (const el of document.querySelectorAll('script[data-zephyr="adsense"]')) el.remove();
   emit();

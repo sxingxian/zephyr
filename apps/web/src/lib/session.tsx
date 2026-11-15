@@ -17,7 +17,14 @@ import {
   setSuspendedHandler,
   setUnauthenticatedHandler,
 } from './api';
-import { browser, endSession, onOtherTabSession, setSessionUserId } from './sessionGuard';
+import {
+  announcePlanChange,
+  browser,
+  endSession,
+  onOtherTabPlanChange,
+  onOtherTabSession,
+  setSessionUserId,
+} from './sessionGuard';
 import { resetUsage } from './usage';
 
 /** The session user; `pendingDeletion` is set while the account is scheduled for deletion. */
@@ -42,7 +49,13 @@ export function SessionProvider({
 }) {
   const [user, setUserState] = useState<AppUser | null | undefined>(undefined);
   const lastId = useRef<string | null>(null);
+  const lastPlan = useRef<string | null>(null);
   const setUser = useCallback((u: AppUser | null) => {
+    // Phase 8: the same member with a different plan (an upgrade here, or one this tab just learned about):
+    // tell the other tabs, which re-read the session (a page with Google's AdSense script reloads off it).
+    if (u && lastId.current === u.id && lastPlan.current !== null && lastPlan.current !== (u.plan ?? null))
+      announcePlanChange();
+    lastPlan.current = u?.plan ?? null;
     // A different member (or none): forget the cached storage figures and stop the previous member's
     // uploads before anything can be sent with the new session.
     if (!u || (lastId.current && lastId.current !== u.id)) {
@@ -54,13 +67,21 @@ export function SessionProvider({
     setUserState(u);
   }, []);
 
+  const unauthRef = useRef(onUnauthenticated);
+  unauthRef.current = onUnauthenticated;
   const refresh = useCallback(async () => {
     try {
       const r = await api<SessionResponse>(APP_API.session, { quiet401: true });
       setUser(r.user);
     } catch (e) {
-      if (e instanceof ApiFailure && (e.code === 'unauthenticated' || e.code === 'forbidden')) setUser(null);
-      else setUserState((u) => (u === undefined ? null : u));
+      if (e instanceof ApiFailure && (e.code === 'unauthenticated' || e.code === 'forbidden')) {
+        // A session that ended while signed in here is handled like any 401: a full page load to sign-in,
+        // so nothing from it (photo data, a loaded ad script) stays in the page. The first check just shows
+        // sign-in.
+        const wasSignedIn = lastId.current !== null;
+        setUser(null);
+        if (wasSignedIn) unauthRef.current();
+      } else setUserState((u) => (u === undefined ? null : u));
     }
   }, [setUser]);
 
@@ -86,6 +107,9 @@ export function SessionProvider({
       }),
     [],
   );
+
+  // Phase 8: another tab saw this member's plan change: re-read it here too.
+  useEffect(() => onOtherTabPlanChange(() => void refresh()), [refresh]);
 
   // An upload call found the cookie now belongs to someone else (a tab that missed the broadcast): same
   // as above, stop everything and reload.

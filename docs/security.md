@@ -192,14 +192,25 @@
       can read what a Free member sees (their private photos, file names) and act as them. httpOnly cookies and CSP
       cannot stop that. **The Owner accepted this risk on 15 November 2026** after professional advice against it.
     - **Mitigations:**
-      - Free members, in their own library, only.
-      - Only on the Library grid, sidebar and batch queue. Units are unmounted on the editor, sharing, billing,
-        settings and sign-in pages.
-      - An upgrade, sign-out or account change reloads the page, so the script doesn't carry over.
-      - The CSP is widened for Google's hosts only while AdSense is on, and `scripts/csp.mjs` checks both variants.
-      - Google's certified consent message runs for the EEA, UK and Switzerland.
-      - AdSense stays off until an Owner turns it on with a recent passkey. Turning it off applies to page loads within
-        60 seconds and needs no passkey. - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
+      - Free members, in their own library, only, and never a member of any team library. Their session reaches
+        every library they belong to, and the team's owner didn't accept the risk. They still get sponsored cards.
+      - Only on the Library grid, sidebar and batch queue, on the library pages (`apps/web/worker/adPages.js`).
+      - Once the script is loaded, every other page (editor, viewer, sharing, billing, settings, sign-in) opens
+        with a full page load, so the script is never in a document showing those pages.
+      - The app Worker widens the CSP for Google's hosts only for documents on the library pages, and only while
+        AdSense is on. Every other document, and the service worker's offline fallback (`/index.html`), gets the
+        strict policy. `scripts/csp.mjs` checks both variants and that the ad pages stay narrow.
+      - The page reloads when the member the script was loaded for is gone (sign-out, an ended session, another
+        member) or loses ads. That includes an upgrade in this tab, another tab, another device or by staff. Tabs
+        tell each other about plan changes, and a tab holding the script re-reads the session every 2 minutes
+        and on focus.
+      - Google's certified consent message runs for the EEA, UK and Switzerland. Auto ads and other formats that
+        Google places itself stay off in the AdSense console (`docs/setup.md` §3.9).
+      - AdSense stays off until an Owner turns it on with a recent passkey. Turning it off applies to page loads
+        within 60 seconds and needs no passkey.
+    - **Ad events** count at most one impression and one click per member, card and day. Only members who are shown
+        ads can send them. The dedup key is a keyed hash kept for two days, never the member id.
+    - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
         Turnstile.
 
 See the design decisions doc and `docs/phase-8.md` for the details.
