@@ -335,10 +335,15 @@ export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> 
   // Phase 8: one page per configured store per run, each with its own cursor. A copy on a store other than
   // its photo's is left alone while a migration is moving photos (old copies are deleted only after the
   // verify-plus-hold, by the migration); with no migration under way it's a leftover and goes too.
+  // A rolled-back or finished migration whose old copies are still held (cleanupPending) counts as moving
+  // too: the copies away from their photo's store are the migration's until the hold is over.
   let moving = true;
   try {
-    const status = await rpc<{ migration: { state: string } | null } | null>(env, 'storage_status');
-    moving = !!status?.migration && MOVING.has(status.migration.state);
+    const status = await rpc<{ migration: { state: string } | null; cleanupPending?: boolean } | null>(
+      env,
+      'storage_status',
+    );
+    moving = (!!status?.migration && MOVING.has(status.migration.state)) || status?.cleanupPending === true;
   } catch (err) {
     logError('cron', 'job_sweep_status', err);
   }

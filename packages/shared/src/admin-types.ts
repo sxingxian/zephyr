@@ -502,6 +502,10 @@ export interface StorageMigration {
   from: string;
   to: string;
   state: MigrationState;
+  /** forward: from → to; back: a rollback (to → from), which keeps its direction when paused or failed. */
+  direction: 'forward' | 'back';
+  /** False once it's a rollback or an old copy's deletion has started. */
+  canRollBack: boolean;
   startedAt: string;
   startedBy: string;
   photos: { total: number; copied: number; verified: number; failed: number };

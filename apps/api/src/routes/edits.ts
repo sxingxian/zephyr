@@ -17,6 +17,7 @@ import { imageInfo } from '../library/files';
 import { contentLength, expectedUser, newEditKey, readExact, UUID } from '../library/storage';
 import { deleteEverywhere } from '../storage';
 import { photoStore, storeIdOf } from '../storage/config';
+import { followMove } from '../storage/migrate';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 
@@ -187,6 +188,8 @@ editRoutes.put('/:id/edit/variants/:kind', requireRole('edit'), requireWritable,
       outcomeUnknown = false;
       if (res.status === 'ok') {
         recorded = true;
+        // Phase 8: the photo may have moved to another store between the check and the record.
+        await followMove(c.env, id, store.id, [key]);
         if (res.previousKey && res.previousKey !== key) {
           await dropLater(c, [res.previousKey], 'edit_variant_replace');
         }

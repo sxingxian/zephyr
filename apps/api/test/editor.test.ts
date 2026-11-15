@@ -708,6 +708,24 @@ describe('every variant PUT writes its own key', () => {
     expect(r2.deleted).not.toContain(liveKey);
     expect(must(db.edits.get(p.id)).previewBytes).toBe(9000);
   });
+  it('a variant recorded after its photo moved to another store is followed there (phase 8)', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id);
+    const edit = (await read(await save(j, p.id, warm, null))).edit;
+    // The photo is flipped to 'r2' again here (no other store is configured), so nothing is copied; the
+    // point is that the store is re-read after the record, with the object it wrote.
+    world.rpc.storage_photo_store = (a) => (a.p_photo === p.id ? 'r2' : null);
+    expect(
+      (await put(EDIT_API.photoEditVariant(p.id, 'thumb', edit.version), jpegVariant(512, 384, 3000), j))
+        .status,
+    ).toBe(200);
+    const calls = world.calls.filter((c) => c.url.endsWith('/rpc/storage_photo_store'));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.body).toEqual({ p_photo: p.id });
+    const recorded = world.calls.findIndex((c) => c.url.endsWith('/rpc/record_edit_variant'));
+    expect(recorded).toBeGreaterThanOrEqual(0);
+    expect(world.calls.indexOf(calls[0] as (typeof world.calls)[number])).toBeGreaterThan(recorded);
+  });
   it('a duplicate recorded between the check and the record deletes only its own object', async () => {
     const j = await signedIn(MEI);
     const p = await stored(MEI.id);

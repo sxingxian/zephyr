@@ -5,11 +5,18 @@
  * marked verified (which flips `photos.store_id` in the database, under the photo's row lock).
  *
  * - Queue `zephyr-storage`: each message says "claim and copy the next batch of this migration" (20 photos,
- *   leased by storage_migration_batch). A full batch enqueues the next one.
- * - Failures go back to pending with a backoff; the fifth becomes `failed` (shown in Admin, retryable).
- * - The 5-minute cron re-enqueues a batch for a migration that's copying (expired leases are reclaimed by the
- *   database) and deletes old copies once storage_old_copies_due says the hold has passed. Before deleting,
- *   any object that reached the old store after the copy (a late write during the flip) is copied over too.
+ *   leased by storage_migration_batch, each with its own token). A full batch enqueues the next one. Each item's
+ *   lease is renewed (storage_item_touch) just before it's copied, and only the holder of the current token can
+ *   report it, so a slow consumer whose lease was taken over can't flip a photo.
+ * - A copy counts only if it includes every key the database records for the photo (the original, its
+ *   variants, edited variants and masks) and weighs at least the original.
+ * - Failures go back to pending with a backoff; the fifth attempt becomes `failed` (shown in Admin, retryable).
+ * - The 5-minute cron re-enqueues a batch for a migration that's copying, rolling back, verifying or holding
+ *   (expired leases are reclaimed; late arrivals are queued) and deletes old copies once
+ *   storage_old_copies_due says the hold has passed. Each deletion is claimed first (from then on the move
+ *   can't be rolled back); for a photo that moved, any object missing on its store is copied there first.
+ * - Writers that store an object under a photo's prefix call `followMove` after recording it, so an object
+ *   written to the old store while the photo was being flipped ends up on the new store too.
  *
  * Nothing here logs keys, endpoints or error bodies: only store ids and short StoreError codes.
  */
@@ -43,7 +50,15 @@ export interface MigrationItem {
   ownerId: string;
   from: string;
   to: string;
+  /** This claim's attempt number (1 on the first claim). */
   attempts: number;
+  /** The lease's token: reports without it are refused. */
+  token: string;
+}
+/** storage_item_touch: what the copy must include. */
+export interface ItemLease {
+  keys: string[];
+  minBytes: number;
 }
 export interface OldCopyItem {
   migrationId: string;
@@ -78,11 +93,11 @@ async function listAll(store: ObjectStore, prefix: string): Promise<string[]> {
 
 /**
  * Streams one object from `from` into `to`, hashing on the way, then reads the copy back and compares.
- * Returns the bytes copied, or 0 if the source object is gone (deleted while the photo was moving).
+ * Returns the bytes copied, or null if the source object is gone (deleted while the photo was moving).
  */
-export async function copyVerified(from: ObjectStore, to: ObjectStore, key: string): Promise<number> {
+export async function copyVerified(from: ObjectStore, to: ObjectStore, key: string): Promise<number | null> {
   const src = await from.get(key);
-  if (!src) return 0;
+  if (!src) return null;
   const { stream, result } = hashing(src.body);
   await to.put(key, stream, { contentType: src.contentType ?? 'application/octet-stream', length: src.size });
   const source = await result;
@@ -95,8 +110,12 @@ export async function copyVerified(from: ObjectStore, to: ObjectStore, key: stri
   return source.bytes;
 }
 
-/** Copies and verifies every object of one photo. Re-lists until a pass finds nothing new. */
-export async function copyPhoto(env: Env, item: MigrationItem): Promise<number> {
+/**
+ * Copies and verifies every object of one photo. Re-lists until a pass finds nothing new. Throws
+ * `source_incomplete` unless every key in `lease.keys` (always at least the original) was copied and the copy
+ * weighs at least `lease.minBytes`: an empty or partial listing never counts as a copy.
+ */
+export async function copyPhoto(env: Env, item: MigrationItem, lease: ItemLease): Promise<number> {
   const from = photoStore(env, item.from);
   const to = photoStore(env, item.to);
   const prefix = photoPrefix(item.ownerId, item.photoId);
@@ -106,10 +125,15 @@ export async function copyPhoto(env: Env, item: MigrationItem): Promise<number> 
     const fresh = (await listAll(from, prefix)).filter((k) => !done.has(k));
     if (!fresh.length) break;
     for (const key of fresh) {
-      bytes += await copyVerified(from, to, key);
+      const n = await copyVerified(from, to, key);
+      if (n === null) continue;
+      bytes += n;
       done.add(key);
     }
   }
+  const required = new Set([`${prefix}original`, ...lease.keys.filter((k) => k.startsWith(prefix))]);
+  for (const key of required) if (!done.has(key)) throw new StoreError('source_incomplete');
+  if (bytes <= 0 || bytes < lease.minBytes) throw new StoreError('source_incomplete');
   return bytes;
 }
 
@@ -120,7 +144,7 @@ async function mark(
   state: ItemState,
   bytes: number,
   error: string | null,
-  retryAfterS: number | null = null,
+  extra: { retryAfterS?: number | null; token?: string | null; store?: string | null } = {},
 ) {
   await rpc(env, 'storage_item_mark', {
     p_migration: migration,
@@ -128,25 +152,44 @@ async function mark(
     p_state: state,
     p_bytes: bytes,
     p_error: error,
-    p_retry_after_s: retryAfterS,
+    p_retry_after_s: extra.retryAfterS ?? null,
+    p_token: extra.token ?? null,
+    p_store: extra.store ?? null,
   });
 }
 
-/** One item, end to end: verified, back to pending with a backoff, or failed after the last attempt. */
-export async function migrateItem(env: Env, migration: string, item: MigrationItem): Promise<ItemState> {
+/**
+ * One item, end to end: renew its lease, copy, then verified, back to pending with a backoff, or failed on
+ * the last attempt. 'skipped' when the lease was taken over (or the item was rolled back) before it started.
+ */
+export async function migrateItem(
+  env: Env,
+  migration: string,
+  item: MigrationItem,
+): Promise<ItemState | 'skipped'> {
+  const lease = await rpc<ItemLease | null>(env, 'storage_item_touch', {
+    p_migration: migration,
+    p_photo: item.photoId,
+    p_token: item.token,
+  });
+  if (!lease) return 'skipped';
   try {
-    const bytes = await copyPhoto(env, item);
-    await mark(env, migration, item.photoId, 'verified', bytes, null);
+    const bytes = await copyPhoto(env, item, lease);
+    await mark(env, migration, item.photoId, 'verified', bytes, null, { token: item.token });
     return 'verified';
   } catch (err) {
     const code = codeOf(err);
     logError('storage', `migrate_item ${item.from}->${item.to}`, err);
-    const attempts = (Number.isInteger(item.attempts) ? item.attempts : 0) + 1;
+    // The claim already counted this attempt.
+    const attempts = Number.isInteger(item.attempts) && item.attempts > 0 ? item.attempts : 1;
     if (attempts >= MIGRATION_LIMITS.attempts) {
-      await mark(env, migration, item.photoId, 'failed', 0, code);
+      await mark(env, migration, item.photoId, 'failed', 0, code, { token: item.token });
       return 'failed';
     }
-    await mark(env, migration, item.photoId, 'pending', 0, code, backoffSeconds(attempts));
+    await mark(env, migration, item.photoId, 'pending', 0, code, {
+      token: item.token,
+      retryAfterS: backoffSeconds(attempts),
+    });
     return 'pending';
   }
 }
@@ -184,24 +227,54 @@ export async function handleStorageBatch(batch: MessageBatch<StorageMessage>, en
 }
 
 /**
- * Deletes the old copy of one photo. Every object on the old store is first checked on the new one; one
- * that's missing there (written to the old store during the flip) is copied and verified before anything
- * is deleted.
+ * Deletes the old copy of one photo, once storage_old_copy_claim has claimed it (which also re-checks that
+ * the photo isn't on that store now). For a photo that moved and still exists (`copyTo`), every object on the
+ * old store is first checked on the photo's store; one that's missing there is copied and verified before
+ * anything is deleted. A photo that's gone, or a partial copy that was never used, is just deleted: nothing is
+ * copied back. Returns how many objects were deleted, or null when the copy wasn't due any more.
  */
-export async function deleteOldCopy(env: Env, item: OldCopyItem): Promise<number> {
+export async function deleteOldCopy(env: Env, item: OldCopyItem): Promise<number | null> {
+  const claim = await rpc<{ copyTo: string | null } | null>(env, 'storage_old_copy_claim', {
+    p_migration: item.migrationId,
+    p_photo: item.photoId,
+    p_store: item.from,
+  });
+  if (!claim) return null;
   const from = photoStore(env, item.from);
-  const to = photoStore(env, item.to);
-  if (from.id === to.id) return 0;
   const keys = await listAll(from, photoPrefix(item.ownerId, item.photoId));
-  for (const key of keys) {
-    const there = await to.head(key);
-    if (!there) await copyVerified(from, to, key);
+  if (claim.copyTo && claim.copyTo !== item.from) {
+    const to = photoStore(env, claim.copyTo);
+    for (const key of keys) {
+      const there = await to.head(key);
+      if (!there) await copyVerified(from, to, key);
+    }
   }
   for (let i = 0; i < keys.length; i += 1000) await from.delete(keys.slice(i, i + 1000));
   return keys.length;
 }
 
-/** The 5-minute cron's migration part: keep a copying migration moving, and delete old copies once due. */
+/**
+ * After a writer recorded an object it stored under a photo's prefix on `wrote` (the store it read before
+ * writing): if the photo has moved since, the object is copied to the photo's store now. The flip and the
+ * record are serialised by the photo's row, and the record changes the photo's stamp, so either the copy that
+ * was being made is refused (and redone with this object), or the photo had already moved and this copies the
+ * object after it. A failure here is logged: the old copy keeps the object, and the old-copy deletion copies
+ * anything missing forward before deleting.
+ */
+export async function followMove(env: Env, photoId: string, wrote: string, keys: string[]): Promise<void> {
+  if (!keys.length) return;
+  try {
+    const now = await rpc<string | null>(env, 'storage_photo_store', { p_photo: photoId });
+    if (!now || now === wrote) return;
+    const from = photoStore(env, wrote);
+    const to = photoStore(env, now);
+    for (const key of keys) await copyVerified(from, to, key);
+  } catch (err) {
+    logError('storage', 'follow_move', err);
+  }
+}
+
+/** The 5-minute cron's migration part: keep a migration moving, and delete old copies once due. */
 export async function runMigrationCron(env: Env): Promise<{ enqueued: boolean; oldCopiesDeleted: number }> {
   let enqueued = false;
   try {
@@ -210,7 +283,8 @@ export async function runMigrationCron(env: Env): Promise<{ enqueued: boolean; o
       'storage_status',
     );
     const m = status?.migration;
-    if (m && (m.state === 'copying' || m.state === 'rolling_back')) {
+    // Holding and verifying migrations get a batch too: it queues late arrivals (at most every 2 minutes).
+    if (m && ['copying', 'rolling_back', 'verifying', 'holding'].includes(m.state)) {
       await env.STORAGE_QUEUE.send({ t: 'migrate', migration: m.id });
       enqueued = true;
     }
@@ -225,7 +299,8 @@ export async function runMigrationCron(env: Env): Promise<{ enqueued: boolean; o
     for (const item of due ?? []) {
       try {
         const n = await deleteOldCopy(env, item);
-        await mark(env, item.migrationId, item.photoId, 'deleted', 0, null);
+        if (n === null) continue;
+        await mark(env, item.migrationId, item.photoId, 'deleted', 0, null, { store: item.from });
         oldCopiesDeleted += n;
       } catch (err) {
         logError('cron', `storage_old_copy ${item.from}`, err);

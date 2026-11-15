@@ -160,7 +160,7 @@ the media host's cache and Cloudflare's CSAM Scanning Tool sit in front of them.
    (capacity minus what Zephyr stores there) and marks the store degraded below 15% free.
 5. **Cost:** `"costPerTbMonthUsd"` and `"egressNote"` feed the cost comparison in Admin › Storage.
 6. **Declare it** in `apps/api/wrangler.jsonc` `vars.STORAGE_STORES` (a JSON array; see the example there):
-   `id` (lower-case slug, 2-32 characters, never reused for a different store), `name`, `kind` (`"s3"`),
+   `id` (a lower-case letter, then lower-case letters, digits and dashes; 2-32 characters; never reused for a different store), `name`, `kind` (`"s3"`),
    `connection` (`"https"`, `"vpc"` or `"tunnel"`), `endpoint`, `bucket`, `region`, `pathStyle`, `binding` (VPC
    only), `costPerTbMonthUsd`, `egressNote`, `capacityBytes`, `encryptionAtRest`. An invalid list leaves only `r2`
    working and shows `config_invalid` in Admin.

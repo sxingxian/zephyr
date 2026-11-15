@@ -132,16 +132,23 @@ All new tables: RLS on, no grants to anon or authenticated, SECURITY DEFINER fun
 - `photos.store_id text not null default 'r2'`, `uploads.store_id text not null default 'r2'`.
 - `storage_state(singleton: write_store, updated_at)`.
 - `storage_checks(store_id, at, result jsonb)`: keeps the last 50 per store.
-- `storage_migrations(id, from_store, to_store, state, started_by, started_at, reason, delete_old_after, last_error)`.
-- `storage_migration_items(migration_id, photo_id, state ('pending','copied','verified','failed','deleted'), bytes, attempts, error, updated_at)`.
+- `storage_migrations(id, from_store, to_store, state, direction ('forward' | 'back'), started_by, started_at, reason, delete_old_after, last_error, topped_up_at)`.
+- `storage_migration_items(migration_id, photo_id, src, dst, state ('pending','copied','verified','failed','deleted','skipped'), bytes, attempts, error, lease_until, token, stamp, cleanup_store, deleting_at, cleaned_at)`.
+- Store ids follow one rule everywhere: `STORE_ID_RE` in `admin-schemas.ts` = SQL `_store_id_ok` (a lower-case letter, then lower-case letters, digits and dashes, 2-32 characters). Secret names map dashes to underscores.
+- **Stamps:** `photos.write_seq` and `photo_edits.write_seq` take a fresh number from one sequence whenever a photo's variant columns or its edit row are written (triggers), and masks are stamped by their id set. `_photo_stamp(photo)` combines the three, so any write that records an object under the photo's prefix changes it (including `record_edit_variant`, which doesn't touch `updated_at`).
 - **Functions:**
   - `storage_switch(p_staff, p_to, p_reason)`: one migration at a time. It sets the write store, enqueues every photo not on `p_to`, and records new uploads with the new store at once.
-  - `storage_migration_batch(p_migration, p_limit)`: claims items with a lease.
-  - `storage_item_mark(...)`: on `verified`, flips `photos.store_id` in the same transaction under the photo's row lock, so readers switch atomically.
-  - `storage_migration_action(p_staff, p_action, p_reason)`.
-  - `storage_old_copies_due(p_limit)`: after every item is verified and the hold has passed.
+  - `storage_migration_batch(p_migration, p_limit)`: under the storage lock, claims items with a 10-minute lease and a fresh token each. It looks for late arrivals on the store being emptied at most every 2 minutes (and at every switch and rollback): an index scan of the photos still there, never a recount of every item. Photos still publishing their variants (`publish_pending`; their staging copies sit outside the photo prefix) aren't queued or claimed until that's done.
+  - `storage_item_touch(p_migration, p_photo, p_token)`: renews one item's lease just before it's copied and takes the stamp then. Returns the keys a copy must include (the original, the variants the photo has, recorded edited variants and masks) and the original's size. Null for any token but the current one.
+  - `storage_item_mark(..., p_token, p_store)`: only the current lease's token can report an item. `verified` needs at least the original's size in bytes and flips `photos.store_id` in the same transaction under the photo's row lock, only while the stamp is unchanged, so readers switch atomically.
+  - `storage_migration_action(p_staff, p_action, p_reason)`: resume and retry carry on in the migration's direction, so a failed or paused rollback stays a rollback.
+  - `storage_old_copies_due(p_limit)` lists old copies once every item is verified and the hold has passed. `storage_old_copy_claim(p_migration, p_photo, p_store)` claims one under the storage lock before it's deleted. From the first claim on, the move can't be rolled back (`rollback_closed`; Admin hides the button). It says whether missing objects go to the photo's store first: only for a photo that moved and still exists. A deletion is reported with `storage_item_mark(..., 'deleted', p_store => the store emptied)`.
+  - `storage_status()` also says `cleanupPending`: some migration (finished or rolled back included) still holds old copies, so the orphan sweep leaves copies away from their photo's store alone.
+  - `storage_photo_store(p_photo)`: where a photo is now (see "Writers" under API).
   - `storage_usage()`: objects and bytes per store from `photos` plus `photo_bytes`.
-- **Rollback:** writes go back to `from`, and photos already moved get copy items in the other direction (the same pipeline).
+  - `ai_mask_key`, `bulk_photos` (delete forever) and `empty_trash` name each photo's store, like the other wrapped functions.
+- **Rollback:** writes go back to `from`, and photos already moved get copy items in the other direction (the same pipeline). Available while the move goes forward and no old copy's deletion has started.
+- **Lock order:** the storage advisory lock, then the migration row, then item rows, then the photo row. Photo writers take only the photo row.
 
 ## API
 
@@ -157,8 +164,10 @@ All new tables: RLS on, no grants to anon or authenticated, SECURITY DEFINER fun
 - **Migration:**
   - The queue `zephyr-storage` (consumer in the API Worker) takes batches of 20 photos.
   - For each object under the photo's prefix, it streams the source into the destination (SHA-256 computed while streaming), then reads the destination back and compares the hash, then marks the item verified.
-  - Failures retry 5 times with backoff, then become `failed`, which is shown in Admin and retryable.
-  - A cron re-enqueues stuck leases, and deletes old copies once due.
+  - Each item's lease is renewed just before it's copied. A copy counts only if it includes every key `storage_item_touch` listed and weighs at least the original; an empty or partial listing is never a copy.
+  - Failures retry with backoff; the fifth attempt (counted by the claim) becomes `failed`, which is shown in Admin and retryable.
+  - The 5-minute cron re-enqueues a batch for a migration that's copying, rolling back, verifying or holding, and deletes up to 50 old copies once due. Each deletion is claimed first, and a missing object is copied forward only for a photo that moved and still exists.
+  - **Writers:** an edited variant or mask is stored on the store read before writing, then recorded. After recording, the writer calls `followMove`: if `storage_photo_store` now says another store, the object is copied there. The record changes the photo's stamp and the flip checks it under the photo's row lock, so either the copy in flight is refused and redone, or the photo had already moved and the object follows it. Upload variants never need this: publishing photos aren't moved.
 - **Health check:**
   - A cron every 5 minutes checks the write store (reachability, a signed write/read/delete round trip, latency); on demand from Admin it also measures upload speed (a 4 MB object) and free space (declared capacity minus usage, or the store's own report where it has one).
   - Three failures in a row on the write store turn on `read_only_auto` and email the Owners. Two successes turn it off (auto only, never a manual read-only).
@@ -188,9 +197,9 @@ All new tables: RLS on, no grants to anon or authenticated, SECURITY DEFINER fun
 - **Suspension:** `requireMember` → 403 `account_suspended` and the session cookies cleared. Guest galleries of a suspended owner answer as unavailable.
 
 **Crons (existing scheduled handler):**
-- every 5 min: storage health, re-enqueue stuck migration items;
+- every 5 min: storage health, keep migrations moving (re-enqueue a batch), and old-copy deletion (up to 50 per run);
 - 15 min (existing): `limits_activate_due`, notices, plan override expiries;
-- daily 02:20 UTC: `retention_sweep`, retention notices, old-copy deletion, ad status (scheduled → live → ended).
+- daily 02:20 UTC: `retention_sweep`, retention notices, ad status (scheduled → live → ended).
 
 ## Ads (member app)
 
@@ -245,7 +254,7 @@ New pages matching the mockups: Users, Safety, Plan limits, Ads, Storage, Retent
 - **Storage:**
   - Credentials only in secrets.
   - S3 requests are signed; tunnel requests also carry the Access service token; the Workers VPC binding has no public hostname.
-  - A photo flips store only after its copy is verified, and old copies are deleted only after the hold.
+  - A photo flips store only after its copy is verified (every recorded key, at least the original's size, reported by the current lease), and old copies are deleted only after the hold and a claim that closes rollback.
   - Purges cover every store.
   - Responses never leak store endpoints, keys or bucket names to members.
   - Store error bodies are never logged; only short codes are.
