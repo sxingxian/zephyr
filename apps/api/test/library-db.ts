@@ -734,7 +734,11 @@ function editorRpc(): Record<string, (a: Args) => unknown> {
       const e = db.edits.get(p.id);
       const v = Number(a.p_version);
       if (!e || e.version !== v) return { status: 'stale' };
-      return { status: (kind === 'thumb' ? e.thumbVersion : e.previewVersion) === v ? 'exists' : 'current' };
+      const exists = (kind === 'thumb' ? e.thumbVersion : e.previewVersion) === v;
+      // Phase 8: 'exists' also gives the recorded variant's key.
+      return exists
+        ? { status: 'exists', key: kind === 'thumb' ? e.thumbKey : e.previewKey }
+        : { status: 'current' };
     },
     record_edit_variant: (a) => {
       const kind = String(a.p_kind);

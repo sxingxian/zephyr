@@ -354,6 +354,7 @@ const defaultRpc: Record<string, (a: Record<string, unknown>) => unknown> = {
   storage_followup_add: () => 1,
   storage_followup_done: () => null,
   storage_followups_due: () => [],
+  storage_followups_expire: () => 0,
   get_public_config: () => ({
     signupMode: 'invite_only',
     acceptingInviteRequests: true,

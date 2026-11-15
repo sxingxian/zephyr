@@ -207,6 +207,13 @@ export async function runCleanup(env: Env, requestId = 'cron'): Promise<CleanupC
     logError(requestId, 'job_orphan_sweep', err);
   }
 
+  // 5b. Phase 8: staged variants older than 2 days on stores without R2's lifecycle rule.
+  try {
+    counts.objectsDeleted += await sweepStaging(env);
+  } catch (err) {
+    logError(requestId, 'job_staging_sweep', err);
+  }
+
   // 6. Sharing: renditions of ended galleries, gallery data 30 days after the end, old attempts and events,
   // expiry reminders (each sent once: the database marks it before returning it).
   try {
@@ -257,52 +264,100 @@ interface PendingPublish {
   thumbBytes: number;
   previewBytes: number;
   storeId?: string | null;
+  /** Phase 8: waiting for at least 2 days (the photo was created more than 3 days ago). */
+  stale?: boolean;
 }
 
 /**
  * Finishes publishing photos left publish_pending: copies each counted variant from staging to the
  * photo's key when the staged copy has the counted size (or accepts a published copy that already does),
  * then confirms. A variant with neither is lost: finish_publish drops it and its bytes. A staged copy of
- * the wrong size (a late PUT not yet removed) is left for a later run. Staging copies of pending photos
- * are only deleted after the confirmation.
+ * the wrong size (a late PUT not yet removed) is left for a later run, until the photo has waited 2 days
+ * (`stale`): then it's lost too and the staged copy is deleted, so a photo never stays publish_pending (and a
+ * storage migration never waits on it) for ever. Staging copies of pending photos are only deleted after the
+ * confirmation. Each photo is handled on its own: one whose store can't be reached waits for the next run
+ * without holding up the others.
  */
 export async function retryPublishes(env: Env): Promise<{ published: number; lost: number }> {
   const due = await rpc<PendingPublish[]>(env, 'due_publishes', { p_limit: JOB_LIMITS.publishes });
   let published = 0;
   let lost = 0;
   for (const p of due) {
-    const store = photoStore(env, storeIdOf(p));
-    const outcome: Record<'thumb' | 'preview', 'ok' | 'lost' | 'wait'> = { thumb: 'ok', preview: 'ok' };
-    for (const kind of ['thumb', 'preview'] as const) {
-      const counted = kind === 'thumb' ? p.thumbBytes : p.previewBytes;
-      if (counted <= 0) continue;
-      const staged = await store.get(stagingKey(p.ownerId, p.photoId, kind));
-      if (staged && staged.size === counted) {
-        const bytes = await staged.bytes();
-        const type = staged.contentType === 'image/jpeg' ? 'image/jpeg' : 'image/webp';
-        await store.put(photoKey(p.ownerId, p.photoId, kind), bytes, { contentType: type });
-        published += 1;
-        continue;
-      }
-      if (staged) await staged.body.cancel().catch(() => undefined);
-      const final = await store.head(photoKey(p.ownerId, p.photoId, kind));
-      if (final && final.size === counted) continue;
-      outcome[kind] = staged ? 'wait' : 'lost';
+    try {
+      const r = await publishOne(env, p);
+      published += r.published;
+      lost += r.lost;
+    } catch (err) {
+      logError('cron', 'job_publish_photo', err);
     }
-    if (outcome.thumb === 'wait' || outcome.preview === 'wait') continue;
-    await rpc(env, 'finish_publish', {
-      p_owner: p.ownerId,
-      p_photo: p.photoId,
-      p_lost_thumb: outcome.thumb === 'lost',
-      p_lost_preview: outcome.preview === 'lost',
-    });
-    lost += Number(outcome.thumb === 'lost') + Number(outcome.preview === 'lost');
-    await deleteKeys(store, [
-      stagingKey(p.ownerId, p.photoId, 'thumb'),
-      stagingKey(p.ownerId, p.photoId, 'preview'),
-    ]);
   }
   return { published, lost };
+}
+
+async function publishOne(env: Env, p: PendingPublish): Promise<{ published: number; lost: number }> {
+  const store = photoStore(env, storeIdOf(p));
+  let published = 0;
+  const outcome: Record<'thumb' | 'preview', 'ok' | 'lost' | 'wait'> = { thumb: 'ok', preview: 'ok' };
+  for (const kind of ['thumb', 'preview'] as const) {
+    const counted = kind === 'thumb' ? p.thumbBytes : p.previewBytes;
+    if (counted <= 0) continue;
+    const staged = await store.get(stagingKey(p.ownerId, p.photoId, kind));
+    if (staged && staged.size === counted) {
+      const bytes = await staged.bytes();
+      const type = staged.contentType === 'image/jpeg' ? 'image/jpeg' : 'image/webp';
+      await store.put(photoKey(p.ownerId, p.photoId, kind), bytes, { contentType: type });
+      published += 1;
+      continue;
+    }
+    if (staged) await staged.body.cancel().catch(() => undefined);
+    const final = await store.head(photoKey(p.ownerId, p.photoId, kind));
+    if (final && final.size === counted) continue;
+    outcome[kind] = staged && !p.stale ? 'wait' : 'lost';
+  }
+  if (outcome.thumb === 'wait' || outcome.preview === 'wait') return { published, lost: 0 };
+  await rpc(env, 'finish_publish', {
+    p_owner: p.ownerId,
+    p_photo: p.photoId,
+    p_lost_thumb: outcome.thumb === 'lost',
+    p_lost_preview: outcome.preview === 'lost',
+  });
+  await deleteKeys(store, [
+    stagingKey(p.ownerId, p.photoId, 'thumb'),
+    stagingKey(p.ownerId, p.photoId, 'preview'),
+  ]);
+  return { published, lost: Number(outcome.thumb === 'lost') + Number(outcome.preview === 'lost') };
+}
+
+/** Staged variants older than this are deleted on stores other than R2 (R2's lifecycle rule does the same). */
+export const STAGING_MAX_AGE_MS = 2 * 24 * 3600 * 1000;
+
+/**
+ * `staging/` on every store other than R2 (where a lifecycle rule empties it after 2 days): one page per store
+ * per run, resuming from a stored cursor, deleting staged variants older than 2 days. A store that fails is
+ * skipped until the next run. Returns how many objects were deleted.
+ */
+export async function sweepStaging(env: Env, now = Date.now()): Promise<number> {
+  const { stores: all } = allStores(env);
+  let deleted = 0;
+  for (const store of all) {
+    if (store.id === 'r2') continue;
+    try {
+      const key = `staging_sweep_cursor:${store.id}`;
+      const cursor = await rpc<string | null>(env, 'get_job_state', { p_key: key });
+      const listed = await store.list('staging/', { limit: JOB_LIMITS.sweepPage, cursor });
+      const old = listed.objects
+        .filter((o) => {
+          const at = o.uploaded instanceof Date ? o.uploaded.getTime() : 0;
+          return at > 0 && now - at > STAGING_MAX_AGE_MS;
+        })
+        .map((o) => o.key);
+      if (old.length) deleted += await deleteKeys(store, old);
+      await rpc(env, 'set_job_state', { p_key: key, p_value: listed.cursor });
+    } catch (err) {
+      logError('cron', 'job_staging_sweep_store', err);
+    }
+  }
+  return deleted;
 }
 
 interface PhotoRowState {
@@ -328,8 +383,8 @@ const MOVING = new Set(['copying', 'paused', 'verifying', 'holding', 'rolling_ba
  * write may be between storing the object and recording it), edited variants
  * (`edit-<version>-<kind>-<nonce>`) that aren't the object the photo's edit records and masks
  * (`m/<maskId>.png`) that no `photo_masks` row records. Keys of existing photos (including in-flight
- * uploads) and keys of any other shape are left alone; `staging/` isn't swept (an R2 lifecycle rule
- * empties it after 2 days).
+ * uploads) and keys of any other shape are left alone; `staging/` isn't swept here (an R2 lifecycle rule
+ * empties it after 2 days; sweepStaging does the same on other stores).
  */
 export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> {
   // Phase 8: one page per configured store per run, each with its own cursor. A copy on a store other than

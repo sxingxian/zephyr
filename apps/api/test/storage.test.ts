@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { ADMIN8_API, STORE_ID_RE } from '@zephyr/shared';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env';
-import { sweepOrphans } from '../src/jobs';
+import { retryPublishes, sweepOrphans, sweepStaging } from '../src/jobs';
 import { purgeNow } from '../src/library/storage';
 import { secretName, storeConfigError, storeConfigs, storeFor } from '../src/storage/config';
 import { checkStore, recordCheck, runHealthCron } from '../src/storage/health';
@@ -14,6 +14,8 @@ import {
   copyVerified,
   deleteOldCopy,
   followMove,
+  followRecorded,
+  followUnknown,
   handleStorageBatch,
   type MigrationItem,
   migrateItem,
@@ -834,6 +836,41 @@ describe('migration copy and verify', () => {
     expect(rpcCalls('storage_followup_done').at(-1)?.body).toMatchObject({ p_ok: false });
   });
 
+  it('followUnknown records a follow-up without copying (the cron decides once the outcome is known)', async () => {
+    await seed();
+    await followUnknown(menv, PHOTO, 'r2', [`${prefix}thumb`]);
+    expect(rpcCalls('storage_followup_add')[0]?.body).toEqual({
+      p_photo: PHOTO,
+      p_from: 'r2',
+      p_keys: [`${prefix}thumb`],
+    });
+    expect(mocks.b2.objects.size).toBe(0);
+  });
+
+  it("followRecorded copies a recorded object to its photo's store from whichever store has it", async () => {
+    await seed();
+    world.rpc.storage_photo_store = () => 'b2-eu';
+    await followRecorded(menv, PHOTO, `${prefix}thumb`);
+    expect(mocks.b2.objects.has(`${prefix}thumb`)).toBe(true);
+    expect(rpcCalls('storage_followup_add')[0]?.body).toMatchObject({
+      p_from: 'r2',
+      p_keys: [`${prefix}thumb`],
+    });
+    // Already on the photo's store, or the photo gone: nothing more.
+    await followRecorded(menv, PHOTO, `${prefix}thumb`);
+    world.rpc.storage_photo_store = () => null;
+    await followRecorded(menv, PHOTO, `${prefix}original`);
+    expect(rpcCalls('storage_followup_add')).toHaveLength(1);
+    expect(mocks.b2.objects.has(`${prefix}original`)).toBe(false);
+  });
+
+  it('the cron drops follow-ups older than 7 days before retrying the rest', async () => {
+    await runFollowups(menv);
+    const fns = world.calls.map((c) => c.url.split('/rpc/')[1]).filter(Boolean);
+    expect(fns.indexOf('storage_followups_expire')).toBeGreaterThanOrEqual(0);
+    expect(fns.indexOf('storage_followups_expire')).toBeLessThan(fns.indexOf('storage_followups_due'));
+  });
+
   it('a rollback accepts a recorded key that is already on the destination (a follow-up copy that never reached the new store)', async () => {
     await seed();
     const marks: Record<string, unknown>[] = [];
@@ -894,6 +931,61 @@ describe('photos on another store: purges and the orphan sweep', () => {
     expect(r2b.objects.has(`${prefix}original`)).toBe(false);
     expect(mocks.b2.objects.has(`u/${OWNER}/p/${PHOTO2}/original`)).toBe(false);
     expect(rpcCalls('confirm_photo_purges')[0]?.body).toEqual({ p_ids: [PHOTO, PHOTO2] });
+  });
+
+  it('staged variants older than 2 days are swept on stores other than R2 (R2 has its lifecycle rule)', async () => {
+    const staged = `staging/${OWNER}/${PHOTO2}/thumb`;
+    await storeFor(menv, 'b2-eu').put(staged, bytes('staged'), { contentType: 'image/webp' });
+    await r2b.put(`staging/${OWNER}/${PHOTO}/thumb`, bytes('on r2'));
+    r2b.backdate(`staging/${OWNER}/${PHOTO}/thumb`, 5 * 24 * 3600 * 1000);
+    const cursors = new Map<string, unknown>();
+    world.rpc.get_job_state = (a) => cursors.get(String(a.p_key)) ?? null;
+    world.rpc.set_job_state = (a) => {
+      cursors.set(String(a.p_key), a.p_value);
+      return null;
+    };
+    // The mock S3 lists objects as modified on 1 November 10:00: a day later they're kept.
+    expect(await sweepStaging(menv, Date.parse('2026-11-02T10:00:00Z'))).toBe(0);
+    expect(mocks.b2.objects.has(staged)).toBe(true);
+    expect(await sweepStaging(menv, Date.parse('2026-11-04T10:00:00Z'))).toBe(1);
+    expect(mocks.b2.objects.has(staged)).toBe(false);
+    expect(r2b.objects.has(`staging/${OWNER}/${PHOTO}/thumb`)).toBe(true);
+    expect(cursors.has('staging_sweep_cursor:b2-eu')).toBe(true);
+    expect([...cursors.keys()].some((k) => k.endsWith(':r2'))).toBe(false);
+  });
+
+  it("publishing: one photo whose store fails doesn't hold up the others, and a staged copy waiting 2 days is given up on", async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const P3 = '30000000-0000-0000-0000-000000000003';
+    // PHOTO: on a store that isn't configured (throws). PHOTO2: staged copy of the right size. P3: a staged
+    // copy of the wrong size, stale.
+    await r2b.put(`staging/${OWNER}/${PHOTO2}/thumb`, bytes('12345'), {
+      httpMetadata: { contentType: 'image/webp' },
+    });
+    await r2b.put(`staging/${OWNER}/${P3}/thumb`, bytes('123'), {
+      httpMetadata: { contentType: 'image/webp' },
+    });
+    const finished: Record<string, unknown>[] = [];
+    world.rpc.finish_publish = (a) => {
+      finished.push(a);
+      return true;
+    };
+    world.rpc.due_publishes = () => [
+      { photoId: PHOTO, ownerId: OWNER, thumbBytes: 5, previewBytes: 0, storeId: 'gone' },
+      { photoId: PHOTO2, ownerId: OWNER, thumbBytes: 5, previewBytes: 0, storeId: 'r2' },
+      { photoId: P3, ownerId: OWNER, thumbBytes: 5, previewBytes: 0, storeId: 'r2', stale: false },
+    ];
+    expect(await retryPublishes(menv)).toEqual({ published: 1, lost: 0 });
+    expect(finished.map((f) => f.p_photo)).toEqual([PHOTO2]);
+    expect(r2b.objects.has(`u/${OWNER}/p/${PHOTO2}/thumb`)).toBe(true);
+    // Not stale: the wrong-size staged copy waits.
+    expect(r2b.objects.has(`staging/${OWNER}/${P3}/thumb`)).toBe(true);
+    world.rpc.due_publishes = () => [
+      { photoId: P3, ownerId: OWNER, thumbBytes: 5, previewBytes: 0, storeId: 'r2', stale: true },
+    ];
+    expect(await retryPublishes(menv)).toEqual({ published: 0, lost: 1 });
+    expect(finished.at(-1)).toMatchObject({ p_photo: P3, p_lost_thumb: true, p_lost_preview: false });
+    expect(r2b.objects.has(`staging/${OWNER}/${P3}/thumb`)).toBe(false);
   });
 
   it("a copy away from its photo's store is kept while a finished or rolled-back migration still holds old copies", async () => {
@@ -1199,6 +1291,82 @@ describe('admin storage routes', () => {
       access: fresh.access,
     });
     expect(none.status).toBe(409);
+  });
+
+  it('abandoning old copies: Owner only, with a passkey, only on a store that is gone or failing, and emails the Owners', async () => {
+    world.rpc.storage_abandon_old_copies = (a) =>
+      a.p_store === 'old-store' || a.p_store === 'b2-eu'
+        ? { store: a.p_store, copies: 3, migrations: 1 }
+        : { error: 'not_found' };
+    const body = { store: 'old-store', reason: 'The old NAS died' };
+    const admin = await staffSession('admin@zephyr.test');
+    const denied = await call(ADMIN8_API.storageAbandon, { body, jar: admin.j, access: admin.access });
+    expect(denied.status).toBe(403);
+    const stale = await staffSession('owner@zephyr.test', { authAgo: 3600 });
+    const reauth = await call(ADMIN8_API.storageAbandon, { body, jar: stale.j, access: stale.access });
+    expect(await read(reauth)).toMatchObject({ error: 'reauth_required' });
+    expect(rpcCalls('storage_abandon_old_copies')).toHaveLength(0);
+
+    const { j, access } = await staffSession('owner@zephyr.test');
+    // A configured store whose last check passed: the cron deletes its old copies, nothing to abandon.
+    const healthy = await call(ADMIN8_API.storageAbandon, {
+      body: { store: 'b2-eu', reason: 'Not dead' },
+      jar: j,
+      access,
+    });
+    expect(healthy.status).toBe(409);
+    // A configured store never checked: run a check first.
+    const unchecked = await call(ADMIN8_API.storageAbandon, {
+      body: { store: 'tunnel-nas', reason: 'Never checked' },
+      jar: j,
+      access,
+    });
+    expect(unchecked.status).toBe(409);
+    expect(rpcCalls('storage_abandon_old_copies')).toHaveLength(0);
+
+    // A store the deployment no longer declares.
+    const ok = await call(ADMIN8_API.storageAbandon, { body, jar: j, access });
+    expect(ok.status).toBe(200);
+    expect(rpcCalls('storage_abandon_old_copies')[0]?.body).toEqual({
+      p_staff: '10000000-0000-0000-0000-000000000001',
+      p_store: 'old-store',
+      p_reason: 'The old NAS died',
+    });
+    await vi.waitFor(() =>
+      expect(world.emails.some((m) => m.subject.includes('abandoned on old-store'))).toBe(true),
+    );
+
+    // A configured store whose last check failed.
+    checks = [
+      {
+        storeId: 'b2-eu',
+        result: { ...recentCheck(), reachable: false, roundTrip: false, error: 'timeout' },
+      },
+    ];
+    const failing = await call(ADMIN8_API.storageAbandon, {
+      body: { store: 'b2-eu', reason: 'Unreachable for days' },
+      jar: j,
+      access,
+    });
+    expect(failing.status).toBe(200);
+    world.rpc.storage_abandon_old_copies = () => ({ error: 'not_found' });
+    const none = await call(ADMIN8_API.storageAbandon, { body, jar: j, access });
+    expect(none.status).toBe(404);
+  });
+
+  it('the overview passes on the old copies waiting per store and the follow-up counts', async () => {
+    const base = world.rpc.admin_storage as () => Record<string, unknown>;
+    world.rpc.admin_storage = () => ({
+      ...base(),
+      oldCopies: [{ storeId: 'old-store', copies: 4 }],
+      followups: { pending: 2, dropped30d: 1 },
+    });
+    const { j, access } = await staffSession('admin@zephyr.test');
+    const res = await call(ADMIN8_API.storage, { method: 'GET', jar: j, access });
+    expect(await read(res)).toMatchObject({
+      oldCopies: [{ storeId: 'old-store', copies: 4 }],
+      followups: { pending: 2, dropped30d: 1 },
+    });
   });
 });
 

@@ -790,7 +790,11 @@ describe('staff invites', () => {
       role: 'support',
       existingUserId: back.id,
     });
-    world.rpc.staff_invite_complete = () => ({ ok: true });
+    // Completing adds the staff row (account_kind says staff from then on).
+    world.rpc.staff_invite_complete = () => {
+      back.staff = 'support';
+      return { ok: true };
+    };
     const before = world.users.length;
     const res = await call(ADMIN8_API.staffInviteAccept, {
       body: { token: 'B'.repeat(43) },
@@ -845,6 +849,7 @@ describe('staff invites', () => {
     const order: string[] = [];
     world.rpc.staff_invite_complete = () => {
       order.push(back.banned ? 'complete (banned)' : 'complete (unbanned)');
+      back.staff = 'support';
       return { ok: true };
     };
     const res = await call(ADMIN8_API.staffInviteAccept, {
@@ -873,6 +878,7 @@ describe('staff invites', () => {
     world.rpc.staff_invite_complete = () => {
       if (used) return null;
       used = true;
+      back.staff = 'support';
       return { ok: true };
     };
     const access = await accessToken(back.email);
@@ -881,6 +887,56 @@ describe('staff invites', () => {
       call(ADMIN8_API.staffInviteAccept, { body: { token: 'B'.repeat(43) }, access }),
     ]);
     expect([a.status, b.status].sort()).toEqual([200, 400]);
+    expect(back.banned).toBe(false);
+  });
+
+  it('accept: removed again between completing and the unban — banned again', async () => {
+    const back: User = {
+      id: '20000000-0000-0000-0000-0000000000fa',
+      email: 'back6@zephyr.test',
+      banned: true,
+    };
+    world.users.push(back);
+    world.rpc.staff_invite_accept = () => ({
+      inviteId: INVITE,
+      email: back.email,
+      role: 'support',
+      existingUserId: back.id,
+    });
+    // Completes, but an Owner removes them before the unban runs: account_kind says former staff afterwards.
+    world.rpc.staff_invite_complete = () => ({ ok: true });
+    world.rpc.account_kind = (a) => (String(a.p_email) === back.email ? 'former_staff' : 'none');
+    const res = await call(ADMIN8_API.staffInviteAccept, {
+      body: { token: 'B'.repeat(43) },
+      access: await accessToken(back.email),
+    });
+    expect(res.status).toBe(200);
+    expect(back.banned).toBe(true);
+  });
+
+  it('accept: a failed re-check after the unban leaves a returning member of staff unbanned', async () => {
+    const back: User = {
+      id: '20000000-0000-0000-0000-0000000000fb',
+      email: 'back7@zephyr.test',
+      banned: true,
+    };
+    world.users.push(back);
+    world.rpc.staff_invite_accept = () => ({
+      inviteId: INVITE,
+      email: back.email,
+      role: 'support',
+      existingUserId: back.id,
+    });
+    world.rpc.staff_invite_complete = () => {
+      back.staff = 'support';
+      return { ok: true };
+    };
+    world.rpc.account_kind = () => new Response(JSON.stringify({ message: 'down' }), { status: 500 });
+    const res = await call(ADMIN8_API.staffInviteAccept, {
+      body: { token: 'B'.repeat(43) },
+      access: await accessToken(back.email),
+    });
+    expect(res.status).toBe(200);
     expect(back.banned).toBe(false);
   });
 

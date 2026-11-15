@@ -2,6 +2,7 @@ import {
   ADMIN8_API,
   type AdminStorageResult,
   type MigrationState,
+  STORAGE_FOLLOWUP_MAX_DAYS,
   STORAGE_FREE_ALERT,
   STORAGE_HOLD_DAYS,
   type StoreConnection,
@@ -41,6 +42,15 @@ const STATE: Record<MigrationState, [string, ChipTone]> = {
   rolling_back: ['Rolling back', 'warn'],
   rolled_back: ['Rolled back', 'neutral'],
   failed: ['Failed', 'bad'],
+};
+/** Plain words for the migration's last error codes that need a person (anything else shows as its code). */
+export const MIGRATION_ERROR_TEXT: Record<string, string> = {
+  publish_stuck:
+    'A photo has been publishing its thumbnails for more than a day. The clean-up job gives up on them after 3 days; retry after that.',
+  upload_stuck:
+    'A photo has been uploading for more than a day. Expired uploads are removed by the clean-up job; retry once it has run.',
+  busy: 'A photo kept changing while it was being copied (it was edited non-stop). Retry when it’s quieter, or turn on read-only mode briefly.',
+  abandoned: 'Old copies on a store that can’t be reached were abandoned by an Owner.',
 };
 const kindLabel = (s: StoreStatus) =>
   s.kind === 'r2'
@@ -140,6 +150,8 @@ export function Storage() {
   const [actErr, setActErr] = useState<string | null>(null);
   const [switching, setSwitching] = useState<StoreStatus | null>(null);
   const [migAction, setMigAction] = useState<'pause' | 'resume' | 'rollback' | null>(null);
+  const [abandoning, setAbandoning] = useState<{ storeId: string; copies: number } | null>(null);
+  const isOwner = staff?.role === 'owner';
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const load = useCallback(async () => {
@@ -367,7 +379,7 @@ export function Storage() {
                     <span className="z-hint">
                       {n(mig.photos.copied)} of {n(mig.photos.total)} photos · {formatBytes(mig.bytes.copied)}{' '}
                       of about {formatBytes(mig.bytes.total)}
-                      {mig.photos.failed ? ` · ${n(mig.photos.failed)} retrying` : ''}
+                      {mig.photos.failed ? ` · ${n(mig.photos.failed)} need retry` : ''}
                       {mig.photos.waiting
                         ? ` · ${n(mig.photos.waiting)} waiting for uploads in progress to finish`
                         : ''}
@@ -397,6 +409,7 @@ export function Storage() {
                 {mig.lastError && (
                   <Note tone="warn" icon="alert">
                     Last error: <span className="z-mono">{mig.lastError}</span>
+                    {MIGRATION_ERROR_TEXT[mig.lastError] ? ` · ${MIGRATION_ERROR_TEXT[mig.lastError]}` : ''}
                   </Note>
                 )}
                 {migActive && (
@@ -428,6 +441,54 @@ export function Storage() {
                   Photos keep working during every step: each one is read from whichever store holds it.
                 </p>
               </Card>
+            )}
+            {(data.oldCopies ?? []).length > 0 && (
+              <Card aria-labelledby="st-old">
+                <CardHead title={<span id="st-old">Old copies waiting for deletion</span>} />
+                <div className="a8-kv a8-kv--rows">
+                  {(data.oldCopies ?? []).map((o) => {
+                    const st = byId(o.storeId);
+                    const gone =
+                      !st || st.health === 'unreachable' || (st.lastCheck != null && !st.lastCheck.roundTrip);
+                    return (
+                      <div key={o.storeId}>
+                        <span>
+                          {st?.name ?? o.storeId}
+                          {!st ? ' · no longer set up' : gone ? ' · can’t be reached' : ''}
+                        </span>
+                        <strong className="btn-row btn-row--tight">
+                          {n(o.copies)} {o.copies === 1 ? 'copy' : 'copies'}
+                          {isOwner && gone && (
+                            <Button size="sm" kind="danger" onClick={() => setAbandoning(o)}>
+                              Abandon…
+                            </Button>
+                          )}
+                        </strong>
+                      </div>
+                    );
+                  })}
+                </div>
+                <p className="z-hint">
+                  The clean-up job deletes these after the hold. On a store that can’t be reached it never
+                  can, and no new switch can start until they’re gone: an Owner can abandon them (nothing is
+                  deleted there).
+                </p>
+              </Card>
+            )}
+            {(data.followups?.dropped30d ?? 0) > 0 && (
+              <Note tone="warn" icon="alert">
+                {n(data.followups?.dropped30d ?? 0)} follow-up{' '}
+                {data.followups?.dropped30d === 1 ? 'copy was' : 'copies were'} dropped in the last 30 days
+                after {STORAGE_FOLLOWUP_MAX_DAYS} days of retries: an edited variant or mask written during a
+                move may be missing on its photo’s store. The audit log lists the stores.
+              </Note>
+            )}
+            {(data.followups?.pending ?? 0) > 0 && (
+              <p className="z-hint">
+                {n(data.followups?.pending ?? 0)} follow-up{' '}
+                {data.followups?.pending === 1 ? 'copy' : 'copies'} (objects written while photos moved)
+                waiting to reach their photo’s store.
+              </p>
             )}
             <Card>
               <CardHead title="Stores set up for this deployment" />
@@ -533,6 +594,42 @@ export function Storage() {
                     reason,
                   }),
                 );
+              }}
+            />
+            <ReasonDialog
+              open={abandoning !== null}
+              title={
+                abandoning
+                  ? `Abandon old copies on ${byId(abandoning.storeId)?.name ?? abandoning.storeId}`
+                  : ''
+              }
+              intro={
+                abandoning && (
+                  <Effects
+                    items={[
+                      [
+                        'alert',
+                        `${n(abandoning.copies)} old ${abandoning.copies === 1 ? 'copy stays' : 'copies stay'} on that store: nothing is deleted there. If it comes back, delete them by hand or reconnect it and let the orphan sweep clear them.`,
+                      ],
+                      ['refresh', 'The migration finishes, so a new switch can start.'],
+                      ['file', 'Recorded in the audit log; every Owner gets an email.'],
+                    ]}
+                  />
+                )
+              }
+              confirmLabel="Abandon with passkey"
+              passkey
+              danger
+              onClose={() => setAbandoning(null)}
+              onConfirm={async (reason) => {
+                if (!abandoning) return;
+                setData(
+                  await write<AdminStorageResult>(ADMIN8_API.storageAbandon, 'POST', {
+                    store: abandoning.storeId,
+                    reason,
+                  }),
+                );
+                toast.show('Old copies abandoned', 'good');
               }}
             />
           </>

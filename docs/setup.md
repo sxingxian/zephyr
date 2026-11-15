@@ -150,8 +150,9 @@ the media host's cache and Cloudflare's CSAM Scanning Tool sit in front of them.
 **Every store, cloud or on premises:**
 
 1. **Bucket:** a private bucket used only by Zephyr. No public access, no website hosting, no versioning (old
-   copies are deleted on purpose), no lifecycle rules on `u/`. Add one that empties `staging/` after 2 days if the
-   store supports it (the orphan sweep doesn't look there).
+   copies are deleted on purpose), no lifecycle rules on `u/`. You don't need a `staging/` rule: the clean-up job
+   deletes staged variants older than 2 days on every store other than R2 (one page per store per run). If the store
+   supports lifecycle rules, one that empties `staging/` after 2 days is a harmless extra.
 2. **Key:** an access key limited to that one bucket, with list, read, write, delete and multipart permissions.
 3. **Encryption at rest (NFR-SEC-02):** confirm it, then declare `"encryptionAtRest": true`. Zephyr can't check it
    from outside, and refuses to switch to a store that doesn't declare it. Cloud S3 services encrypt by default
@@ -176,6 +177,10 @@ the media host's cache and Cloudflare's CSAM Scanning Tool sit in front of them.
 9. **Deploy, then check:** Admin › Storage › the store › **Run check** (a signed write/read/delete round trip, a 4 MB
    upload speed test and free space). The switch is offered only after a passing check in the last 24 hours. The
    switch itself needs a passkey sign-in in the last 10 minutes and emails every Owner.
+10. **Retiring a store:** keep it declared (and reachable) until Admin › Storage shows no photos and no old copies
+    on it. If it dies for good while old copies still wait there, an Owner can **Abandon** them (passkey; the
+    store's latest check must have failed, or it's no longer declared): the migration finishes and a new switch can
+    start, but nothing is deleted on that store, so wipe its disks yourself if it ever comes back.
 
 **A cloud S3 store** (AWS S3, Backblaze B2, Wasabi, and so on): `"connection": "https"`, the provider's HTTPS
 endpoint (no bucket in it), its region, and `"pathStyle": false` where the provider supports virtual-host

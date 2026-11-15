@@ -1,5 +1,6 @@
 import {
   type AdminStorageResult,
+  adminStorageAbandonSchema,
   adminStorageMigrationSchema,
   adminStorageSwitchSchema,
   STAFF_CAN,
@@ -13,7 +14,7 @@ import {
 } from '@zephyr/shared';
 import type { Context, Hono, MiddlewareHandler } from 'hono';
 import { sendEmail } from '../email/resend';
-import { storageRollbackEmail, storageSwitchEmail } from '../email/storage-templates';
+import { storageAbandonEmail, storageRollbackEmail, storageSwitchEmail } from '../email/storage-templates';
 import { background, fail, logError, readBody } from '../http';
 import { storeConfigError, storeConfigs } from '../storage/config';
 import { checkOk, checkStore, recordCheck } from '../storage/health';
@@ -36,6 +37,8 @@ interface StorageDb {
   usage: { storeId: string; objects: number; bytes: number }[];
   checks: { storeId: string; result: StoreCheck }[];
   autoReadOnly: boolean;
+  oldCopies?: { storeId: string; copies: number }[];
+  followups?: { pending: number; dropped30d: number };
 }
 
 const canStorage: MiddlewareHandler<HonoEnv> = async (c, next) => {
@@ -120,6 +123,11 @@ export async function storageOverview(c: Ctx): Promise<AdminStorageResult> {
       bytes: stores.reduce((n, s) => n + s.bytes, 0),
     },
     autoReadOnly: Boolean(db.autoReadOnly),
+    oldCopies: (db.oldCopies ?? []).map((o) => ({ storeId: o.storeId, copies: Number(o.copies) || 0 })),
+    followups: {
+      pending: Number(db.followups?.pending) || 0,
+      dropped30d: Number(db.followups?.dropped30d) || 0,
+    },
   };
 }
 
@@ -167,8 +175,9 @@ async function kick(c: Ctx, migration: string | null | undefined) {
 
 /**
  * /admin/api/v1/storage/*: Admin › Storage (docs/phase-8.md). Owner and Admin only. The switch and a rollback
- * need a passkey sign-in in the last 10 minutes and email every Owner; pause and resume save at once. Every
- * change is audited by its database function, with the reason.
+ * need a passkey sign-in in the last 10 minutes and email every Owner; pause and resume save at once.
+ * Abandoning old copies on a dead store is Owner only, with a passkey, and emails every Owner. Every change is
+ * audited by its database function, with the reason.
  */
 export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: RequireStaff) {
   router.get('/v1/storage', requireStaff(), canStorage, async (c) => {
@@ -264,6 +273,42 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
       return c.json(await storageOverview(c));
     } catch (err) {
       return failed(c, 'admin_storage_migration', err);
+    }
+  });
+
+  // Abandoning old copies on a store that's gone: Owner only, passkey, every Owner emailed. Only for a store
+  // that's no longer configured or whose latest check failed (on a healthy store the cron just deletes them).
+  router.post('/v1/storage/abandon', requireStaff({ write: true }), canStorage, async (c) => {
+    if (c.get('staff').role !== 'owner') return c.json(fail('forbidden'), 403);
+    const body = await readBody(c, adminStorageAbandonSchema);
+    if (!body) return c.json(fail('invalid'), 400);
+    if (!c.get('staff').recentPasskey) return c.json(fail('reauth_required'), 403);
+    try {
+      const before = await storageOverview(c);
+      const store = before.stores.find((s) => s.id === body.store);
+      const configured = storeConfigs(c.env).some((s) => s.id === body.store);
+      // A configured store must have failed its latest check (run one from Admin first); one the deployment no
+      // longer declares can't be reached at all.
+      if (configured && (!store?.lastCheck || checkOk(store.lastCheck))) return c.json(fail('conflict'), 409);
+      const res = await rpc<{ store?: string; copies?: number; migrations?: number; error?: string }>(
+        c.env,
+        'storage_abandon_old_copies',
+        { p_staff: c.get('staff').id, p_store: body.store, p_reason: body.reason },
+      );
+      if (res?.error) return refused(c, res.error);
+      await tellOwners(
+        c,
+        storageAbandonEmail({
+          actor: actorOf(c),
+          store: body.store,
+          copies: Number(res?.copies) || 0,
+          adminUrl: adminUrl(c),
+        }),
+        'storage_abandon_notify',
+      );
+      return c.json(await storageOverview(c));
+    } catch (err) {
+      return failed(c, 'admin_storage_abandon', err);
     }
   });
 }

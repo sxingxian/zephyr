@@ -172,6 +172,7 @@ export const adminStorageSwitchSchema = z.object({ to: storeIdSchema, reason }).
 export const adminStorageMigrationSchema = z
   .object({ action: z.enum(['pause', 'resume', 'rollback']), reason })
   .strict();
+export const adminStorageAbandonSchema = z.object({ store: storeIdSchema, reason }).strict();
 
 export const adminRetentionApproveSchema = z
   .object({ ownerIds: z.array(uuid).min(1).max(100), reason })

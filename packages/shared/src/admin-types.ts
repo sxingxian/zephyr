@@ -125,6 +125,8 @@ export const ADMIN8_API = {
   storageSwitch: '/admin/api/v1/storage/switch',
   /** POST { action: 'pause' | 'resume' | 'rollback', reason } → AdminStorageResult (rollback: reauth) */
   storageMigration: '/admin/api/v1/storage/migration',
+  /** POST AdminStorageAbandonBody → AdminStorageResult (Owner only, reauth; the store must be unreachable or gone) */
+  storageAbandon: '/admin/api/v1/storage/abandon',
 
   // retention
   /** GET → AdminRetentionResult */
@@ -540,11 +542,22 @@ export interface AdminStorageResult {
   totals: { photos: number; bytes: number };
   /** Read-only mode turned on automatically because the write store stopped answering. */
   autoReadOnly: boolean;
+  /** Old copies still waiting for deletion, per store (an Owner can abandon them on a store that's gone). */
+  oldCopies?: { storeId: string; copies: number }[];
+  /** Follow-up copies outstanding, and how many were dropped after 7 days in the last 30 days. */
+  followups?: { pending: number; dropped30d: number };
 }
 export interface AdminStorageSwitchBody {
   to: string;
   reason: string;
 }
+/** Give up on the old copies waiting on a store that's unreachable or no longer configured (bytes may remain). */
+export interface AdminStorageAbandonBody {
+  store: string;
+  reason: string;
+}
+/** Follow-up copies older than this are dropped (audited, counted in Admin › Storage). */
+export const STORAGE_FOLLOWUP_MAX_DAYS = 7;
 export const STORAGE_HOLD_DAYS = 7;
 export const STORAGE_FREE_ALERT = 0.15;
 

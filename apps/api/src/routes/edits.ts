@@ -17,7 +17,7 @@ import { imageInfo } from '../library/files';
 import { contentLength, expectedUser, newEditKey, readExact, UUID } from '../library/storage';
 import { deleteEverywhere } from '../storage';
 import { photoStore, storeIdOf } from '../storage/config';
-import { followMove } from '../storage/migrate';
+import { followMove, followRecorded, followUnknown } from '../storage/migrate';
 import { rpc } from '../supabase';
 import type { HonoEnv } from '../types';
 
@@ -139,18 +139,29 @@ editRoutes.put('/:id/edit/variants/:kind', requireRole('edit'), requireWritable,
     if (len < 1) return c.json(fail('invalid'), 400);
     // Checked before anything is written: a stale render (common after quick edits) or a repeat of one
     // already stored (a retry, a second tab) never touches R2.
-    const check = await rpc<{
-      status: 'current' | 'exists' | 'stale';
-      storeId?: string | null;
-    } | null>(c.env, 'edit_variant_check', {
-      p_owner: owner,
-      p_photo: id,
-      p_version: version,
-      p_kind: kind,
-    });
+    const variantCheck = () =>
+      rpc<{
+        status: 'current' | 'exists' | 'stale';
+        storeId?: string | null;
+        /** With 'exists': the recorded variant's key. */
+        key?: string | null;
+      } | null>(c.env, 'edit_variant_check', {
+        p_owner: owner,
+        p_photo: id,
+        p_version: version,
+        p_kind: kind,
+      });
+    // Phase 8: a variant recorded by an earlier attempt (whose reply was lost, so it may not have followed a move).
+    const followExisting = async (k: string | null | undefined) => {
+      if (typeof k === 'string' && k.startsWith(`u/${owner}/p/${id}/`)) await followRecorded(c.env, id, k);
+    };
+    const check = await variantCheck();
     if (!check) return c.json(fail('not_found'), 404);
     if (check.status === 'stale') return c.json(fail('conflict'), 410);
-    if (check.status === 'exists') return c.json({ ok: true });
+    if (check.status === 'exists') {
+      await followExisting(check.key);
+      return c.json({ ok: true });
+    }
     const bytes = await readExact(c.req.raw.body, len);
     if (!bytes) return c.json(fail('invalid'), 400);
     const info = imageInfo(bytes);
@@ -166,8 +177,8 @@ editRoutes.put('/:id/edit/variants/:kind', requireRole('edit'), requireWritable,
     // may still have committed, so the object is left for the orphan sweep, which removes it after an hour
     // only if it turns out not to be the recorded key.
     let outcomeUnknown = false;
+    const store = photoStore(c.env, storeIdOf(check));
     try {
-      const store = photoStore(c.env, storeIdOf(check));
       await store.put(key, bytes, { contentType: info.format === 'jpeg' ? 'image/jpeg' : 'image/webp' });
       const head = await store.head(key);
       if (!head) return c.json(fail('server'), 500);
@@ -195,7 +206,14 @@ editRoutes.put('/:id/edit/variants/:kind', requireRole('edit'), requireWritable,
         }
         return c.json({ ok: true });
       }
-      if (res.status === 'exists') return c.json({ ok: true });
+      if (res.status === 'exists') {
+        try {
+          await followExisting((await variantCheck())?.key);
+        } catch (err) {
+          logError(c.get('requestId'), 'edit_variant_follow', err);
+        }
+        return c.json({ ok: true });
+      }
       if (res.status === 'storage_full') return c.json(fail('storage_full'), 413);
       if (res.status === 'gone') return c.json(fail('conflict'), 410);
       return c.json(fail('invalid'), 400);
@@ -203,6 +221,9 @@ editRoutes.put('/:id/edit/variants/:kind', requireRole('edit'), requireWritable,
       // Definitely not recorded (lost, duplicate, full, invalid, or failed before the record call): this
       // object must not stay.
       if (!recorded && !outcomeUnknown) await dropLater(c, [key], 'edit_variant_unstore');
+      // The record may have committed: if the photo moved meanwhile, the cron copies this object after it
+      // (a follow-up for an object that wasn't recorded is just cleared, or its copy swept as an orphan).
+      if (outcomeUnknown) await followUnknown(c.env, id, store.id, [key]);
     }
   } catch (err) {
     logError(c.get('requestId'), 'edit_variant', err);

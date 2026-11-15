@@ -20,7 +20,7 @@ import { imageInfo } from '../library/files';
 import { photoKey } from '../library/storage';
 import { deleteEverywhere } from '../storage';
 import { photoStore, storeIdOf } from '../storage/config';
-import { followMove } from '../storage/migrate';
+import { followMove, followUnknown } from '../storage/migrate';
 import { rpc } from '../supabase';
 import { encodeMask, MaskError, readMask, resizeMask } from './png';
 import {
@@ -181,19 +181,27 @@ export async function processBgItem(env: Env, itemId: string): Promise<BgOutcome
       await store.put(key, png, { contentType: 'image/png' });
       // If this call fails (or its answer is lost after it committed), the mask is left in place: the
       // orphan sweep removes it later if no row records it. Deleting it here could break a recipe that does.
-      const done = await rpc<{ status: string; deleteKeys?: string[] }>(env, 'ai_item_complete', {
-        p_item: itemId,
-        p_mask: maskId,
-        p_key: key,
-        p_bytes: png.byteLength,
-        p_width: out.width,
-        p_height: out.height,
-        p_provider: step.provider,
-        p_cost: spent,
-        p_latency_ms: Date.now() - t0,
-        p_calls: calls,
-        p_attempt: attempt,
-      });
+      let done: { status: string; deleteKeys?: string[] };
+      try {
+        done = await rpc<{ status: string; deleteKeys?: string[] }>(env, 'ai_item_complete', {
+          p_item: itemId,
+          p_mask: maskId,
+          p_key: key,
+          p_bytes: png.byteLength,
+          p_width: out.width,
+          p_height: out.height,
+          p_provider: step.provider,
+          p_cost: spent,
+          p_latency_ms: Date.now() - t0,
+          p_calls: calls,
+          p_attempt: attempt,
+        });
+      } catch (err) {
+        // Phase 8: the row may have committed with its reply lost. If the photo moved meanwhile, the cron
+        // copies the mask after it (a follow-up for a mask that wasn't recorded is cleared or swept).
+        await followUnknown(env, photoId, store.id, [key]);
+        throw err;
+      }
       // Phase 8: the photo may have moved to another store while the provider ran.
       if (done.status === 'ok') await followMove(env, photoId, store.id, [key]);
       const drop = (done.deleteKeys ?? []).filter(

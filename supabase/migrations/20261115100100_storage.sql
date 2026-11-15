@@ -91,6 +91,10 @@ create table public.storage_migrations (
   last_error text check (last_error is null or length(last_error) <= 200),
   -- When late arrivals on the store being emptied were last looked for (batches look at most every 2 minutes).
   topped_up_at timestamptz,
+  -- A switch or rollback can't finish before this (2 minutes after it started): a photo whose insert read the
+  -- old write store while the switch was committing is only visible to a later transaction, so finishing waits
+  -- for a batch that runs after this (the 5-minute cron sends one) and looks for late arrivals first.
+  settle_after timestamptz,
   check (from_store <> to_store)
 );
 alter table public.storage_migrations enable row level security;
@@ -114,6 +118,9 @@ create table public.storage_migration_items (
   token uuid,
   -- What the copy was taken from (_photo_stamp): a later change means copying again.
   stamp text check (stamp is null or length(stamp) <= 100),
+  -- Verified copies refused because the photo changed meanwhile (an edit, a mask): each one backs off longer,
+  -- and the tenth fails the item (`busy`, retryable), so a photo edited non-stop can't keep a migration open.
+  stamp_misses integer not null default 0 check (stamp_misses between 0 and 1000),
   -- A store holding a copy of this photo that's no longer needed (deleted once due), when its deletion was
   -- claimed (from then on the migration can't be rolled back), and when it was done.
   cleanup_store text check (cleanup_store is null or public._store_id_ok(cleanup_store)),
@@ -243,7 +250,7 @@ language sql stable set search_path = '' as $$
     'deleteOldAfter', m.delete_old_after, 'lastError', m.last_error);
 $$;
 
--- After an item changes: moves the migration on when nothing is left to copy. Only looks for open items (an
+-- After an item changes: moves the migration on when nothing is left to copy (never before settle_after). Only looks for open items (an
 -- index lookup) and recent photos, so it costs the same for every item of a large migration. Photos still
 -- uploading or publishing their variants on the store being emptied are pending items, so the migration
 -- can't finish (done, holding or rolled back) while any remain; an upload that expires is purged, which
@@ -270,6 +277,9 @@ begin
                           jsonb_build_object('failed', failed, 'direction', m.direction));
     return;
   end if;
+  -- Never in the transaction that started the switch or rollback, nor in the 2 minutes after it: a photo whose
+  -- insert raced it is only visible later. The batch the cron sends after that finishes it.
+  if m.settle_after is not null and now() < m.settle_after then return; end if;
   -- A last look for late arrivals (recent photos only, so it's cheap): one found means more to copy.
   if public._migration_top_up(m, false) > 0 then return; end if;
   held := exists (select 1 from public.storage_migration_items
@@ -357,7 +367,8 @@ $$;
 
 -- The database's half of AdminStorageResult: { writeStore, migration: StorageMigration | null (the latest),
 -- usage: [{ storeId, objects, bytes }], checks: [{ storeId, result: StoreCheck }] (the latest per store),
--- totals: { photos, bytes }, autoReadOnly }, or null when the staff member may not see Storage. The API adds each
+-- totals: { photos, bytes }, autoReadOnly, oldCopies: [{ storeId, copies }], followups: { pending, dropped30d } },
+-- or null when the staff member may not see Storage. The API adds each
 -- configured store's name, kind, connection, cost and health.
 create function public.admin_storage(p_staff uuid) returns jsonb
 language sql stable security definer set search_path = '' as $$
@@ -371,7 +382,19 @@ language sql stable security definer set search_path = '' as $$
     'totals', jsonb_build_object('photos', coalesce((select sum((e ->> 'objects')::bigint) from jsonb_array_elements(u.j) e), 0),
                                  'bytes', coalesce((select sum((e ->> 'bytes')::bigint) from jsonb_array_elements(u.j) e), 0)),
     'autoReadOnly', (select coalesce((a.read_only ->> 'on')::boolean and (a.read_only ->> 'auto')::boolean, false)
-                       from public.app_settings a where a.id = 1))
+                       from public.app_settings a where a.id = 1),
+    -- Old copies still waiting for deletion, per store (an Owner can abandon them on a store that's gone).
+    'oldCopies', coalesce((select jsonb_agg(jsonb_build_object('storeId', x.cleanup_store, 'copies', x.n) order by x.cleanup_store)
+                             from (select i.cleanup_store, count(*) as n
+                                     from public.storage_migration_items i join public.storage_migrations m on m.id = i.migration_id
+                                    where i.cleanup_store is not null and i.cleaned_at is null and i.state in ('verified', 'skipped')
+                                      and m.state in ('holding', 'done', 'rolled_back')
+                                    group by i.cleanup_store) x), '[]'::jsonb),
+    -- Follow-up copies outstanding, and how many were dropped after 7 days in the last 30.
+    'followups', jsonb_build_object(
+      'pending', (select count(*) from public.storage_followups),
+      'dropped30d', coalesce((select sum((a.details ->> 'count')::bigint) from public.audit_log a
+                               where a.action = 'storage.followups_dropped' and a.created_at > now() - interval '30 days'), 0)))
     from (select public.storage_usage() as j) u
    where public._staff_can(p_staff, 'storage');
 $$;
@@ -432,11 +455,12 @@ begin
     return jsonb_build_object('error', 'conflict');
   end if;
   update public.storage_state set write_store = p_to, updated_at = now(), updated_by = p_staff where id = 1;
-  insert into public.storage_migrations (from_store, to_store, started_by, reason)
-  values (cur, p_to, p_staff, btrim(p_reason)) returning * into m;
+  insert into public.storage_migrations (from_store, to_store, started_by, reason, settle_after)
+  values (cur, p_to, p_staff, btrim(p_reason), now() + interval '2 minutes') returning * into m;
   n := public._migration_top_up(m, true);
-  -- Nothing to move (and nothing uploading there): done at once. (Photos on a third store stay there; they're
-  -- read from their own store.)
+  -- Even with nothing to move the migration stays open until a batch after settle_after has looked for late
+  -- arrivals (a photo inserted while this transaction was committing still went to the old store). (Photos
+  -- on a third store stay there; they're read from their own store.)
   perform public._migration_progress(m.id);
   perform public._audit(p_staff, 'storage.switch', m.id::text,
                         jsonb_build_object('from', cur, 'to', p_to, 'photos', n, 'reason', btrim(p_reason)));
@@ -450,7 +474,8 @@ $$;
 -- lease with storage_item_touch just before copying it. Candidates are walked in order (an index range scan that
 -- stops at the limit), and each is checked on its own: a photo that went away is skipped (a partial copy on the
 -- destination is cleaned up), a photo still uploading or publishing its variants is put back for 2 minutes
--- (no attempt counted), the rest are claimed. Late arrivals on the store being emptied are looked for at most
+-- (no attempt counted; failed with upload_stuck or publish_stuck once that's gone on for more than a day), the
+-- rest are claimed. Late arrivals on the store being emptied are looked for at most
 -- every 2 minutes (and at every switch and rollback, and before the migration finishes).
 -- [{ photoId, ownerId, from, to, attempts, token }]; empty unless the migration is copying or rolling back.
 -- Measured locally with 200k queued photos: about 4 ms a batch (2–6 s before, when every batch rescanned
@@ -485,7 +510,7 @@ begin
     exit when jsonb_array_length(items) >= lim;
     seen := 0;
     for r in
-      select i.photo_id, p.status, p.publish_pending
+      select i.photo_id, p.status, p.publish_pending, p.created_at
         from public.storage_migration_items i left join public.photos p on p.id = i.photo_id
        where i.migration_id = p_migration and i.state = 'pending' and (i.lease_until is null or i.lease_until < now())
        order by i.updated_at, i.photo_id
@@ -495,10 +520,24 @@ begin
       seen := seen + 1;
       if r.status is null or r.status not in ('uploading', 'ready', 'trashed') then
         -- Purged or being purged: nothing to copy.
+        -- A partial copy (an attempt was made) is on dst. An item a rollback reversed keeps the cleanup store it
+        -- was given then: the store it had moved to still holds that copy.
         update public.storage_migration_items
            set state = 'skipped', lease_until = null, token = null, updated_at = now(),
-               cleanup_store = case when attempts > 0 then dst end
+               cleanup_store = case when attempts > 0 then dst else cleanup_store end
          where migration_id = p_migration and photo_id = r.photo_id;
+      elsif (r.status = 'uploading' or r.publish_pending) and r.created_at < now() - interval '2 days' then
+        -- Uploads finish within 24 hours, so this photo has been uploading, or publishing its variants, for at
+        -- least a day: something is stuck (a staged variant of the wrong size, a clean-up job that can't reach
+        -- its store). Failed, so Admin shows it and the migration isn't held open for ever; retryable once the
+        -- clean-up job has finished or given up on the variants (after 3 days).
+        update public.storage_migration_items
+           set state = 'failed', lease_until = null, token = null, updated_at = now(),
+               error = case when r.status = 'uploading' then 'upload_stuck' else 'publish_stuck' end
+         where migration_id = p_migration and photo_id = r.photo_id;
+        update public.storage_migrations
+           set last_error = case when r.status = 'uploading' then 'upload_stuck' else 'publish_stuck' end
+         where id = p_migration;
       elsif r.status = 'uploading' or r.publish_pending then
         update public.storage_migration_items set lease_until = now() + interval '2 minutes', updated_at = now()
          where migration_id = p_migration and photo_id = r.photo_id;
@@ -544,7 +583,8 @@ $$;
 --   verified: every object's hash matched on the destination, including every key storage_item_touch listed,
 --             and p_bytes is at least the original's size. Flips photos.store_id under the photo's row lock in
 --             the same transaction, only while the photo is still on the source and unchanged since the touch
---             (an edit, variant or mask written meanwhile sends it back to pending, to be copied again);
+--             (an edit, variant or mask written meanwhile sends it back to pending, to be copied again after a
+--             growing wait; the tenth time it fails with `busy`);
 --   pending:  try again after p_retry_after_s seconds (backoff chosen by the consumer);
 --   failed:   gave up (shown in Admin; "retry" requeues it).
 -- And for an old copy (no token; p_store is the store whose copy was deleted):
@@ -630,7 +670,20 @@ begin
     return jsonb_build_object('state', 'pending', 'flipped', false);
   end if;
   if ph.store_id <> it.src or public._photo_stamp(p_photo) is distinct from it.stamp then
-    update public.storage_migration_items set lease_until = null, token = null, updated_at = now()
+    -- Changed while it was being copied: copied again, after a growing wait (30 s, 1 min, 2 min … at most an
+    -- hour); the tenth time the item fails (`busy`), so a photo edited non-stop can't keep the migration open.
+    if it.stamp_misses + 1 >= 10 then
+      update public.storage_migration_items
+         set state = 'failed', lease_until = null, token = null, error = 'busy',
+             stamp_misses = it.stamp_misses + 1, updated_at = now()
+       where migration_id = p_migration and photo_id = p_photo;
+      update public.storage_migrations set last_error = 'busy' where id = p_migration;
+      perform public._migration_progress(p_migration);
+      return jsonb_build_object('state', 'failed', 'flipped', false);
+    end if;
+    update public.storage_migration_items
+       set lease_until = now() + make_interval(secs => least(30 * power(2, it.stamp_misses), 3600)),
+           token = null, stamp_misses = it.stamp_misses + 1, updated_at = now()
      where migration_id = p_migration and photo_id = p_photo;
     return jsonb_build_object('state', 'pending', 'flipped', false);
   end if;
@@ -667,7 +720,8 @@ begin
     update public.storage_migrations set state = 'paused' where id = m.id;
   elsif p_action in ('resume', 'retry') then
     if m.state not in ('paused', 'failed') then return jsonb_build_object('error', 'conflict'); end if;
-    update public.storage_migration_items set state = 'pending', attempts = 0, error = null, lease_until = null, token = null, updated_at = now()
+    update public.storage_migration_items
+       set state = 'pending', attempts = 0, stamp_misses = 0, error = null, lease_until = null, token = null, updated_at = now()
      where migration_id = m.id and state = 'failed';
     update public.storage_migrations
        set state = case when direction = 'back' then 'rolling_back' else 'copying' end, last_error = null
@@ -684,12 +738,16 @@ begin
            cleanup_store = case when attempts > 0 or state = 'copied' then dst end
      where migration_id = m.id and state in ('pending', 'copied', 'failed');
     -- Moved photos come back (their old copy is still there, but they may have changed on the new store since,
-    -- so they're copied, not just flipped).
+    -- so they're copied, not just flipped). Until the copy back is verified the item keeps tracking the copy on
+    -- the store it had moved from (cleanup_store: its new dst; SET reads the old row), so a photo deleted
+    -- meanwhile still has that copy cleaned up.
     update public.storage_migration_items
-       set src = dst, dst = src, state = 'pending', attempts = 0, error = null, lease_until = null, token = null,
-           cleanup_store = null, deleting_at = null, cleaned_at = null, bytes = 0, stamp = null, updated_at = now()
+       set src = dst, dst = src, state = 'pending', attempts = 0, stamp_misses = 0, error = null, lease_until = null,
+           token = null, cleanup_store = src, deleting_at = null, cleaned_at = null, bytes = 0, stamp = null, updated_at = now()
      where migration_id = m.id and state in ('verified', 'deleted');
-    update public.storage_migrations set state = 'rolling_back', direction = 'back', delete_old_after = null, last_error = null
+    update public.storage_migrations
+       set state = 'rolling_back', direction = 'back', delete_old_after = null, last_error = null,
+           settle_after = now() + interval '2 minutes'
      where id = m.id returning * into m;
     -- Photos uploaded to the new store since the switch (finished or still uploading) go back too.
     perform public._migration_top_up(m, true);
@@ -808,6 +866,68 @@ begin
 end;
 $$;
 
+-- Follow-ups older than 7 days are dropped (a store that's gone for good would otherwise keep the orphan sweep
+-- off copies away from their photo's store for ever). Audited with how many went from which stores: the
+-- object may be missing on its photo's store (Admin › Storage shows the count). Returns how many were dropped.
+create function public.storage_followups_expire() returns integer
+language plpgsql volatile security definer set search_path = '' as $$
+declare
+  n integer;
+  per jsonb;
+begin
+  with gone as (
+    delete from public.storage_followups where created_at < now() - interval '7 days' returning from_store
+  )
+  select coalesce(sum(x.c), 0)::integer, coalesce(jsonb_object_agg(x.from_store, x.c), '{}'::jsonb) into n, per
+    from (select g.from_store, count(*) as c from gone g group by g.from_store) x;
+  if n > 0 then
+    perform public._audit(null, 'storage.followups_dropped', null, jsonb_build_object('count', n, 'stores', per));
+  end if;
+  return n;
+end;
+$$;
+
+-- An Owner gives up on the old copies still waiting for deletion on p_store (a store that's unreachable or gone,
+-- so the 5-minute cron can never delete them and no later switch could start). The copies are marked cleaned
+-- with error 'abandoned' and every held or rolled-back migration with nothing else to clean finishes. Bytes may
+-- remain on that store; nothing is deleted. Not while a migration is moving photos. The API checks the
+-- passkey, that the store is unreachable or no longer configured, and emails every Owner.
+-- { store, copies, migrations } or { error: forbidden | invalid | conflict | not_found }.
+create function public.storage_abandon_old_copies(p_staff uuid, p_store text, p_reason text) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare
+  n integer;
+  mids uuid[];
+begin
+  if public._staff_role_of(p_staff) is distinct from 'owner' then return jsonb_build_object('error', 'forbidden'); end if;
+  if p_store is null or not public._store_id_ok(p_store) or p_reason is null or length(btrim(p_reason)) not between 3 and 300 then
+    return jsonb_build_object('error', 'invalid');
+  end if;
+  perform public._storage_lock();
+  if exists (select 1 from public.storage_migrations where state in ('copying', 'paused', 'verifying', 'rolling_back', 'failed')) then
+    return jsonb_build_object('error', 'conflict');
+  end if;
+  with upd as (
+    update public.storage_migration_items i
+       set cleaned_at = now(), error = 'abandoned', updated_at = now()
+      from public.storage_migrations m
+     where m.id = i.migration_id and m.state in ('holding', 'done', 'rolled_back')
+       and i.cleanup_store = p_store and i.cleaned_at is null and i.state in ('verified', 'skipped')
+    returning i.migration_id
+  )
+  select count(*), array_agg(distinct migration_id) into n, mids from upd;
+  if n = 0 then return jsonb_build_object('error', 'not_found'); end if;
+  update public.storage_migrations m
+     set state = case when m.state = 'holding' then 'done' else m.state end, finished_at = now()
+   where m.id = any (mids) and m.state in ('holding', 'rolled_back') and m.finished_at is null
+     and not exists (select 1 from public.storage_migration_items i
+                      where i.migration_id = m.id and i.cleanup_store is not null and i.cleaned_at is null);
+  perform public._audit(p_staff, 'storage.old_copies_abandoned', p_store,
+                        jsonb_build_object('store', p_store, 'copies', n, 'migrations', to_jsonb(mids), 'reason', btrim(p_reason)));
+  return jsonb_build_object('store', p_store, 'copies', n, 'migrations', cardinality(mids));
+end;
+$$;
+
 -- ---------------------------------------------------------------------------------------------
 -- storeId in the existing functions' results
 -- ---------------------------------------------------------------------------------------------
@@ -888,9 +1008,14 @@ language sql volatile security definer set search_path = '' as $$
 $$;
 
 alter function public.due_publishes(integer) rename to _v7_due_publishes;
+-- Also `stale`: the photo was created more than 3 days ago, so (uploads finish within 24 hours) its variants
+-- have been waiting to publish for at least 2 days: a staged copy of the wrong size is given up on (lost).
 create function public.due_publishes(p_limit integer) returns jsonb
 language sql stable security definer set search_path = '' as $$
-  select public._with_photo_stores(public._v7_due_publishes(p_limit), 'photoId');
+  select coalesce(jsonb_agg(e.value || jsonb_build_object('stale',
+                    coalesce((select p.created_at < now() - interval '3 days' from public.photos p
+                               where p.id = nullif(e.value ->> 'photoId', '')::uuid), false)) order by e.ord), '[]'::jsonb)
+    from jsonb_array_elements(public._with_photo_stores(public._v7_due_publishes(p_limit), 'photoId')) with ordinality e(value, ord);
 $$;
 
 -- Each open upload gains its store (the account's other keys are on every store its photos used: the API lists
@@ -916,9 +1041,15 @@ language sql stable security definer set search_path = '' as $$
 $$;
 
 alter function public.edit_variant_check(uuid, uuid, integer, text) rename to _v7_edit_variant_check;
+-- With status 'exists' it also gives the recorded variant's key, so a PUT retried after a lost reply can make
+-- sure that object followed the photo if it moved meanwhile.
 create function public.edit_variant_check(p_owner uuid, p_photo uuid, p_version integer, p_kind text) returns jsonb
 language sql stable security definer set search_path = '' as $$
   select r || jsonb_build_object('storeId', public._photo_store(p_photo))
+           || case when r ->> 'status' = 'exists' then
+                coalesce((select jsonb_build_object('key', case p_kind when 'thumb' then e.thumb_key else e.preview_key end)
+                            from public.photo_edits e where e.photo_id = p_photo), '{}'::jsonb)
+              else '{}'::jsonb end
     from (select public._v7_edit_variant_check(p_owner, p_photo, p_version, p_kind) as r) x where r is not null;
 $$;
 
@@ -1033,6 +1164,8 @@ grant execute on function
   public.storage_followup_add(uuid, text, text[]),
   public.storage_followups_due(integer),
   public.storage_followup_done(uuid, text, text, boolean),
+  public.storage_followups_expire(),
+  public.storage_abandon_old_copies(uuid, text, text),
   public.bulk_photos(uuid, uuid[], text, uuid),
   public.empty_trash(uuid),
   public.ai_mask_key(uuid, uuid, uuid),

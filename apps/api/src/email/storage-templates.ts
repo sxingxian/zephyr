@@ -29,6 +29,23 @@ export function storageRollbackEmail(e: { actor: string; from: string; to: strin
   );
 }
 
+export function storageAbandonEmail(e: {
+  actor: string;
+  store: string;
+  copies: number;
+  adminUrl: string;
+}): Mail {
+  return layout(
+    `[Zephyr] Old copies abandoned on ${e.store}`,
+    'Old copies abandoned',
+    [
+      `${e.actor} gave up on deleting ${e.copies} old ${e.copies === 1 ? 'copy' : 'copies'} of moved photos on ${e.store}, which can't be reached. Nothing was deleted there.`,
+      `If ${e.store} comes back, its photo files are still on it: delete them by hand or reconnect it and let the orphan sweep clear them. The reason is in the audit log.`,
+    ],
+    adminLink(e.adminUrl),
+  );
+}
+
 export function readOnlyAutoEmail(e: {
   on: boolean;
   store: string;

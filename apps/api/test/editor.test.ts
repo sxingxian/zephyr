@@ -798,6 +798,7 @@ describe('every variant PUT writes its own key', () => {
   it('a record that commits but then fails in transit keeps the object the database recorded', async () => {
     const j = await signedIn(MEI);
     const p = await stored(MEI.id);
+    world.rpc.storage_photo_store = (a) => (a.p_photo === p.id ? 'r2' : null);
     const v = await renderedEdit(j, p.id);
     const v2 = (await read(await save(j, p.id, { v: 1, light: { exposure: 2 } }, v))).edit.version;
     const record = world.rpc.record_edit_variant as (a: Record<string, unknown>) => unknown;
@@ -810,6 +811,27 @@ describe('every variant PUT writes its own key', () => {
     const recorded = must(must(db.edits.get(p.id)).previewKey);
     expect(recorded.includes(`edit-${v2}-preview-`)).toBe(true);
     expect(r2.objects.has(recorded)).toBe(true);
+    // Phase 8: it may have committed, so a follow-up is recorded: if the photo moved meanwhile, the cron
+    // copies the object after it.
+    const follow = world.calls.filter((c) => c.url.endsWith('/rpc/storage_followup_add'));
+    expect(follow.map((c) => c.body)).toEqual([{ p_photo: p.id, p_from: 'r2', p_keys: [recorded] }]);
+  });
+  it('a repeat PUT for a recorded version makes sure that variant followed a move (phase 8)', async () => {
+    const j = await signedIn(MEI);
+    const p = await stored(MEI.id);
+    world.rpc.storage_photo_store = (a) => (a.p_photo === p.id ? 'r2' : null);
+    const v = await renderedEdit(j, p.id);
+    const liveKey = must(must(db.edits.get(p.id)).previewKey);
+    const before = world.calls.length;
+    const res = await put(EDIT_API.photoEditVariant(p.id, 'preview', v), jpegVariant(2048, 1536, 9000), j);
+    expect(res.status).toBe(200);
+    // The photo's store (r2 here) already has it: it's looked up, nothing is recorded.
+    const calls = world.calls.slice(before);
+    expect(calls.filter((c) => c.url.endsWith('/rpc/storage_photo_store')).map((c) => c.body)).toEqual([
+      { p_photo: p.id },
+    ]);
+    expect(r2.objects.has(liveKey)).toBe(true);
+    expect(calls.some((c) => c.url.endsWith('/rpc/storage_followup_add'))).toBe(false);
   });
   it('the database refuses a key that isn’t this photo’s, version’s and kind’s', () => {
     const rec = libraryRpc().record_edit_variant as (a: Record<string, unknown>) => { status: string };

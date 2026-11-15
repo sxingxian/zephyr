@@ -369,6 +369,15 @@ describe('background-removal consumer', () => {
     world.rpc.ai_item_complete = () => new Response('down', { status: 503 });
     await expect(processBgItem(env, ITEM)).rejects.toBeTruthy();
     expect([...r2.objects.keys()].some((k) => k.startsWith(`u/${MEI.id}/p/${PHOTO}/m/`))).toBe(true);
+    // Phase 8: the row may have committed, so the mask is recorded as a follow-up (copied after its photo if
+    // the photo moved meanwhile; cleared or swept otherwise).
+    const follow = rpcArgs('storage_followup_add');
+    expect(follow).toHaveLength(1);
+    expect(follow[0]).toMatchObject({
+      p_photo: PHOTO,
+      p_from: 'r2',
+      p_keys: [String(rpcArgs('ai_item_complete')[0]?.p_key)],
+    });
   });
 
   it('tries the primary twice, then the fallback', async () => {

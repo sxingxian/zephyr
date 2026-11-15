@@ -430,6 +430,68 @@ describe('Storage', () => {
     expect(await screen.findByRole('button', { name: 'Retry failed photos' }, T)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /Roll back/ })).toBeNull();
     expect(screen.getByText(/can no longer be rolled back/)).toBeTruthy();
+    // Failed items wait for a person: never described as retrying on their own.
+    expect(screen.getByText(/12 need retry/)).toBeTruthy();
+    expect(screen.queryByText(/retrying/)).toBeNull();
+  });
+
+  it('explains stuck and busy photos in plain words', async () => {
+    mock('admin', (c) => {
+      if (c.url.endsWith('/storage') && c.method === 'GET')
+        return json(200, {
+          ...MOVING,
+          migration: { ...MOVING.migration, state: 'failed', lastError: 'publish_stuck' },
+        });
+      return undefined;
+    });
+    renderAt('/storage');
+    expect(await screen.findByText(/publishing its thumbnails for more than a day/, {}, T)).toBeTruthy();
+  });
+
+  it('an Owner can abandon old copies on a store that can’t be reached, with a reason and the passkey', async () => {
+    const withOld: AdminStorageResult = {
+      ...STORAGE,
+      oldCopies: [
+        { storeId: 'nas2', copies: 1200 },
+        { storeId: 'b2', copies: 3 },
+      ],
+      followups: { pending: 2, dropped30d: 1 },
+    };
+    mock('owner', (c) => {
+      if (c.url.endsWith('/storage') && c.method === 'GET') return json(200, withOld);
+      if (c.url.endsWith('/storage/abandon')) return json(200, { ...STORAGE, oldCopies: [] });
+      return undefined;
+    });
+    renderAt('/storage');
+    await screen.findByText('Old copies waiting for deletion', {}, T);
+    expect(screen.getByText(/1 follow-up copy was dropped in the last 30 days/)).toBeTruthy();
+    expect(screen.getByText(/2 follow-up copies/)).toBeTruthy();
+    // Only the unreachable store offers it (the healthy one's copies are deleted by the clean-up job).
+    const abandon = screen.getAllByRole('button', { name: 'Abandon…' });
+    expect(abandon).toHaveLength(1);
+    await act(async () => abandon[0]?.click());
+    const d = dialog('Abandon old copies on Studio NAS · hostname');
+    expect(within(d).getByText(/nothing is deleted there/)).toBeTruthy();
+    const confirm = btn(d, /Abandon with passkey/);
+    expect(confirm.disabled).toBe(true);
+    fireEvent.change(reasonIn(d), { target: { value: 'The NAS died' } });
+    await act(async () => confirm.click());
+    await waitFor(
+      () => expect(writes('/storage/abandon')[0]?.body).toEqual({ store: 'nas2', reason: 'The NAS died' }),
+      T,
+    );
+    await waitFor(() => expect(screen.queryByText('Old copies waiting for deletion')).toBeNull(), T);
+  });
+
+  it('an Admin sees the old copies but can’t abandon them', async () => {
+    mock('admin', (c) => {
+      if (c.url.endsWith('/storage') && c.method === 'GET')
+        return json(200, { ...STORAGE, oldCopies: [{ storeId: 'nas2', copies: 5 }] });
+      return undefined;
+    });
+    renderAt('/storage');
+    await screen.findByText('Old copies waiting for deletion', {}, T);
+    expect(screen.queryByRole('button', { name: 'Abandon…' })).toBeNull();
   });
 });
 

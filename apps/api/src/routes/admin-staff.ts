@@ -237,13 +237,33 @@ export function registerAdminStaffRoutes(router: AdminRouter, requireStaff: Requ
       }
       created = null;
       // A failed unban throws to the catch below: logged, 500, and the staff row stays (harmless while banned).
-      if (existing) await gotrue.adminSetBanned(c.env, userId, false);
+      if (existing) {
+        await gotrue.adminSetBanned(c.env, userId, false);
+        // An Owner may have removed them again between completing and the unban (which then undid the removal's
+        // ban): re-checked after unbanning, and banned again unless they're still staff.
+        await rebanUnlessStaff(c, userId, email);
+      }
       return c.json({ ok: true, email });
     } catch (err) {
       await dropCreated(c, created);
       return serverError(c, 'staff_invite_accept', err);
     }
   });
+}
+
+/**
+ * After a returning staff member's unban: if the address isn't staff any more (removed again in between), the
+ * auth user is banned again. If the check fails they stay unbanned (logged): the database still refuses a
+ * former staff member on both sides, so only the extra Auth-level ban would be missing, whereas banning a
+ * returning member of staff on a transient error would lock them out until they're re-invited.
+ */
+async function rebanUnlessStaff(c: Ctx, userId: string, email: string) {
+  try {
+    if ((await rpc<string>(c.env, 'account_kind', { p_email: email })) === 'staff') return;
+    await gotrue.adminSetBanned(c.env, userId, true);
+  } catch (err) {
+    logError(c.get('requestId'), 'staff_reban', err);
+  }
 }
 
 /** Deletes an auth user created for an invite that didn't complete, unless the address is staff after all. */

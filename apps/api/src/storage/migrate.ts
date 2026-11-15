@@ -17,15 +17,17 @@
  *   can't be rolled back); for a photo that moved, any object missing on its store is copied there first.
  * - Writers that store an object under a photo's prefix call `followMove` after recording it, so an object
  *   written to the old store while the photo was being flipped ends up on the new store too. A copy that fails
- *   is recorded (storage_followups) and retried by the 5-minute cron; until then the orphan sweep leaves copies
- *   away from their photo's store alone.
+ *   is recorded (storage_followups) and retried by the 5-minute cron (for at most 7 days); until then the orphan
+ *   sweep leaves copies away from their photo's store alone. A writer that can't tell whether its record
+ *   committed records the follow-up anyway (followUnknown), and a retried write that finds its object recorded
+ *   makes sure it followed (followRecorded).
  *
  * Nothing here logs keys, endpoints or error bodies: only store ids and short StoreError codes.
  */
 import type { Env, StorageMessage } from '../env';
 import { logError } from '../http';
 import { rpc } from '../supabase';
-import { photoStore } from './config';
+import { allStores, photoStore } from './config';
 import { digestOf, hashing } from './hash';
 import type { ObjectStore } from './types';
 import { StoreError } from './types';
@@ -299,6 +301,37 @@ export async function followMove(env: Env, photoId: string, wrote: string, keys:
   if (recorded) for (const key of keys) await followupDone(env, photoId, key, wrote, true);
 }
 
+/**
+ * A writer stored `keys` on `wrote` but doesn't know whether its record committed (the call threw, or its reply
+ * was lost). The keys are recorded as follow-ups anyway: the cron copies them to the photo's store if the photo
+ * moved meanwhile, and clears them when there's nothing to copy (same store, photo gone, object gone). A copy of
+ * an object that was never recorded is an orphan on the new store, which the sweep removes. Never throws.
+ */
+export async function followUnknown(env: Env, photoId: string, wrote: string, keys: string[]): Promise<void> {
+  if (keys.length) await recordFollowup(env, photoId, wrote, keys);
+}
+
+/**
+ * An object is recorded for the photo, but this request didn't write it (a retried PUT that finds its variant
+ * recorded by an earlier attempt whose reply was lost): if the photo's store doesn't have it, it's copied there
+ * from whichever configured store does, through a follow-up. Best effort; never throws.
+ */
+export async function followRecorded(env: Env, photoId: string, key: string): Promise<void> {
+  try {
+    const now = await rpc<string | null>(env, 'storage_photo_store', { p_photo: photoId });
+    if (!now) return;
+    if (await photoStore(env, now).head(key)) return;
+    for (const store of allStores(env).stores) {
+      if (store.id === now) continue;
+      if (!(await store.head(key))) continue;
+      await followMove(env, photoId, store.id, [key]);
+      return;
+    }
+  } catch (err) {
+    logError('storage', 'follow_recorded', err);
+  }
+}
+
 async function recordFollowup(env: Env, photoId: string, from: string, keys: string[]): Promise<boolean> {
   try {
     for (let i = 0; i < keys.length; i += 20) {
@@ -340,9 +373,17 @@ export interface FollowupItem {
 
 /**
  * Retries follow-up copies: each object goes from the store it was written to to wherever its photo is now
- * (unless it's already there, or the photo is gone or back on that store). Returns how many were copied.
+ * (unless it's already there, or the photo is gone or back on that store). Follow-ups older than 7 days are
+ * dropped (a store that's gone for good would otherwise keep the orphan sweep off for ever). Returns how many
+ * were copied.
  */
 export async function runFollowups(env: Env): Promise<number> {
+  // Follow-ups older than 7 days are dropped first (audited; Admin › Storage shows the count).
+  try {
+    await rpc<number>(env, 'storage_followups_expire');
+  } catch (err) {
+    logError('cron', 'storage_followups_expire', err);
+  }
   const due = await rpc<FollowupItem[]>(env, 'storage_followups_due', {
     p_limit: MIGRATION_LIMITS.followups,
   });
