@@ -8,11 +8,14 @@
 import {
   ADMIN8_API,
   ADS_DOC_COOKIE,
+  ADS_SEEN_COOKIE,
   MEMBER8_API,
   STAFF_CAN,
   type StaffAction,
   type StaffRole,
+  signAdsCookie,
   staffCan,
+  verifyAdsCookie,
 } from '@zephyr/shared';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runAdminCron, runAdminDailyCron } from '../src/admin/cron';
@@ -1241,42 +1244,95 @@ describe('member ads', () => {
     expect(adsLimiter.keys).toEqual([`ads:${MEI.id}`]);
   });
 
-  it('sets the AdSense cookie only when AdSense is returned, and clears it otherwise', async () => {
-    const cookieOf = (r: Response) =>
-      (r.headers.get('Set-Cookie') ?? '')
-        .split(/,(?=\s*[A-Za-z_-]+=)/)
-        .find((c) => c.trim().startsWith(ADS_DOC_COOKIE));
+  it('sets the AdSense cookie only when AdSense is returned (signed for the member), and clears it otherwise', async () => {
+    const cookiesOf = (r: Response) => r.headers.getSetCookie();
+    const named = (r: Response, name: string) => cookiesOf(r).find((c) => c.startsWith(`${name}=`));
     world.rpc.ads_for_member = () => live;
-    const on = cookieOf(await call(MEMBER8_API.ads, { jar: await member(MEI) }));
-    expect(on).toContain(`${ADS_DOC_COOKIE}=1`);
+    const res = await call(MEMBER8_API.ads, { jar: await member(MEI) });
+    const on = named(res, ADS_DOC_COOKIE) ?? '';
     for (const attr of ['Path=/', 'Max-Age=900', 'HttpOnly', 'Secure', 'SameSite=Strict'])
       expect(on).toContain(attr);
     expect(on).not.toMatch(/Domain=/i);
+    // The value is signed for this member, with a 15-minute expiry; page script can't forge it.
+    const value = on.slice(ADS_DOC_COOKIE.length + 1).split(';')[0] ?? '';
+    expect(value).not.toBe('1');
+    expect(await verifyAdsCookie(env.ADS_COOKIE_SECRET, value)).toBe(MEI.id);
+    expect(await verifyAdsCookie('some-other-secret-value', value)).toBeNull();
+    expect(await verifyAdsCookie(env.ADS_COOKIE_SECRET, value, Date.now() / 1000 + 901)).toBeNull();
+    // And marks the browser as one that may have run Google's script (for the conditional reset).
+    const seen = named(res, ADS_SEEN_COOKIE) ?? '';
+    for (const attr of ['Max-Age=2592000', 'HttpOnly', 'Secure', 'SameSite=Strict'])
+      expect(seen).toContain(attr);
     world.rpc.ads_for_member = () => ({ ...live, adsense: null });
-    const off = cookieOf(await call(MEMBER8_API.ads, { jar: await member(MEI) }));
+    const offRes = await call(MEMBER8_API.ads, { jar: await member(MEI) });
+    const off = named(offRes, ADS_DOC_COOKIE) ?? '';
     expect(off).toContain(`${ADS_DOC_COOKIE}=;`);
     expect(off).toContain('Max-Age=0');
+    expect(named(offRes, ADS_SEEN_COOKIE)).toBeUndefined();
     // A team library: cleared too.
-    const team = cookieOf(
+    const team = named(
       await call(MEMBER8_API.ads, { jar: await member(MEI), headers: { 'X-Zephyr-Library': JUN.id } }),
+      ADS_DOC_COOKIE,
     );
     expect(team).toContain('Max-Age=0');
+    // Without ADS_COOKIE_SECRET the cookie is never set (the app Worker would never widen anyway).
+    world.rpc.ads_for_member = () => live;
+    const secret = env.ADS_COOKIE_SECRET;
+    env.ADS_COOKIE_SECRET = undefined;
+    try {
+      const noKey = await call(MEMBER8_API.ads, { jar: await member(MEI) });
+      expect(named(noKey, ADS_DOC_COOKIE)).toContain('Max-Age=0');
+    } finally {
+      env.ADS_COOKIE_SECRET = secret;
+    }
   });
 
-  it('reset: clears the site’s storage and the AdSense cookie, same-origin only, no session needed', async () => {
+  it('reset: clears the site’s storage and the AdSense cookies, same-origin only, no session needed', async () => {
     const res = await call(MEMBER8_API.adReset, { body: {} });
     expect(res.status).toBe(204);
     expect(res.headers.get('Clear-Site-Data')).toBe('"cache", "storage"');
     expect(res.headers.get('Set-Cookie')).toContain(`${ADS_DOC_COOKIE}=;`);
+    expect(res.headers.get('Set-Cookie')).toContain(`${ADS_SEEN_COOKIE}=;`);
     const cross = await call(MEMBER8_API.adReset, { body: {}, origin: 'https://evil.example' });
     expect(cross.status).toBe(403);
     expect(cross.headers.get('Clear-Site-Data')).toBeNull();
     expect((await call(MEMBER8_API.adReset, { method: 'GET' })).status).toBe(401);
+    expect((await call(MEMBER8_API.adReset, { body: { ifSeen: 'yes' } })).status).toBe(400);
   });
 
-  it('sign-out clears the AdSense cookie with the session', async () => {
+  it('reset with ifSeen (a session ending without the script): only when this browser may have run it', async () => {
+    const never = await call(MEMBER8_API.adReset, { body: { ifSeen: true } });
+    expect(never.status).toBe(204);
+    expect(never.headers.get('Clear-Site-Data')).toBeNull();
+    expect(never.headers.get('Set-Cookie')).toContain(`${ADS_DOC_COOKIE}=;`);
+    const j = jar();
+    j.cookies.set(ADS_SEEN_COOKIE, '1');
+    const seen = await call(MEMBER8_API.adReset, { body: { ifSeen: true }, jar: j });
+    expect(seen.headers.get('Clear-Site-Data')).toBe('"cache", "storage"');
+    expect(seen.headers.get('Set-Cookie')).toContain(`${ADS_SEEN_COOKIE}=;`);
+  });
+
+  it('sign-out clears the AdSense cookies with the session', async () => {
     const res = await call('/api/v1/auth/sign-out', { jar: await member(MEI), body: {} });
     expect(res.headers.get('Set-Cookie')).toContain(`${ADS_DOC_COOKIE}=;`);
+    expect(res.headers.get('Set-Cookie')).toContain(`${ADS_SEEN_COOKIE}=;`);
+  });
+
+  it('the session check drops an AdSense cookie that isn’t this member’s, isn’t valid, or is on a plan without ads', async () => {
+    const zads = (r: Response) => r.headers.getSetCookie().find((c) => c.startsWith(`${ADS_DOC_COOKIE}=`));
+    const secret = env.ADS_COOKIE_SECRET ?? '';
+    const j = await member(MEI);
+    j.cookies.set(ADS_DOC_COOKIE, await signAdsCookie(secret, MEI.id, Date.now() / 1000 + 600));
+    expect(zads(await call('/api/v1/auth/session', { jar: j }))).toBeUndefined();
+    for (const bad of [
+      '1',
+      await signAdsCookie(secret, JUN.id, Date.now() / 1000 + 600),
+      await signAdsCookie(secret, MEI.id, Date.now() / 1000 - 1),
+    ]) {
+      const k = await member(MEI);
+      k.cookies.set(ADS_DOC_COOKIE, bad);
+      expect(zads(await call('/api/v1/auth/session', { jar: k })), bad).toContain('Max-Age=0');
+    }
   });
 
   it('plans without ads get nothing (the database decides by the effective plan)', async () => {

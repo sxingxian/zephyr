@@ -8,12 +8,20 @@ import {
   type SharingLimits,
 } from '@zephyr/shared/client';
 import { Button, Dialog, Field, Icon, Note, Switch } from '@zephyr/ui';
-import { type FormEvent, useEffect, useId, useMemo, useState, useSyncExternalStore } from 'react';
+import {
+  type FormEvent,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import { Link, useNavigate } from 'react-router';
-import { adsenseLoaded } from '../../lib/ads';
+import { adsenseLoaded, holdAdsense } from '../../lib/ads';
 import { ApiFailure, errorMessage } from '../../lib/api';
 import { useSession } from '../../lib/session';
-import { sessionUserId } from '../../lib/sessionGuard';
+import { browser, sessionUserId } from '../../lib/sessionGuard';
 import {
   createGallery,
   galleryPreviewPath,
@@ -195,6 +203,14 @@ export function useBranding(limits: SharingLimits): Branding | null {
 export function CreateGalleryDialog(props: Parameters<typeof CreateGalleryDialogInner>[0]) {
   return useSecretsAllowed() ? <CreateGalleryDialogInner {...props} /> : null;
 }
+/**
+ * Phase 8: no Google script may be added to this document while `active` (a link or passcode may show). A layout
+ * effect, so the hold is in place before any ad unit's (passive) effect in the same commit tries to load it.
+ */
+function useHoldAdsense(active: boolean): void {
+  useLayoutEffect(() => (active ? holdAdsense() : undefined), [active]);
+}
+
 function CreateGalleryDialogInner({
   open,
   photoIds,
@@ -208,6 +224,7 @@ function CreateGalleryDialogInner({
   onClose: () => void;
   onCreated: (r: GalleryCreated) => void;
 }) {
+  useHoldAdsense(open);
   const usage = useUsage();
   const limits = sharingLimits(usage);
   const branding = useBranding(limits);
@@ -271,6 +288,13 @@ function CreateGalleryDialogInner({
       });
       // Someone else signed in while this was in flight: don't show them this member's link and passcode.
       if (sessionUserId() !== owner) return;
+      // Phase 8: Google's script got into this document anyway (it was added before the dialog opened): never
+      // show the link or passcode here. The gallery page (no ads, a full page load) can copy the link and set a
+      // new passcode.
+      if (adsenseLoaded()) {
+        browser.assign(`/shared/${encodeURIComponent(r.gallery.id)}`, { keepStorage: true });
+        return;
+      }
       onCreated(r);
       if (r.gallery.downloads === 'full') {
         // Full-size downloads of edited or RAW photos are prepared on this device, for this member only.
@@ -471,6 +495,7 @@ function GalleryLiveDialogInner({
   created: GalleryCreated | null;
   onClose: () => void;
 }) {
+  useHoldAdsense(Boolean(created));
   const nav = useNavigate();
   const g = created?.gallery;
   const expires = g

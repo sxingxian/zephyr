@@ -201,34 +201,63 @@
       - **Nothing secret is ever shown in a document holding the script.** A new gallery's link and passcode,
         copy buttons and anything shown once render nothing there (`NoAdsSurface`). Share from a library page
         hands the selection to `/share/new`, a page without ads opened with a full page load, and the create
-        flow runs there.
+        flow runs there. While a create dialog or its one-time passcode is open, the script isn't added at all
+        (`holdAdsense`); if it was already there when a gallery is created, the app opens the gallery page
+        (no ads) instead of showing the passcode, where a new one can be set.
+      - **Account takeover is closed by a step-up code.** Adding or removing a passkey and deleting the account
+        need, besides a sign-in in the last 10 minutes, a 6-digit code emailed to the account for that very
+        change (single use, 10 minutes, 5 tries, 5 codes an hour, stored only as an HMAC), whenever the member's
+        plan shows ads and AdSense is on or was switched in the last 30 minutes (`step_up_needed`; team
+        membership doesn't lift it). The script acts with the session but can't read the member's email. A new
+        passkey's verify call must present the challenge the code was spent on. The code is entered on Settings ›
+        Security, a page without ads.
       - The app Worker widens the CSP for Google's hosts only for documents on the library pages, only while
-        AdSense is on, and only for requests carrying the AdSense cookie (`__Host-zads`). The API sets that
-        HttpOnly, SameSite=Strict cookie for 15 minutes only when it shows the member AdSense, and clears it
-        otherwise and on sign-out. Every other document, including `/index.html`, gets the strict policy.
-        `scripts/csp.mjs` checks both variants and that the ad pages stay narrow.
+        AdSense is on, and only for requests carrying a valid AdSense cookie (`__Host-zads`): HttpOnly,
+        SameSite=Strict, 15 minutes, its value `v1.<expiry>.<member>.<HMAC>` signed with `ADS_COOKIE_SECRET`,
+        which both Workers hold (packages/shared `ads-cookie.ts`). Page script can write a cookie of that name
+        but not a valid value, so the wider policy can't be made to stick for a paid plan or another member. The
+        API sets it only when it shows the member AdSense and clears it otherwise, on every sign-in, on sign-out,
+        and when the session check finds it isn't the member's or their plan has no ads. Every other document,
+        including `/index.html`, gets the strict policy. `scripts/csp.mjs` checks both variants and that the ad
+        pages stay narrow.
+      - A widened document is marked by a `<meta name="zephyr-ads">` the Worker puts first in its `<head>` (the
+        app reads it; a Server-Timing entry isn't exposed for navigations a service worker answers in every
+        browser). It's also sent `Cross-Origin-Opener-Policy: same-origin-allow-popups`, while every other page
+        keeps `same-origin`, so a popup it opens onto another app page lands in a new browsing context group,
+        out of the opener's reach. **Launch gate:** verify this popup isolation in current Chrome, Safari and
+        Firefox before turning AdSense on.
       - The page reloads when the member the script was loaded for is gone (sign-out, an ended session, another
         member) or loses ads. That includes an upgrade or a team joined in this tab, another tab, another device
         or by staff. Tabs tell each other about plan and team changes. A tab holding the script re-reads the
         session, the member's libraries and their ads every 2 minutes and on focus.
-      - **Nothing the script writes can outlive it.** The service worker serves nothing from Cache Storage: no
-        precache, and the offline page is built into `sw.js`. Scripts, styles and WebAssembly come from the HTTP
-        cache, which page script can't write. `scripts/csp.mjs` fails the build if `sw.js` reads a cache.
-        Sign-out, account deletion and every reload off the script answer `Clear-Site-Data: "cache",
-        "storage"`, which wipes Cache Storage, local and session storage, IndexedDB and the service worker.
-        Values the app reads back from storage are validated, never used as markup, script or a navigation
-        target as they are.
+      - **Caches and storage.** The service worker serves nothing from Cache Storage: no precache, and the
+        offline page is built into `sw.js`. Scripts, styles and WebAssembly come from the HTTP cache, which page
+        script can't write. `scripts/csp.mjs` fails the build if `sw.js` reads a cache. Sign-out, account
+        deletion and every reload off the script answer `Clear-Site-Data: "cache", "storage"`, which wipes Cache
+        Storage, local and session storage, IndexedDB and the service worker. When a session ends in a document
+        without the script (a 401, another member, suspension), the app asks the same, and the server clears only
+        if this browser may have run the script (`__Host-zseen`, an HttpOnly cookie set for 30 days whenever
+        AdSense is returned). Values the app reads back from storage are validated, never used as markup, script
+        or a navigation target as they are. What isn't covered: leaving the library pages for another page of the
+        same member keeps storage (the session goes on), and closing the tab clears nothing until that browser's
+        next session end; neither carries code into a later document.
       - App pages are sent `no-store`, and a page restored from the back/forward cache reloads.
       - Google's certified consent message runs for the EEA, UK and Switzerland. Auto ads and other formats that
         Google places itself stay off in the AdSense console (`docs/setup.md` §3.9).
       - AdSense stays off until an Owner turns it on with a recent passkey. Turning it off needs no passkey and
         reaches new page loads within 75 seconds (15 s API cache plus the app Worker's 60 s). Members stop
-        loading the script at once, because `/api/v1/ads` isn't cached. - **Residual risk (accepted):** while a Free member is on a library page with the script loaded, Google's
-        script can read that page and act as the member through the API. Persistence through the origin's
-        caches and storage, and exposure on any other page, are closed. - **Ad events** count at most one impression and one click per member, card and day. Only members who are
-        shown ads can send them. The dedup key is pseudonymous, not anonymous: an HMAC of member, day, card and
-        kind under its own secret (`AD_DEDUP_SECRET`). Whoever holds that secret and the database could recompute
-        it for a given member, so it's kept for two days and never joined to the stats. - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
-        Turnstile.
+        loading the script at once, because `/api/v1/ads` isn't cached.
+
+    - **Residual risk (accepted):** while a Free member is on a library page with the script loaded, Google's
+      script can read that page and act as the member through the API. That includes creating share links and
+      passcodes (or invites) and sending them elsewhere: such access outlives the page view until the member
+      revokes it (Shared › the gallery › End). Taking over the account (passkeys, deletion) needs the emailed
+      step-up code, and code can't persist through the origin's caches or storage.
+    - **Ad events** count at most one impression and one click per member, card and day. Only members who are
+      shown ads can send them. The dedup key is pseudonymous, not anonymous: an HMAC of member, day, card and kind
+      under its own secret (`AD_DEDUP_SECRET`). Whoever holds that secret and the database could recompute it for a
+      given member, so it's kept for two days and never joined to the stats.
+    - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
+      Turnstile.
 
 See the design decisions doc and `docs/phase-8.md` for the details.

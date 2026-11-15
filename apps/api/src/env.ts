@@ -30,6 +30,11 @@ export interface Env {
   IP_HASH_SECRET: string;
   /** Phase 8: keys the per-member, per-day ad event dedup hash (its own secret, never IP_HASH_SECRET). */
   AD_DEDUP_SECRET: string;
+  /**
+   * Phase 8: signs the AdSense cookie's value (packages/shared ads-cookie.ts). The app Worker holds the same secret
+   * and widens a document's CSP only for a valid, unexpired value. Without it the API never sets the cookie.
+   */
+  ADS_COOKIE_SECRET?: string;
   /** Signs the admin idle-timeout cookie. 32+ random bytes. */
   SESSION_HMAC_SECRET: string;
   BURST_LIMITER: RateLimit;

@@ -5,6 +5,7 @@ import { useNavigate } from 'react-router';
 import { DeleteAccountCard } from '../components/DeleteAccount';
 import { SettingsNav } from '../components/SettingsNav';
 import { Shell } from '../components/Shell';
+import { useStepUp } from '../components/StepUp';
 import { ApiFailure, api, errorMessage } from '../lib/api';
 import { createPasskey, isCancelled, passkeysSupported } from '../lib/passkey';
 import { useSession } from '../lib/session';
@@ -49,6 +50,8 @@ export function Security() {
   const [name, setName] = useState(user?.displayName ?? '');
   const [savingName, setSavingName] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Phase 8: while the member may be shown ads, passkey changes also need an emailed code.
+  const stepUp = useStepUp();
 
   const load = useCallback(async () => {
     try {
@@ -78,12 +81,20 @@ export function Security() {
     setAdding(true);
     setError(null);
     try {
-      const opts = await api<PasskeyOptions>(APP_API.myPasskeyOptions, { method: 'POST', body: {} });
-      const credential = await createPasskey(opts);
-      await api(APP_API.myPasskeyVerify, {
-        method: 'POST',
-        body: { challengeId: opts.challengeId, credential },
+      const done = await stepUp.run('passkey_add', async (headers) => {
+        const opts = await api<PasskeyOptions>(APP_API.myPasskeyOptions, {
+          method: 'POST',
+          body: {},
+          headers,
+        });
+        const credential = await createPasskey(opts);
+        await api(APP_API.myPasskeyVerify, {
+          method: 'POST',
+          body: { challengeId: opts.challengeId, credential },
+        });
+        return true;
       });
+      if (!done) return;
       toast.show('Passkey added', 'good');
       await Promise.all([load(), refresh()]);
     } catch (e) {
@@ -110,9 +121,14 @@ export function Security() {
 
   const remove = async () => {
     if (!removing) return;
+    const target = removing;
     try {
-      await api(APP_API.myPasskey(removing.id), { method: 'DELETE' });
       setRemoving(null);
+      const done = await stepUp.run('passkey_remove', async (headers) => {
+        await api(APP_API.myPasskey(target.id), { method: 'DELETE', headers });
+        return true;
+      });
+      if (!done) return;
       toast.show('Passkey removed', 'good');
       await Promise.all([load(), refresh()]);
     } catch (err) {
@@ -282,6 +298,7 @@ export function Security() {
           more. Email codes still work.
         </p>
       </Dialog>
+      {stepUp.dialog}
     </Shell>
   );
 }

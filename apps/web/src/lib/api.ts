@@ -75,6 +75,8 @@ const KNOWN: ApiErrorCode[] = [
   'passkey_failed',
   'passkey_required',
   'reauth_required',
+  'step_up_required',
+  'step_up_invalid',
   'not_found',
   'conflict',
   'account_pending_deletion',
@@ -187,6 +189,10 @@ export function errorMessage(err: unknown): string {
       return 'Add a passkey to continue.';
     case 'reauth_required':
       return 'For your security, sign in again before changing passkeys.';
+    case 'step_up_required':
+      return 'Enter the code we emailed you to confirm this change.';
+    case 'step_up_invalid':
+      return 'That code didn’t work. Check it, or send a new one.';
     case 'unauthenticated':
       return 'Your session ended. Sign in again.';
     case 'forbidden':

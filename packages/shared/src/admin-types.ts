@@ -168,6 +168,13 @@ export const MEMBER8_API = {
    * the AdSense cookie, so nothing the script could have written survives.
    */
   adReset: '/api/v1/ads/reset',
+  /**
+   * POST StepUpBody → 202 { ok, needed: true } (a one-time code was emailed) | 200 { ok, needed: false } (this
+   * member doesn't need one right now) | 429. Phase 8: account-level changes (adding or removing a passkey,
+   * deleting the account) by a member who may be shown AdSense need that code in STEP_UP_HEADER, as well as a
+   * recent sign-in: Google's script runs with the member's session, but can't read their email.
+   */
+  stepUp: '/api/v1/me/step-up',
   /** GET → image (public, immutable; the URL carries the image version) */
   adImage: (cardId: string, version: number) =>
     `/api/v1/ads/cards/${encodeURIComponent(cardId)}/image?v=${version}`,
@@ -183,6 +190,30 @@ export const MEMBER8_API = {
  */
 export const ADS_DOC_COOKIE = '__Host-zads';
 export const ADS_DOC_COOKIE_MAX_AGE = 15 * 60;
+/**
+ * Phase 8: set by GET /api/v1/ads (HttpOnly, 30 days) whenever it returns AdSense: this browser may have run
+ * Google's script. A session that ends in a document without the script asks POST /ads/reset with
+ * `{ ifSeen: true }`, which clears the site's storage only when this cookie is present (then clears it).
+ */
+export const ADS_SEEN_COOKIE = '__Host-zseen';
+export const ADS_SEEN_COOKIE_MAX_AGE = 30 * 24 * 60 * 60;
+/** Account-level changes that need a step-up code while the member may be shown AdSense. */
+export const STEP_UP_OPS = ['passkey_add', 'passkey_remove', 'account_delete'] as const;
+export type StepUpOp = (typeof STEP_UP_OPS)[number];
+/** Request header carrying the emailed step-up code (6 digits). */
+export const STEP_UP_HEADER = 'X-Zephyr-Step-Up';
+export const STEP_UP_CODE_LENGTH = 6;
+/** A code works once, for this long, for one operation; 5 wrong tries burn it; 5 codes per operation an hour. */
+export const STEP_UP_CODE_MINUTES = 10;
+export const STEP_UP_MAX_ATTEMPTS = 5;
+export const STEP_UP_SENDS_PER_HOUR = 5;
+export interface StepUpBody {
+  op: StepUpOp;
+}
+export interface StepUpResult {
+  ok: true;
+  needed: boolean;
+}
 /** TEAM_API.member DELETE accepts ?replaceLinks=1: replaces the links of every live gallery in that library. */
 export const TEAM_REMOVE_REPLACE_LINKS_PARAM = 'replaceLinks';
 /** Most links `gallery_links_replace` rotates in one call (one transaction); the API pages through more. */

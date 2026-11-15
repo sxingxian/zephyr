@@ -1,15 +1,18 @@
+import { signAdsCookie } from '@zephyr/shared/ads-cookie';
 import { ADS_DOC_COOKIE as SHARED_ADS_DOC_COOKIE } from '@zephyr/shared/client';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ADS_DOC_COOKIE, ADS_DOC_TIMING } from './adPages.js';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ADS_DOC_COOKIE } from './adPages.js';
 import { ADSENSE_SOURCES, APP_HEADERS, APP_HEADERS_FILE, appCsp } from './appHeaders.js';
 import { GUEST_CSP, GUEST_HEADERS } from './guestHeaders.js';
 import worker, {
   __resetForTest,
   ADS_CONFIG_PATH,
+  ADS_META_TAG,
   adsenseState,
   hasAdsCookie,
   isGuestPath,
   isStaticFile,
+  markAdsDocument,
   serveGuest,
 } from './index';
 
@@ -116,12 +119,18 @@ function htmlEnv(adsense: { enabled: boolean; publisherId: string | null } | 'er
   return {
     ASSETS: { fetch: assets } as unknown as Fetcher,
     API: { fetch: api } as unknown as Fetcher,
+    ADS_COOKIE_SECRET: SECRET,
     assets,
     api,
   };
 }
-/** A member the API shows AdSense (its cookie). */
-const ADS = { cookie: `${ADS_DOC_COOKIE}=1` };
+const SECRET = 'ads-cookie-secret-for-tests';
+const MEMBER = '11111111-2222-4333-8444-555555555555';
+/** A member the API shows AdSense (its signed cookie), set before the tests run. */
+const ADS = { cookie: '' };
+beforeAll(async () => {
+  ADS.cookie = `${ADS_DOC_COOKIE}=${await signAdsCookie(SECRET, MEMBER, Date.now() / 1000 + 900)}`;
+});
 const directivesOf = (csp: string) =>
   Object.fromEntries(
     csp.split(';').map((d) => {
@@ -136,7 +145,9 @@ describe('app Worker · HTML pages and AdSense', () => {
   it('serves pages with the strict default policy and every security header while AdSense is off', async () => {
     const e = htmlEnv({ enabled: false, publisherId: null });
     const res = await worker.fetch(new Request('https://x/albums/123', { headers: { cookie: 'sid=1' } }), e);
-    expect(await res.text()).toContain('<title>Zephyr</title>');
+    const text = await res.text();
+    expect(text).toContain('<title>Zephyr</title>');
+    expect(text).not.toContain('zephyr-ads');
     const csp = res.headers.get('Content-Security-Policy') ?? '';
     expect(csp).toBe(appCsp([HASH]));
     expect(csp).not.toMatch(/google|doubleclick|evil/);
@@ -148,7 +159,11 @@ describe('app Worker · HTML pages and AdSense', () => {
   it('adds Google’s hosts to exactly four directives while AdSense is on', async () => {
     const e = htmlEnv({ enabled: true, publisherId: PUB });
     const res = await worker.fetch(new Request('https://x/', { headers: ADS }), e);
-    expect(res.headers.get('Server-Timing')).toBe(ADS_DOC_TIMING);
+    // The app's marker (a <meta> at the top of <head>), no Server-Timing, and COOP that cuts off popups it opens.
+    expect(await res.clone().text()).toBe(`${ADS_META_TAG}<!doctype html><title>Zephyr</title>`);
+    expect(res.headers.get('Server-Timing')).toBeNull();
+    expect(res.headers.get('Content-Length')).toBeNull();
+    expect(res.headers.get('Cross-Origin-Opener-Policy')).toBe('same-origin-allow-popups');
     expect(res.headers.get('Cache-Control')).toBe('no-store');
     const csp = res.headers.get('Content-Security-Policy') ?? '';
     expect(csp).toBe(appCsp([HASH], { adsense: true }));
@@ -193,32 +208,48 @@ describe('app Worker · HTML pages and AdSense', () => {
     ]) {
       const res = await worker.fetch(new Request(`https://x${p}`, { headers: ADS }), e);
       expect(res.headers.get('Content-Security-Policy'), p).toBe(appCsp([HASH]));
-      expect(res.headers.get('Server-Timing'), p).toBeNull();
+      expect(res.headers.get('Cross-Origin-Opener-Policy'), p).toBe('same-origin');
+      expect(await res.text(), p).not.toContain('zephyr-ads');
     }
   });
 
-  it('widens the policy only for a request carrying the AdSense cookie (a member the API shows AdSense)', async () => {
+  it('widens the policy only for a request carrying a valid AdSense cookie (signed by the API, unexpired)', async () => {
     const e = htmlEnv({ enabled: true, publisherId: PUB });
     const wide = appCsp([HASH], { adsense: true });
+    const expired = await signAdsCookie(SECRET, MEMBER, Date.now() / 1000 - 1);
+    const otherKey = await signAdsCookie('another-secret-of-enough-length', MEMBER, Date.now() / 1000 + 900);
+    const good = ADS.cookie.slice(ADS_DOC_COOKIE.length + 1);
     for (const cookie of [
       undefined,
       'sid=1',
       `${ADS_DOC_COOKIE}=`,
-      `${ADS_DOC_COOKIE}=0`,
-      `x${ADS_DOC_COOKIE}=1`,
+      `${ADS_DOC_COOKIE}=1`, // what page script could write itself
+      `${ADS_DOC_COOKIE}=${expired}`,
+      `${ADS_DOC_COOKIE}=${otherKey}`,
+      `${ADS_DOC_COOKIE}=${good.replace(/.$/, (c) => (c === 'A' ? 'B' : 'A'))}`,
+      `x${ADS_DOC_COOKIE}=${good}`,
     ]) {
       const res = await worker.fetch(new Request('https://x/', cookie ? { headers: { cookie } } : {}), e);
       expect(res.headers.get('Content-Security-Policy'), String(cookie)).toBe(appCsp([HASH]));
+      expect(res.headers.get('Cross-Origin-Opener-Policy'), String(cookie)).toBe('same-origin');
     }
     expect(e.api).not.toHaveBeenCalled();
     const res = await worker.fetch(
-      new Request('https://x/', { headers: { cookie: `sid=1; ${ADS_DOC_COOKIE}=1` } }),
+      new Request('https://x/', { headers: { cookie: `sid=1; ${ADS.cookie}` } }),
       e,
     );
     expect(res.headers.get('Content-Security-Policy')).toBe(wide);
-    expect(hasAdsCookie(new Request('https://x/', { headers: { cookie: `${ADS_DOC_COOKIE}=1` } }))).toBe(
-      true,
+    expect(await hasAdsCookie(new Request('https://x/', { headers: ADS }), e)).toBe(true);
+    // Without the secret configured, nothing ever widens.
+    expect(await hasAdsCookie(new Request('https://x/', { headers: ADS }), {})).toBe(false);
+  });
+
+  it('puts the marker first in <head>, whatever its attributes', () => {
+    expect(markAdsDocument('<!doctype html><html><head lang="en"><title>x</title></head></html>')).toBe(
+      `<!doctype html><html><head lang="en">${ADS_META_TAG}<title>x</title></head></html>`,
     );
+    expect(markAdsDocument('<HEAD><title>x</title>')).toBe(`<HEAD>${ADS_META_TAG}<title>x</title>`);
+    expect(ADS_META_TAG).toBe('<meta name="zephyr-ads" content="1">');
   });
 
   it('names the same AdSense cookie as the API', () => {

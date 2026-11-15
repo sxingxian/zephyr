@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AD_PAGE_PATTERNS, adsAllowedOn } from '../worker/adPages.js';
+import { AD_PAGE_PATTERNS, ADS_DOC_META, adsAllowedOn } from '../worker/adPages.js';
 import { ADSENSE_SOURCES, APP_HEADERS, APP_HEADERS_FILE, appCsp } from '../worker/appHeaders.js';
 import { GUEST_HEADERS } from '../worker/guestHeaders.js';
 
@@ -38,6 +38,7 @@ const adsenseCsp = appCsp(hashList, { adsense: true });
 checkPolicies(csp, adsenseCsp);
 checkAdPages();
 checkServiceWorker();
+checkAdsMarker();
 writeFileSync(join(dist, APP_HEADERS_FILE.slice(1)), `${JSON.stringify({ hashes: hashList })}\n`);
 
 // The guest page (served for /g/* by the Worker, which sets these same headers) replaces the app's policy.
@@ -162,7 +163,7 @@ function checkAdPages() {
 }
 
 console.log(
-  `_headers written · ${pages.length} page(s) · ${hashes.size} inline script hash(es) · CSP variants, ad pages and service worker checked (default, AdSense; no cache reads)`,
+  `_headers written · ${pages.length} page(s) · ${hashes.size} inline script hash(es) · CSP variants, ad pages, AdSense marker and service worker checked (default, AdSense; no cache reads)`,
 );
 
 // Phase 8: Google's AdSense script runs in Free members' library pages with this origin, and Cache Storage is
@@ -182,4 +183,17 @@ function checkServiceWorker() {
   if (/\.match\(|\.matchAll\(|cache\.put|\.addAll\(/.test(sw)) fail('sw.js reads or fills a cache');
   if (/\bimport\s*\(|importScripts|^\s*import\s|\bexport\s/m.test(sw)) fail('sw.js loads other code');
   if (files.some((f) => /^workbox-.*\.js$/.test(f))) fail('a Workbox runtime file was emitted');
+}
+
+// Phase 8: the app Worker marks a document it served with the AdSense policy by putting a <meta name="zephyr-ads">
+// first in its <head>; the app reads it to know Google's script may load. The built page must have a <head> for
+// that, and must never carry the marker itself (then every document would claim the wider policy).
+function checkAdsMarker() {
+  const fail = (m) => {
+    throw new Error(`AdSense marker check failed: ${m}`);
+  };
+  const index = readFileSync(join(dist, 'index.html'), 'utf8');
+  if (!/<head(\s[^>]*)?>/i.test(index)) fail('index.html has no <head> for the marker');
+  for (const file of pages)
+    if (readFileSync(file, 'utf8').includes(ADS_DOC_META)) fail(`${file} carries the marker`);
 }

@@ -143,7 +143,12 @@ describe('email code: verify and the session cookies', () => {
       user: { email: 'mei@example.com', displayName: 'Mei Lin', plan: 'free', passkeyCount: 1 },
     });
     expect(JSON.stringify(body)).not.toMatch(/access_token|refresh_token|eyJ/);
-    const cookies = res.headers.getSetCookie();
+    const all = res.headers.getSetCookie();
+    // Phase 8: a new sign-in also clears any AdSense cookie (GET /ads sets a fresh one for this member if any).
+    const ads = all.filter((ck) => ck.startsWith('__Host-zads='));
+    expect(ads).toHaveLength(1);
+    expect(ads[0]).toContain('Max-Age=0');
+    const cookies = all.filter((ck) => !ck.startsWith('__Host-zads='));
     expect(cookies).toHaveLength(2);
     for (const ck of cookies) {
       expect(ck).toMatch(/^__Host-zs-(at|rt)=/);
@@ -333,6 +338,128 @@ describe('passkeys', () => {
 
   it('passkey routes need a session', async () => {
     expect((await call('/api/v1/me/passkeys/options', { body: {} })).status).toBe(401);
+  });
+});
+
+describe('step-up codes (phase 8: account changes while the member may be shown AdSense)', () => {
+  const H = 'X-Zephyr-Step-Up';
+  const lastCode = () =>
+    /^(\d{6}) is your Zephyr confirmation code$/.exec(world.emails.at(-1)?.subject ?? '')?.[1];
+  const askCode = async (j: ReturnType<typeof jar>, op: string) =>
+    call('/api/v1/me/step-up', { body: { op }, jar: j });
+  const del = (j: ReturnType<typeof jar>, code?: string) =>
+    call('/api/v1/me/passkeys/pk-0', {
+      method: 'DELETE',
+      jar: j,
+      headers: { 'Content-Length': '0', ...(code ? { [H]: code } : {}) },
+    });
+
+  it('members who aren’t shown AdSense keep the recent sign-in check alone', async () => {
+    const { j } = await signIn();
+    expect(await read(await askCode(j, 'passkey_remove'))).toEqual({ ok: true, needed: false });
+    expect(world.emails).toHaveLength(0);
+    expect((await del(j)).status).toBe(204);
+  });
+
+  it('without a code: step_up_required; the emailed code works once, for that operation only', async () => {
+    world.stepUp.needed = true;
+    const { j } = await signIn();
+    const none = await del(j);
+    expect(none.status).toBe(403);
+    expect((await read(none)).error).toBe('step_up_required');
+    const sent = await askCode(j, 'passkey_remove');
+    expect(sent.status).toBe(202);
+    expect(await read(sent)).toEqual({ ok: true, needed: true });
+    const email = world.emails.at(-1);
+    expect(email?.to).toBe('mei@example.com');
+    expect(email?.text).toContain('remove a passkey from your account');
+    const code = lastCode() ?? '';
+    expect(code).toMatch(/^\d{6}$/);
+    // Only a hash is stored, never the code.
+    expect([...world.stepUp.codes.values()].some((r) => String(r.hash).includes(code))).toBe(false);
+    // Not for another operation.
+    const wrongOp = await call('/api/v1/me/delete', {
+      body: { confirm: 'DELETE' },
+      jar: j,
+      headers: { [H]: code },
+    });
+    expect((await read(wrongOp)).error).toBe('step_up_invalid');
+    const bad = await del(j, code === '000000' ? '000001' : '000000');
+    expect((await read(bad)).error).toBe('step_up_invalid');
+    expect((await read(await del(j, '12ab56'))).error).toBe('step_up_invalid');
+    expect((await del(j, code)).status).toBe(204);
+    const again = await del(j, code);
+    expect((await read(again)).error).toBe('step_up_invalid');
+  });
+
+  it('expired codes and a fifth wrong try are refused', async () => {
+    world.stepUp.needed = true;
+    const { j } = await signIn();
+    await askCode(j, 'passkey_remove');
+    const code = lastCode() ?? '';
+    for (const r of world.stepUp.codes.values()) r.expires = Date.now() - 1;
+    expect((await read(await del(j, code))).error).toBe('step_up_invalid');
+    await askCode(j, 'passkey_remove');
+    const fresh = lastCode() ?? '';
+    const wrong = fresh === '999999' ? '999998' : '999999';
+    for (let i = 0; i < 5; i++) await del(j, wrong);
+    expect((await read(await del(j, fresh))).error).toBe('step_up_invalid');
+  });
+
+  it('five codes an hour per operation', async () => {
+    world.stepUp.needed = true;
+    const { j } = await signIn();
+    for (let i = 0; i < 5; i++) expect((await askCode(j, 'account_delete')).status).toBe(202);
+    const sixth = await askCode(j, 'account_delete');
+    expect(sixth.status).toBe(429);
+    expect(world.emails).toHaveLength(5);
+    expect((await askCode(j, 'nope')).status).toBe(400);
+  });
+
+  it('adding a passkey: the code is spent on the options, and only that challenge can be completed', async () => {
+    world.stepUp.needed = true;
+    const { j } = await signIn();
+    const none = await call('/api/v1/me/passkeys/options', { body: {}, jar: j });
+    expect((await read(none)).error).toBe('step_up_required');
+    // A challenge from options without a code (another route to one) can't be verified.
+    const sneaky = await call('/api/v1/me/passkeys/verify', {
+      body: { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
+      jar: j,
+    });
+    expect((await read(sneaky)).error).toBe('step_up_required');
+    await askCode(j, 'passkey_add');
+    const code = lastCode() ?? '';
+    const opt = await call('/api/v1/me/passkeys/options', { body: {}, jar: j, headers: { [H]: code } });
+    expect((await read(opt)).challengeId).toBe('ch-reg');
+    const other = await call('/api/v1/me/passkeys/verify', {
+      body: { challengeId: 'ch-other', credential: credential('webauthn.create', APP) },
+      jar: j,
+    });
+    expect((await read(other)).error).toBe('step_up_required');
+    const reg = await call('/api/v1/me/passkeys/verify', {
+      body: { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
+      jar: j,
+    });
+    expect(reg.status).toBe(201);
+    const replay = await call('/api/v1/me/passkeys/verify', {
+      body: { challengeId: 'ch-reg', credential: credential('webauthn.create', APP) },
+      jar: j,
+    });
+    expect((await read(replay)).error).toBe('step_up_required');
+  });
+
+  it('a recent sign-in is still checked first, and the check fails closed', async () => {
+    world.stepUp.needed = true;
+    const { j } = await signIn();
+    const stale = jar();
+    stale.cookies.set('__Host-zs-at', await sbToken({ sub: MEI().id, email: MEI().email, authAgo: 11 * 60 }));
+    for (const [k, v] of j.cookies) if (k !== '__Host-zs-at') stale.cookies.set(k, v);
+    expect(await read(await del(stale))).toEqual({ ok: false, error: 'reauth_required' });
+    world.rpc.step_up_needed = () => new Response('{}', { status: 500 });
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect((await del(j)).status).toBe(500);
+    expect((await askCode(j, 'passkey_remove')).status).toBe(500);
+    spy.mockRestore();
   });
 });
 

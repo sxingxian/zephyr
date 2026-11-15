@@ -67,6 +67,8 @@ export type ApiErrorCode =
   | 'passkey_failed' // WebAuthn ceremony rejected
   | 'passkey_required' // admin: enrolment session can only add a passkey
   | 'reauth_required' // adding or removing a passkey needs a sign-in in the last 10 minutes
+  | 'step_up_required' // phase 8 (403): also needs the one-time code emailed by POST /me/step-up
+  | 'step_up_invalid' // phase 8 (403): that code is wrong, expired, used or for another change
   | 'not_found'
   | 'conflict'
   | 'account_pending_deletion' // scheduled for deletion: only restore, session and sign-out work

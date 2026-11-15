@@ -85,7 +85,7 @@ function Root() {
     const next = safeReturnPath(`${loc.pathname}${loc.search}`);
     const to = next === '/' ? '/sign-in' : `/sign-in?next=${encodeURIComponent(next)}`;
     if (loc.pathname.startsWith('/sign-in')) nav(to, { replace: true });
-    else browser.assign(to);
+    else browser.assign(to, { sessionEnd: true });
   }, [nav, loc.pathname, loc.search]);
   return (
     <SessionProvider onUnauthenticated={onUnauthenticated}>

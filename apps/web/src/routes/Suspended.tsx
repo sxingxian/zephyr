@@ -32,7 +32,7 @@ export function SuspendedPage() {
         busy={busy}
         onClick={() => {
           setBusy(true);
-          browser.assign('/sign-in');
+          browser.assign('/sign-in', { sessionEnd: true });
         }}
       >
         Use a different account

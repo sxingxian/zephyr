@@ -132,3 +132,42 @@ export function accountDeletionEmail(e: AccountDeletionEmail): {
   const text = [subject, '', what, '', undo, `Open Zephyr: ${e.appUrl}`, '', advice].join('\n');
   return { subject, html, text };
 }
+
+export interface StepUpEmail {
+  code: string;
+  op: 'passkey_add' | 'passkey_remove' | 'account_delete';
+  minutes: number;
+}
+
+const STEP_UP_WHAT: Record<StepUpEmail['op'], string> = {
+  passkey_add: 'add a passkey to your account',
+  passkey_remove: 'remove a passkey from your account',
+  account_delete: 'delete your account',
+};
+
+/**
+ * Phase 8: the one-time code that confirms an account-level change (adding or removing a passkey, deleting the
+ * account) while the member may be shown ads. Only the six digits and fixed text; nothing user-provided.
+ */
+export function stepUpEmail(e: StepUpEmail): { subject: string; html: string; text: string } {
+  const code = /^\d{4,10}$/.test(e.code) ? e.code : '';
+  const subject = `${code} is your Zephyr confirmation code`;
+  const what = `Enter this code in Zephyr to ${STEP_UP_WHAT[e.op]}. It works once, for ${e.minutes} minutes.`;
+  const advice =
+    'Didn’t ask for this? Don’t enter the code anywhere. Your account stays as it is; sign out of Zephyr on any device you don’t recognise and reply to this email so we can help.';
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#F4F6F9;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0D1117;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F4F6F9;padding:40px 16px;"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#FFFFFF;border-radius:20px;padding:36px 32px;">
+<tr><td style="font-size:20px;font-weight:600;letter-spacing:-0.02em;padding-bottom:28px;">zephyr</td></tr>
+<tr><td style="font-size:22px;font-weight:600;letter-spacing:-0.03em;line-height:1.25;padding-bottom:12px;">Confirm this change</td></tr>
+<tr><td style="font-size:15px;line-height:1.55;color:#2A313C;padding-bottom:20px;">${escapeHtml(what)}</td></tr>
+<tr><td style="font-family:'SF Mono',ui-monospace,Menlo,Consolas,monospace;font-size:32px;font-weight:600;letter-spacing:0.18em;padding-bottom:24px;">${escapeHtml(code)}</td></tr>
+<tr><td style="font-size:13px;line-height:1.55;color:#566070;">${escapeHtml(advice)}</td></tr>
+</table>
+<p style="font-size:12px;color:#566070;margin:20px 0 0;">Midnight Poetry Studio · zephyr.midnightpoetry.studio</p>
+</td></tr></table></body></html>`;
+  const text = [subject, '', what, '', code, '', advice].join('\n');
+  return { subject, html, text };
+}

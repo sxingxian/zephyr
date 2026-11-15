@@ -1,12 +1,16 @@
 import {
   type Accepted,
+  ADS_DOC_COOKIE,
   emailStartSchema,
   emailVerifySchema,
   type PasskeyOptions,
+  PLANS,
   passkeyVerifySchema,
   type SessionResponse,
+  verifyAdsCookie,
 } from '@zephyr/shared';
 import { type Context, Hono } from 'hono';
+import { getCookie } from 'hono/cookie';
 import {
   CODE_WINDOW,
   padReply,
@@ -16,6 +20,8 @@ import {
 } from '../auth/code-limits';
 import { type GoTrueSession, gotrue } from '../auth/gotrue';
 import {
+  adsDocCookie,
+  adsSeenCookie,
   appendCookies,
   clearCookies,
   endSession,
@@ -190,6 +196,14 @@ appAuthRoutes.post('/passkey/verify', async (c) => {
 
 appAuthRoutes.get('/session', requireMember, async (c) => {
   const body: SessionResponse = { ok: true, user: await sessionUser(c, c.get('session'), c.get('profile')) };
+  // Phase 8: an AdSense cookie that isn't this member's, isn't valid, or belongs to a plan without ads goes now
+  // (GET /ads, which only Free members call, would otherwise be the only thing to clear it).
+  const raw = getCookie(c, ADS_DOC_COOKIE);
+  if (raw !== undefined) {
+    const owner = await verifyAdsCookie(c.env.ADS_COOKIE_SECRET, raw);
+    const ads = PLANS.find((p) => p.id === body.user.plan)?.limits.ads === true;
+    if (owner !== body.user.id || !ads) appendCookies(c, [await adsDocCookie(c.env, null)]);
+  }
   return c.json(body);
 });
 
@@ -200,6 +214,7 @@ appAuthRoutes.post('/sign-out', async (c) => {
   // storage area (local and session storage, IndexedDB, Cache Storage, the service worker), so nothing a page
   // script wrote (Google's AdSense script runs in Free members' library pages) survives into the next session.
   c.header('Clear-Site-Data', '"cache", "storage"');
+  appendCookies(c, [adsSeenCookie(false)]);
   return c.body(null, 204);
 });
 
@@ -231,6 +246,8 @@ export async function startMemberSession(
     return c.json(fail('forbidden'), 403);
   }
   appendCookies(c, sessionCookies('app', session));
+  // Phase 8: a new sign-in never inherits an AdSense cookie (GET /ads sets a fresh one for this member if any).
+  appendCookies(c, [await adsDocCookie(c.env, null)]);
   const active = {
     userId: claims.sub,
     email: (claims.email ?? '').toLowerCase(),

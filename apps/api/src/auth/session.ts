@@ -13,7 +13,13 @@
  * 30 idle minutes.
  */
 
-import { ADS_DOC_COOKIE } from '@zephyr/shared';
+import {
+  ADS_DOC_COOKIE,
+  ADS_DOC_COOKIE_MAX_AGE,
+  ADS_SEEN_COOKIE,
+  ADS_SEEN_COOKIE_MAX_AGE,
+  signAdsCookie,
+} from '@zephyr/shared';
 import type { Context, MiddlewareHandler } from 'hono';
 import { getCookie } from 'hono/cookie';
 import { createRemoteJWKSet, type JWTPayload, jwtVerify } from 'jose';
@@ -86,6 +92,25 @@ export function clearCookies(realm: Realm): string[] {
   // Phase 8: the AdSense cookie goes with the member's session (the next document gets the strict CSP).
   if (realm === 'app') out.push(cookie(ADS_DOC_COOKIE, '', '/', 'Strict', 0));
   return out;
+}
+
+/**
+ * Phase 8: the AdSense cookie for `userId` (a signed, 15-minute value the app Worker checks before it widens a
+ * document's CSP), or the header that clears it (`userId` null, or no ADS_COOKIE_SECRET configured).
+ */
+export async function adsDocCookie(env: Env, userId: string | null): Promise<string> {
+  if (!userId || !env.ADS_COOKIE_SECRET || env.ADS_COOKIE_SECRET.length < 16)
+    return cookie(ADS_DOC_COOKIE, '', '/', 'Strict', 0);
+  const value = await signAdsCookie(
+    env.ADS_COOKIE_SECRET,
+    userId,
+    Math.floor(Date.now() / 1000) + ADS_DOC_COOKIE_MAX_AGE,
+  );
+  return cookie(ADS_DOC_COOKIE, value, '/', 'Strict', ADS_DOC_COOKIE_MAX_AGE);
+}
+/** Phase 8: "this browser may have run Google's AdSense script" (30 days), or the header that clears it. */
+export function adsSeenCookie(on: boolean): string {
+  return cookie(ADS_SEEN_COOKIE, on ? '1' : '', '/', 'Strict', on ? ADS_SEEN_COOKIE_MAX_AGE : 0);
 }
 
 export async function adminSeenCookie(env: Env, userId: string): Promise<string> {

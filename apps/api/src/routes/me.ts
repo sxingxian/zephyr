@@ -5,11 +5,16 @@ import {
   passkeyVerifySchema,
   profilePatchSchema,
   type SessionResponse,
+  STEP_UP_HEADER,
+  type StepUpOp,
+  type StepUpResult,
+  stepUpSchema,
   type Usage,
 } from '@zephyr/shared';
 import { Hono, type MiddlewareHandler } from 'hono';
 import { gotrue } from '../auth/gotrue';
-import { appendCookies, clearCookies, recentlyAuthenticated } from '../auth/session';
+import { adsSeenCookie, appendCookies, clearCookies, recentlyAuthenticated } from '../auth/session';
+import { checkStepUp, issueStepUp, stepUpNeeded, useStepUpGrant } from '../auth/step-up';
 import { ceremonyMatches } from '../auth/webauthn';
 import { cancelForDeletion, undoCancelForDeletion } from '../billing/deletion';
 import { notifyAccountDeletion, notifyPasskeyChange } from '../email/notify';
@@ -39,6 +44,42 @@ const requireRecentAuth: MiddlewareHandler<HonoEnv> = async (c, next) => {
   await next();
 };
 
+/**
+ * Phase 8 (review round 3): while the member may be shown AdSense, Google's script runs with their session, so a
+ * recent sign-in isn't enough: these changes also need the one-time code emailed by POST /step-up for this very
+ * operation (auth/step-up.ts). Fails closed when the database can't say whether one is needed.
+ */
+const requireStepUp =
+  (op: StepUpOp): MiddlewareHandler<HonoEnv> =>
+  async (c, next) => {
+    try {
+      if (await stepUpNeeded(c)) {
+        const r = await checkStepUp(c, op);
+        if (r === 'missing') return c.json(fail('step_up_required'), 403);
+        if (r === 'invalid') return c.json(fail('step_up_invalid'), 403);
+      }
+    } catch (err) {
+      logError(c.get('requestId'), 'step_up_check', err);
+      return c.json(fail('server'), 500);
+    }
+    await next();
+  };
+
+/** Emails a step-up code for one operation, when this member needs one (else says so). */
+meRoutes.post('/step-up', async (c) => {
+  const body = await readBody(c, stepUpSchema);
+  if (!body) return c.json(fail('invalid'), 400);
+  if (!(await burstOk(c, 'step_up'))) return rateLimited(c, 60);
+  try {
+    if (!(await stepUpNeeded(c))) return c.json({ ok: true, needed: false } satisfies StepUpResult);
+    if ((await issueStepUp(c, body.op)) === 'rate_limited') return rateLimited(c, 3600);
+    return c.json({ ok: true, needed: true } satisfies StepUpResult, 202);
+  } catch (err) {
+    logError(c.get('requestId'), 'step_up_issue', err);
+    return c.json(fail('server'), 500);
+  }
+});
+
 meRoutes.patch('/', async (c) => {
   const body = await readBody(c, profilePatchSchema);
   if (!body) return c.json(fail('invalid'), 400);
@@ -66,7 +107,15 @@ meRoutes.get('/passkeys', async (c) => {
 meRoutes.post('/passkeys/options', requireRecentAuth, async (c) => {
   if (!(await burstOk(c, 'passkey_reg'))) return rateLimited(c, 60);
   try {
+    // Phase 8: a member who may be shown AdSense spends their step-up code here; it leaves a grant for this
+    // challenge only, which the verify call below must present.
+    const needed = await stepUpNeeded(c);
+    if (needed && !c.req.header(STEP_UP_HEADER)) return c.json(fail('step_up_required'), 403);
     const ch = await gotrue.passkeyRegisterOptions(c.env, c.get('session').accessToken);
+    if (needed) {
+      const r = await checkStepUp(c, 'passkey_add', ch.challenge_id);
+      if (r !== 'ok') return c.json(fail(r === 'missing' ? 'step_up_required' : 'step_up_invalid'), 403);
+    }
     return c.json({ challengeId: ch.challenge_id, options: ch.options });
   } catch (err) {
     logError(c.get('requestId'), 'passkey_reg_options', err);
@@ -81,6 +130,9 @@ meRoutes.post('/passkeys/verify', requireRecentAuth, async (c) => {
     return c.json(fail('passkey_failed'), 400);
   }
   try {
+    // Phase 8: only a challenge issued after a step-up code (when one is needed) can be completed.
+    if ((await stepUpNeeded(c)) && !(await useStepUpGrant(c, 'passkey_add', body.challengeId)))
+      return c.json(fail('step_up_required'), 403);
     const pk = await gotrue.passkeyRegisterVerify(
       c.env,
       c.get('session').accessToken,
@@ -114,19 +166,28 @@ meRoutes.patch('/passkeys/:id', async (c) => {
   }
 });
 
-meRoutes.delete('/passkeys/:id', requireRecentAuth, async (c) => {
-  const id = c.req.param('id');
-  if (!PASSKEY_ID.test(id)) return c.json(fail('invalid'), 400);
-  try {
-    await gotrue.deletePasskey(c.env, c.get('session').accessToken, id);
-    await notifyPasskeyChange(c, c.get('session').email, 'removed', null, 'Zephyr');
-    return c.body(null, 204);
-  } catch (err) {
-    if (err instanceof UpstreamError && err.status === 404) return c.json(fail('not_found'), 404);
-    logError(c.get('requestId'), 'passkey_delete', err);
-    return c.json(fail('server'), 500);
-  }
-});
+meRoutes.delete(
+  '/passkeys/:id',
+  requireRecentAuth,
+  async (c, next) => {
+    // A malformed id never spends a step-up code.
+    if (!PASSKEY_ID.test(c.req.param('id'))) return c.json(fail('invalid'), 400);
+    await next();
+  },
+  requireStepUp('passkey_remove'),
+  async (c) => {
+    const id = c.req.param('id');
+    try {
+      await gotrue.deletePasskey(c.env, c.get('session').accessToken, id);
+      await notifyPasskeyChange(c, c.get('session').email, 'removed', null, 'Zephyr');
+      return c.body(null, 204);
+    } catch (err) {
+      if (err instanceof UpstreamError && err.status === 404) return c.json(fail('not_found'), 404);
+      logError(c.get('requestId'), 'passkey_delete', err);
+      return c.json(fail('server'), 500);
+    }
+  },
+);
 
 // Phase 7: the open library's storage (the sidebar meter of a team library shows the owner's usage).
 meRoutes.get('/usage', libraryContext, async (c) => {
@@ -146,7 +207,7 @@ meRoutes.get('/usage', libraryContext, async (c) => {
  * Schedules the account for deletion in 30 days, signs out every session (all devices) and emails the
  * account. Signing in again shows the Restore screen until the purge job runs.
  */
-meRoutes.post('/delete', requireRecentAuth, async (c) => {
+meRoutes.post('/delete', requireRecentAuth, requireStepUp('account_delete'), async (c) => {
   const body = await readBody(c, deleteAccountSchema);
   if (!body) return c.json(fail('invalid'), 400);
   const s = c.get('session');
@@ -170,7 +231,7 @@ meRoutes.post('/delete', requireRecentAuth, async (c) => {
       // The pending-deletion gate still refuses every other route for any session left.
       logError(c.get('requestId'), 'delete_logout', err);
     }
-    appendCookies(c, clearCookies('app'));
+    appendCookies(c, [...clearCookies('app'), adsSeenCookie(false)]);
     c.header('Clear-Site-Data', '"cache", "storage"');
     await notifyAccountDeletion(c, s.email, purgeAt);
     return c.json({ ok: true, purgeAt } satisfies DeleteAccountResult);
