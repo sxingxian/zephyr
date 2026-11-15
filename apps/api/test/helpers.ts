@@ -349,6 +349,10 @@ export async function sessionFor(u: User, amr: string[] = ['otp']) {
 
 // Default RPC behaviour, close enough to the SQL for routing tests. Tests override as needed.
 const defaultRpc: Record<string, (a: Record<string, unknown>) => unknown> = {
+  // Storage follow-ups (phase 8): none due unless a test says otherwise.
+  storage_followup_add: () => 1,
+  storage_followup_done: () => null,
+  storage_followups_due: () => [],
   get_public_config: () => ({
     signupMode: 'invite_only',
     acceptingInviteRequests: true,

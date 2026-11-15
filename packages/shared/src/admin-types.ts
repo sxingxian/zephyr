@@ -508,7 +508,10 @@ export interface StorageMigration {
   canRollBack: boolean;
   startedAt: string;
   startedBy: string;
-  photos: { total: number; copied: number; verified: number; failed: number };
+  /** waiting: queued photos still uploading or publishing their variants (copied once they're done; the
+   *  migration can't finish before). */
+  photos: { total: number; copied: number; verified: number; failed: number; waiting?: number };
+  /** total is approximate while photos move: photos not copied yet count their original and variants only. */
   bytes: { total: number; copied: number };
   /** Old copies are deleted only after every photo is verified and this hold has passed. */
   deleteOldAfter: string | null;

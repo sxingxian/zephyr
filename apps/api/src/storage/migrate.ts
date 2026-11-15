@@ -16,7 +16,9 @@
  *   storage_old_copies_due says the hold has passed. Each deletion is claimed first (from then on the move
  *   can't be rolled back); for a photo that moved, any object missing on its store is copied there first.
  * - Writers that store an object under a photo's prefix call `followMove` after recording it, so an object
- *   written to the old store while the photo was being flipped ends up on the new store too.
+ *   written to the old store while the photo was being flipped ends up on the new store too. A copy that fails
+ *   is recorded (storage_followups) and retried by the 5-minute cron; until then the orphan sweep leaves copies
+ *   away from their photo's store alone.
  *
  * Nothing here logs keys, endpoints or error bodies: only store ids and short StoreError codes.
  */
@@ -41,6 +43,8 @@ export const MIGRATION_LIMITS = {
   backoffMaxS: 3600,
   /** Old-copy deletions per cron run. */
   oldCopies: 50,
+  /** Follow-up copies per cron run. */
+  followups: 50,
   /** Re-lists of the source prefix to pick up objects written while a photo was being copied. */
   passes: 3,
 } as const;
@@ -112,8 +116,10 @@ export async function copyVerified(from: ObjectStore, to: ObjectStore, key: stri
 
 /**
  * Copies and verifies every object of one photo. Re-lists until a pass finds nothing new. Throws
- * `source_incomplete` unless every key in `lease.keys` (always at least the original) was copied and the copy
- * weighs at least `lease.minBytes`: an empty or partial listing never counts as a copy.
+ * `source_incomplete` unless the original was copied from the source, every other key in `lease.keys` was
+ * copied or is already on the destination (an object a writer stored on the old store whose follow-up copy
+ * hadn't reached the new one, met again by a rollback; keys never change content), and the copy weighs at
+ * least `lease.minBytes`: an empty or partial listing never counts as a copy.
  */
 export async function copyPhoto(env: Env, item: MigrationItem, lease: ItemLease): Promise<number> {
   const from = photoStore(env, item.from);
@@ -131,8 +137,16 @@ export async function copyPhoto(env: Env, item: MigrationItem, lease: ItemLease)
       done.add(key);
     }
   }
-  const required = new Set([`${prefix}original`, ...lease.keys.filter((k) => k.startsWith(prefix))]);
-  for (const key of required) if (!done.has(key)) throw new StoreError('source_incomplete');
+  const original = `${prefix}original`;
+  if (!done.has(original)) throw new StoreError('source_incomplete');
+  const required = new Set([original, ...lease.keys.filter((k) => k.startsWith(prefix))]);
+  for (const key of required) {
+    if (done.has(key)) continue;
+    const there = await to.head(key);
+    if (!there) throw new StoreError('source_incomplete');
+    bytes += there.size;
+    done.add(key);
+  }
   if (bytes <= 0 || bytes < lease.minBytes) throw new StoreError('source_incomplete');
   return bytes;
 }
@@ -258,24 +272,103 @@ export async function deleteOldCopy(env: Env, item: OldCopyItem): Promise<number
  * writing): if the photo has moved since, the object is copied to the photo's store now. The flip and the
  * record are serialised by the photo's row, and the record changes the photo's stamp, so either the copy that
  * was being made is refused (and redone with this object), or the photo had already moved and this copies the
- * object after it. A failure here is logged: the old copy keeps the object, and the old-copy deletion copies
- * anything missing forward before deleting.
+ * object after it. The copy is recorded as a follow-up first and cleared once it's done, so a copy that fails
+ * (or a Worker that stops half-way) is retried by the cron. If the photo's store can't even be read, the
+ * follow-up is recorded anyway: the cron works out where the photo is.
  */
 export async function followMove(env: Env, photoId: string, wrote: string, keys: string[]): Promise<void> {
   if (!keys.length) return;
+  let now: string | null;
   try {
-    const now = await rpc<string | null>(env, 'storage_photo_store', { p_photo: photoId });
-    if (!now || now === wrote) return;
+    now = await rpc<string | null>(env, 'storage_photo_store', { p_photo: photoId });
+  } catch (err) {
+    logError('storage', 'follow_move_store', err);
+    await recordFollowup(env, photoId, wrote, keys);
+    return;
+  }
+  if (!now || now === wrote) return;
+  const recorded = await recordFollowup(env, photoId, wrote, keys);
+  try {
     const from = photoStore(env, wrote);
     const to = photoStore(env, now);
     for (const key of keys) await copyVerified(from, to, key);
   } catch (err) {
     logError('storage', 'follow_move', err);
+    return;
+  }
+  if (recorded) for (const key of keys) await followupDone(env, photoId, key, wrote, true);
+}
+
+async function recordFollowup(env: Env, photoId: string, from: string, keys: string[]): Promise<boolean> {
+  try {
+    for (let i = 0; i < keys.length; i += 20) {
+      await rpc(env, 'storage_followup_add', {
+        p_photo: photoId,
+        p_from: from,
+        p_keys: keys.slice(i, i + 20),
+      });
+    }
+    return true;
+  } catch (err) {
+    logError('storage', 'follow_move_record', err);
+    return false;
   }
 }
 
-/** The 5-minute cron's migration part: keep a migration moving, and delete old copies once due. */
-export async function runMigrationCron(env: Env): Promise<{ enqueued: boolean; oldCopiesDeleted: number }> {
+async function followupDone(
+  env: Env,
+  photoId: string,
+  key: string,
+  from: string,
+  ok: boolean,
+): Promise<void> {
+  try {
+    await rpc(env, 'storage_followup_done', { p_photo: photoId, p_key: key, p_from: from, p_ok: ok });
+  } catch (err) {
+    // Listed again later: a copy that's already there is just cleared then.
+    logError('storage', 'follow_move_done', err);
+  }
+}
+
+export interface FollowupItem {
+  photoId: string;
+  key: string;
+  from: string;
+  /** The photo's store now, or null once it's gone. */
+  to: string | null;
+}
+
+/**
+ * Retries follow-up copies: each object goes from the store it was written to to wherever its photo is now
+ * (unless it's already there, or the photo is gone or back on that store). Returns how many were copied.
+ */
+export async function runFollowups(env: Env): Promise<number> {
+  const due = await rpc<FollowupItem[]>(env, 'storage_followups_due', {
+    p_limit: MIGRATION_LIMITS.followups,
+  });
+  let copied = 0;
+  for (const item of due ?? []) {
+    try {
+      if (item.to && item.to !== item.from) {
+        const to = photoStore(env, item.to);
+        if (!(await to.head(item.key))) {
+          const n = await copyVerified(photoStore(env, item.from), to, item.key);
+          if (n !== null) copied++;
+        }
+      }
+      await followupDone(env, item.photoId, item.key, item.from, true);
+    } catch (err) {
+      logError('cron', `storage_followup ${item.from}`, err);
+      await followupDone(env, item.photoId, item.key, item.from, false);
+    }
+  }
+  return copied;
+}
+
+/** The 5-minute cron's migration part: keep a migration moving, delete old copies once due, retry follow-ups. */
+export async function runMigrationCron(
+  env: Env,
+): Promise<{ enqueued: boolean; oldCopiesDeleted: number; followupsCopied: number }> {
   let enqueued = false;
   try {
     const status = await rpc<{ migration: { id: string; state: string } | null } | null>(
@@ -309,5 +402,11 @@ export async function runMigrationCron(env: Env): Promise<{ enqueued: boolean; o
   } catch (err) {
     logError('cron', 'storage_old_copies', err);
   }
-  return { enqueued, oldCopiesDeleted };
+  let followupsCopied = 0;
+  try {
+    followupsCopied = await runFollowups(env);
+  } catch (err) {
+    logError('cron', 'storage_followups', err);
+  }
+  return { enqueued, oldCopiesDeleted, followupsCopied };
 }

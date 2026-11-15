@@ -366,8 +366,11 @@ export function Storage() {
                     />
                     <span className="z-hint">
                       {n(mig.photos.copied)} of {n(mig.photos.total)} photos · {formatBytes(mig.bytes.copied)}{' '}
-                      of {formatBytes(mig.bytes.total)}
+                      of about {formatBytes(mig.bytes.total)}
                       {mig.photos.failed ? ` · ${n(mig.photos.failed)} retrying` : ''}
+                      {mig.photos.waiting
+                        ? ` · ${n(mig.photos.waiting)} waiting for uploads in progress to finish`
+                        : ''}
                     </span>
                   </div>
                   <div>

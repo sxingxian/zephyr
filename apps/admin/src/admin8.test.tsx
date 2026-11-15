@@ -343,7 +343,7 @@ const MOVING: AdminStorageResult = {
     canRollBack: true,
     startedAt: '2026-11-14T01:12:00Z',
     startedBy: 'Jason L.',
-    photos: { total: 9_800_000, copied: 6_100_000, verified: 6_000_000, failed: 12 },
+    photos: { total: 9_800_000, copied: 6_100_000, verified: 6_000_000, failed: 12, waiting: 3 },
     bytes: { total: 41.6e12, copied: 25.8e12 },
     deleteOldAfter: null,
     lastError: null,
@@ -398,6 +398,7 @@ describe('Storage', () => {
     renderAt('/storage');
     const bar = await screen.findByRole('progressbar', { name: 'Photos copied' }, T);
     expect(bar.getAttribute('aria-valuenow')).toBe('62');
+    expect(screen.getByText(/3 waiting for uploads in progress to finish/)).toBeTruthy();
     expect(screen.getByRole('button', { name: /Roll back to Cloudflare R2/ })).toBeTruthy();
     const before = gets('/admin/api/v1/storage').length;
     await act(async () => undefined); // let the polling effect start
