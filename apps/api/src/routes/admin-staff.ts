@@ -175,14 +175,24 @@ export function registerAdminStaffRoutes(router: AdminRouter, requireStaff: Requ
    * The invite link. Cloudflare Access has already checked the identity (admin.ts); it must be the invited address.
    * `staff_invite_accept` only checks the token (live, unused, unrevoked) and refuses addresses that belong to a
    * member or to current staff (409 conflict); `staff_invite_complete` uses it up and adds the staff row in one
-   * transaction. A former staff member coming back keeps their auth user (`existingUserId`): it's unbanned first
-   * and banned again if completing fails.
+   * transaction.
+   *
+   * A former staff member coming back keeps their auth user (`existingUserId`). It stays banned until
+   * `staff_invite_complete` has succeeded, and only then is it unbanned, so a second accept of the same link (two
+   * tabs, a retry) that loses the race changes nothing at Auth and can never re-ban someone who is staff again.
+   * A staff row whose auth user is still banned (the unban failed) does no harm: signing in fails until an Owner
+   * removes and re-invites them, and it's logged.
+   *
+   * A new address gets a fresh auth user first (staff_invite_complete needs its id). If completing fails or
+   * throws, that user is deleted only while `account_kind` still says it isn't staff, so a commit whose reply was
+   * lost never leaves a staff row without its auth user.
    */
   router.post(STAFF_ACCEPT_PATH, async (c) => {
     if (!(await burstOk(c, 'staff_invite'))) return rateLimited(c, 60);
     const body = await readBody(c, staffInviteTokenSchema);
     if (!body) return c.json(fail('invite_invalid'), 400);
     const invalid = () => c.json(fail('invite_invalid'), 400);
+    let created: { userId: string; email: string } | null = null;
     try {
       const invite = await rpc<{
         inviteId: string;
@@ -204,7 +214,6 @@ export function registerAdminStaffRoutes(router: AdminRouter, requireStaff: Requ
       let userId: string;
       if (existing) {
         userId = existing;
-        await gotrue.adminSetBanned(c.env, userId, false);
       } else {
         try {
           userId = (await gotrue.adminCreateUser(c.env, email)).id;
@@ -214,23 +223,36 @@ export function registerAdminStaffRoutes(router: AdminRouter, requireStaff: Requ
           }
           throw err;
         }
+        created = { userId, email };
       }
       const done = await rpc<unknown>(c.env, 'staff_invite_complete', {
         p_invite_id: invite.inviteId,
         p_user_id: userId,
       });
       if (!done || isDbError(done)) {
-        // Lost a race (used or revoked meanwhile): don't leave an orphan auth user behind, and keep a former
-        // staff member banned.
-        await (existing
-          ? gotrue.adminSetBanned(c.env, userId, true)
-          : gotrue.adminDeleteUser(c.env, userId)
-        ).catch((e) => logError(c.get('requestId'), 'staff_orphan', e));
+        // Lost a race (used or revoked meanwhile). A former staff member was never unbanned, so there's nothing
+        // to undo for them; a user created just now is removed (unless it somehow became staff).
+        await dropCreated(c, created);
         return invalid();
       }
+      created = null;
+      // A failed unban throws to the catch below: logged, 500, and the staff row stays (harmless while banned).
+      if (existing) await gotrue.adminSetBanned(c.env, userId, false);
       return c.json({ ok: true, email });
     } catch (err) {
+      await dropCreated(c, created);
       return serverError(c, 'staff_invite_accept', err);
     }
   });
+}
+
+/** Deletes an auth user created for an invite that didn't complete, unless the address is staff after all. */
+async function dropCreated(c: Ctx, created: { userId: string; email: string } | null) {
+  if (!created) return;
+  try {
+    if ((await rpc<string>(c.env, 'account_kind', { p_email: created.email })) === 'staff') return;
+    await gotrue.adminDeleteUser(c.env, created.userId);
+  } catch (err) {
+    logError(c.get('requestId'), 'staff_orphan', err);
+  }
 }

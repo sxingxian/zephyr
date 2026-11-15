@@ -227,6 +227,11 @@ select public.admin_user_suspend(:saf, :mei, 'abuse', 'Spam galleries');
 select public.admin_user_unsuspend(:saf, :mei, 'Appeal accepted');
 select pg_temp.ok((select sharing_suspended_at is null and not sharing_by_suspension from public.profiles where id = :mei),
   'a suspension on its own still lifts the sharing suspension it set');
+select count(*) as audits from public.audit_log where action in ('users.unsuspend', 'users.sharing_lift') \gset
+select pg_temp.ok(public.admin_user_unsuspend(:saf, :mei, 'Again') ->> 'error' = 'unchanged'
+  and public.admin_user_sharing_lift(:saf, :mei, 'Again') ->> 'error' = 'unchanged'
+  and (select count(*) from public.audit_log where action in ('users.unsuspend', 'users.sharing_lift')) = :audits,
+  'unsuspending an active account or lifting sharing that isn''t suspended is unchanged, with no audit row');
 
 -- Deletion by staff
 select pg_temp.ok(public.admin_user_deletion_schedule(:adm, :jun, 'Legal request') ->> 'error' = 'forbidden', 'only an Owner schedules a deletion');
@@ -442,7 +447,16 @@ select pg_temp.ok(:'r'::jsonb ->> 'enabled' = 'true'
   and (public.adsense_public() ->> 'enabled')::boolean, 'an Owner turns AdSense on; Free members get it');
 select pg_temp.ok(public.ads_for_member(:jun) -> 'adsense' = 'null'::jsonb and jsonb_array_length(public.ads_for_member(:jun) -> 'cards') = 1,
   'a Free member of any team library gets sponsored cards but never AdSense');
+select count(*) as audits from public.audit_log where action = 'ads.adsense' \gset
+select public.admin_adsense_set(:own, '{"enabled": true, "slots": {"library": "1234567890"}}', 'Again') as r \gset
+select pg_temp.ok((:'r'::jsonb ->> 'changed')::boolean = false and (:'r'::jsonb ->> 'enabled')::boolean
+  and (select count(*) from public.audit_log where action = 'ads.adsense') = :audits,
+  'turning AdSense on when it''s already on, with the same slots, changes nothing and isn''t audited');
 select pg_temp.ok((public.admin_adsense_set(:adm, '{"enabled": false}', 'Pause AdSense') -> 'adsense' ->> 'enabled')::boolean = false, 'turning it off saves at once (Admin)');
+select count(*) as audits from public.audit_log where action = 'ads.adsense' \gset
+select pg_temp.ok((public.admin_adsense_set(:adm, '{"enabled": false}', 'Pause again') ->> 'changed')::boolean = false
+  and (select count(*) from public.audit_log where action = 'ads.adsense') = :audits,
+  'turning it off when it''s off is still a success, with nothing written');
 select pg_temp.ok(exists (select 1 from public.audit_log where action = 'ads.adsense' and kind = 'ads'), 'AdSense changes are audited');
 update public.ad_cards set ends_at = now() - interval '1 second' where id = :'card';
 insert into public.ad_event_seen (h, day) values (pg_temp.h('old-day'), (now() at time zone 'utc')::date - 2),
@@ -550,6 +564,9 @@ select public.admin_staff_set_role(:own, :adm, 'owner', 'Second owner');
 select public.admin_staff_set_role(:adm, :own, 'admin', 'Swap roles') as r \gset
 select pg_temp.ok(:'r'::jsonb -> 'staff' is not null and public._staff_role_of(:own) = 'admin', 'with two Owners, one can step down');
 select pg_temp.ok(public.admin_staff_set_role(:own, :adm, 'admin', 'Nope') ->> 'error' = 'forbidden', 'an Admin can''t change roles');
+select pg_temp.ok(public.admin_staff_set_role(:adm, :adm, 'owner', 'Same') ->> 'error' = 'unchanged'
+  and not exists (select 1 from public.audit_log where action = 'staff.role' and details ->> 'reason' = 'Same'),
+  'setting the role someone already has is unchanged, with no audit row');
 insert into auth.sessions (user_id) values (:sup);
 select public.admin_staff_remove(:adm, :sup, 'Contract ended') as r \gset
 select pg_temp.ok(:'r'::jsonb -> 'staff' is not null and public._staff_role_of(:sup) is null

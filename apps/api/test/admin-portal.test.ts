@@ -589,6 +589,36 @@ describe('high-risk writes: a recent passkey and an email to every Owner', () =>
     expect(world.emails).toHaveLength(0);
   });
 
+  it('no-ops (not suspended, sharing not suspended, the same role) are 409 with no Owners email', async () => {
+    const s = await staff('owner');
+    world.rpc.admin_user_unsuspend = () => ({ error: 'unchanged' });
+    world.rpc.admin_user_sharing_lift = () => ({ error: 'unchanged' });
+    world.rpc.admin_staff_set_role = () => ({ error: 'unchanged' });
+    world.emails.length = 0;
+    const un = await as(s, ADMIN8_API.userSuspend(USER), { method: 'DELETE', body: { reason } });
+    expect([un.status, (await read(un)).error]).toEqual([409, 'conflict']);
+    const lift = await as(s, ADMIN8_API.userSharing(USER), { method: 'DELETE', body: { reason } });
+    expect(lift.status).toBe(409);
+    const role = await as(s, ADMIN8_API.staffMember(STAFF_USER), {
+      method: 'PATCH',
+      body: { role: 'support', reason },
+    });
+    expect(role.status).toBe(409);
+    expect(world.emails).toHaveLength(0);
+  });
+
+  it('AdSense: a change that changes nothing emails no one; a real one emails the Owners', async () => {
+    const s = await staff('owner');
+    world.rpc.admin_adsense_set = () => ({ enabled: true, changed: false });
+    world.emails.length = 0;
+    const same = await as(s, ADMIN8_API.adsense, { method: 'PATCH', body: { enabled: true, reason } });
+    expect(same.status).toBe(200);
+    expect(world.emails).toHaveLength(0);
+    world.rpc.admin_adsense_set = () => ({ enabled: true, changed: true });
+    await as(s, ADMIN8_API.adsense, { method: 'PATCH', body: { enabled: true, reason } });
+    expect(world.emails.length).toBeGreaterThan(0);
+  });
+
   it('plan limits: too_soon and no_changes reach the admin app as their own codes', async () => {
     const s = await staff('owner');
     world.rpc.admin_limits_schedule = () => ({ error: 'too_soon' });
@@ -792,6 +822,110 @@ describe('staff invites', () => {
     expect((await read(res)).error).toBe('invite_invalid');
     expect(back.banned).toBe(true);
     expect(world.users.some((u) => u.id === back.id)).toBe(true);
+    // Never unbanned, so a losing second accept can't re-ban someone the winner just made staff.
+    expect(
+      world.calls.some((c) => c.method === 'PUT' && c.url.endsWith(`/auth/v1/admin/users/${back.id}`)),
+    ).toBe(false);
+  });
+
+  it('accept: a former staff member is unbanned only after the invite completes', async () => {
+    const back: User = {
+      id: '20000000-0000-0000-0000-0000000000f7',
+      email: 'back3@zephyr.test',
+      banned: true,
+    };
+    world.users.push(back);
+    world.rpc.staff_invite_accept = () => ({
+      inviteId: INVITE,
+      email: back.email,
+      role: 'support',
+      existingUserId: back.id,
+    });
+    const order: string[] = [];
+    world.rpc.staff_invite_complete = () => {
+      order.push(back.banned ? 'complete (banned)' : 'complete (unbanned)');
+      return { ok: true };
+    };
+    const res = await call(ADMIN8_API.staffInviteAccept, {
+      body: { token: 'B'.repeat(43) },
+      access: await accessToken(back.email),
+    });
+    expect(res.status).toBe(200);
+    expect(order).toEqual(['complete (banned)']);
+    expect(back.banned).toBe(false);
+  });
+
+  it('accept: double accept of a former staff member’s link leaves the winner unbanned', async () => {
+    const back: User = {
+      id: '20000000-0000-0000-0000-0000000000f8',
+      email: 'back4@zephyr.test',
+      banned: true,
+    };
+    world.users.push(back);
+    world.rpc.staff_invite_accept = () => ({
+      inviteId: INVITE,
+      email: back.email,
+      role: 'support',
+      existingUserId: back.id,
+    });
+    let used = false;
+    world.rpc.staff_invite_complete = () => {
+      if (used) return null;
+      used = true;
+      return { ok: true };
+    };
+    const access = await accessToken(back.email);
+    const [a, b] = await Promise.all([
+      call(ADMIN8_API.staffInviteAccept, { body: { token: 'B'.repeat(43) }, access }),
+      call(ADMIN8_API.staffInviteAccept, { body: { token: 'B'.repeat(43) }, access }),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 400]);
+    expect(back.banned).toBe(false);
+  });
+
+  it('accept: completing throws — a former staff member stays banned; a new user is removed', async () => {
+    const back: User = {
+      id: '20000000-0000-0000-0000-0000000000f9',
+      email: 'back5@zephyr.test',
+      banned: true,
+    };
+    world.users.push(back);
+    world.rpc.staff_invite_accept = () => ({
+      inviteId: INVITE,
+      email: back.email,
+      role: 'support',
+      existingUserId: back.id,
+    });
+    world.rpc.staff_invite_complete = () => new Response('{"message":"boom"}', { status: 500 });
+    const old = await call(ADMIN8_API.staffInviteAccept, {
+      body: { token: 'B'.repeat(43) },
+      access: await accessToken(back.email),
+    });
+    expect(old.status).toBe(500);
+    expect(back.banned).toBe(true);
+
+    world.rpc.staff_invite_accept = () => ({ inviteId: INVITE, email: 'fresh@zephyr.test', role: 'support' });
+    const fresh = await call(ADMIN8_API.staffInviteAccept, {
+      body: { token: 'B'.repeat(43) },
+      access: await accessToken('fresh@zephyr.test'),
+    });
+    expect(fresh.status).toBe(500);
+    expect(world.users.some((u) => u.email === 'fresh@zephyr.test')).toBe(false);
+  });
+
+  it('accept: a lost reply after the invite committed keeps the new staff member’s auth user', async () => {
+    world.rpc.staff_invite_accept = () => ({ inviteId: INVITE, email: 'kept@zephyr.test', role: 'support' });
+    world.rpc.staff_invite_complete = () => {
+      const u = must(world.users.find((x) => x.email === 'kept@zephyr.test'));
+      u.staff = 'support'; // committed, then the reply was lost
+      return new Response('{"message":"timeout"}', { status: 500 });
+    };
+    const res = await call(ADMIN8_API.staffInviteAccept, {
+      body: { token: 'B'.repeat(43) },
+      access: await accessToken('kept@zephyr.test'),
+    });
+    expect(res.status).toBe(500);
+    expect(world.users.some((u) => u.email === 'kept@zephyr.test')).toBe(true);
   });
 
   it('accept: unknown tokens, member accounts and lost races', async () => {

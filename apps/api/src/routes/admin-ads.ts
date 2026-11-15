@@ -215,12 +215,14 @@ export function registerAdminAdsRoutes(router: AdminRouter, requireStaff: Requir
     const offOnly = changed.length === 1 && patch.enabled === false;
     if (!offOnly && needsReauth(c)) return reauth(c);
     try {
-      const out = await rpc<{ enabled: boolean } | null>(c.env, 'admin_adsense_set', {
+      const out = await rpc<{ enabled: boolean; changed?: boolean } | null>(c.env, 'admin_adsense_set', {
         p_staff: staffId(c),
         p_patch: patch,
         p_reason: reason,
       });
       if (isDbError(out)) return dbError(c, out);
+      // A no-op (already on, the same id and slots) writes nothing and emails no one.
+      if (out?.changed === false) return await adsView(c);
       resetAdsConfigCache();
       if (!offOnly) await tellOwners(c, { kind: 'adsense', enabled: out?.enabled === true, changed }, reason);
       return await adsView(c);

@@ -752,6 +752,7 @@ $$;
 
 -- Unsuspends (the API checks the passkey). Sharing is lifted with it only when the account suspension alone set it
 -- (sharing_by_suspension) and no photo is on hold; a separate sharing suspension stays until lifted on its own.
+-- An account that isn't suspended: { error: 'unchanged' } (no audit row, and the API emails no one).
 create function public.admin_user_unsuspend(p_staff uuid, p_user uuid, p_reason text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
@@ -760,7 +761,7 @@ declare
 begin
   if err is not null then return case when err = 'not_found' then null else jsonb_build_object('error', err) end; end if;
   select * into pr from public.profiles where id = p_user for update;
-  if pr.suspended_at is null then return public._user_detail(p_user); end if;
+  if pr.suspended_at is null then return jsonb_build_object('error', 'unchanged'); end if;
   update public.profiles set suspended_at = null, suspended_category = null, suspended_by = null,
          sharing_suspended_at = case when sharing_by_suspension
                                           and not exists (select 1 from public.photos p where p.owner_id = p_user and p.safety_hold_at is not null)
@@ -773,11 +774,16 @@ end;
 $$;
 
 -- Lifts a sharing suspension (API checks the passkey). Refused while a photo is on hold or the account is suspended.
+-- Sharing that isn't suspended: { error: 'unchanged' } (no audit row, no email).
 create function public.admin_user_sharing_lift(p_staff uuid, p_user uuid, p_reason text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare err text := public._user_target_ok(p_staff, p_user, 'suspend', p_reason);
 begin
   if err is not null then return case when err = 'not_found' then null else jsonb_build_object('error', err) end; end if;
+  perform 1 from public.profiles p where p.id = p_user for update;
+  if exists (select 1 from public.profiles p where p.id = p_user and p.sharing_suspended_at is null) then
+    return jsonb_build_object('error', 'unchanged');
+  end if;
   if exists (select 1 from public.photos p where p.owner_id = p_user and p.safety_hold_at is not null)
      or exists (select 1 from public.profiles p where p.id = p_user and p.suspended_at is not null) then
     return jsonb_build_object('error', 'conflict');
@@ -1510,7 +1516,7 @@ language sql stable security definer set search_path = '' as $$
 $$;
 
 -- AdSense settings. Turning on: Owner (the API checks the passkey) and a publisher id set. Edits: Owner or Admin.
--- p_patch: { enabled?, publisherId?, slots? }. AdminAdsResult plus { enabled }, or { error }.
+-- p_patch: { enabled?, publisherId?, slots? }. AdminAdsResult plus { enabled, changed }, or { error }.
 create function public.admin_adsense_set(p_staff uuid, p_patch jsonb, p_reason text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
@@ -1553,10 +1559,15 @@ begin
       nxt := nxt || jsonb_build_object('enabled', false);
     end if;
   end if;
+  -- Nothing would change (already on, the same id and slots, already off): no write, no audit row, and
+  -- { changed: false } so the API emails no one. Turning off stays a success either way (the kill switch).
+  if nxt is not distinct from cur then
+    return public.admin_ads(p_staff) || jsonb_build_object('enabled', coalesce((cur ->> 'enabled')::boolean, false), 'changed', false);
+  end if;
   update public.app_settings set adsense = nxt, updated_at = now(), updated_by = p_staff where id = 1;
   perform public._audit(p_staff, 'ads.adsense', 'adsense',
     jsonb_build_object('reason', btrim(p_reason), 'enabled', nxt -> 'enabled', 'was', cur -> 'enabled'));
-  return public.admin_ads(p_staff) || jsonb_build_object('enabled', coalesce((nxt ->> 'enabled')::boolean, false));
+  return public.admin_ads(p_staff) || jsonb_build_object('enabled', coalesce((nxt ->> 'enabled')::boolean, false), 'changed', true);
 end;
 $$;
 
@@ -2043,6 +2054,7 @@ begin
   if not public._staff_can(p_staff, 'staff') then return jsonb_build_object('error', 'forbidden'); end if;
   select role into old from public.staff where user_id = p_user for update;
   if not found then return null; end if;
+  if old = p_role::public.staff_role then return jsonb_build_object('error', 'unchanged'); end if;
   if old = 'owner' and p_role <> 'owner' and (select count(*) from public.staff where role = 'owner') <= 1 then
     return jsonb_build_object('error', 'last_owner');
   end if;
