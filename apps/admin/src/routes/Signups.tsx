@@ -173,7 +173,14 @@ function SettingsPanel({
   const [reasonOpen, setReasonOpen] = useState(false);
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
-  useEffect(() => setDraft(base), [base]);
+  // Follow the server's settings only when they really change, never because the parent re-fetched the same
+  // values, and never while a change is waiting for its reason: that would drop the change and save only the reason.
+  const baseKey = JSON.stringify(base);
+  const [pending, setPending] = useState<Partial<SignupSettings> | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on the settings' content, not the object identity.
+  useEffect(() => {
+    if (!pending) setDraft(base);
+  }, [baseKey]);
   const changes = useMemo(() => diffSettings(base, draft), [base, draft]);
   const dirty = Object.keys(changes).length > 0;
   const set = <K extends keyof SignupSettings>(k: K, v: SignupSettings[K]) =>
@@ -186,10 +193,11 @@ function SettingsPanel({
     try {
       const saved = await api<SignupSettings>(ADMIN_API.settings, {
         method: 'PATCH',
-        body: withReason ? { ...changes, reason: withReason } : changes,
+        body: withReason ? { ...(pending ?? changes), reason: withReason } : changes,
       });
       onSaved(saved);
       setReasonOpen(false);
+      setPending(null);
       setReason('');
       toast.show('Sign-up settings saved', 'good');
     } catch (e) {
@@ -215,7 +223,11 @@ function SettingsPanel({
               size="sm"
               disabled={!dirty}
               busy={busy}
-              onClick={() => (needsReason ? setReasonOpen(true) : save())}
+              onClick={() => {
+                if (!needsReason) return void save();
+                setPending(changes);
+                setReasonOpen(true);
+              }}
             >
               Save
             </Button>
@@ -296,11 +308,20 @@ function SettingsPanel({
       </div>
       <Dialog
         open={reasonOpen}
-        onClose={() => setReasonOpen(false)}
+        onClose={() => {
+          setReasonOpen(false);
+          setPending(null);
+        }}
         title="Why are you making this change?"
         footer={
           <>
-            <Button kind="ghost" onClick={() => setReasonOpen(false)}>
+            <Button
+              kind="ghost"
+              onClick={() => {
+                setReasonOpen(false);
+                setPending(null);
+              }}
+            >
               Cancel
             </Button>
             <Button
@@ -315,8 +336,8 @@ function SettingsPanel({
         }
       >
         <p className="z-muted">
-          {'signupMode' in changes
-            ? `Switching to ${changes.signupMode === 'open' ? 'Open: anyone will be able to create an account' : 'Invite only: new accounts will need an invite'}.`
+          {pending && 'signupMode' in pending
+            ? `Switching to ${pending.signupMode === 'open' ? 'Open: anyone will be able to create an account' : 'Invite only: new accounts will need an invite'}.`
             : 'Pausing stops every new account, including invites, until you turn it back on.'}{' '}
           Your reason is saved to the audit log.
         </p>
