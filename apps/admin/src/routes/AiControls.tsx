@@ -138,7 +138,10 @@ function Controls({
   const [form, setForm] = useState<AiForm>(() => toForm(base));
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  useEffect(() => setForm(toForm(base)), [base]);
+  // Follow the server only when its values change, not when the parent re-fetches the same values mid-edit.
+  const baseKey = JSON.stringify(base);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on the settings' content, not the object identity.
+  useEffect(() => setForm(toForm(base)), [baseKey]);
 
   const parsed = useMemo(() => parseForm(form, base), [form, base]);
   const errors: AiFormErrors = parsed.errors ?? {};
