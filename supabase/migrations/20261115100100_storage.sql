@@ -400,14 +400,16 @@ language sql stable security definer set search_path = '' as $$
                                     group by i.cleanup_store) x), '[]'::jsonb),
     -- Photos still read from a store other than the write store while no migration is moving anything (a
     -- given-up rollback leaves these on the store it was rolling back to): unreadable while that store is
-    -- unreachable (Admin shows them only then). While a migration is active, photos on its source are expected.
+    -- unreachable (Admin shows them only then). Photos on the stores of an active migration are expected there and
+    -- not counted; photos on any other store still are, even while a migration between other stores runs.
     'stranded', coalesce((select jsonb_agg(jsonb_build_object('storeId', x.store_id, 'photos', x.n) order by x.store_id)
                             from (select p.store_id, count(*) as n
                                     from public.photos p
                                    where p.status in ('ready', 'trashed')
                                      and p.store_id <> (select s.write_store from public.storage_state s where s.id = 1)
                                      and not exists (select 1 from public.storage_migrations a
-                                                      where a.state in ('copying', 'paused', 'verifying', 'rolling_back', 'failed'))
+                                                      where a.state in ('copying', 'paused', 'verifying', 'rolling_back', 'failed')
+                                                        and p.store_id in (a.from_store, a.to_store))
                                    group by p.store_id) x), '[]'::jsonb),
     -- Follow-up copies outstanding, and how many were dropped after 7 days in the last 30.
     'followups', jsonb_build_object(

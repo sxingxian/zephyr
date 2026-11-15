@@ -232,8 +232,6 @@ export const ACCOUNT_ACTION_PATH = '/account-action';
  * own address to the bare path (history.replaceState) and see the token arrive as a same-document fragment change.
  */
 export const ACCOUNT_ACTION_NONCE_RE = /^[A-Za-z0-9_-]{22}$/;
-/** Open links per member and change; issuing another retires the oldest. */
-export const ACCOUNT_ACTION_OPEN_MAX = 3;
 /** The emailed link for `nonce` and `token`. */
 export const accountActionLink = (appUrl: string, nonce: string, token: string): string =>
   `${appUrl.replace(/\/$/, '')}${ACCOUNT_ACTION_PATH}/${nonce}#t=${token}`;

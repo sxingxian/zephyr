@@ -32,7 +32,7 @@ create index account_actions_user_op on public.account_actions (user_id, op, cre
 alter table public.account_actions enable row level security;
 revoke all on public.account_actions from public, anon, authenticated;
 
--- Stores a new link for (member, change[, passkey]), retiring the oldest open ones beyond 3 for that change.
+-- Stores a new link for (member, change[, passkey]). Earlier links stay valid until they expire or are used.
 -- 'ok', 'rate_limited' (5 an hour or 10 a day per change) or 'invalid' (unknown change, a passkey id with the wrong
 -- change or a malformed one, a malformed hash, or no such member). Rows older than two days are forgotten here, so
 -- the table stays small without a job.

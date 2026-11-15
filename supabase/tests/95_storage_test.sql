@@ -604,6 +604,8 @@ select pg_temp.ok((:'ab12b'::jsonb ->> 'copies')::int = (select count(*) from c1
   and not (public.storage_status() ->> 'cleanupPending')::boolean
   and public.storage_switch(:own, 'cold', 'Elsewhere') ->> 'migrationId' is not null,
   'with the NAS copies abandoned too the migration finishes, and the next switch can start');
+select pg_temp.ok(public.admin_storage(:own) -> 'stranded' = jsonb_build_array(jsonb_build_object('storeId', 'nas', 'photos', :onnas)),
+  'a switch between two other stores doesn''t hide the photos stranded on the NAS');
 rollback to savepoint give_up;
 
 -- ---- Follow-up copies (followMove couldn't copy an object to the photo's new store) ---------------------------------
