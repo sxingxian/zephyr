@@ -193,7 +193,7 @@ export function errorMessage(err: unknown): string {
     case 'account_action_required':
       return 'This change is made from the link we email you. Ask for it in Settings › Security.';
     case 'account_action_invalid':
-      return 'That link doesn’t work any more. It may have expired, been used or been replaced. Ask for a new one.';
+      return 'That link doesn’t work any more. It may have expired or been used already. Ask for a new one.';
     case 'account_action_wrong_member':
       return 'That link was sent to another account. Sign in as that account and open it again.';
     case 'unauthenticated':

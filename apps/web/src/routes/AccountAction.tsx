@@ -53,8 +53,11 @@ export function AccountActionPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // While this page holds an unspent link, other tabs' session broadcasts are ignored (any same-origin page can
-  // forge one); the API refusing the link is the source of truth. Released once the link is spent or left.
+  // While this page holds an unspent link, or a passkey grant it hasn't used yet (between the options and verify
+  // calls), other tabs' session broadcasts are ignored: any same-origin page can forge one, and following it would
+  // unload the page mid-change. The API refusing the link is the source of truth. The hold ends once the change
+  // has settled, and whenever the page shows anything but the link (invalid, wrong member, error, done...), so a
+  // real sign-out or account switch elsewhere is followed again.
   useEffect(() => {
     setHoldOtherTabSession(Boolean(token.current));
     return () => {
@@ -62,11 +65,21 @@ export function AccountActionPage() {
       forgetAccountActionToken();
     };
   }, []);
-  const release = () => {
+  const forget = () => {
     forgetAccountActionToken();
     token.current = null;
+  };
+  const release = () => {
+    forget();
     setHoldOtherTabSession(false);
   };
+
+  // (signed_out is transient while the session loads, and broadcasts can't move a signed-out page anyway.)
+  useEffect(() => {
+    const live = state.kind === 'loading' || state.kind === 'ready' || state.kind === 'signed_out';
+    if (!live) setHoldOtherTabSession(false);
+    else if (token.current) setHoldOtherTabSession(true);
+  }, [state.kind]);
 
   useEffect(() => {
     const t = token.current;
@@ -118,13 +131,15 @@ export function AccountActionPage() {
     setBusy(true);
     setError(null);
     try {
-      // The link is spent on the options call; only this challenge can then be completed.
+      // The link is spent on the options call; only this challenge can then be completed. The token is forgotten
+      // now, but the hold stays until the verify call has settled (finally), so a forged broadcast can't unload
+      // the page during the browser's passkey prompt and waste the grant.
       const opts = await api<PasskeyOptions>(APP_API.myPasskeyOptions, {
         method: 'POST',
         body: {},
         headers: accountActionHeaders(t),
       });
-      release();
+      forget();
       const credential = await createPasskey(opts);
       await api(APP_API.myPasskeyVerify, {
         method: 'POST',
@@ -141,6 +156,8 @@ export function AccountActionPage() {
             : `Your device couldn’t save the passkey. ${AGAIN}`,
       );
     } finally {
+      // The link is spent (or was refused) and the grant used or abandoned: nothing left to protect.
+      if (!token.current) setHoldOtherTabSession(false);
       setBusy(false);
     }
   };
@@ -229,7 +246,7 @@ export function AccountActionPage() {
           : state.kind === 'invalid'
             ? [
                 'This link doesn’t work any more',
-                `It may have expired (links last ${ACCOUNT_ACTION_MINUTES} minutes), been used, or been replaced by a newer one. ${AGAIN}`,
+                `It may have expired (links last ${ACCOUNT_ACTION_MINUTES} minutes) or been used already. ${AGAIN}`,
               ]
             : state.kind === 'missing'
               ? [

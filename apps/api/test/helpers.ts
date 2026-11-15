@@ -381,9 +381,7 @@ const defaultRpc: Record<string, (a: Record<string, unknown>) => unknown> = {
       mine.filter((r) => r.created > now - 86400_000).length >= 10
     )
       return 'rate_limited';
-    // At most 3 open per member and change: a fourth retires the oldest.
-    const open = mine.filter((r) => !r.used && r.expires > now);
-    for (const r of open.slice(0, Math.max(0, open.length - 2))) r.expires = now;
+    // No link already sent is retired: the caps above bound how many are open.
     world.actions.push({
       user,
       op,

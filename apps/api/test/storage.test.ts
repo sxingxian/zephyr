@@ -1550,6 +1550,15 @@ describe('admin storage routes', () => {
       p_store: 'b2-eu',
       p_targets: ['old-store'],
     });
+    // The Owners' email names the store that's gone, not the one that answered.
+    await vi.waitFor(() =>
+      expect(world.emails.some((m) => m.subject.includes('abandoned on b2-eu'))).toBe(true),
+    );
+    const viaMail = world.emails.find((m) => m.subject.includes('abandoned on b2-eu'))?.text ?? '';
+    expect(viaMail).toContain(
+      "the copies whose photos are on old-store, which can't be reached (b2-eu itself answered)",
+    );
+    expect(viaMail).not.toContain("on b2-eu, which can't be reached");
     world.rpc.storage_old_copy_targets = () => [];
 
     // A store the deployment no longer declares (the config parses cleanly).
@@ -1565,9 +1574,9 @@ describe('admin storage routes', () => {
     await vi.waitFor(() =>
       expect(world.emails.some((m) => m.subject.includes('abandoned on old-store'))).toBe(true),
     );
-    expect(world.emails.find((m) => m.subject.includes('abandoned on old-store'))?.text).toContain(
-      "Don't delete them by hand",
-    );
+    const oldMail = world.emails.find((m) => m.subject.includes('abandoned on old-store'))?.text ?? '';
+    expect(oldMail).toContain("Don't delete them by hand");
+    expect(oldMail).toContain("on old-store, which can't be reached");
 
     // A configured store that fails the check run now; the acknowledgement is passed on.
     mocks.b2.down = true;
@@ -1614,7 +1623,8 @@ describe('admin storage routes', () => {
       to: 'b2-eu',
       photos: 4,
       returned: 1,
-      stranded: 1,
+      stranded: 3,
+      edited: 1,
     });
     world.rpc.storage_check_record = () => ({ failStreak: 0, okStreak: 1, autoReadOnly: true });
     const readOnly: Record<string, unknown>[] = [];
@@ -1649,9 +1659,9 @@ describe('admin storage routes', () => {
     await vi.waitFor(() =>
       expect(world.emails.some((m) => m.subject.includes('Rollback given up'))).toBe(true),
     );
-    // The email says which photos couldn't come back to the new write store.
+    // The email counts every photo still read from the store that's gone, and how many were edited there.
     expect(world.emails.find((m) => m.subject.includes('Rollback given up'))?.text).toContain(
-      "1 photo was edited on r2 after being copied back, so it stays there and can't be shown while r2 is unreachable.",
+      "3 photos are still read from r2, so they can't be shown while r2 is unreachable (1 of them edited there after being copied back).",
     );
 
     // A new write store that doesn't answer leaves read-only as it is.

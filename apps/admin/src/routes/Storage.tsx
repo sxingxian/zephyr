@@ -515,11 +515,10 @@ export function Storage() {
               .filter((x) => x.photos > 0 && isGone(x.storeId))
               .map((x) => (
                 <Note key={`stranded-${x.storeId}`} tone="bad" icon="alert">
-                  {n(x.photos)} {x.photos === 1 ? 'photo' : 'photos'} can’t be recovered while{' '}
-                  {byId(x.storeId)?.name ?? x.storeId} is unreachable:{' '}
-                  {x.photos === 1 ? 'it was' : 'they were'} edited there after a rollback copied{' '}
-                  {x.photos === 1 ? 'it' : 'them'} back, so the older copy elsewhere can’t stand in.{' '}
-                  {x.photos === 1 ? 'It comes' : 'They come'} back if the store does.
+                  {n(x.photos)} {x.photos === 1 ? 'photo is' : 'photos are'} still read from{' '}
+                  {byId(x.storeId)?.name ?? x.storeId}, so {x.photos === 1 ? 'it' : 'they'} can’t be shown
+                  while it’s unreachable (left there when a rollback was given up). Any copy elsewhere is
+                  kept, and {x.photos === 1 ? 'it comes' : 'they come'} back if the store does.
                 </Note>
               ))}
             {(data.followups?.dropped30d ?? 0) > 0 && (

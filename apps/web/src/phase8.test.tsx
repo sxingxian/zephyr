@@ -978,6 +978,51 @@ describe('account action links (passkeys and deletion are made from an emailed l
     other.close();
   });
 
+  it('a forged "signed out" broadcast during the passkey prompt (link spent, grant unused) is ignored until verify settles', async () => {
+    let finish: (v: { id: string }) => void = () => {};
+    passkeyMock.create.mockImplementationOnce(
+      () =>
+        new Promise<{ id: string }>((r) => {
+          finish = r;
+        }),
+    );
+    mockApi((url) => {
+      if (url === '/api/v1/me/account-actions/peek') return peekWith('passkey_add');
+      if (url === '/api/v1/me/passkeys/options')
+        return json(200, { challengeId: 'ch-1', options: { challenge: 'abc' } });
+      if (url === '/api/v1/me/passkeys/verify') return json(201, { ok: true, passkey: PK });
+      return undefined;
+    });
+    openLink();
+    fireEvent.click(await screen.findByRole('button', { name: 'Add a passkey' }));
+    await waitFor(() => expect(passkeyMock.create).toHaveBeenCalledTimes(1));
+    const other = new BroadcastChannel('zephyr-session');
+    other.postMessage({ type: 'session-user', id: null });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(assign).not.toHaveBeenCalled();
+    finish({ id: 'cred' });
+    expect(await screen.findByText('Passkey added')).toBeTruthy();
+    expect(calls.some((c) => c.url === '/api/v1/me/passkeys/verify')).toBe(true);
+    // Settled: the hold is gone, so a sign-out elsewhere is followed again.
+    other.postMessage({ type: 'session-user', id: null });
+    await waitFor(() => expect(assign).toHaveBeenCalledWith('/', { sessionEnd: true }));
+    other.close();
+  });
+
+  it('a link that doesn’t work releases the hold: a real sign-out in another tab is followed', async () => {
+    mockApi((url) =>
+      url === '/api/v1/me/account-actions/peek'
+        ? json(400, { ok: false, error: 'account_action_invalid' })
+        : undefined,
+    );
+    openLink();
+    expect(await screen.findByText('This link doesn’t work any more')).toBeTruthy();
+    const other = new BroadcastChannel('zephyr-session');
+    other.postMessage({ type: 'session-user', id: null });
+    await waitFor(() => expect(assign).toHaveBeenCalledWith('/', { sessionEnd: true }));
+    other.close();
+  });
+
   it('signed out: asks to sign in as that account, without checking the link', async () => {
     mockApi((url) =>
       url.endsWith('/auth/session') ? json(401, { ok: false, error: 'unauthenticated' }) : undefined,

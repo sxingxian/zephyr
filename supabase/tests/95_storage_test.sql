@@ -510,10 +510,19 @@ select pg_temp.ok(public.storage_rollback_give_up(:own, 'Not a rollback') ->> 'e
   'only a failed rollback can be given up (not a forward move)');
 select pg_temp.settle(:'m12'::uuid);
 create temp table c12 as select e.value as v from jsonb_array_elements(public.storage_migration_batch(:'m12'::uuid, 100)) e;
-select public.storage_item_mark(:'m12'::uuid, (v ->> 'photoId')::uuid, 'verified', 5000, null, null, (v ->> 'token')::uuid) from c12;
-select pg_temp.ok((select count(*) >= 4 from c12), 'enough photos moved for the give-up cases');
+-- One photo (sk) has its copy written to S3, but its report never lands (a lost lease): claimed, not verified.
+select (select (v ->> 'photoId')::uuid from c12 order by v ->> 'photoId' desc limit 1) as sk \gset
+select public.storage_item_mark(:'m12'::uuid, (v ->> 'photoId')::uuid, 'verified', 5000, null, null, (v ->> 'token')::uuid)
+  from c12 where (v ->> 'photoId')::uuid <> :'sk'::uuid;
+select pg_temp.ok((select count(*) >= 5 from c12)
+  and (select state = 'pending' and attempts > 0 from public.storage_migration_items where migration_id = :'m12'::uuid and photo_id = :'sk'::uuid),
+  'enough photos moved for the give-up cases, one copied but not verified');
 select public.storage_migration_action(:own, 'rollback', 'Back to the NAS');
 select pg_temp.settle(:'m12'::uuid);
+select pg_temp.ok((select state = 'skipped' and cleanup_store = 's3' from public.storage_migration_items
+                    where migration_id = :'m12'::uuid and photo_id = :'sk'::uuid)
+  and (select store_id = 'nas' from public.photos where id = :'sk'::uuid),
+  'the rollback skips the unverified photo (it never left the NAS), tracking its S3 copy for clean-up');
 -- Two photos are copied back to the NAS (then it dies): one unchanged since (gb), one edited there afterwards (gs).
 create temp table b12 as select e.value as v from jsonb_array_elements(public.storage_migration_batch(:'m12'::uuid, 2)) e;
 select (select (v ->> 'photoId')::uuid from b12 order by v ->> 'photoId' limit 1) as gb \gset
@@ -536,33 +545,43 @@ select pg_temp.ok(public.storage_migration_action(:own, 'rollback', 'Again') ->>
 select pg_temp.ok(public.storage_rollback_give_up(:fin, 'NAS gone for good') ->> 'error' = 'forbidden'
   and public.storage_rollback_give_up(:own, 'x') ->> 'error' = 'invalid', 'giving up is for an Owner, with a reason');
 select public.storage_rollback_give_up(:own, 'NAS gone for good') as gu \gset
-select pg_temp.ok(:'gu'::jsonb ->> 'migrationId' = :'m12' and (:'gu'::jsonb ->> 'photos')::int = (select count(*) from c12) - 1
-  and (:'gu'::jsonb ->> 'returned')::int = 1 and (:'gu'::jsonb ->> 'stranded')::int = 1
+select count(*) as onnas from public.photos where store_id = 'nas' and status in ('ready', 'trashed') \gset
+select pg_temp.ok(:'gu'::jsonb ->> 'migrationId' = :'m12' and (:'gu'::jsonb ->> 'photos')::int = (select count(*) from c12) - 2
+  and (:'gu'::jsonb ->> 'returned')::int = 1 and (:'gu'::jsonb ->> 'edited')::int = 1
+  and (:'gu'::jsonb ->> 'stranded')::int = :onnas and :onnas >= 2
   and (select write_store = 's3' from public.storage_state where id = 1)
   and (select state = 'rolled_back' and last_error = 'rollback_abandoned' from public.storage_migrations where id = :'m12'::uuid),
   'giving up sends uploads back to S3; the migration ends rolled back');
 select pg_temp.ok((select bool_and(i.src = 'nas' and i.dst = 's3' and i.state = 'verified' and i.cleanup_store = 'nas' and i.cleaned_at is null and p.store_id = 's3')
                      from public.storage_migration_items i join public.photos p on p.id = i.photo_id
-                    where i.migration_id = :'m12'::uuid and i.photo_id <> :'gs'::uuid
+                    where i.migration_id = :'m12'::uuid and i.photo_id not in (:'gs'::uuid, :'sk'::uuid)
                       and i.photo_id in (select (v ->> 'photoId')::uuid from c12)),
   'photos not copied back, and the unchanged one copied back (flipped back to S3), are verified on S3 again with their NAS copy as the old copy');
 select pg_temp.ok((select store_id = 's3' from public.photos where id = :'gb'::uuid)
   and (select store_id = 'nas' from public.photos where id = :'gs'::uuid)
   and (select state = 'verified' and error = 'rollback_stranded' and cleanup_store = 's3' from public.storage_migration_items
         where migration_id = :'m12'::uuid and photo_id = :'gs'::uuid)
-  and public.admin_storage(:own) -> 'stranded' = jsonb_build_array(jsonb_build_object('storeId', 'nas', 'photos', 1)),
-  'the photo edited on the NAS after its copy back stays there (its S3 copy is older): Admin lists it as stranded');
+  and public.admin_storage(:own) -> 'stranded' = jsonb_build_array(jsonb_build_object('storeId', 'nas', 'photos', :onnas)),
+  'the photo edited on the NAS after its copy back stays there (its S3 copy is older): Admin counts it as stranded');
+select pg_temp.ok((select state = 'skipped' and cleanup_store is null from public.storage_migration_items
+                    where migration_id = :'m12'::uuid and photo_id = :'sk'::uuid)
+  and (select store_id = 'nas' from public.photos where id = :'sk'::uuid),
+  'the photo that never left the NAS keeps its S3 copy (maybe the only readable one now): no longer tracked for clean-up, and counted as stranded');
 select pg_temp.ok((select delete_old_after > now() + interval '6 days' and finished_at is null from public.storage_migrations where id = :'m12'::uuid)
   and (public.storage_status() ->> 'cleanupPending')::boolean,
   'the old copies (the partial copy on the NAS included) wait for the hold');
 select pg_temp.ok(exists (select 1 from public.audit_log where action = 'storage.rollback_abandoned' and target = :'m12'
                             and details ->> 'reason' = 'NAS gone for good' and details ->> 'writeStore' = 's3'
-                            and (details ->> 'returned')::int = 1 and (details ->> 'stranded')::int = 1),
+                            and (details ->> 'returned')::int = 1 and (details ->> 'edited')::int = 1
+                            and (details ->> 'stranded')::int = :onnas),
   'it''s audited');
 select pg_temp.ok(public.storage_rollback_give_up(:own, 'Again') ->> 'error' = 'not_found', 'and can''t be done twice');
 -- After the hold: old copies on the NAS go to S3 (missing objects copied there first); the stranded photo's
 -- S3 copy would be checked against the NAS, which is gone.
 update public.storage_migrations set delete_old_after = now() - interval '1 second' where id = :'m12'::uuid;
+select pg_temp.ok(jsonb_array_length(public.storage_old_copies_due(1000)) > 0
+  and not exists (select 1 from jsonb_array_elements(public.storage_old_copies_due(1000)) e where (e ->> 'photoId')::uuid = :'sk'::uuid),
+  'after the hold, the S3 copy of the photo still on the NAS is never listed for deletion');
 select pg_temp.ok(public.storage_old_copy_claim(:'m12'::uuid, :'gb'::uuid, 'nas') = '{"copyTo": "s3"}'::jsonb
   and public.storage_old_copy_claim(:'m12'::uuid, :'gs'::uuid, 's3') = '{"copyTo": "nas"}'::jsonb
   and public.storage_old_copy_claim(:'m12'::uuid, :'tried'::uuid, 'nas') = '{"copyTo": "s3"}'::jsonb,
@@ -576,11 +595,11 @@ select public.storage_abandon_old_copies(:own, 's3', 'NAS gone for good', false,
 select pg_temp.ok((:'ab12'::jsonb ->> 'copies')::int = 1
   and (select cleaned_at is not null and error = 'rollback_stranded' from public.storage_migration_items
         where migration_id = :'m12'::uuid and photo_id = :'gs'::uuid)
-  and public.admin_storage(:own) -> 'stranded' = jsonb_build_array(jsonb_build_object('storeId', 'nas', 'photos', 1))
+  and public.admin_storage(:own) -> 'stranded' = jsonb_build_array(jsonb_build_object('storeId', 'nas', 'photos', :onnas))
   and (select finished_at is null from public.storage_migrations where id = :'m12'::uuid),
   'its S3 copy can be abandoned (nothing deleted; the photo stays listed as stranded); the NAS copies still wait');
 select public.storage_abandon_old_copies(:own, 'nas', 'NAS gone for good') as ab12b \gset
-select pg_temp.ok((:'ab12b'::jsonb ->> 'copies')::int = (select count(*) from c12) - 1
+select pg_temp.ok((:'ab12b'::jsonb ->> 'copies')::int = (select count(*) from c12) - 2
   and (select finished_at is not null from public.storage_migrations where id = :'m12'::uuid)
   and not (public.storage_status() ->> 'cleanupPending')::boolean
   and public.storage_switch(:own, 'cold', 'Elsewhere') ->> 'migrationId' is not null,

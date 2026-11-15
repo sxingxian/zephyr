@@ -33,15 +33,27 @@ export function storageAbandonEmail(e: {
   actor: string;
   store: string;
   copies: number;
+  /**
+   * Set when `store` answered and only the copies whose photos are on these unreachable stores were abandoned
+   * (each copy's deletion first copies anything missing to the photo's store, so a dead one blocks it).
+   */
+  targets?: string[] | null;
   adminUrl: string;
 }): Mail {
+  const copies = `${e.copies} old ${e.copies === 1 ? 'copy' : 'copies'} of moved photos on ${e.store}`;
+  const dead = e.targets?.length ? e.targets.join(', ') : null;
   return layout(
     `[Zephyr] Old copies abandoned on ${e.store}`,
     'Old copies abandoned',
-    [
-      `${e.actor} gave up on deleting ${e.copies} old ${e.copies === 1 ? 'copy' : 'copies'} of moved photos on ${e.store}, which can't be reached. Nothing was deleted there.`,
-      `The copies stay on ${e.store}. Don't delete them by hand: some may be the only copy of an edit or mask made while photos moved. If ${e.store} comes back, keep it configured and reachable; the orphan sweep then copies anything a photo's own store is missing over to it before deleting the rest. The reason is in the audit log.`,
-    ],
+    dead
+      ? [
+          `${e.actor} gave up on deleting ${copies}: the copies whose photos are on ${dead}, which can't be reached (${e.store} itself answered). Nothing was deleted.`,
+          `The copies stay on ${e.store}. Don't delete them by hand: while ${dead} ${e.targets?.length === 1 ? 'is' : 'are'} unreachable they may be the only readable copy of those photos. If ${dead} ${e.targets?.length === 1 ? 'comes' : 'come'} back, keep ${e.targets?.length === 1 ? 'it' : 'them'} configured and reachable; the orphan sweep then copies anything a photo's own store is missing over to it before deleting the rest. The reason is in the audit log.`,
+        ]
+      : [
+          `${e.actor} gave up on deleting ${copies}, which can't be reached. Nothing was deleted there.`,
+          `The copies stay on ${e.store}. Don't delete them by hand: some may be the only copy of an edit or mask made while photos moved. If ${e.store} comes back, keep it configured and reachable; the orphan sweep then copies anything a photo's own store is missing over to it before deleting the rest. The reason is in the audit log.`,
+        ],
     adminLink(e.adminUrl),
   );
 }
@@ -51,11 +63,14 @@ export function storageGiveUpEmail(e: {
   from: string;
   to: string;
   photos: number;
-  /** Photos copied back that changed afterwards, so they stay on `from`. */
+  /** Every photo still read from `from` (never moved, uploaded there, or edited after its copy back). */
   stranded?: number;
+  /** Of those, the ones copied back and edited on `from` afterwards. */
+  edited?: number;
   adminUrl: string;
 }): Mail {
   const stranded = e.stranded ?? 0;
+  const edited = Math.min(e.edited ?? 0, stranded);
   return layout(
     `[Zephyr] Rollback given up: uploads go to ${e.to} again`,
     'Rollback given up',
@@ -64,7 +79,7 @@ export function storageGiveUpEmail(e: {
       `${e.photos} ${e.photos === 1 ? 'photo is' : 'photos are'} read from ${e.to} now, including any already copied back that hadn't changed since. The reason is in the audit log.`,
       ...(stranded > 0
         ? [
-            `${stranded} ${stranded === 1 ? 'photo was' : 'photos were'} edited on ${e.from} after being copied back, so ${stranded === 1 ? 'it stays' : 'they stay'} there and can't be shown while ${e.from} is unreachable. Admin › Storage lists ${stranded === 1 ? 'it' : 'them'}.`,
+            `${stranded} ${stranded === 1 ? 'photo is' : 'photos are'} still read from ${e.from}, so ${stranded === 1 ? 'it' : 'they'} can't be shown while ${e.from} is unreachable${edited > 0 ? ` (${edited} of them edited there after being copied back)` : ''}. Any copy on ${e.to} is kept, and ${stranded === 1 ? 'it comes' : 'they come'} back if ${e.from} does. Admin › Storage lists them.`,
           ]
         : []),
     ],

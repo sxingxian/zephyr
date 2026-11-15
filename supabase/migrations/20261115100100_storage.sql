@@ -135,8 +135,6 @@ alter table public.storage_migration_items enable row level security;
 create index storage_items_claim on public.storage_migration_items (migration_id, updated_at, photo_id) where state = 'pending';
 create index storage_items_open on public.storage_migration_items (migration_id, state) where state in ('pending', 'copied', 'failed');
 create index storage_items_cleanup on public.storage_migration_items (migration_id) where cleanup_store is not null and cleaned_at is null;
--- Photos a given-up rollback had to leave on the store it was rolling back to (see storage_rollback_give_up).
-create index storage_items_stranded on public.storage_migration_items (dst) where error = 'rollback_stranded';
 
 -- Objects a writer stored on a photo's old store after the photo moved, whose copy to the photo's store failed
 -- (followMove). The 5-minute cron copies each one to wherever the photo is then, and the orphan sweep leaves
@@ -400,14 +398,17 @@ language sql stable security definer set search_path = '' as $$
                                     where i.cleanup_store is not null and i.cleaned_at is null and i.state in ('verified', 'skipped')
                                       and m.state in ('holding', 'done', 'rolled_back')
                                     group by i.cleanup_store) x), '[]'::jsonb),
-    -- Photos a given-up rollback left on the store it was rolling back to (changed after they were copied back,
-    -- so the older copy couldn't stand in for them): read from there, so unreadable while it's unreachable.
-    'stranded', coalesce((select jsonb_agg(jsonb_build_object('storeId', x.dst, 'photos', x.n) order by x.dst)
-                            from (select i.dst, count(*) as n
-                                    from public.storage_migration_items i
-                                    join public.photos p on p.id = i.photo_id and p.store_id = i.dst and p.status in ('ready', 'trashed')
-                                   where i.error = 'rollback_stranded'
-                                   group by i.dst) x), '[]'::jsonb),
+    -- Photos still read from a store other than the write store while no migration is moving anything (a
+    -- given-up rollback leaves these on the store it was rolling back to): unreadable while that store is
+    -- unreachable (Admin shows them only then). While a migration is active, photos on its source are expected.
+    'stranded', coalesce((select jsonb_agg(jsonb_build_object('storeId', x.store_id, 'photos', x.n) order by x.store_id)
+                            from (select p.store_id, count(*) as n
+                                    from public.photos p
+                                   where p.status in ('ready', 'trashed')
+                                     and p.store_id <> (select s.write_store from public.storage_state s where s.id = 1)
+                                     and not exists (select 1 from public.storage_migrations a
+                                                      where a.state in ('copying', 'paused', 'verifying', 'rolling_back', 'failed'))
+                                   group by p.store_id) x), '[]'::jsonb),
     -- Follow-up copies outstanding, and how many were dropped after 7 days in the last 30.
     'followups', jsonb_build_object(
       'pending', (select count(*) from public.storage_followups),
@@ -993,11 +994,15 @@ $$;
 --     older, so they stay on from_store, marked 'rollback_stranded' (Admin lists them: unreadable while that
 --     store is unreachable; their old copies on to_store can be abandoned once from_store fails a check);
 --   * photos uploaded to to_store during the rollback (late arrivals, never moved): skipped, with a partial
---     copy on from_store tracked for clean-up.
+--     copy on from_store tracked for clean-up;
+--   * photos the rollback skipped mid-move that are still on from_store: their copy on to_store is no longer
+--     cleaned up (it may be the only readable one); the orphan sweep keeps it while from_store is unreachable.
 -- The migration finishes as rolled back with error 'rollback_abandoned' (old copies wait for the hold). Lock
 -- order as everywhere: the storage lock, the migration row, items, then each photo row. The API checks the
 -- passkey, re-evaluates automatic read-only mode and emails every Owner.
--- { migrationId, from, to, photos, returned, stranded } (photos: on to_store now) or
+-- { migrationId, from, to, photos, returned, stranded, edited } (photos: on to_store now; stranded: every photo
+-- still read from from_store, so unreadable while it's unreachable; edited: those of them copied back and changed
+-- since) or
 -- { error: forbidden | invalid | not_found | conflict }.
 create function public.storage_rollback_give_up(p_staff uuid, p_reason text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
@@ -1006,6 +1011,7 @@ declare
   kept integer;
   late integer;
   returned integer := 0;
+  edited integer := 0;
   stranded integer := 0;
   held boolean;
   r record;
@@ -1036,6 +1042,16 @@ begin
          cleanup_store = case when attempts > 0 or state = 'copied' then dst else cleanup_store end
    where migration_id = m.id and state in ('pending', 'copied', 'failed');
   get diagnostics late = row_count;
+  -- Never moved (the rollback skipped them mid-copy, tracking the partial or complete copy on to_store for
+  -- clean-up) and still on from_store: that copy may now be the only readable one, so it's no longer cleaned up.
+  -- The orphan sweep keeps it while from_store is unreachable (a live key away from its photo's store is only
+  -- deleted once the photo's own store has it) and copies anything missing back if from_store returns.
+  update public.storage_migration_items i
+     set cleanup_store = null, updated_at = now()
+   where i.migration_id = m.id and i.state = 'skipped' and i.src = m.from_store and i.dst = m.to_store
+     and i.cleanup_store = m.to_store and i.cleaned_at is null and i.deleting_at is null
+     and exists (select 1 from public.photos p
+                  where p.id = i.photo_id and p.store_id = m.from_store and p.status in ('ready', 'trashed'));
   -- Copied back: flipped back to to_store when the copy there is still held and the photo is unchanged since.
   for r in
     select i.photo_id, i.stamp from public.storage_migration_items i
@@ -1057,9 +1073,13 @@ begin
     else
       update public.storage_migration_items set error = 'rollback_stranded', updated_at = now()
        where migration_id = m.id and photo_id = r.photo_id;
-      stranded := stranded + 1;
+      edited := edited + 1;
     end if;
   end loop;
+  -- Everything still read from from_store (never moved, uploaded there, or edited after its copy back): it
+  -- can't be shown while that store is unreachable. Admin › Storage counts these per store too.
+  select count(*) into stranded from public.photos p
+   where p.store_id = m.from_store and p.status in ('ready', 'trashed');
   held := exists (select 1 from public.storage_migration_items
                    where migration_id = m.id and cleanup_store is not null and cleaned_at is null);
   update public.storage_migrations
@@ -1069,9 +1089,9 @@ begin
    where id = m.id;
   perform public._audit(p_staff, 'storage.rollback_abandoned', m.id::text,
                         jsonb_build_object('photos', kept + late + returned, 'returned', returned, 'stranded', stranded,
-                                           'writeStore', m.to_store, 'reason', btrim(p_reason)));
+                                           'edited', edited, 'writeStore', m.to_store, 'reason', btrim(p_reason)));
   return jsonb_build_object('migrationId', m.id, 'from', m.from_store, 'to', m.to_store,
-                            'photos', kept + late + returned, 'returned', returned, 'stranded', stranded);
+                            'photos', kept + late + returned, 'returned', returned, 'stranded', stranded, 'edited', edited);
 end;
 $$;
 

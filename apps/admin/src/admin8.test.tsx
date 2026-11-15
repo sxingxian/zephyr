@@ -506,9 +506,11 @@ describe('Storage', () => {
     ).toBeTruthy();
     // Stranded photos are only called out while their store can't be reached.
     expect(
-      screen.getByText(/2 photos can’t be recovered while Studio NAS · hostname is unreachable/),
+      screen.getByText(
+        /2 photos are still read from Studio NAS · hostname, so they can’t be shown while it’s unreachable/,
+      ),
     ).toBeTruthy();
-    expect(screen.queryByText(/5 photos can’t be recovered/)).toBeNull();
+    expect(screen.queryByText(/5 photos are still read from/)).toBeNull();
     await act(async () => screen.getByRole('button', { name: 'Abandon…' }).click());
     const d = dialog('Abandon old copies on Backblaze B2');
     expect(

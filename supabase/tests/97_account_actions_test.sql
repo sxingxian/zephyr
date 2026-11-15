@@ -1,4 +1,4 @@
--- Assertions for account action links (phase 8, review round 4): issuing (binding, at most 3 open, rate limits),
+-- Assertions for account action links (phase 8, review round 4): issuing (binding, none retired, rate limits),
 -- peeking, spending (single use, bound to member, change and passkey, expiry), the passkey grant, and privileges.
 -- Run with supabase/tests/run-local.sh.
 \set ON_ERROR_STOP on
@@ -70,17 +70,12 @@ update public.account_actions set expires_at = now() - interval '1 second' where
 select pg_temp.ok(public.account_action_use(:fre, 'account_delete', null, pg_temp.h('d1'), null) = 'invalid'
   and public.account_action_peek(:fre, pg_temp.h('d1')) is null, 'an expired link is refused');
 
-select public.account_action_issue(:fre, 'account_delete', null, pg_temp.h('d' || g)) from generate_series(2, 4) g;
-select pg_temp.ok(public.account_action_peek(:fre, pg_temp.h('d2')) is not null
-  and public.account_action_peek(:fre, pg_temp.h('d3')) is not null
-  and public.account_action_peek(:fre, pg_temp.h('d4')) is not null,
-  'up to three links stay open for the same change, so asking again doesn''t cancel the one already sent');
-select public.account_action_issue(:fre, 'account_delete', null, pg_temp.h('d5'));
-select pg_temp.ok(public.account_action_use(:fre, 'account_delete', null, pg_temp.h('d2'), null) = 'invalid',
-  'a fourth retires the oldest');
-select pg_temp.ok(public.account_action_use(:fre, 'account_delete', null, pg_temp.h('d3'), null) = 'ok'
+select public.account_action_issue(:fre, 'account_delete', null, pg_temp.h('d' || g)) from generate_series(2, 5) g;
+select pg_temp.ok((select bool_and(public.account_action_peek(:fre, pg_temp.h('d' || g)) is not null) from generate_series(2, 5) g),
+  'asking again never retires a link already sent: all four are open');
+select pg_temp.ok(public.account_action_use(:fre, 'account_delete', null, pg_temp.h('d2'), null) = 'ok'
   and public.account_action_peek(:fre, pg_temp.h('d5')) is not null,
-  'and the others still work');
+  'the first one asked for still works, and so do the others');
 
 -- ---- Rate limits ------------------------------------------------------------------------------------------
 delete from public.account_actions where user_id = :fre and op = 'passkey_remove';

@@ -9,8 +9,7 @@
  * so a link the script asked for gives it nothing (supabase/migrations/20261115100200_account_actions.sql).
  *
  * Tokens are 32 random bytes (base64url), stored only as HMAC(SESSION_HMAC_SECRET, "acct-action|token"): bound to
- * the member, the change and (passkey_remove) the passkey; 15 minutes; single use; at most 3 open per change (a
- * fourth retires the oldest);
+ * the member, the change and (passkey_remove) the passkey; 15 minutes; single use; never retired by a newer link;
  * 5 an hour and 10 a day per change, plus the per-network burst limit. Never logged, never in a response.
  */
 import {

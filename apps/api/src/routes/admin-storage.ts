@@ -343,6 +343,7 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
           actor: actorOf(c),
           store: body.store,
           copies: Number(res?.copies) || 0,
+          targets,
           adminUrl: adminUrl(c),
         }),
         'storage_abandon_notify',
@@ -367,6 +368,7 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
         to?: string;
         photos?: number;
         stranded?: number;
+        edited?: number;
         error?: string;
       }>(c.env, 'storage_rollback_give_up', { p_staff: c.get('staff').id, p_reason: body.reason });
       if (res?.error) return refused(c, res.error);
@@ -384,6 +386,7 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
           to: res?.to ?? '',
           photos: Number(res?.photos) || 0,
           stranded: Number(res?.stranded) || 0,
+          edited: Number(res?.edited) || 0,
           adminUrl: adminUrl(c),
         }),
         'storage_give_up_notify',
