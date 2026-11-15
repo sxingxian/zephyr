@@ -1,5 +1,4 @@
 import {
-  ACCOUNT_ACTION_HEADER,
   type AccountActionPeek,
   accountActionPeekSchema,
   accountActionRequestSchema,
@@ -14,6 +13,7 @@ import {
 } from '@zephyr/shared';
 import { Hono, type MiddlewareHandler } from 'hono';
 import {
+  checkAccountAction,
   issueAccountAction,
   peekAccountAction,
   useAccountAction,
@@ -151,7 +151,9 @@ meRoutes.post('/passkeys/options', async (c) => {
   try {
     // Phase 8: only from the page an emailed passkey_add link opens. The link is spent here and leaves a grant for
     // this challenge only, which the verify call below must present.
-    if (!c.req.header(ACCOUNT_ACTION_HEADER)) return c.json(fail('account_action_required'), 403);
+    // Checked (not spent) before GoTrue, so a missing, malformed or foreign link never creates a challenge there.
+    const pre = await checkAccountAction(c, 'passkey_add');
+    if (pre !== 'ok') return actionRefused(c, pre);
     const ch = await gotrue.passkeyRegisterOptions(c.env, c.get('session').accessToken);
     const r = await useAccountAction(c, 'passkey_add', { challengeId: ch.challenge_id });
     if (r !== 'ok') return actionRefused(c, r);

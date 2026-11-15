@@ -167,7 +167,7 @@ export function accountActionEmail(e: AccountActionEmail): { subject: string; ht
       : e.op === 'passkey_remove'
         ? `Someone signed in to your Zephyr account asked to remove ${name ? `the passkey “${name}”` : 'a passkey'}. Open this link to confirm.`
         : 'Someone signed in to your Zephyr account asked to delete it. Open this link to confirm. You can still restore the account for 30 days afterwards.';
-  const rules = `The link works once, only while you’re signed in to this account, for ${e.minutes} minutes. Zephyr only ever asks for this change from a link in an email like this one, never inside your library.`;
+  const rules = `The link works once, only while you’re signed in to this account, for ${e.minutes} minutes. Click the link — never paste it into Zephyr. Zephyr only ever asks for this change from a link in an email like this one, never inside your library.`;
   const advice =
     'Didn’t ask for this? Ignore this email and nothing changes. If you don’t recognise it, sign out of Zephyr on any device you don’t trust and reply to this email so we can help.';
   const link = escapeHtml(e.link);

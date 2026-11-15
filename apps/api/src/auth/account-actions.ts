@@ -4,20 +4,21 @@
  * Google's AdSense script runs inside Free members' library pages with their session, so neither a recent sign-in
  * nor a code typed into the app proves the member asked for a change. Adding or removing a passkey and deleting the
  * account are therefore only requested in Settings (`issueAccountAction`): the member's account address gets a
- * single-use link to `/account-action#t=<token>`, and the change is made on that page, which sends the token in
+ * single-use link to `/account-action/<nonce>#t=<token>`, and the change is made on that page, which sends the token in
  * ACCOUNT_ACTION_HEADER (`useAccountAction`). A passkey created there comes from the member's own authenticator,
  * so a link the script asked for gives it nothing (supabase/migrations/20261115100200_account_actions.sql).
  *
  * Tokens are 32 random bytes (base64url), stored only as HMAC(SESSION_HMAC_SECRET, "acct-action|token"): bound to
- * the member, the change and (passkey_remove) the passkey; 15 minutes; single use; a newer link replaces older ones;
+ * the member, the change and (passkey_remove) the passkey; 15 minutes; single use; at most 3 open per change (a
+ * fourth retires the oldest);
  * 5 an hour and 10 a day per change, plus the per-network burst limit. Never logged, never in a response.
  */
 import {
   ACCOUNT_ACTION_HEADER,
   ACCOUNT_ACTION_MINUTES,
-  ACCOUNT_ACTION_PATH,
   ACCOUNT_ACTION_TOKEN_RE,
   type AccountActionOp,
+  accountActionLink,
 } from '@zephyr/shared';
 import type { Context } from 'hono';
 import { base64url, hmac, toPgBytea } from '../crypto';
@@ -57,7 +58,11 @@ export async function issueAccountAction(
   });
   if (out === 'rate_limited') return 'rate_limited';
   if (out !== 'ok') throw new Error(`account_action_issue: ${String(out)}`);
-  const link = `${c.env.APP_URL.replace(/\/$/, '')}${ACCOUNT_ACTION_PATH}#t=${token}`;
+  // A fresh, non-secret nonce in the path (review round 5): the link's address then always differs from any page
+  // the AdSense script could have set with history.replaceState, so opening it is a new document, never a
+  // same-document fragment change the script's page would see.
+  const nonce = base64url(crypto.getRandomValues(new Uint8Array(16)));
+  const link = accountActionLink(c.env.APP_URL, nonce, token);
   await sendEmail(c.env, {
     to,
     ...accountActionEmail({ op, link, minutes: ACCOUNT_ACTION_MINUTES, passkeyName }),
@@ -87,6 +92,22 @@ export async function peekAccountAction(
   if (out.error === 'wrong_member') return { kind: 'wrong_member' };
   if (!out.op || !out.expiresAt) return { kind: 'invalid' };
   return { kind: 'ok', op: out.op, passkeyId: out.passkeyId ?? null, expiresAt: out.expiresAt };
+}
+
+/**
+ * Checks the link in ACCOUNT_ACTION_HEADER is open, this member's and for `op`, without spending it. Used before
+ * any upstream call (GoTrue), so a bogus or someone else's header never creates anything there (review round 5).
+ */
+export async function checkAccountAction(
+  c: Ctx,
+  op: AccountActionOp,
+): Promise<'ok' | 'missing' | 'wrong_member' | 'invalid'> {
+  const token = c.req.header(ACCOUNT_ACTION_HEADER)?.trim();
+  if (!token) return 'missing';
+  if (!ACCOUNT_ACTION_TOKEN_RE.test(token)) return 'invalid';
+  const p = await peekAccountAction(c, token);
+  if (p.kind !== 'ok') return p.kind;
+  return p.op === op ? 'ok' : 'invalid';
 }
 
 /**

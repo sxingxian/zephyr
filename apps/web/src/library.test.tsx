@@ -315,8 +315,8 @@ describe('delete account', () => {
         return json(200, { ok: true, purgeAt: '2026-11-27T00:00:00Z' });
       return undefined;
     });
-    window.history.replaceState(null, '', `/account-action#t=${TOKEN}`);
-    const router = renderAt('/account-action');
+    window.history.replaceState(null, '', `/account-action/${'n'.repeat(22)}#t=${TOKEN}`);
+    const router = renderAt(`/account-action/${'n'.repeat(22)}`);
     // The token leaves the address bar at once.
     expect(window.location.hash).toBe('');
     const go = await screen.findByRole('button', { name: 'Delete my account' });

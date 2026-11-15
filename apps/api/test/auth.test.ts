@@ -347,7 +347,7 @@ describe('passkeys', () => {
 
 describe('account action links (phase 8: account changes only from a link emailed to the account)', () => {
   const linkIn = (text: string | undefined) =>
-    /\/account-action#t=([A-Za-z0-9_-]{43})(?:\s|$)/.exec(text ?? '')?.[1];
+    /\/account-action\/[A-Za-z0-9_-]{22}#t=([A-Za-z0-9_-]{43})(?:\s|$)/.exec(text ?? '')?.[1];
   const ask = (j: ReturnType<typeof jar>, body: Record<string, unknown>) =>
     call('/api/v1/me/account-actions', { body, jar: j });
   const del = (j: ReturnType<typeof jar>, token?: string, id = 'pk-0') =>
@@ -370,6 +370,47 @@ describe('account action links (phase 8: account changes only from a link emaile
     expect(world.emails).toHaveLength(0);
   });
 
+  it('a bogus, foreign or used link on the options call never reaches GoTrue', async () => {
+    const { j } = await signIn();
+    const bogus = await call('/api/v1/me/passkeys/options', { body: {}, jar: j, headers: { [AH]: 'nope' } });
+    expect((await read(bogus)).error).toBe('account_action_invalid');
+    const unknown = await call('/api/v1/me/passkeys/options', {
+      body: {},
+      jar: j,
+      headers: { [AH]: 'A'.repeat(43) },
+    });
+    expect((await read(unknown)).error).toBe('account_action_invalid');
+    // A real link for another change isn't spent and creates nothing upstream.
+    const remove = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    const wrongOp = await call('/api/v1/me/passkeys/options', {
+      body: {},
+      jar: j,
+      headers: { [AH]: remove },
+    });
+    expect((await read(wrongOp)).error).toBe('account_action_invalid');
+    world.users.push({ id: '20000000-0000-0000-0000-000000000009', email: 'sam@example.com', passkeys: 1 });
+    const { j: k } = await signIn('sam@example.com');
+    const add = await accountActionToken(j, 'passkey_add');
+    const foreign = await call('/api/v1/me/passkeys/options', { body: {}, jar: k, headers: { [AH]: add } });
+    expect((await read(foreign)).error).toBe('account_action_wrong_member');
+    expect(gotrueCalls('/passkeys/registration')).toHaveLength(0);
+    expect((await del(j, remove)).status).toBe(204);
+  });
+
+  it('asking again doesn’t cancel a link already sent: up to three stay open, then the oldest goes', async () => {
+    const { j } = await signIn();
+    const first = await accountActionToken(j, 'account_delete');
+    const second = await accountActionToken(j, 'account_delete');
+    const third = await accountActionToken(j, 'account_delete');
+    const peekOf = async (t: string) =>
+      read(await call('/api/v1/me/account-actions/peek', { body: { token: t }, jar: j }));
+    for (const t of [first, second, third]) expect((await peekOf(t)).op).toBe('account_delete');
+    const fourth = await accountActionToken(j, 'account_delete');
+    expect((await peekOf(first)).error).toBe('account_action_invalid');
+    expect((await peekOf(second)).op).toBe('account_delete');
+    expect((await peekOf(fourth)).op).toBe('account_delete');
+  });
+
   it('asking emails a link to the account address and returns nothing secret', async () => {
     const { j } = await signIn();
     const spy = vi.spyOn(console, 'error');
@@ -382,8 +423,13 @@ describe('account action links (phase 8: account changes only from a link emaile
     expect(email.to).toBe('mei@example.com');
     expect(email.subject).toBe('Remove a passkey from your Zephyr account');
     const token = must(linkIn(email.text));
-    expect(email.text).toContain(`${APP}/account-action#t=${token}`);
-    expect(email.html).toContain(`/account-action#t=${token}`);
+    // A fresh path nonce per link: opening it is always a new document (review round 5).
+    const nonce = must(/\/account-action\/([A-Za-z0-9_-]{22})#t=/.exec(email.text)?.[1]);
+    expect(email.text).toContain(`${APP}/account-action/${nonce}#t=${token}`);
+    expect(email.html).toContain(`/account-action/${nonce}#t=${token}`);
+    expect(email.text).toContain('never paste it into Zephyr');
+    await ask(j, { op: 'passkey_remove', passkeyId: 'pk-0' });
+    expect(must(world.emails.at(-1)).text).not.toContain(`/account-action/${nonce}#`);
     expect(email.subject).not.toContain(token);
     expect(email.text).toContain('never inside your library');
     // The token is in the email only: not in the response, not stored, not logged.
@@ -412,15 +458,18 @@ describe('account action links (phase 8: account changes only from a link emaile
     expect((await read(await del(j, token))).error).toBe('account_action_invalid');
   });
 
-  it('expired and replaced links are refused', async () => {
+  it('expired and retired links are refused', async () => {
     const { j } = await signIn();
     const old = await accountActionToken(j, 'passkey_remove', 'pk-0');
     for (const r of world.actions) r.expires = Date.now() - 1;
     expect((await read(await del(j, old))).error).toBe('account_action_invalid');
+    // Three may be open at once; a fourth retires the oldest.
     const first = await accountActionToken(j, 'passkey_remove', 'pk-0');
-    const second = await accountActionToken(j, 'passkey_remove', 'pk-0');
+    await accountActionToken(j, 'passkey_remove', 'pk-0');
+    await accountActionToken(j, 'passkey_remove', 'pk-0');
+    const fourth = await accountActionToken(j, 'passkey_remove', 'pk-0');
     expect((await read(await del(j, first))).error).toBe('account_action_invalid');
-    expect((await del(j, second)).status).toBe(204);
+    expect((await del(j, fourth)).status).toBe(204);
   });
 
   it('asking checks the body and the passkey, and is rate limited', async () => {
@@ -689,6 +738,20 @@ describe('security review fixes (app)', () => {
     expect((await call('/api/v1/me/passkeys', { jar: j })).status).toBe(200);
     expect(gotrueCalls('/passkeys/registration')).toHaveLength(0);
     expect(world.emails).toHaveLength(0);
+  });
+
+  it('asking again doesn’t cancel a link already sent: up to three stay open, then the oldest goes', async () => {
+    const { j } = await signIn();
+    const first = await accountActionToken(j, 'account_delete');
+    const second = await accountActionToken(j, 'account_delete');
+    const third = await accountActionToken(j, 'account_delete');
+    const peekOf = async (t: string) =>
+      read(await call('/api/v1/me/account-actions/peek', { body: { token: t }, jar: j }));
+    for (const t of [first, second, third]) expect((await peekOf(t)).op).toBe('account_delete');
+    const fourth = await accountActionToken(j, 'account_delete');
+    expect((await peekOf(first)).error).toBe('account_action_invalid');
+    expect((await peekOf(second)).op).toBe('account_delete');
+    expect((await peekOf(fourth)).op).toBe('account_delete');
   });
 
   it('L2: the account is emailed when a passkey is added or removed', async () => {

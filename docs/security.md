@@ -209,9 +209,12 @@
         (no ads) instead of showing the passcode, where a new one can be set.
       - **Account takeover is closed by emailed action links.** For every member, adding or removing a passkey
         and deleting the account are only _requested_ in the app. The API emails the account a single-use link
-        (`/account-action#t=…`: 256-bit token stored only as an HMAC, bound to the member, the change and the
-        passkey, 15 minutes, a newer link replaces older ones, 5 an hour and 10 a day per change), and the change
-        is made on the page that link opens, carrying the token. The script acts with the session but can't read
+        (`/account-action/<nonce>#t=…`: 256-bit token stored only as an HMAC, bound to the member, the change and
+        the passkey, 15 minutes, at most 3 open per change, 5 an hour and 10 a day per change), and the change is
+        made on the page that link opens, carrying the token. The fresh nonce in the path makes every link's
+        address unique, so opening it always loads a new document: a page with the script loaded can't set its
+        own address to the link's and receive the token as a same-document fragment change. The options call
+        checks the link before anything reaches GoTrue. The script acts with the session but can't read
         the member's email, can't drive a page it isn't in, and a passkey created on that page comes from the
         member's own authenticator. A new passkey's verify call must present the challenge the link was spent on.
         A code typed into the app would not do: the script could draw the prompt itself.
@@ -261,11 +264,17 @@
       revokes it (Shared › the gallery › End). It can't add a passkey of its own, remove passkeys or delete the
       account: those only complete on a page opened from a link emailed to the member, and a passkey created there
       comes from the member's own authenticator. Its code can't persist through the origin's caches or storage.
-    - **Ad events** count at most one impression and one click per member, card and day. Only members who are
-      shown ads can send them. The dedup key is pseudonymous, not anonymous: an HMAC of member, day, card and kind
-      under its own secret (`AD_DEDUP_SECRET`). Whoever holds that secret and the database could recompute it for a
-      given member, so it's kept for two days and never joined to the stats.
-    - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
-      Turnstile.
+    - **Also accepted:**
+      - **Phishing the link.** The script could draw a "paste your link here" prompt on the real domain. The
+        email's warning ("click the link, never paste it into Zephyr; Zephyr only asks from a link in an email")
+        is the mitigation, and the account-action page only takes a token from the emailed link's own address.
+      - **Denial of service.** Within 10 minutes of the member's sign-in, the script can ask for links until the
+        daily cap (10 per change) is used up, blocking these changes for up to a day. It can't cancel a link
+        already sent (3 stay open), and the account-action page ignores other tabs' session broadcasts while it
+        holds an unspent link. - **Ad events** count at most one impression and one click per member, card and day. Only members who are
+        shown ads can send them. The dedup key is pseudonymous, not anonymous: an HMAC of member, day, card and kind
+        under its own secret (`AD_DEDUP_SECRET`). Whoever holds that secret and the database could recompute it for a
+        given member, so it's kept for two days and never joined to the stats. - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
+        Turnstile.
 
 See the design decisions doc and `docs/phase-8.md` for the details.

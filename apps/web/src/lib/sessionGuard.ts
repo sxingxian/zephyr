@@ -224,12 +224,24 @@ export function onOtherTabLibrariesChange(fn: () => void): () => void {
 }
 
 /** Calls `fn` when another tab reports a different signed-in member (or none) than this tab has. */
+/**
+ * Phase 8 (review round 5): while the account-action page holds an unspent emailed link, it ignores other tabs'
+ * session broadcasts. Any same-origin page can post on the channel (Google's AdSense script in a library tab
+ * included), so a forged "signed out" must not bounce the member off the page and waste the link. The API stays
+ * the source of truth: if the session really ended or changed, the link's calls are refused.
+ */
+let holdOtherTabSession = false;
+export function setHoldOtherTabSession(hold: boolean): void {
+  holdOtherTabSession = hold;
+}
+
 export function onOtherTabSession(fn: (id: string | null) => void): () => void {
   const ch = getChannel();
   if (!ch) return () => {};
   const h = (e: MessageEvent) => {
     const d = e.data as { type?: unknown; id?: unknown } | null;
     if (d?.type !== 'session-user' || (d.id !== null && typeof d.id !== 'string')) return;
+    if (holdOtherTabSession) return;
     if (currentId !== null && d.id !== currentId) fn(d.id as string | null);
   };
   ch.addEventListener('message', h);

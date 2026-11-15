@@ -837,9 +837,10 @@ describe('account action links (passkeys and deletion are made from an emailed l
   const TOKEN = 'T'.repeat(43);
   const peekWith = (op: string, passkeyId: string | null = null) =>
     json(200, { ok: true, op, passkeyId, expiresAt: '2026-11-15T12:00:00Z' });
-  const openLink = (hash = `#t=${TOKEN}`) => {
-    window.history.replaceState(null, '', `/account-action${hash}`);
-    return renderAt('/account-action');
+  const NONCE = 'N'.repeat(22);
+  const openLink = (hash = `#t=${TOKEN}`, path = `/account-action/${NONCE}`) => {
+    window.history.replaceState(null, '', `${path}${hash}`);
+    return renderAt(path);
   };
   beforeEach(() => {
     passkeyMock.create.mockClear();
@@ -889,7 +890,9 @@ describe('account action links (passkeys and deletion are made from an emailed l
       return undefined;
     });
     openLink();
+    // The nonce and the token both leave the address bar at once.
     expect(window.location.hash).toBe('');
+    expect(window.location.pathname).toBe('/account-action');
     expect(await screen.findByText('Work laptop')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Remove passkey' }));
     expect(await screen.findByText('Passkey removed')).toBeTruthy();
@@ -937,8 +940,42 @@ describe('account action links (passkeys and deletion are made from an emailed l
     cleanup();
     mockApi();
     openLink('#t=<script>');
-    expect(await screen.findByText('This link looks incomplete')).toBeTruthy();
+    expect(await screen.findByText('Open the link from your email')).toBeTruthy();
     expect(calls.some((c) => c.url.endsWith('/peek'))).toBe(false);
+  });
+
+  it('a token on the bare path (no nonce) is never taken: a page could have set that address itself', async () => {
+    mockApi((url) => (url.endsWith('/peek') ? peekWith('passkey_add') : undefined));
+    openLink(`#t=${TOKEN}`, '/account-action');
+    expect(await screen.findByText('Open the link from your email')).toBeTruthy();
+    expect(window.location.hash).toBe('');
+    expect(calls.some((c) => c.url.endsWith('/peek'))).toBe(false);
+    cleanup();
+    mockApi((url) => (url.endsWith('/peek') ? peekWith('passkey_add') : undefined));
+    openLink(`#t=${TOKEN}`, '/account-action/short');
+    expect(await screen.findByText('Open the link from your email')).toBeTruthy();
+    expect(calls.some((c) => c.url.endsWith('/peek'))).toBe(false);
+  });
+
+  it('while holding an unspent link, a forged "signed out" broadcast from another tab is ignored', async () => {
+    mockApi((url) => (url.endsWith('/peek') ? peekWith('account_delete') : undefined));
+    openLink();
+    await screen.findByRole('button', { name: 'Delete my account' });
+    const other = new BroadcastChannel('zephyr-session');
+    other.postMessage({ type: 'session-user', id: null });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(assign).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Delete my account' })).toBeTruthy();
+    // Control: once the page is left (the hold released), the same broadcast ends the session here as usual.
+    cleanup();
+    mockApi((url, method) =>
+      url === '/api/v1/me/passkeys' && method === 'GET' ? json(200, { ok: true, passkeys: [PK] }) : undefined,
+    );
+    renderAt('/settings/security');
+    await screen.findByText('Work laptop');
+    other.postMessage({ type: 'session-user', id: null });
+    await waitFor(() => expect(assign).toHaveBeenCalledWith('/', { sessionEnd: true }));
+    other.close();
   });
 
   it('signed out: asks to sign in as that account, without checking the link', async () => {

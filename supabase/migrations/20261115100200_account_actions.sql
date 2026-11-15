@@ -9,8 +9,9 @@
 -- there comes from the member's own authenticator, so even a link the script asked for gives it nothing.
 --
 -- The API stores only HMAC(server secret, token): the table holds nothing a reader could turn back into a link.
--- One row per link: bound to one member, one change and (passkey_remove) one passkey; 15 minutes; single use; a
--- newer link for the same member and change replaces older ones. passkey_add spends the link on the options call
+-- One row per link: bound to one member, one change and (passkey_remove) one passkey; 15 minutes; single use; at
+-- most 3 open per member and change (a fourth retires the oldest). The emailed link carries a random path nonce
+-- (not stored: it only makes the address unique, so opening it always loads a new document). passkey_add spends the link on the options call
 -- and leaves a grant tied to that registration challenge, which the verify call must present.
 
 create table public.account_actions (
@@ -30,7 +31,7 @@ create index account_actions_user_op on public.account_actions (user_id, op, cre
 alter table public.account_actions enable row level security;
 revoke all on public.account_actions from public, anon, authenticated;
 
--- Stores a new link for (member, change[, passkey]) and retires the member's earlier open links for that change.
+-- Stores a new link for (member, change[, passkey]), retiring the oldest open ones beyond 3 for that change.
 -- 'ok', 'rate_limited' (5 an hour or 10 a day per change) or 'invalid' (unknown change, a passkey id with the wrong
 -- change or a malformed one, a malformed hash, or no such member). Rows older than two days are forgotten here, so
 -- the table stays small without a job.
@@ -53,10 +54,15 @@ begin
           where user_id = p_user and op = p_op and created_at > now() - interval '1 day') >= 10 then
     return 'rate_limited';
   end if;
+  -- At most 3 open links per member and change: a fourth retires the oldest. Older links are not retired on every
+  -- issue, so a script in the member's page asking for links can't keep cancelling the one the member asked for.
   update public.account_actions set expires_at = least(expires_at, now())
-   where user_id = p_user and op = p_op and used_at is null and expires_at > now();
-  insert into public.account_actions (user_id, op, passkey_id, token_hash, expires_at)
-  values (p_user, p_op, p_passkey, p_hash, now() + interval '15 minutes');
+   where id in (select id from public.account_actions
+                 where user_id = p_user and op = p_op and used_at is null and expires_at > now()
+                 order by created_at desc, id desc offset 2);
+  -- clock_timestamp(), so links issued in one transaction still have an order for "oldest".
+  insert into public.account_actions (user_id, op, passkey_id, token_hash, created_at, expires_at)
+  values (p_user, p_op, p_passkey, p_hash, clock_timestamp(), now() + interval '15 minutes');
   return 'ok';
 end;
 $$;

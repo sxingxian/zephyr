@@ -8,6 +8,9 @@ Nothing here is committed; each value goes into Cloudflare, Supabase, Resend or 
    gives you in Cloudflare DNS.
 2. Create two API keys: one for the API Worker (sending access, this domain only) and one for Supabase SMTP.
 3. Sender: `Zephyr <hello@zephyr.midnightpoetry.studio>`.
+4. Domain settings: keep **click tracking** and **open tracking** off. Emails carry single-use links (account
+   actions, invites, staff invites) whose secret is in the URL; click tracking would route them through Resend's
+   redirect, and open tracking adds a tracking pixel.
 
 ## 2. Supabase
 
@@ -247,7 +250,7 @@ it on:
    for a valid one. Without it on either side, AdSense never loads (the strict policy everywhere).
 7. Every member adds or removes passkeys and deletes their account from a link emailed through Resend
    (`docs/phase-8.md`, "Account changes only from an emailed link"): check that those emails arrive and that the link
-   opens `/account-action` on the app host (`APP_URL`), before launch and before turning AdSense on.
+   opens `/account-action/<nonce>` on the app host (`APP_URL`), before launch and before turning AdSense on.
 8. **Launch gate:** in current Chrome, Safari and Firefox, check that a library page served with the AdSense policy
    (`Cross-Origin-Opener-Policy: same-origin-allow-popups`) can't read a same-origin popup it opens onto another app
    page (`same-origin`): `window.open('/settings')` from the console, then `w.document` must throw or be null.

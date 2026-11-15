@@ -218,13 +218,24 @@ export type AccountActionOp = (typeof ACCOUNT_ACTION_OPS)[number];
 export const ACCOUNT_ACTION_HEADER = 'X-Zephyr-Account-Action';
 /** The link's token: 32 random bytes, base64url (43 characters). */
 export const ACCOUNT_ACTION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
-/** A link works once, for 15 minutes, only for the member and change it was sent for. A newer link replaces it. */
+/** A link works once, for 15 minutes, only for the member and change it was sent for. */
 export const ACCOUNT_ACTION_MINUTES = 15;
 /** Links per member and change: 5 an hour, 10 a day (plus the per-network burst limit). */
 export const ACCOUNT_ACTION_PER_HOUR = 5;
 export const ACCOUNT_ACTION_PER_DAY = 10;
-/** The page the emailed link opens (never an ad page). */
+/** The page the emailed link opens (never an ad page). The link adds a nonce: `/account-action/<nonce>#t=<token>`. */
 export const ACCOUNT_ACTION_PATH = '/account-action';
+/**
+ * The link's path nonce: 16 random bytes, base64url (22 characters). Not secret; it makes every link's address
+ * unique, so opening one always loads a new document. A page with Google's script loaded could otherwise set its
+ * own address to the bare path (history.replaceState) and see the token arrive as a same-document fragment change.
+ */
+export const ACCOUNT_ACTION_NONCE_RE = /^[A-Za-z0-9_-]{22}$/;
+/** Open links per member and change; issuing another retires the oldest. */
+export const ACCOUNT_ACTION_OPEN_MAX = 3;
+/** The emailed link for `nonce` and `token`. */
+export const accountActionLink = (appUrl: string, nonce: string, token: string): string =>
+  `${appUrl.replace(/\/$/, '')}${ACCOUNT_ACTION_PATH}/${nonce}#t=${token}`;
 export interface AccountActionRequestBody {
   op: AccountActionOp;
   /** passkey_remove only: the passkey to remove. */
