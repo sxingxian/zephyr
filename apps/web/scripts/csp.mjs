@@ -141,6 +141,7 @@ function checkAdPages() {
     '/settings/team',
     '/share/new',
     '/account-action',
+    '/account-action/AbCdEfGhIjKlMnOpQrStUv',
     '/settings/ai',
     '/settings/invites',
     '/settings/about',

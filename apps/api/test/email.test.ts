@@ -61,7 +61,7 @@ describe('passkey change notice', () => {
 });
 
 describe('account action link email (phase 8)', () => {
-  const link = `https://zephyrapp.midnightpoetry.studio/account-action#t=${'A'.repeat(43)}`;
+  const link = `https://zephyrapp.midnightpoetry.studio/account-action/${'n'.repeat(22)}#t=${'A'.repeat(43)}`;
   it('says what will happen, carries the link only in the body, and says where Zephyr asks', () => {
     const m = accountActionEmail({ op: 'account_delete', link, minutes: 15 });
     expect(m.subject).toBe('Delete your Zephyr account');

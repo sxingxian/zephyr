@@ -21,7 +21,7 @@ import { ApiFailure, api, errorMessage } from '../lib/api';
 import { deleteAccount } from '../lib/library';
 import { createPasskey, isCancelled, passkeysSupported } from '../lib/passkey';
 import { useSession } from '../lib/session';
-import { browser, endSession } from '../lib/sessionGuard';
+import { browser, endSession, setHoldOtherTabSession } from '../lib/sessionGuard';
 
 type State =
   | { kind: 'missing' }
@@ -36,7 +36,7 @@ type State =
 const AGAIN = 'Ask again from Settings › Security.';
 
 /**
- * /account-action: the page an emailed account action link opens (phase 8, review round 4). Adding or removing a
+ * /account-action/<nonce>: the page an emailed account action link opens (phase 8, review rounds 4 and 5). Adding or removing a
  * passkey and deleting the account are made here and nowhere else: the link's token (from the URL fragment,
  * stripped at once) goes with the change, so Google's AdSense script, which runs in Free members' library pages,
  * can't make these changes even though it acts with their session. Never an ad page; the strict CSP; the token
@@ -53,7 +53,20 @@ export function AccountActionPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => () => forgetAccountActionToken(), []);
+  // While this page holds an unspent link, other tabs' session broadcasts are ignored (any same-origin page can
+  // forge one); the API refusing the link is the source of truth. Released once the link is spent or left.
+  useEffect(() => {
+    setHoldOtherTabSession(Boolean(token.current));
+    return () => {
+      setHoldOtherTabSession(false);
+      forgetAccountActionToken();
+    };
+  }, []);
+  const release = () => {
+    forgetAccountActionToken();
+    token.current = null;
+    setHoldOtherTabSession(false);
+  };
 
   useEffect(() => {
     const t = token.current;
@@ -92,7 +105,7 @@ export function AccountActionPage() {
       e instanceof ApiFailure &&
       (e.code === 'account_action_invalid' || e.code === 'account_action_required')
     ) {
-      forgetAccountActionToken();
+      release();
       setState({ kind: 'invalid' });
       return true;
     }
@@ -111,8 +124,7 @@ export function AccountActionPage() {
         body: {},
         headers: accountActionHeaders(t),
       });
-      forgetAccountActionToken();
-      token.current = null;
+      release();
       const credential = await createPasskey(opts);
       await api(APP_API.myPasskeyVerify, {
         method: 'POST',
@@ -140,8 +152,7 @@ export function AccountActionPage() {
     setError(null);
     try {
       await api(APP_API.myPasskey(id), { method: 'DELETE', headers: accountActionHeaders(t) });
-      forgetAccountActionToken();
-      token.current = null;
+      release();
       setState({ kind: 'done', op: 'passkey_remove' });
     } catch (e) {
       if (!spent(e)) setError(errorMessage(e));
@@ -157,8 +168,7 @@ export function AccountActionPage() {
     setError(null);
     try {
       const r = await deleteAccount(accountActionHeaders(t));
-      forgetAccountActionToken();
-      token.current = null;
+      release();
       try {
         sessionStorage.setItem('zephyr.purgeAt', r.purgeAt);
       } catch {
@@ -222,7 +232,10 @@ export function AccountActionPage() {
                 `It may have expired (links last ${ACCOUNT_ACTION_MINUTES} minutes), been used, or been replaced by a newer one. ${AGAIN}`,
               ]
             : state.kind === 'missing'
-              ? ['This link looks incomplete', `Open it straight from the email. ${AGAIN}`]
+              ? [
+                  'Open the link from your email',
+                  `Click the link in the email itself; don’t paste it here. ${AGAIN}`,
+                ]
               : ['We couldn’t open this link', state.message];
     return (
       <AuthLayout pose="ponder" line="That link blew away." footer={false}>

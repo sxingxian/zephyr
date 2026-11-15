@@ -381,7 +381,9 @@ const defaultRpc: Record<string, (a: Record<string, unknown>) => unknown> = {
       mine.filter((r) => r.created > now - 86400_000).length >= 10
     )
       return 'rate_limited';
-    for (const r of mine) if (!r.used && r.expires > now) r.expires = now;
+    // At most 3 open per member and change: a fourth retires the oldest.
+    const open = mine.filter((r) => !r.used && r.expires > now);
+    for (const r of open.slice(0, Math.max(0, open.length - 2))) r.expires = now;
     world.actions.push({
       user,
       op,
@@ -768,7 +770,9 @@ export async function accountActionToken(jar: Jar, op: string, passkeyId?: strin
     jar,
   });
   if (res.status !== 202) throw new Error(`account action request answered ${res.status}`);
-  const m = /\/account-action#t=([A-Za-z0-9_-]{43})(?:\s|$)/.exec(world.emails.at(-1)?.text ?? '');
+  const m = /\/account-action\/[A-Za-z0-9_-]{22}#t=([A-Za-z0-9_-]{43})(?:\s|$)/.exec(
+    world.emails.at(-1)?.text ?? '',
+  );
   if (!m?.[1]) throw new Error('no account action link in the last email');
   return m[1];
 }

@@ -171,6 +171,7 @@ export const routes: RouteObject[] = [
       // Phase 8: the page an emailed account action link opens (passkeys, deletion). Never an ad page; it says
       // what to do when nobody, or someone else, is signed in.
       { path: '/account-action', element: <AccountActionPage /> },
+      { path: '/account-action/:nonce', element: <AccountActionPage /> },
       { path: '/account-deleted', element: <AccountDeleted /> },
       // Phase 8: a suspended account (from any call, sign-in included). No session by then.
       { path: '/suspended', element: <SuspendedPage /> },
