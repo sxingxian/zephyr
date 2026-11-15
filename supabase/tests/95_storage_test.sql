@@ -430,23 +430,29 @@ select pg_temp.settle(:'m11'::uuid);
 create temp table c11 as select e.value as v from jsonb_array_elements(public.storage_migration_batch(:'m11'::uuid, 100)) e;
 select public.storage_item_mark(:'m11'::uuid, (v ->> 'photoId')::uuid, 'verified', 5000, null, null, (v ->> 'token')::uuid) from c11;
 select pg_temp.ok((select state = 'holding' from public.storage_migrations where id = :'m11'::uuid)
-  and public.admin_storage(:own) -> 'oldCopies' = jsonb_build_array(jsonb_build_object('storeId', 'nas', 'copies', (select count(*) from c11))),
-  'Admin lists the old copies waiting on each store');
+  and public.admin_storage(:own) -> 'oldCopies' = jsonb_build_array(jsonb_build_object('storeId', 'nas', 'copies', (select count(*) from c11), 'endsRollback', true)),
+  'Admin lists the old copies waiting on each store, and that abandoning them would end a rollback that''s still possible');
 select pg_temp.ok(public.storage_abandon_old_copies(:fin, 'nas', 'NAS died') ->> 'error' = 'forbidden'
   and public.storage_abandon_old_copies(:own, 'NAS!', 'NAS died') ->> 'error' = 'invalid'
   and public.storage_abandon_old_copies(:own, 'nas', 'x') ->> 'error' = 'invalid'
   and public.storage_abandon_old_copies(:own, 'cold', 'Nothing there') ->> 'error' = 'not_found',
   'only an Owner, with a store and a reason, and only where copies are waiting');
-select public.storage_abandon_old_copies(:own, 'nas', 'NAS died') as ab \gset
+select pg_temp.ok(public.storage_abandon_old_copies(:own, 'nas', 'NAS died') ->> 'error' = 'rollback_ends'
+  and (select state = 'holding' from public.storage_migrations where id = :'m11'::uuid)
+  and (select bool_and(cleaned_at is null) from public.storage_migration_items where migration_id = :'m11'::uuid and cleanup_store = 'nas'),
+  'finishing a move that can still be rolled back needs an explicit acknowledgement; nothing changes without it');
+select public.storage_abandon_old_copies(:own, 'nas', 'NAS died', true) as ab \gset
 select pg_temp.ok((:'ab'::jsonb ->> 'copies')::int = (select count(*) from c11) and (:'ab'::jsonb ->> 'migrations')::int = 1
   and (select state = 'done' and finished_at is not null from public.storage_migrations where id = :'m11'::uuid)
   and (select bool_and(cleaned_at is not null and error = 'abandoned' and state = 'verified') from public.storage_migration_items where migration_id = :'m11'::uuid and cleanup_store = 'nas')
   and not (public.storage_status() ->> 'cleanupPending')::boolean and public.admin_storage(:own) -> 'oldCopies' = '[]'::jsonb
-  and public.storage_old_copies_due(100) = '[]'::jsonb,
+  and public.storage_old_copies_due(100) = '[]'::jsonb
+  and (select delete_old_after is null from public.storage_migrations where id = :'m11'::uuid),
   'abandoning marks the copies cleaned (nothing deleted) and finishes the migration');
 select pg_temp.ok(exists (select 1 from public.audit_log where action = 'storage.old_copies_abandoned' and target = 'nas'
-                            and details ->> 'reason' = 'NAS died' and (details ->> 'copies')::int = (select count(*) from c11)),
-  'it''s audited');
+                            and details ->> 'reason' = 'NAS died' and (details ->> 'copies')::int = (select count(*) from c11)
+                            and (details ->> 'endedRollback')::boolean),
+  'it''s audited, with the rollback it ended');
 select pg_temp.ok(public.storage_abandon_old_copies(:own, 'nas', 'Again') ->> 'error' = 'not_found'
   and public.storage_switch(:own, 'cold', 'Next') ->> 'migrationId' is not null, 'nothing left to abandon; the next switch can start');
 rollback to savepoint abandon;
@@ -490,6 +496,43 @@ select public.storage_item_mark(:'m6'::uuid, :'mid'::uuid, 'verified', 2000, nul
 select pg_temp.ok((select state = 'rolled_back' from public.storage_migrations where id = :'m6'::uuid)
   and (select store_id = 'nas' from public.photos where id = :'mid'::uuid), 'then the rollback finishes, with nothing left on the abandoned store');
 rollback to savepoint rollback_upload;
+
+-- ---- Giving up a failed rollback (the store it was rolling back to is gone for good) --------------------------------
+savepoint give_up;
+select public.storage_switch(:own, 's3', 'Try S3 again') ->> 'migrationId' as m12 \gset
+select pg_temp.ok(public.storage_rollback_give_up(:own, 'Not a rollback') ->> 'error' = 'conflict',
+  'only a failed rollback can be given up (not a forward move)');
+select pg_temp.settle(:'m12'::uuid);
+create temp table c12 as select e.value as v from jsonb_array_elements(public.storage_migration_batch(:'m12'::uuid, 100)) e;
+select public.storage_item_mark(:'m12'::uuid, (v ->> 'photoId')::uuid, 'verified', 5000, null, null, (v ->> 'token')::uuid) from c12;
+select public.storage_migration_action(:own, 'rollback', 'Back to the NAS');
+-- The copies back fail for good: one was attempted (a partial copy may sit on the NAS), the rest never started.
+select (select photo_id from public.storage_migration_items where migration_id = :'m12'::uuid and state = 'pending' order by photo_id limit 1) as tried \gset
+update public.storage_migration_items set state = 'failed', attempts = case when photo_id = :'tried'::uuid then 5 else 0 end, error = 'copy_failed'
+ where migration_id = :'m12'::uuid and state = 'pending';
+update public.storage_migrations set state = 'failed' where id = :'m12'::uuid;
+select pg_temp.ok(public.storage_migration_action(:own, 'rollback', 'Again') ->> 'error' = 'conflict'
+  and public.storage_abandon_old_copies(:own, 'nas', 'NAS gone', true) ->> 'error' = 'conflict'
+  and public.storage_switch(:own, 'cold', 'Elsewhere') ->> 'error' is not null,
+  'a failed rollback can''t be rolled back, abandoned or switched away from');
+select pg_temp.ok(public.storage_rollback_give_up(:fin, 'NAS gone for good') ->> 'error' = 'forbidden'
+  and public.storage_rollback_give_up(:own, 'x') ->> 'error' = 'invalid', 'giving up is for an Owner, with a reason');
+select public.storage_rollback_give_up(:own, 'NAS gone for good') as gu \gset
+select pg_temp.ok(:'gu'::jsonb ->> 'migrationId' = :'m12' and (:'gu'::jsonb ->> 'photos')::int = (select count(*) from c12)
+  and (select write_store = 's3' from public.storage_state where id = 1)
+  and (select state = 'rolled_back' and last_error = 'rollback_abandoned' from public.storage_migrations where id = :'m12'::uuid)
+  and (select bool_and(state = 'skipped') from public.storage_migration_items where migration_id = :'m12'::uuid and photo_id in (select (v ->> 'photoId')::uuid from c12))
+  and (select bool_and(p.store_id = 's3') from public.photos p where p.id in (select (v ->> 'photoId')::uuid from c12)),
+  'giving up sends uploads back to S3 and leaves the photos there; the migration ends rolled back');
+select pg_temp.ok((select cleanup_store = 'nas' from public.storage_migration_items where migration_id = :'m12'::uuid and photo_id = :'tried'::uuid)
+  and (select delete_old_after > now() + interval '6 days' and finished_at is null from public.storage_migrations where id = :'m12'::uuid)
+  and (public.storage_status() ->> 'cleanupPending')::boolean,
+  'the partial copy on the NAS is tracked for clean-up after the hold');
+select pg_temp.ok(exists (select 1 from public.audit_log where action = 'storage.rollback_abandoned' and target = :'m12'
+                            and details ->> 'reason' = 'NAS gone for good' and details ->> 'writeStore' = 's3'),
+  'it''s audited');
+select pg_temp.ok(public.storage_rollback_give_up(:own, 'Again') ->> 'error' = 'not_found', 'and can''t be done twice');
+rollback to savepoint give_up;
 
 -- ---- Follow-up copies (followMove couldn't copy an object to the photo's new store) ---------------------------------
 select ('u/' || :mei || '/p/' || :'pa' || '/e/v1-thumb.jpg') as fk \gset
@@ -613,8 +656,12 @@ select pg_temp.ok(not has_function_privilege('service_role', 'public._v7_get_upl
   and not has_function_privilege('service_role', 'public._migration_progress(uuid)', 'execute')
   and not has_function_privilege('service_role', 'public._migration_top_up(public.storage_migrations, boolean)', 'execute')
   and has_function_privilege('service_role', 'public.storage_followup_add(uuid, text, text[])', 'execute')
-  and has_function_privilege('service_role', 'public.storage_abandon_old_copies(uuid, text, text)', 'execute')
-  and not has_function_privilege('authenticated', 'public.storage_abandon_old_copies(uuid, text, text)', 'execute')
+  and has_function_privilege('service_role', 'public.storage_abandon_old_copies(uuid, text, text, boolean)', 'execute')
+  and not has_function_privilege('authenticated', 'public.storage_abandon_old_copies(uuid, text, text, boolean)', 'execute')
+  and not has_function_privilege('anon', 'public.storage_abandon_old_copies(uuid, text, text, boolean)', 'execute')
+  and has_function_privilege('service_role', 'public.storage_rollback_give_up(uuid, text)', 'execute')
+  and not has_function_privilege('authenticated', 'public.storage_rollback_give_up(uuid, text)', 'execute')
+  and not has_function_privilege('anon', 'public.storage_rollback_give_up(uuid, text)', 'execute')
   and has_function_privilege('service_role', 'public.storage_followups_expire()', 'execute')
   and not has_function_privilege('anon', 'public.storage_followups_expire()', 'execute')
   and not has_function_privilege('authenticated', 'public.storage_followup_add(uuid, text, text[])', 'execute')

@@ -2,7 +2,8 @@
 # Concurrency checks for the admin and storage migrations (phase 8), run by run-local.sh against its throwaway
 # database (two real sessions; the SQL tests run in one transaction and can't race). Expects PSQL_ARGS.
 # - Staff: two Owners demoting each other at once never leave zero Owners.
-# - Storage: two consumers claiming items at once never get the same photo.
+# - Storage: two consumers claiming items at once never get the same photo; abandoning old copies while the cron
+#   reports one deleted never deadlocks (both take the migration row before the items).
 # - Retention: approving twice at once approves once; two trash batches at once trash each photo once.
 # - Notices: two runs claiming limit and retention notices at once never hand out the same notice.
 set -euo pipefail
@@ -103,5 +104,34 @@ total="$(P -c "select count(*) from public.limits_notices n join public.plan_lim
 r="$(run_pair "public.race_lnotices()" "public.race_lnotices()")"
 [ "$r" = "$total 0" ] || fail "limit notices claimed twice: got '$r', want '$total 0'"
 echo "ok - two runs claiming limit notices at once hand each out once"
+
+# Abandon vs the cron's deleted report: a held move with two old copies on R2 (photos now on the NAS). The cron
+# session holds the migration row, then reports one copy deleted; the Owner abandons meanwhile.
+P <<SQL >/dev/null
+update public.storage_migrations set state = 'done', finished_at = now() where id = '$mig';
+insert into public.storage_migrations (id, from_store, to_store, state, started_by, reason, delete_old_after)
+  values ('92200000-0000-0000-0000-000000000001', 'r2', 'nas', 'holding', '$o1', 'Race hold', now() - interval '1 minute');
+with two as (select id, owner_id from public.photos where owner_id = '$ret' and filename like 'r%' order by id limit 2)
+insert into public.storage_migration_items (migration_id, photo_id, owner_id, src, dst, state, bytes, cleanup_store, deleting_at)
+  select '92200000-0000-0000-0000-000000000001', id, owner_id, 'r2', 'nas', 'verified', 1000, 'r2', now() from two;
+update public.photos set store_id = 'nas'
+ where id in (select photo_id from public.storage_migration_items where migration_id = '92200000-0000-0000-0000-000000000001');
+SQL
+hm=92200000-0000-0000-0000-000000000001
+first="$(P -c "select photo_id from public.storage_migration_items where migration_id = '$hm' order by photo_id limit 1")"
+out1="$(mktemp)"
+( P -c "begin;" -c "select 1 from public.storage_migrations where id = '$hm' for update;" -c "select pg_sleep(1.5);" \
+    -c "select public.storage_item_mark('$hm', '$first', 'deleted', 0, null, null, null, 'r2') ->> 'state';" -c "commit;" \
+    >"$out1" 2>&1 ) &
+sleep 0.5
+ab="$(P -c "select public.storage_abandon_old_copies('$o1', 'r2', 'Race abandon', true)::text" 2>&1)"
+wait
+grep -qi deadlock "$out1" && fail "the cron's report deadlocked"
+grep -q '^deleted$' "$out1" || fail "the cron's report should have deleted its copy: $(cat "$out1")"
+rm -f "$out1"
+case "$ab" in *deadlock*) fail "abandon deadlocked" ;; esac
+[ "$(P -c "select ('$ab'::jsonb ->> 'copies')")" = 1 ] || fail "abandon should take the one copy left: $ab"
+[ "$(P -c "select state from public.storage_migrations where id = '$hm'")" = done ] || fail "the held move should be done"
+echo "ok - abandoning old copies while the cron reports one deleted never deadlocks"
 
 echo "All admin race tests passed."

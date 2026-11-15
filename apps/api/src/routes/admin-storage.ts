@@ -1,6 +1,7 @@
 import {
   type AdminStorageResult,
   adminStorageAbandonSchema,
+  adminStorageGiveUpSchema,
   adminStorageMigrationSchema,
   adminStorageSwitchSchema,
   STAFF_CAN,
@@ -14,10 +15,15 @@ import {
 } from '@zephyr/shared';
 import type { Context, Hono, MiddlewareHandler } from 'hono';
 import { sendEmail } from '../email/resend';
-import { storageAbandonEmail, storageRollbackEmail, storageSwitchEmail } from '../email/storage-templates';
+import {
+  storageAbandonEmail,
+  storageGiveUpEmail,
+  storageRollbackEmail,
+  storageSwitchEmail,
+} from '../email/storage-templates';
 import { background, fail, logError, readBody } from '../http';
 import { storeConfigError, storeConfigs } from '../storage/config';
-import { checkOk, checkStore, recordCheck } from '../storage/health';
+import { checkOk, checkStore, recordCheck, reevaluateWriteStore } from '../storage/health';
 import { rpc, UpstreamError } from '../supabase';
 import type { HonoEnv } from '../types';
 
@@ -37,7 +43,7 @@ interface StorageDb {
   usage: { storeId: string; objects: number; bytes: number }[];
   checks: { storeId: string; result: StoreCheck }[];
   autoReadOnly: boolean;
-  oldCopies?: { storeId: string; copies: number }[];
+  oldCopies?: { storeId: string; copies: number; endsRollback?: boolean }[];
   followups?: { pending: number; dropped30d: number };
 }
 
@@ -123,7 +129,11 @@ export async function storageOverview(c: Ctx): Promise<AdminStorageResult> {
       bytes: stores.reduce((n, s) => n + s.bytes, 0),
     },
     autoReadOnly: Boolean(db.autoReadOnly),
-    oldCopies: (db.oldCopies ?? []).map((o) => ({ storeId: o.storeId, copies: Number(o.copies) || 0 })),
+    oldCopies: (db.oldCopies ?? []).map((o) => ({
+      storeId: o.storeId,
+      copies: Number(o.copies) || 0,
+      endsRollback: o.endsRollback === true,
+    })),
     followups: {
       pending: Number(db.followups?.pending) || 0,
       dropped30d: Number(db.followups?.dropped30d) || 0,
@@ -277,23 +287,34 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
   });
 
   // Abandoning old copies on a store that's gone: Owner only, passkey, every Owner emailed. Only for a store
-  // that's no longer configured or whose latest check failed (on a healthy store the cron just deletes them).
+  // that fails a health check run now, or one a cleanly parsed config no longer declares (on a healthy store
+  // the cron just deletes them). A config that doesn't parse leaves only R2 declared, so nothing is abandoned
+  // then. Finishing a migration that could still be rolled back needs acknowledgeRollbackEnds.
   router.post('/v1/storage/abandon', requireStaff({ write: true }), canStorage, async (c) => {
     if (c.get('staff').role !== 'owner') return c.json(fail('forbidden'), 403);
     const body = await readBody(c, adminStorageAbandonSchema);
     if (!body) return c.json(fail('invalid'), 400);
     if (!c.get('staff').recentPasskey) return c.json(fail('reauth_required'), 403);
+    if (storeConfigError(c.env)) return c.json(fail('conflict'), 409);
     try {
-      const before = await storageOverview(c);
-      const store = before.stores.find((s) => s.id === body.store);
       const configured = storeConfigs(c.env).some((s) => s.id === body.store);
-      // A configured store must have failed its latest check (run one from Admin first); one the deployment no
-      // longer declares can't be reached at all.
-      if (configured && (!store?.lastCheck || checkOk(store.lastCheck))) return c.json(fail('conflict'), 409);
+      if (configured) {
+        // A fresh check, recorded (and counted for auto read-only if it's the write store): a store that answers
+        // now keeps its copies, whatever an older check said.
+        const status = await rpc<{ writeStore: string } | null>(c.env, 'storage_status');
+        const check = await checkStore(c.env, body.store, false);
+        await recordCheck(c.env, body.store, check, body.store === (status?.writeStore || 'r2'));
+        if (checkOk(check)) return c.json(fail('conflict'), 409);
+      }
       const res = await rpc<{ store?: string; copies?: number; migrations?: number; error?: string }>(
         c.env,
         'storage_abandon_old_copies',
-        { p_staff: c.get('staff').id, p_store: body.store, p_reason: body.reason },
+        {
+          p_staff: c.get('staff').id,
+          p_store: body.store,
+          p_reason: body.reason,
+          p_ack: body.acknowledgeRollbackEnds === true,
+        },
       );
       if (res?.error) return refused(c, res.error);
       await tellOwners(
@@ -309,6 +330,45 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
       return c.json(await storageOverview(c));
     } catch (err) {
       return failed(c, 'admin_storage_abandon', err);
+    }
+  });
+
+  // Giving up a failed rollback (its store is gone for good): Owner only, passkey, every Owner emailed. Uploads
+  // go back to the store the photos had moved to, and read-only mode is re-evaluated against it straight away.
+  router.post('/v1/storage/rollback/give-up', requireStaff({ write: true }), canStorage, async (c) => {
+    if (c.get('staff').role !== 'owner') return c.json(fail('forbidden'), 403);
+    const body = await readBody(c, adminStorageGiveUpSchema);
+    if (!body) return c.json(fail('invalid'), 400);
+    if (!c.get('staff').recentPasskey) return c.json(fail('reauth_required'), 403);
+    try {
+      const res = await rpc<{
+        migrationId?: string;
+        from?: string;
+        to?: string;
+        photos?: number;
+        error?: string;
+      }>(c.env, 'storage_rollback_give_up', { p_staff: c.get('staff').id, p_reason: body.reason });
+      if (res?.error) return refused(c, res.error);
+      try {
+        if (res?.to) await reevaluateWriteStore(c.env, res.to);
+      } catch (err) {
+        // The cron re-checks the write store within 5 minutes anyway.
+        logError('admin', 'admin_storage_give_up_check', err);
+      }
+      await tellOwners(
+        c,
+        storageGiveUpEmail({
+          actor: actorOf(c),
+          from: res?.from ?? '',
+          to: res?.to ?? '',
+          photos: Number(res?.photos) || 0,
+          adminUrl: adminUrl(c),
+        }),
+        'storage_give_up_notify',
+      );
+      return c.json(await storageOverview(c));
+    } catch (err) {
+      return failed(c, 'admin_storage_give_up', err);
     }
   });
 }

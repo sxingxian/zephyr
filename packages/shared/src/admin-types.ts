@@ -127,6 +127,8 @@ export const ADMIN8_API = {
   storageMigration: '/admin/api/v1/storage/migration',
   /** POST AdminStorageAbandonBody → AdminStorageResult (Owner only, reauth; the store must be unreachable or gone) */
   storageAbandon: '/admin/api/v1/storage/abandon',
+  /** POST AdminStorageGiveUpBody → AdminStorageResult (Owner only, reauth; a failed rollback only) */
+  storageGiveUp: '/admin/api/v1/storage/rollback/give-up',
 
   // retention
   /** GET → AdminRetentionResult */
@@ -573,8 +575,9 @@ export interface AdminStorageResult {
   totals: { photos: number; bytes: number };
   /** Read-only mode turned on automatically because the write store stopped answering. */
   autoReadOnly: boolean;
-  /** Old copies still waiting for deletion, per store (an Owner can abandon them on a store that's gone). */
-  oldCopies?: { storeId: string; copies: number }[];
+  /** Old copies still waiting for deletion, per store (an Owner can abandon them on a store that's gone).
+   *  endsRollback: abandoning them finishes a migration that can still be rolled back. */
+  oldCopies?: { storeId: string; copies: number; endsRollback?: boolean }[];
   /** Follow-up copies outstanding, and how many were dropped after 7 days in the last 30 days. */
   followups?: { pending: number; dropped30d: number };
 }
@@ -585,6 +588,12 @@ export interface AdminStorageSwitchBody {
 /** Give up on the old copies waiting on a store that's unreachable or no longer configured (bytes may remain). */
 export interface AdminStorageAbandonBody {
   store: string;
+  reason: string;
+  /** Required (true) when abandoning finishes a migration that could still be rolled back. */
+  acknowledgeRollbackEnds?: boolean;
+}
+/** Give up a failed rollback: uploads go back to the store the photos had moved to; photos not copied back stay. */
+export interface AdminStorageGiveUpBody {
   reason: string;
 }
 /** Follow-up copies older than this are dropped (audited, counted in Admin › Storage). */

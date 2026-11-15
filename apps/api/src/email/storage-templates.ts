@@ -40,7 +40,25 @@ export function storageAbandonEmail(e: {
     'Old copies abandoned',
     [
       `${e.actor} gave up on deleting ${e.copies} old ${e.copies === 1 ? 'copy' : 'copies'} of moved photos on ${e.store}, which can't be reached. Nothing was deleted there.`,
-      `If ${e.store} comes back, its photo files are still on it: delete them by hand or reconnect it and let the orphan sweep clear them. The reason is in the audit log.`,
+      `The copies stay on ${e.store}. Don't delete them by hand: some may be the only copy of an edit or mask made while photos moved. If ${e.store} comes back, keep it configured and reachable; the orphan sweep then copies anything a photo's own store is missing over to it before deleting the rest. The reason is in the audit log.`,
+    ],
+    adminLink(e.adminUrl),
+  );
+}
+
+export function storageGiveUpEmail(e: {
+  actor: string;
+  from: string;
+  to: string;
+  photos: number;
+  adminUrl: string;
+}): Mail {
+  return layout(
+    `[Zephyr] Rollback given up: uploads go to ${e.to} again`,
+    'Rollback given up',
+    [
+      `${e.actor} gave up the failed rollback from ${e.to} to ${e.from}. New uploads go to ${e.to} again.`,
+      `${e.photos} ${e.photos === 1 ? 'photo that was' : 'photos that were'} still waiting to be copied back stay on ${e.to}. Photos already copied back stay on ${e.from} for as long as it's configured. The reason is in the audit log.`,
     ],
     adminLink(e.adminUrl),
   );

@@ -85,6 +85,8 @@ class MockS3 {
   corrupt = false;
   completeError = false;
   deleteError = false;
+  /** Every request fails with 503 (a store that's down). */
+  down = false;
   pageSize = 1000;
   constructor(
     readonly bucket = 'zephyr',
@@ -110,6 +112,7 @@ class MockS3 {
       this.next = null;
       return new Response(n.body, { status: n.status });
     }
+    if (this.down) return new Response('', { status: 503 });
     const key = this.keyOf(url);
     const q = url.searchParams;
     const xml = (s: string, status = 200) =>
@@ -1002,6 +1005,65 @@ describe('photos on another store: purges and the orphan sweep', () => {
     world.rpc.storage_status = () => ({ writeStore: 'r2', migration: null, cleanupPending: false });
     await sweepOrphans(menv, later);
     expect(r2b.objects.has(`${prefix}original`)).toBe(false);
+    // The photo still points at its original, so it was copied to the photo's store before going.
+    expect(new TextDecoder().decode(mocks.b2.objects.get(`${prefix}original`)?.bytes)).toBe('old copy');
+  });
+
+  it("never deletes a live copy away from its photo's store until the photo's store holds it", async () => {
+    const edit = `${prefix}edit-3-thumb-${'a'.repeat(32)}`;
+    const staleEdit = `${prefix}edit-2-thumb-${'b'.repeat(32)}`;
+    const mask = `${prefix}m/${'c0000000-0000-4000-8000-000000000001'}.png`;
+    await r2b.put(edit, bytes('only copy of the edit'));
+    await r2b.put(staleEdit, bytes('replaced edit'));
+    await r2b.put(mask, bytes('mask'));
+    await r2b.put(`${prefix}thumb`, bytes('thumb'));
+    await r2b.put(`${prefix}preview`, bytes('preview, already there'));
+    mocks.b2.objects.set(`${prefix}preview`, {
+      bytes: bytes('preview, already there'),
+      type: 'image/webp',
+      etag: '"p"',
+    });
+    world.rpc.get_job_state = () => null;
+    world.rpc.set_job_state = () => null;
+    world.rpc.storage_status = () => ({ writeStore: 'b2-eu', migration: null, cleanupPending: false });
+    const row = {
+      id: PHOTO,
+      ownerId: OWNER,
+      status: 'ready',
+      activeUpload: false,
+      storeId: 'b2-eu',
+      editThumbKey: edit,
+      editPreviewKey: null,
+      maskKeys: [mask],
+      hasThumb: false,
+      hasPreview: true,
+    };
+    world.rpc.sweep_photo_rows = () => [row];
+    const later = Date.now() + 3 * 60 * 60 * 1000;
+    // The photo's store is down: nothing it still points at is deleted; the unrecorded keys go.
+    mocks.b2.down = true;
+    await sweepOrphans(menv, later);
+    expect(r2b.objects.has(edit)).toBe(true);
+    expect(r2b.objects.has(mask)).toBe(true);
+    expect(r2b.objects.has(`${prefix}preview`)).toBe(true);
+    expect(r2b.objects.has(staleEdit)).toBe(false);
+    expect(r2b.objects.has(`${prefix}thumb`)).toBe(false);
+    // Back up: the edit and mask are copied over (verified) first, the preview was already there; then all go.
+    mocks.b2.down = false;
+    await sweepOrphans(menv, later);
+    expect(new TextDecoder().decode(mocks.b2.objects.get(edit)?.bytes)).toBe('only copy of the edit');
+    expect(new TextDecoder().decode(mocks.b2.objects.get(mask)?.bytes)).toBe('mask');
+    for (const k of [edit, mask, `${prefix}preview`]) expect(r2b.objects.has(k)).toBe(false);
+    // A photo being purged, or still uploading: nothing is rescued, and an upload's copies are left alone.
+    await r2b.put(`${prefix}original`, bytes('purging'));
+    world.rpc.sweep_photo_rows = () => [{ ...row, status: 'purging' }];
+    await sweepOrphans(menv, later);
+    expect(r2b.objects.has(`${prefix}original`)).toBe(false);
+    expect(mocks.b2.objects.has(`${prefix}original`)).toBe(false);
+    await r2b.put(`${prefix}original`, bytes('uploading'));
+    world.rpc.sweep_photo_rows = () => [{ ...row, status: 'uploading', activeUpload: true }];
+    await sweepOrphans(menv, later);
+    expect(r2b.objects.has(`${prefix}original`)).toBe(true);
   });
 });
 
@@ -1293,7 +1355,7 @@ describe('admin storage routes', () => {
     expect(none.status).toBe(409);
   });
 
-  it('abandoning old copies: Owner only, with a passkey, only on a store that is gone or failing, and emails the Owners', async () => {
+  it('abandoning old copies: Owner only, with a passkey, only on a store that fails a check now or is gone, and emails the Owners', async () => {
     world.rpc.storage_abandon_old_copies = (a) =>
       a.p_store === 'old-store' || a.p_store === 'b2-eu'
         ? { store: a.p_store, copies: 3, migrations: 1 }
@@ -1308,50 +1370,126 @@ describe('admin storage routes', () => {
     expect(rpcCalls('storage_abandon_old_copies')).toHaveLength(0);
 
     const { j, access } = await staffSession('owner@zephyr.test');
-    // A configured store whose last check passed: the cron deletes its old copies, nothing to abandon.
-    const healthy = await call(ADMIN8_API.storageAbandon, {
-      body: { store: 'b2-eu', reason: 'Not dead' },
-      jar: j,
-      access,
-    });
-    expect(healthy.status).toBe(409);
-    // A configured store never checked: run a check first.
-    const unchecked = await call(ADMIN8_API.storageAbandon, {
-      body: { store: 'tunnel-nas', reason: 'Never checked' },
-      jar: j,
-      access,
-    });
-    expect(unchecked.status).toBe(409);
-    expect(rpcCalls('storage_abandon_old_copies')).toHaveLength(0);
-
-    // A store the deployment no longer declares.
-    const ok = await call(ADMIN8_API.storageAbandon, { body, jar: j, access });
-    expect(ok.status).toBe(200);
-    expect(rpcCalls('storage_abandon_old_copies')[0]?.body).toEqual({
-      p_staff: '10000000-0000-0000-0000-000000000001',
-      p_store: 'old-store',
-      p_reason: 'The old NAS died',
-    });
-    await vi.waitFor(() =>
-      expect(world.emails.some((m) => m.subject.includes('abandoned on old-store'))).toBe(true),
-    );
-
-    // A configured store whose last check failed.
+    // A configured store whose last recorded check failed but which answers now: a fresh check runs (and is
+    // recorded), passes, and nothing is abandoned: the cron deletes its old copies itself.
     checks = [
       {
         storeId: 'b2-eu',
         result: { ...recentCheck(), reachable: false, roundTrip: false, error: 'timeout' },
       },
     ];
+    const recovered = await call(ADMIN8_API.storageAbandon, {
+      body: { store: 'b2-eu', reason: 'It was down last week' },
+      jar: j,
+      access,
+    });
+    expect(recovered.status).toBe(409);
+    expect(rpcCalls('storage_check_record').map((c) => (c.body as { p_store: string }).p_store)).toEqual([
+      'b2-eu',
+    ]);
+    expect(rpcCalls('storage_abandon_old_copies')).toHaveLength(0);
+
+    // A store the deployment no longer declares (the config parses cleanly).
+    const ok = await call(ADMIN8_API.storageAbandon, { body, jar: j, access });
+    expect(ok.status).toBe(200);
+    expect(rpcCalls('storage_abandon_old_copies')[0]?.body).toEqual({
+      p_staff: '10000000-0000-0000-0000-000000000001',
+      p_store: 'old-store',
+      p_reason: 'The old NAS died',
+      p_ack: false,
+    });
+    await vi.waitFor(() =>
+      expect(world.emails.some((m) => m.subject.includes('abandoned on old-store'))).toBe(true),
+    );
+    expect(world.emails.find((m) => m.subject.includes('abandoned on old-store'))?.text).toContain(
+      "Don't delete them by hand",
+    );
+
+    // A configured store that fails the check run now; the acknowledgement is passed on.
+    mocks.b2.down = true;
     const failing = await call(ADMIN8_API.storageAbandon, {
-      body: { store: 'b2-eu', reason: 'Unreachable for days' },
+      body: { store: 'b2-eu', reason: 'Unreachable for days', acknowledgeRollbackEnds: true },
       jar: j,
       access,
     });
     expect(failing.status).toBe(200);
+    expect(rpcCalls('storage_abandon_old_copies').at(-1)?.body).toMatchObject({
+      p_store: 'b2-eu',
+      p_ack: true,
+    });
+    world.rpc.storage_abandon_old_copies = () => ({ error: 'rollback_ends' });
+    const ends = await call(ADMIN8_API.storageAbandon, {
+      body: { store: 'b2-eu', reason: 'Unreachable for days' },
+      jar: j,
+      access,
+    });
+    expect(ends.status).toBe(409);
     world.rpc.storage_abandon_old_copies = () => ({ error: 'not_found' });
     const none = await call(ADMIN8_API.storageAbandon, { body, jar: j, access });
     expect(none.status).toBe(404);
+  });
+
+  it("refuses to abandon anything while the stores config doesn't parse (every store would look undeclared)", async () => {
+    Object.assign(env, { STORAGE_STORES: '{not json' });
+    world.rpc.storage_abandon_old_copies = () => ({ store: 'old-store', copies: 1, migrations: 1 });
+    const { j, access } = await staffSession('owner@zephyr.test');
+    const res = await call(ADMIN8_API.storageAbandon, {
+      body: { store: 'old-store', reason: 'Config broke' },
+      jar: j,
+      access,
+    });
+    expect(res.status).toBe(409);
+    expect(rpcCalls('storage_abandon_old_copies')).toHaveLength(0);
+  });
+
+  it('giving up a failed rollback: Owner only, with a passkey; re-checks the new write store and emails the Owners', async () => {
+    world.rpc.storage_rollback_give_up = () => ({
+      migrationId: MIGRATION,
+      from: 'r2',
+      to: 'b2-eu',
+      photos: 4,
+    });
+    world.rpc.storage_check_record = () => ({ failStreak: 0, okStreak: 1, autoReadOnly: true });
+    const readOnly: Record<string, unknown>[] = [];
+    world.rpc.read_only_auto = (a) => {
+      readOnly.push(a);
+      return { changed: true };
+    };
+    const body = { reason: 'The NAS is gone for good' };
+    const admin = await staffSession('admin@zephyr.test');
+    expect((await call(ADMIN8_API.storageGiveUp, { body, jar: admin.j, access: admin.access })).status).toBe(
+      403,
+    );
+    const stale = await staffSession('owner@zephyr.test', { authAgo: 3600 });
+    const reauth = await call(ADMIN8_API.storageGiveUp, { body, jar: stale.j, access: stale.access });
+    expect(await read(reauth)).toMatchObject({ error: 'reauth_required' });
+    expect(rpcCalls('storage_rollback_give_up')).toHaveLength(0);
+
+    const { j, access } = await staffSession('owner@zephyr.test');
+    const bad = await call(ADMIN8_API.storageGiveUp, { body: { reason: 'x' }, jar: j, access });
+    expect(bad.status).toBe(400);
+    const ok = await call(ADMIN8_API.storageGiveUp, { body, jar: j, access });
+    expect(ok.status).toBe(200);
+    expect(rpcCalls('storage_rollback_give_up')[0]?.body).toEqual({
+      p_staff: '10000000-0000-0000-0000-000000000001',
+      p_reason: 'The NAS is gone for good',
+    });
+    // The new write store answered: automatic read-only (for the store that stopped answering) goes off now.
+    expect(rpcCalls('storage_check_record').map((c) => (c.body as { p_store: string }).p_store)).toEqual([
+      'b2-eu',
+    ]);
+    expect(readOnly).toEqual([{ p_on: false, p_reason: 'storage_recovered' }]);
+    await vi.waitFor(() =>
+      expect(world.emails.some((m) => m.subject.includes('Rollback given up'))).toBe(true),
+    );
+
+    // A new write store that doesn't answer leaves read-only as it is.
+    readOnly.length = 0;
+    mocks.b2.down = true;
+    expect((await call(ADMIN8_API.storageGiveUp, { body, jar: j, access })).status).toBe(200);
+    expect(readOnly).toEqual([]);
+    world.rpc.storage_rollback_give_up = () => ({ error: 'conflict' });
+    expect((await call(ADMIN8_API.storageGiveUp, { body, jar: j, access })).status).toBe(409);
   });
 
   it('the overview passes on the old copies waiting per store and the follow-up counts', async () => {

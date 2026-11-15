@@ -179,9 +179,14 @@ the media host's cache and Cloudflare's CSAM Scanning Tool sit in front of them.
    upload speed test and free space). The switch is offered only after a passing check in the last 24 hours. The
    switch itself needs a passkey sign-in in the last 10 minutes and emails every Owner.
 10. **Retiring a store:** keep it declared (and reachable) until Admin › Storage shows no photos and no old copies
-    on it. If it dies for good while old copies still wait there, an Owner can **Abandon** them (passkey; the
-    store's latest check must have failed, or it's no longer declared): the migration finishes and a new switch can
-    start, but nothing is deleted on that store, so wipe its disks yourself if it ever comes back.
+    on it. If it dies for good while old copies still wait there, an Owner can **Abandon** them (passkey; Zephyr
+    checks the store again and refuses if it answers, and a store no longer declared counts only while the config
+    parses): the migration finishes and a new switch can start, but nothing is deleted on that store. Don't wipe it
+    by hand if it comes back: some copies may be the only copy of an edit or mask made while photos moved. Declare
+    it again and let the orphan sweep run; it copies anything a photo's own store is missing over before deleting
+    the rest. If a **rollback** fails because the store it rolls back to is gone for good, an Owner can **Give up
+    rollback** (passkey): uploads go back to the store the photos had moved to and photos not copied back stay
+    there.
 
 **A cloud S3 store** (AWS S3, Backblaze B2, Wasabi, and so on): `"connection": "https"`, the provider's HTTPS
 endpoint (no bucket in it), its region, and `"pathStyle": false` where the provider supports virtual-host

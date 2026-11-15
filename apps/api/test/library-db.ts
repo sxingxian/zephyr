@@ -642,6 +642,8 @@ export function libraryRpc(): Record<string, (a: Args) => unknown> {
             editThumbKey: e?.thumbKey ?? null,
             editPreviewKey: e?.previewKey ?? null,
             maskKeys: db.maskKeys.get(id) ?? [],
+            hasThumb: p.thumb > 0,
+            hasPreview: p.preview > 0,
           },
         ];
       }),

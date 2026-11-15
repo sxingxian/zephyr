@@ -9,7 +9,18 @@ import {
   type StoreHealth,
   type StoreStatus,
 } from '@zephyr/shared/client';
-import { Button, Card, CardHead, Chip, type ChipTone, type Column, Note, Table, useToast } from '@zephyr/ui';
+import {
+  Button,
+  Card,
+  CardHead,
+  Chip,
+  type ChipTone,
+  type Column,
+  type IconName,
+  Note,
+  Table,
+  useToast,
+} from '@zephyr/ui';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Effects, Kpi, PageState, Progress, ReasonDialog } from '../components/Kit8';
 import { AdminShell } from '../components/Shell';
@@ -51,6 +62,7 @@ export const MIGRATION_ERROR_TEXT: Record<string, string> = {
     'A photo has been uploading for more than a day. Expired uploads are removed by the clean-up job; retry once it has run.',
   busy: 'A photo kept changing while it was being copied (it was edited non-stop). Retry when it’s quieter, or turn on read-only mode briefly.',
   abandoned: 'Old copies on a store that can’t be reached were abandoned by an Owner.',
+  rollback_abandoned: 'An Owner gave up this rollback; photos not copied back stayed where they were.',
 };
 const kindLabel = (s: StoreStatus) =>
   s.kind === 'r2'
@@ -150,7 +162,12 @@ export function Storage() {
   const [actErr, setActErr] = useState<string | null>(null);
   const [switching, setSwitching] = useState<StoreStatus | null>(null);
   const [migAction, setMigAction] = useState<'pause' | 'resume' | 'rollback' | null>(null);
-  const [abandoning, setAbandoning] = useState<{ storeId: string; copies: number } | null>(null);
+  const [abandoning, setAbandoning] = useState<{
+    storeId: string;
+    copies: number;
+    endsRollback?: boolean;
+  } | null>(null);
+  const [givingUp, setGivingUp] = useState(false);
   const isOwner = staff?.role === 'owner';
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -430,6 +447,11 @@ export function Storage() {
                         Roll back to {byId(mig.from)?.name ?? mig.from}…
                       </Button>
                     )}
+                    {isOwner && mig.direction === 'back' && mig.state === 'failed' && (
+                      <Button kind="danger" icon="alert" onClick={() => setGivingUp(true)}>
+                        Give up rollback…
+                      </Button>
+                    )}
                   </div>
                 )}
                 <p className="z-hint">
@@ -454,7 +476,11 @@ export function Storage() {
                       <div key={o.storeId}>
                         <span>
                           {st?.name ?? o.storeId}
-                          {!st ? ' · no longer set up' : gone ? ' · can’t be reached' : ''}
+                          {!st
+                            ? ' · no longer set up'
+                            : gone
+                              ? ` · last check failed${st.lastCheck ? ` (${dateTime(st.lastCheck.at)})` : ''}`
+                              : ''}
                         </span>
                         <strong className="btn-row btn-row--tight">
                           {n(o.copies)} {o.copies === 1 ? 'copy' : 'copies'}
@@ -470,8 +496,8 @@ export function Storage() {
                 </div>
                 <p className="z-hint">
                   The clean-up job deletes these after the hold. On a store that can’t be reached it never
-                  can, and no new switch can start until they’re gone: an Owner can abandon them (nothing is
-                  deleted there).
+                  can, and no new switch can start until they’re gone: an Owner can abandon them. Zephyr
+                  checks the store again first and refuses if it answers. Nothing is deleted there.
                 </p>
               </Card>
             )}
@@ -608,11 +634,26 @@ export function Storage() {
                   <Effects
                     items={[
                       [
-                        'alert',
-                        `${n(abandoning.copies)} old ${abandoning.copies === 1 ? 'copy stays' : 'copies stay'} on that store: nothing is deleted there. If it comes back, delete them by hand or reconnect it and let the orphan sweep clear them.`,
+                        'refresh',
+                        'Zephyr checks the store again first. If it answers, nothing is abandoned: the clean-up job deletes the copies itself.',
                       ],
-                      ['refresh', 'The migration finishes, so a new switch can start.'],
-                      ['file', 'Recorded in the audit log; every Owner gets an email.'],
+                      [
+                        'alert',
+                        `${n(abandoning.copies)} old ${abandoning.copies === 1 ? 'copy stays' : 'copies stay'} on that store: nothing is deleted there. Don’t delete them by hand: some may be the only copy of an edit made while photos moved. If the store comes back, keep it set up; the orphan sweep copies anything a photo’s own store is missing before deleting the rest.`,
+                      ],
+                      ...(abandoning.endsRollback
+                        ? [
+                            [
+                              'undo',
+                              'This ends the move: it can no longer be rolled back.',
+                              'warn',
+                            ] satisfies [IconName, string, 'warn'],
+                          ]
+                        : []),
+                      [
+                        'file',
+                        'The migration finishes, so a new switch can start. Recorded in the audit log; every Owner gets an email.',
+                      ],
                     ]}
                   />
                 )
@@ -627,9 +668,36 @@ export function Storage() {
                   await write<AdminStorageResult>(ADMIN8_API.storageAbandon, 'POST', {
                     store: abandoning.storeId,
                     reason,
+                    ...(abandoning.endsRollback ? { acknowledgeRollbackEnds: true } : {}),
                   }),
                 );
                 toast.show('Old copies abandoned', 'good');
+              }}
+            />
+            <ReasonDialog
+              open={givingUp}
+              title="Give up the rollback"
+              intro={
+                mig && (
+                  <Effects
+                    items={[
+                      ['upload', `New uploads go to ${byId(mig.to)?.name ?? mig.to} again.`],
+                      [
+                        'alert',
+                        `Photos still waiting to be copied back stay on ${byId(mig.to)?.name ?? mig.to}. Photos already copied back stay on ${byId(mig.from)?.name ?? mig.from} while it’s set up.`,
+                      ],
+                      ['file', 'Recorded in the audit log; every Owner gets an email.'],
+                    ]}
+                  />
+                )
+              }
+              confirmLabel="Give up with passkey"
+              passkey
+              danger
+              onClose={() => setGivingUp(false)}
+              onConfirm={async (reason) => {
+                setData(await write<AdminStorageResult>(ADMIN8_API.storageGiveUp, 'POST', { reason }));
+                toast.show('Rollback given up', 'good');
               }}
             />
           </>

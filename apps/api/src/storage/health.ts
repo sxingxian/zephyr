@@ -171,6 +171,25 @@ export async function recordCheck(
   return { readOnly: null };
 }
 
+/**
+ * After the write store changed by an Owner's action (giving up a rollback): checks the new write store now and,
+ * when it answers and read-only mode was turned on automatically (for the store that stopped answering), turns it
+ * off at once. The two-success rule is for one store flapping; this is a different store. Otherwise the cron's
+ * rule applies as usual.
+ */
+export async function reevaluateWriteStore(env: Env, storeId: string): Promise<StoreCheck> {
+  const check = await checkStore(env, storeId, false);
+  const rec = await rpc<Recorded>(env, 'storage_check_record', { p_store: storeId, p_result: check });
+  if (checkOk(check) && rec?.autoReadOnly) {
+    const r = await rpc<{ changed: boolean }>(env, 'read_only_auto', {
+      p_on: false,
+      p_reason: 'storage_recovered',
+    });
+    if (r?.changed) await emailOwners(env, false, storeId, null);
+  }
+  return check;
+}
+
 /** The 5-minute cron's health part: check the write store and apply the auto read-only rule. */
 export async function runHealthCron(env: Env): Promise<{ store: string; ok: boolean } | null> {
   try {

@@ -10,6 +10,7 @@ import {
   type PlanId,
   type PlanLimits,
   type StaffRole,
+  type StorageMigration,
 } from '@zephyr/shared/client';
 import { createMemoryRouter, RouterProvider } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -350,6 +351,8 @@ const MOVING: AdminStorageResult = {
   },
 };
 
+const MIG = MOVING.migration as StorageMigration;
+
 describe('Storage', () => {
   it('estimates monthly cost from the declared price', () => {
     expect(monthlyCost(STORAGE.stores[0] as never, 41.6e12)).toBeCloseTo(624);
@@ -481,6 +484,85 @@ describe('Storage', () => {
       T,
     );
     await waitFor(() => expect(screen.queryByText('Old copies waiting for deletion')).toBeNull(), T);
+  });
+
+  it('warns that abandoning ends a rollback that’s still possible, and sends the acknowledgement', async () => {
+    mock('owner', (c) => {
+      if (c.url.endsWith('/storage') && c.method === 'GET')
+        return json(200, { ...STORAGE, oldCopies: [{ storeId: 'nas2', copies: 7, endsRollback: true }] });
+      if (c.url.endsWith('/storage/abandon')) return json(200, { ...STORAGE, oldCopies: [] });
+      return undefined;
+    });
+    renderAt('/storage');
+    const abandon = await screen.findByRole('button', { name: 'Abandon…' }, T);
+    await act(async () => abandon.click());
+    const d = dialog('Abandon old copies on Studio NAS · hostname');
+    expect(within(d).getByText(/can no longer be rolled back/)).toBeTruthy();
+    expect(within(d).getByText(/checks the store again first/)).toBeTruthy();
+    expect(within(d).getByText(/Don’t delete them by hand/)).toBeTruthy();
+    fireEvent.change(reasonIn(d), { target: { value: 'The NAS died' } });
+    await act(async () => btn(d, /Abandon with passkey/).click());
+    await waitFor(
+      () =>
+        expect(writes('/storage/abandon')[0]?.body).toEqual({
+          store: 'nas2',
+          reason: 'The NAS died',
+          acknowledgeRollbackEnds: true,
+        }),
+      T,
+    );
+  });
+
+  it('an Owner can give up a failed rollback, with a reason and the passkey', async () => {
+    const backMig: StorageMigration = {
+      ...MIG,
+      state: 'failed',
+      direction: 'back',
+      canRollBack: false,
+      lastError: 'copy_failed',
+    };
+    const failedBack: AdminStorageResult = { ...MOVING, writeStore: 'r2', migration: backMig };
+    mock('owner', (c) => {
+      if (c.url.endsWith('/storage') && c.method === 'GET') return json(200, failedBack);
+      if (c.url.endsWith('/storage/rollback/give-up'))
+        return json(200, {
+          ...STORAGE,
+          writeStore: 'b2',
+          migration: { ...backMig, state: 'rolled_back', lastError: 'rollback_abandoned' },
+        });
+      return undefined;
+    });
+    renderAt('/storage');
+    const giveUp = await screen.findByRole('button', { name: 'Give up rollback…' }, T);
+    await act(async () => giveUp.click());
+    const d = dialog('Give up the rollback');
+    expect(within(d).getByText(/New uploads go to Backblaze B2 again/)).toBeTruthy();
+    const confirm = btn(d, /Give up with passkey/);
+    expect(confirm.disabled).toBe(true);
+    fireEvent.change(reasonIn(d), { target: { value: 'The old store is gone for good' } });
+    await act(async () => confirm.click());
+    await waitFor(
+      () =>
+        expect(writes('/storage/rollback/give-up')[0]?.body).toEqual({
+          reason: 'The old store is gone for good',
+        }),
+      T,
+    );
+    expect(await screen.findByText('Rollback given up', {}, T)).toBeTruthy();
+  });
+
+  it('an Admin can’t give up a rollback', async () => {
+    mock('admin', (c) => {
+      if (c.url.endsWith('/storage') && c.method === 'GET')
+        return json(200, {
+          ...MOVING,
+          migration: { ...MIG, state: 'failed', direction: 'back', canRollBack: false },
+        });
+      return undefined;
+    });
+    renderAt('/storage');
+    await screen.findByRole('button', { name: 'Retry failed photos' }, T);
+    expect(screen.queryByRole('button', { name: 'Give up rollback…' })).toBeNull();
   });
 
   it('an Admin sees the old copies but can’t abandon them', async () => {

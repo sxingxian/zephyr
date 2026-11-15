@@ -384,8 +384,10 @@ language sql stable security definer set search_path = '' as $$
     'autoReadOnly', (select coalesce((a.read_only ->> 'on')::boolean and (a.read_only ->> 'auto')::boolean, false)
                        from public.app_settings a where a.id = 1),
     -- Old copies still waiting for deletion, per store (an Owner can abandon them on a store that's gone).
-    'oldCopies', coalesce((select jsonb_agg(jsonb_build_object('storeId', x.cleanup_store, 'copies', x.n) order by x.cleanup_store)
-                             from (select i.cleanup_store, count(*) as n
+    -- endsRollback: abandoning them would finish a migration that can still be rolled back.
+    'oldCopies', coalesce((select jsonb_agg(jsonb_build_object('storeId', x.cleanup_store, 'copies', x.n,
+                                                               'endsRollback', x.ends) order by x.cleanup_store)
+                             from (select i.cleanup_store, count(*) as n, bool_or(public._migration_can_roll_back(m)) as ends
                                      from public.storage_migration_items i join public.storage_migrations m on m.id = i.migration_id
                                     where i.cleanup_store is not null and i.cleaned_at is null and i.state in ('verified', 'skipped')
                                       and m.state in ('holding', 'done', 'rolled_back')
@@ -889,11 +891,16 @@ $$;
 
 -- An Owner gives up on the old copies still waiting for deletion on p_store (a store that's unreachable or gone,
 -- so the 5-minute cron can never delete them and no later switch could start). The copies are marked cleaned
--- with error 'abandoned' and every held or rolled-back migration with nothing else to clean finishes. Bytes may
--- remain on that store; nothing is deleted. Not while a migration is moving photos. The API checks the
--- passkey, that the store is unreachable or no longer configured, and emails every Owner.
--- { store, copies, migrations } or { error: forbidden | invalid | conflict | not_found }.
-create function public.storage_abandon_old_copies(p_staff uuid, p_store text, p_reason text) returns jsonb
+-- with error 'abandoned' and every held or rolled-back migration with nothing else to clean finishes. Nothing is
+-- deleted: the copies stay on that store, and if it comes back the orphan sweep only deletes a copy once the
+-- photo's own store holds the key (copying it there first if needed). Not while a migration is moving photos.
+-- Finishing a held migration that could still be rolled back ends that option, so it needs p_ack
+-- (`rollback_ends` otherwise). The API checks the passkey, runs a fresh health check that must fail (or the
+-- store must be undeclared in a config that parses), and emails every Owner. Lock order as everywhere: the
+-- storage lock, then the migration rows (in id order), then their items.
+-- { store, copies, migrations } or { error: forbidden | invalid | conflict | not_found | rollback_ends }.
+create function public.storage_abandon_old_copies(p_staff uuid, p_store text, p_reason text, p_ack boolean default false)
+returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   n integer;
@@ -907,24 +914,75 @@ begin
   if exists (select 1 from public.storage_migrations where state in ('copying', 'paused', 'verifying', 'rolling_back', 'failed')) then
     return jsonb_build_object('error', 'conflict');
   end if;
-  with upd as (
-    update public.storage_migration_items i
-       set cleaned_at = now(), error = 'abandoned', updated_at = now()
-      from public.storage_migrations m
-     where m.id = i.migration_id and m.state in ('holding', 'done', 'rolled_back')
-       and i.cleanup_store = p_store and i.cleaned_at is null and i.state in ('verified', 'skipped')
-    returning i.migration_id
-  )
-  select count(*), array_agg(distinct migration_id) into n, mids from upd;
+  -- The migrations holding copies on p_store, locked before any of their items (storage_item_mark takes the
+  -- migration row, then the item).
+  select array_agg(m.id order by m.id) into mids
+    from (select m.id from public.storage_migrations m
+           where m.state in ('holding', 'done', 'rolled_back')
+             and exists (select 1 from public.storage_migration_items i
+                          where i.migration_id = m.id and i.cleanup_store = p_store and i.cleaned_at is null
+                            and i.state in ('verified', 'skipped'))
+           order by m.id for update) m;
+  if mids is null then return jsonb_build_object('error', 'not_found'); end if;
+  if not coalesce(p_ack, false)
+     and exists (select 1 from public.storage_migrations m where m.id = any (mids) and public._migration_can_roll_back(m)) then
+    return jsonb_build_object('error', 'rollback_ends');
+  end if;
+  update public.storage_migration_items i
+     set cleaned_at = now(), error = 'abandoned', updated_at = now()
+   where i.migration_id = any (mids) and i.cleanup_store = p_store and i.cleaned_at is null and i.state in ('verified', 'skipped');
+  get diagnostics n = row_count;
   if n = 0 then return jsonb_build_object('error', 'not_found'); end if;
   update public.storage_migrations m
-     set state = case when m.state = 'holding' then 'done' else m.state end, finished_at = now()
+     set state = case when m.state = 'holding' then 'done' else m.state end, finished_at = now(), delete_old_after = null
    where m.id = any (mids) and m.state in ('holding', 'rolled_back') and m.finished_at is null
      and not exists (select 1 from public.storage_migration_items i
                       where i.migration_id = m.id and i.cleanup_store is not null and i.cleaned_at is null);
   perform public._audit(p_staff, 'storage.old_copies_abandoned', p_store,
-                        jsonb_build_object('store', p_store, 'copies', n, 'migrations', to_jsonb(mids), 'reason', btrim(p_reason)));
+                        jsonb_build_object('store', p_store, 'copies', n, 'migrations', to_jsonb(mids),
+                                           'endedRollback', coalesce(p_ack, false), 'reason', btrim(p_reason)));
   return jsonb_build_object('store', p_store, 'copies', n, 'migrations', cardinality(mids));
+end;
+$$;
+
+-- An Owner gives up a failed rollback (its copies back can't succeed, e.g. the store it was rolling back to is
+-- gone for good). Uploads go back to the store the photos were moved to (to_store); photos still waiting to come
+-- back stay where they are; a partial copy on the rollback's destination is tracked for clean-up after the hold,
+-- like any skipped item. The migration finishes as rolled back with error 'rollback_abandoned'. The API checks the
+-- passkey, re-evaluates automatic read-only mode and emails every Owner.
+-- { migrationId, from, to, photos } or { error: forbidden | invalid | not_found | conflict }.
+create function public.storage_rollback_give_up(p_staff uuid, p_reason text) returns jsonb
+language plpgsql volatile security definer set search_path = '' as $$
+declare
+  m public.storage_migrations;
+  n integer;
+  held boolean;
+begin
+  if public._staff_role_of(p_staff) is distinct from 'owner' then return jsonb_build_object('error', 'forbidden'); end if;
+  if p_reason is null or length(btrim(p_reason)) not between 3 and 300 then return jsonb_build_object('error', 'invalid'); end if;
+  perform public._storage_lock();
+  select * into m from public.storage_migrations
+   where state in ('copying', 'paused', 'verifying', 'holding', 'rolling_back', 'failed') for update;
+  if not found then return jsonb_build_object('error', 'not_found'); end if;
+  if m.direction <> 'back' or m.state <> 'failed' then return jsonb_build_object('error', 'conflict'); end if;
+  update public.storage_state set write_store = m.to_store, updated_at = now(), updated_by = p_staff where id = 1;
+  -- Not copied back: they stay on the store they were moved to (the rollback's src). A partial copy on the
+  -- rollback's destination (an attempt was made) is cleaned up after the hold.
+  update public.storage_migration_items
+     set state = 'skipped', lease_until = null, token = null, updated_at = now(), error = coalesce(error, 'rollback_abandoned'),
+         cleanup_store = case when attempts > 0 or state = 'copied' then dst else cleanup_store end
+   where migration_id = m.id and state in ('pending', 'copied', 'failed');
+  get diagnostics n = row_count;
+  held := exists (select 1 from public.storage_migration_items
+                   where migration_id = m.id and cleanup_store is not null and cleaned_at is null);
+  update public.storage_migrations
+     set state = 'rolled_back', last_error = 'rollback_abandoned',
+         delete_old_after = case when held then now() + interval '7 days' end,
+         finished_at = case when held then null else now() end
+   where id = m.id;
+  perform public._audit(p_staff, 'storage.rollback_abandoned', m.id::text,
+                        jsonb_build_object('photos', n, 'writeStore', m.to_store, 'reason', btrim(p_reason)));
+  return jsonb_build_object('migrationId', m.id, 'from', m.from_store, 'to', m.to_store, 'photos', n);
 end;
 $$;
 
@@ -1078,9 +1136,16 @@ end;
 $$;
 
 alter function public.sweep_photo_rows(uuid[]) rename to _v7_sweep_photo_rows;
+-- Also says whether the thumbnail and preview exist: the orphan sweep never deletes a copy away from the
+-- photo's store that the photo still points at until the photo's store holds it.
 create function public.sweep_photo_rows(p_ids uuid[]) returns jsonb
 language sql stable security definer set search_path = '' as $$
-  select public._with_photo_stores(public._v7_sweep_photo_rows(p_ids), 'id');
+  select coalesce(jsonb_agg(e.value || jsonb_build_object('hasThumb', coalesce(p.has_thumb, false),
+                                                          'hasPreview', coalesce(p.has_preview, false))
+                            order by e.ord), '[]'::jsonb)
+    from jsonb_array_elements(public._with_photo_stores(public._v7_sweep_photo_rows(p_ids), 'id'))
+         with ordinality e(value, ord)
+    left join public.photos p on p.id = (e.value ->> 'id')::uuid;
 $$;
 
 -- Permanent deletes ("Delete forever", "Empty Trash") name each photo's store, so the API deletes the objects
@@ -1165,7 +1230,7 @@ grant execute on function
   public.storage_followups_due(integer),
   public.storage_followup_done(uuid, text, text, boolean),
   public.storage_followups_expire(),
-  public.storage_abandon_old_copies(uuid, text, text),
+  public.storage_abandon_old_copies(uuid, text, text, boolean), public.storage_rollback_give_up(uuid, text),
   public.bulk_photos(uuid, uuid[], text, uuid),
   public.empty_trash(uuid),
   public.ai_mask_key(uuid, uuid, uuid),

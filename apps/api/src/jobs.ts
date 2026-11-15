@@ -21,6 +21,7 @@ import {
 } from './library/storage';
 import { deleteAll, deleteUnder, stores } from './storage';
 import { allStores, photoStore, storeIdOf } from './storage/config';
+import { copyVerified } from './storage/migrate';
 import type { ObjectStore } from './storage/types';
 import { rpc } from './supabase';
 
@@ -372,6 +373,33 @@ interface PhotoRowState {
   maskKeys?: string[];
   /** Phase 8: the store the photo lives on ('r2' until sweep_photo_rows returns it). */
   storeId?: string | null;
+  /** Phase 8: whether the photo's thumbnail and preview exist (their keys are live while true). */
+  hasThumb?: boolean;
+  hasPreview?: boolean;
+}
+
+/**
+ * True when `key` is an object the photo's row still points at: the original of any photo that isn't being
+ * purged, its thumbnail and preview while it has them, the edited variants its edit records and the masks its
+ * rows record. A live key away from the photo's store may be the only copy (a follow-up that never ran, or old
+ * copies abandoned on a store that came back), so the sweep never deletes one before the photo's store has it.
+ */
+function liveKey(row: PhotoRowState, key: string, k: NonNullable<ReturnType<typeof parseKey>>): boolean {
+  if (row.status === 'purging') return false;
+  switch (k.kind) {
+    case 'original':
+      return true;
+    case 'thumb':
+      return row.hasThumb !== false;
+    case 'preview':
+      return row.hasPreview !== false;
+    case 'edit':
+      return key === row.editThumbKey || key === row.editPreviewKey;
+    case 'mask':
+      return (row.maskKeys ?? []).includes(key);
+    default:
+      return false;
+  }
 }
 
 /** Migration states during which a photo can have a copy on a store other than its own. */
@@ -389,7 +417,8 @@ const MOVING = new Set(['copying', 'paused', 'verifying', 'holding', 'rolling_ba
 export async function sweepOrphans(env: Env, now = Date.now()): Promise<number> {
   // Phase 8: one page per configured store per run, each with its own cursor. A copy on a store other than
   // its photo's is left alone while a migration is moving photos (old copies are deleted only after the
-  // verify-plus-hold, by the migration); with no migration under way it's a leftover and goes too.
+  // verify-plus-hold, by the migration); with no migration under way it's a leftover and goes too, but a key
+  // the photo still points at goes only once the photo's store holds it (see liveKey).
   // A rolled-back or finished migration whose old copies are still held (cleanupPending) counts as moving
   // too: the copies away from their photo's store are the migration's until the hold is over.
   let moving = true;
@@ -429,6 +458,9 @@ async function sweepStore(env: Env, store: ObjectStore, moving: boolean, now: nu
   const ids = [...new Set(parsed.flatMap((p) => (p.k ? [p.k.photo] : [])))];
   const rows = ids.length ? await rpc<PhotoRowState[]>(env, 'sweep_photo_rows', { p_ids: ids }) : [];
   const byId = new Map(rows.map((r) => [r.id, r]));
+  // Copies away from their photo's store that the photo still points at: deleted only once the photo's own
+  // store is known to hold the key (rescued there first if it doesn't).
+  const away: { key: string; home: string }[] = [];
   const orphans = parsed.flatMap(({ key, k, uploaded }) => {
     // Ids spelled in another case: never recorded or counted, whatever its age.
     if (!k) return isNonCanonicalPhotoKey(key) ? [key] : [];
@@ -436,8 +468,15 @@ async function sweepStore(env: Env, store: ObjectStore, moving: boolean, now: nu
     if (!row || row.ownerId !== k.owner) return [key];
     if (storeIdOf(row) !== store.id) {
       // A copy away from the photo's store: the migration owns it while photos are moving. Gallery renders
-      // (`u/<owner>/g/…`) don't parse as photo keys, so they never get here.
-      return !moving && now - uploaded > LIBRARY_LIMITS.editGraceMs ? [key] : [];
+      // (`u/<owner>/g/…`) don't parse as photo keys, so they never get here. A photo still uploading keeps
+      // everything until its upload is done or expired.
+      if (moving || now - uploaded <= LIBRARY_LIMITS.editGraceMs) return [];
+      if (row.status === 'uploading' || row.activeUpload) return [];
+      if (liveKey(row, key, k)) {
+        away.push({ key, home: storeIdOf(row) });
+        return [];
+      }
+      return [key];
     }
     if (k.kind === 'edit') {
       // Every PUT writes its own key, so a key that isn't the recorded one is never going to be: once it's
@@ -452,6 +491,20 @@ async function sweepStore(env: Env, store: ObjectStore, moving: boolean, now: nu
     }
     return [];
   });
+  for (const a of away) {
+    try {
+      const home = photoStore(env, a.home);
+      if (!(await home.head(a.key))) {
+        // The only copy may be this one: copy it to the photo's store (verified) before letting it go. A
+        // source that vanished meanwhile leaves nothing to delete.
+        if ((await copyVerified(store, home, a.key)) === null) continue;
+      }
+      orphans.push(a.key);
+    } catch (err) {
+      // The photo's store can't be read or written right now: keep the copy, the next pass tries again.
+      logError('cron', 'job_sweep_rescue', err);
+    }
+  }
   if (orphans.length) await deleteKeys(store, orphans);
   try {
     await rpc(env, 'set_job_state', { p_key: key, p_value: listed.cursor });
