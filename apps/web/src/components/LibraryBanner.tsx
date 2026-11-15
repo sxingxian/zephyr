@@ -116,8 +116,12 @@ export function retentionOf(user: unknown): RetentionNotice | null {
  */
 export function RetentionBanner() {
   const { user } = useSession();
+  const libs = useLibraries();
   const lib = useActiveLibrary();
-  const r = lib.self ? retentionOf(user) : null;
+  // Only once the library list has loaded and confirms the open library is the member's own: until the session id
+  // is known, a tab opened on a team library briefly looks like the member's own.
+  const r =
+    libs && lib.self && user && lib.ownerId === (user as { id?: string }).id ? retentionOf(user) : null;
   if (!r) return null;
   const n = r.photos.toLocaleString('en-GB');
   return (
