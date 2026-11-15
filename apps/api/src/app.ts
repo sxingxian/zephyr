@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { rejectDuplicateCookies } from './auth/session';
 import { fail, logError } from './http';
+import { readOnlyGate } from './library/read-only-gate';
 import { adminRoutes } from './routes/admin';
 import { adsRoutes } from './routes/ads';
 import { aiRoutes } from './routes/ai';
@@ -57,6 +58,8 @@ function applyHeaders(h: Headers, method: string, requestId: string) {
 // A session cookie name sent twice means one copy was planted: refuse before anything reads them.
 app.use('/api/*', rejectDuplicateCookies('app'));
 app.use('/admin/api/*', rejectDuplicateCookies('admin'));
+// Phase 8: read-only mode refuses library writes here, except the exposure-reducing ones (library/read-only-gate.ts).
+app.use('/api/v1/*', readOnlyGate);
 // Members and the landing page (same origin on each host, via the site Workers' service bindings).
 app.route('/api', publicRoutes);
 app.route('/api/v1/auth', appAuthRoutes);

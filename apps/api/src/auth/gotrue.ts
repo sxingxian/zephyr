@@ -153,6 +153,18 @@ export const gotrue = {
       throw err;
     }
   },
+  /**
+   * Bans or unbans an Auth user (removed staff: no sign-in of any kind, and refresh tokens stop working). A ban
+   * of about 100 years is Supabase's "indefinitely"; 'none' lifts it.
+   */
+  adminSetBanned: (env: Env, userId: string, banned: boolean) =>
+    call<unknown>(
+      env,
+      'PUT',
+      `/admin/users/${encodeURIComponent(userId)}`,
+      { kind: 'admin' },
+      { ban_duration: banned ? '876000h' : 'none' },
+    ),
   adminCreateUser: (env: Env, email: string, displayName?: string) =>
     call<GoTrueUser>(
       env,

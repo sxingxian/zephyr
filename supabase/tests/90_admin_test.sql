@@ -134,12 +134,34 @@ select pg_temp.ok(:'r'::jsonb -> 'override' = 'null'::jsonb
 select pg_temp.ok((select lapsed_at is not null from public.profiles where id = :jun), 'a paid plan ending starts the retention clock (lapsed_at)');
 
 -- Credits
-select pg_temp.ok(public.admin_user_grant_credits(:sup, :jun, 1001, 'Refund for a failed batch') ->> 'error' = 'forbidden', 'Support can grant at most 1,000 credits');
+select pg_temp.ok(public.admin_user_grant_credits(:sup, :jun, 1001, 'Refund for a failed batch') ->> 'error' = 'limit_reached', 'Support can grant at most 1,000 credits');
 select pg_temp.ok(public.admin_user_grant_credits(:fin, :jun, 10, 'Refund for a failed batch') ->> 'error' = 'forbidden', 'Finance can''t grant credits');
 select public.admin_user_grant_credits(:sup, :jun, 500, 'Refund for a failed batch') as r \gset
 select pg_temp.ok((:'r'::jsonb -> 'usage' ->> 'credits')::int >= 500
   and exists (select 1 from public.credit_ledger where owner_id = :jun and reason = 'admin_adjust' and delta = 500), 'Support grants credits (admin_adjust)');
-select pg_temp.ok(public.admin_user_grant_credits(:own, :jun, 50001, 'Too many') ->> 'error' = 'invalid', 'more than 50,000 is refused');
+select pg_temp.ok(public.admin_user_grant_credits(:own, :jun, 50001, 'Too many', true) ->> 'error' = 'invalid', 'more than 50,000 is refused');
+select pg_temp.ok((public.admin_user_grant_credits(:sup, :jun, 500, 'Second refund') ->> 'large')::boolean = false
+  and public.admin_user_grant_credits(:sup, :jun, 1, 'Third refund') ->> 'error' = 'limit_reached'
+  and public.admin_user_grant_credits(:saf, :jun, 1, 'Safety refund') ->> 'error' = 'limit_reached',
+  'Support and Safety together give one member at most 1,000 credits in 24 hours');
+insert into public.audit_log (actor, action, target, details)
+values (:sup, 'users.credits', 'a9000000-0000-0000-0000-000000000099', '{"amount": 3900, "role": "support"}');
+select pg_temp.ok(public.admin_user_grant_credits(:sup, :mei, 101, 'Refund') ->> 'error' = 'limit_reached'
+  and public.admin_user_grant_credits(:sup, :mei, 100, 'Refund') ->> 'error' is null,
+  'one Support member grants at most 5,000 credits in 24 hours across all members');
+select pg_temp.ok((select coalesce(sum(delta), 0) from public.credit_ledger where owner_id = :mei and reason = 'admin_adjust') = 100,
+  'only the grant within the limit was credited');
+select pg_temp.ok(public.admin_user_grant_credits(:adm, :ret, 1001, 'Goodwill') ->> 'error' = 'reauth_required'
+  and not exists (select 1 from public.credit_ledger where owner_id = :ret and reason = 'admin_adjust'),
+  'an Admin grant above 1,000 needs a recent passkey');
+select pg_temp.ok((public.admin_user_grant_credits(:adm, :ret, 1001, 'Goodwill', true) ->> 'large')::boolean
+  and (public.admin_user_grant_credits(:adm, :ret, 1000, 'Goodwill') ->> 'large')::boolean = false,
+  'with the passkey it goes through and is flagged large (the Owners are emailed); 1,000 is not large');
+insert into public.audit_log (actor, action, target, details)
+values (:adm, 'users.credits', 'a9000000-0000-0000-0000-000000000099', '{"amount": 2500, "role": "admin"}');
+select pg_temp.ok(public.admin_user_grant_credits(:adm, :ret, 500, 'Goodwill') ->> 'error' = 'reauth_required'
+  and (public.admin_user_grant_credits(:adm, :ret, 500, 'Goodwill', true) ->> 'large')::boolean,
+  'small Admin grants that pass 5,000 in 24 hours need the passkey too');
 
 -- Sign out everywhere
 insert into auth.sessions (id, user_id) values ('a9500000-0000-0000-0000-000000000001', :jun), ('a9500000-0000-0000-0000-000000000002', :jun);
@@ -174,6 +196,37 @@ select public.admin_user_unsuspend(:saf, :mei, 'Appeal accepted') as r \gset
 select pg_temp.ok(:'r'::jsonb ->> 'status' = 'active'
   and not public.member_suspended(:mei) and (select sharing_suspended_at is null from public.profiles where id = :mei)
   and public.library_access(:jun, :mei) is not null, 'unsuspending restores the account, its sharing and the team');
+-- A separate sharing suspension outlives the account suspension, whichever came first.
+update public.profiles set sharing_suspended_at = now() - interval '1 hour', sharing_by_suspension = false where id = :mei;
+select public.admin_user_suspend(:saf, :mei, 'abuse', 'Spam galleries');
+select public.admin_user_unsuspend(:saf, :mei, 'Appeal accepted');
+select pg_temp.ok((select sharing_suspended_at is not null and not sharing_by_suspension from public.profiles where id = :mei),
+  'sharing suspended before the account suspension stays suspended after unsuspending');
+select public.admin_user_sharing_lift(:saf, :mei, 'Reviewed');
+insert into public.gallery_reports (id, gallery_id, owner_id, photo_id, reason, details, network_hash, created_at) values
+  ('a9700000-0000-0000-0000-000000000091', null, :mei, null, 'privacy', 'Order test', pg_temp.h('n91'), now()),
+  ('a9700000-0000-0000-0000-000000000092', null, :mei, null, 'privacy', 'Order test', pg_temp.h('n92'), now()),
+  ('a9700000-0000-0000-0000-000000000093', null, :mei, null, 'privacy', 'Order test', pg_temp.h('n93'), now());
+select public.admin_user_suspend(:saf, :mei, 'abuse', 'Spam galleries');
+select public.admin_report_resolve(:saf, 'a9700000-0000-0000-0000-000000000091', array['suspend_sharing'], 'Sharing abuse too');
+select public.admin_user_unsuspend(:saf, :mei, 'Appeal accepted');
+select pg_temp.ok((select sharing_suspended_at is not null from public.profiles where id = :mei),
+  'a sharing suspension Safety added during the account suspension stays after unsuspending');
+select public.admin_user_sharing_lift(:saf, :mei, 'Reviewed');
+select public.admin_report_resolve(:saf, 'a9700000-0000-0000-0000-000000000092', array['suspend_sharing', 'suspend_account'], 'Both');
+select public.admin_user_unsuspend(:saf, :mei, 'Appeal accepted');
+select pg_temp.ok((select sharing_suspended_at is not null from public.profiles where id = :mei),
+  'resolving with suspend_sharing and suspend_account together: unsuspending keeps sharing suspended');
+select public.admin_user_sharing_lift(:saf, :mei, 'Reviewed');
+select public.admin_report_resolve(:saf, 'a9700000-0000-0000-0000-000000000093', array['suspend_account', 'suspend_sharing'], 'Both');
+select public.admin_user_unsuspend(:saf, :mei, 'Appeal accepted');
+select pg_temp.ok((select sharing_suspended_at is not null from public.profiles where id = :mei),
+  'in either order');
+select public.admin_user_sharing_lift(:saf, :mei, 'Reviewed');
+select public.admin_user_suspend(:saf, :mei, 'abuse', 'Spam galleries');
+select public.admin_user_unsuspend(:saf, :mei, 'Appeal accepted');
+select pg_temp.ok((select sharing_suspended_at is null and not sharing_by_suspension from public.profiles where id = :mei),
+  'a suspension on its own still lifts the sharing suspension it set');
 
 -- Deletion by staff
 select pg_temp.ok(public.admin_user_deletion_schedule(:adm, :jun, 'Legal request') ->> 'error' = 'forbidden', 'only an Owner schedules a deletion');
@@ -280,6 +333,13 @@ select public.admin_hold_release(:own, :'s2', 'Confirmed false positive') as r \
 select pg_temp.ok(:'r' <> ''
   and (select safety_hold_at is null from public.photos where id = :'s2') and coalesce(current_setting('zephyr.safety_release', true), '') = '',
   'an Owner releases a hold (and the release flag doesn''t linger)');
+select (select count(*) from public.audit_log where action = 'safety.hold_released') as rel_n \gset
+select pg_temp.photo(:mei, 'never-held.jpg') as nh \gset
+select pg_temp.ok(public.admin_hold_release(:own, :'s2', 'Already released') is null
+  and public.admin_hold_release(:own, :'nh', 'Never held') is null
+  and public.admin_hold_release(:own, 'a9000000-0000-4000-8000-00000000dead', 'Unknown') is null
+  and (select count(*) from public.audit_log where action = 'safety.hold_released') = :rel_n,
+  'releasing a photo that isn''t held answers null and writes no audit row');
 
 -- ---- Plan limits --------------------------------------------------------------------------------------
 select pg_temp.ok(public.admin_limits(:sup) ->> 'error' = 'forbidden' and public.admin_limits(:adm) -> 'active' ->> 'version' = '1'
@@ -451,7 +511,7 @@ select pg_temp.ok(:'acc'::jsonb ->> 'role' = 'safety' and :'acc'::jsonb ->> 'ema
   'the invite link resolves (checks only)');
 select pg_temp.ok(public.staff_invite_accept(pg_temp.h('si1')) ->> 'inviteId' = :'acc'::jsonb ->> 'inviteId', 'checking doesn''t use the invite up');
 insert into auth.users (id, email) values ('a9000000-0000-0000-0000-000000000006', 'new.staff9@zephyr.test');
-select pg_temp.ok(public.staff_invite_accept(pg_temp.h('si1')) ->> 'error' = 'account_exists', 'an address that already has an account is refused at the link');
+select pg_temp.ok(public.staff_invite_accept(pg_temp.h('si1')) ->> 'error' = 'member_account', 'an address that already has a member account is refused at the link');
 select pg_temp.ok(public.staff_invite_complete((:'acc'::jsonb ->> 'inviteId')::uuid, :mei) is null, 'the invite is bound to its address');
 select public.staff_invite_complete((:'acc'::jsonb ->> 'inviteId')::uuid, 'a9000000-0000-0000-0000-000000000006') as r \gset
 select pg_temp.ok(:'r'::jsonb ->> 'role' = 'safety'
@@ -476,6 +536,21 @@ insert into auth.sessions (user_id) values (:sup);
 select public.admin_staff_remove(:adm, :sup, 'Contract ended') as r \gset
 select pg_temp.ok(:'r'::jsonb -> 'staff' is not null and public._staff_role_of(:sup) is null
   and public.staff_lookup(:sup) is null and not exists (select 1 from auth.sessions where user_id = :sup), 'removing staff ends their sessions and access');
+select pg_temp.ok(public.account_kind('support9@zephyr.test') = 'former_staff' and (public.get_session_profile(:sup) ->> 'isStaff')::boolean
+  and (select display_name = 'support9@zephyr.test' and role = 'support' and removed_by = :adm from public.former_staff where user_id = :sup),
+  'removed staff stay on the staff side (former_staff): no member sign-in, no member app');
+select pg_temp.ok((select bool_and(e -> 'actor' ->> 'name' = 'support9@zephyr.test (former staff)' and e -> 'actor' ->> 'role' = 'support')
+                     from jsonb_array_elements(public.admin_audit(:adm, :sup, null, null, null, null, null) -> 'items') e
+                    where e ->> 'action' = 'users.credits'), 'the audit log still names what former staff did');
+select pg_temp.ok(public.admin_staff_invite(:adm, 'support9@zephyr.test', 'support', pg_temp.h('si4'), 'Rehired') ->> 'error' is null,
+  'a former staff member can be invited again');
+select public.staff_invite_accept(pg_temp.h('si4')) as acc4 \gset
+select pg_temp.ok(:'acc4'::jsonb ->> 'existingUserId' = 'a9000000-0000-0000-0000-000000000005'
+  and public.staff_invite_accept(pg_temp.h('si1')) is null, 'the link names the existing auth user to reuse');
+select public.staff_invite_complete((:'acc4'::jsonb ->> 'inviteId')::uuid, :sup) as r \gset
+select pg_temp.ok(:'r'::jsonb ->> 'role' = 'support' and public.account_kind('support9@zephyr.test') = 'staff'
+  and not exists (select 1 from public.former_staff where user_id = :sup), 'completing it restores them as staff');
+select public.admin_staff_remove(:adm, :sup, 'Contract ended again');
 select public.admin_staff_set_role(:adm, :own, 'owner', 'Back to owner');
 
 -- ---- Audit -------------------------------------------------------------------------------------------
@@ -556,11 +631,11 @@ end $$;
 
 -- ---- Privileges --------------------------------------------------------------------------------------------
 select pg_temp.ok(not exists (
-  select 1 from unnest(array['safety_hold_reports', 'reveal_grants', 'limits_notices', 'ad_cards', 'ad_stats_daily', 'retention_items', 'staff_invites']) t
+  select 1 from unnest(array['safety_hold_reports', 'reveal_grants', 'limits_notices', 'ad_cards', 'ad_stats_daily', 'retention_items', 'staff_invites', 'former_staff']) t
    where has_table_privilege('anon', 'public.' || t, 'select') or has_table_privilege('authenticated', 'public.' || t, 'select')
       or has_table_privilege('authenticated', 'public.' || t, 'insert')), 'anon and authenticated can''t read or write the new tables');
 select pg_temp.ok((select bool_and(c.relrowsecurity) from pg_class c where c.relnamespace = 'public'::regnamespace
-                    and c.relname in ('safety_hold_reports', 'reveal_grants', 'limits_notices', 'ad_cards', 'ad_stats_daily', 'retention_items', 'staff_invites')),
+                    and c.relname in ('safety_hold_reports', 'reveal_grants', 'limits_notices', 'ad_cards', 'ad_stats_daily', 'retention_items', 'staff_invites', 'former_staff')),
   'RLS is on for every new table');
 select pg_temp.ok(not has_function_privilege('authenticated', 'public.admin_users(uuid, text, text, text, text, text)', 'execute')
   and not has_function_privilege('anon', 'public.app_status()', 'execute')
@@ -576,6 +651,20 @@ do $$ begin
     perform 1 from public.staff_invites;
     raise exception 'FAILED: authenticated read staff_invites';
   exception when insufficient_privilege then raise notice 'ok - authenticated can''t select staff_invites';
+  end;
+  begin
+    perform 1 from public.former_staff;
+    raise exception 'FAILED: authenticated read former_staff';
+  exception when insufficient_privilege then raise notice 'ok - authenticated can''t select former_staff';
+  end;
+end $$;
+reset role;
+set local role anon;
+do $$ begin
+  begin
+    perform 1 from public.former_staff;
+    raise exception 'FAILED: anon read former_staff';
+  exception when insufficient_privilege then raise notice 'ok - anon can''t select former_staff';
   end;
 end $$;
 reset role;

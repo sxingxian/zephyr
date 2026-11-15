@@ -48,11 +48,14 @@ export function StaffInvite() {
         nav('/enrol', { replace: true, state: { email: r.email } });
       } catch (e) {
         setError(
-          e instanceof ApiFailure && (e.code === 'invalid' || e.code === 'not_found' || e.code === 'conflict')
+          e instanceof ApiFailure &&
+            (e.code === 'invite_invalid' || e.code === 'invalid' || e.code === 'not_found')
             ? 'This invite has expired or was already used. Ask an Owner to send a new one.'
-            : e instanceof ApiFailure && e.code === 'forbidden'
-              ? 'This invite is for a different email than the one you signed in to Cloudflare Access with. Sign in to Access with the invited address and open the link again.'
-              : errorMessage(e),
+            : e instanceof ApiFailure && e.code === 'conflict'
+              ? 'This address already has a Zephyr account (a member or staff account), so it can’t take a staff invite. Ask an Owner to invite a different address.'
+              : e instanceof ApiFailure && e.code === 'forbidden'
+                ? 'This invite is for a different email than the one you signed in to Cloudflare Access with. Sign in to Access with the invited address and open the link again.'
+                : errorMessage(e),
         );
       }
     })();

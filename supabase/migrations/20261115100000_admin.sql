@@ -47,6 +47,31 @@ language sql stable set search_path = '' as $$
                   (select u.email::text from auth.users u where u.id = p_staff), 'Staff');
 $$;
 
+-- Removed staff. Their auth user is kept (audit rows and invites point at it) but banned in Auth by the API, and
+-- the account stays on the staff side: account_kind says 'former_staff', which neither sign-in accepts, and the
+-- member app treats it as staff. A new staff invite for the address brings it back (staff_invite_complete).
+create table public.former_staff (
+  user_id uuid primary key references auth.users (id) on delete cascade,
+  display_name text not null check (length(display_name) between 1 and 320),
+  role public.staff_role not null,
+  removed_by uuid,
+  removed_at timestamptz not null default now()
+);
+alter table public.former_staff enable row level security;
+revoke all on public.former_staff from anon, authenticated;
+
+-- 'none' | 'member' | 'staff' | 'former_staff' (phase 1's function, plus removed staff).
+create or replace function public.account_kind(p_email text) returns text
+language sql stable security definer set search_path = '' as $$
+  select case
+    when u.id is null then 'none'
+    when exists (select 1 from public.staff s where s.user_id = u.id) then 'staff'
+    when exists (select 1 from public.former_staff f where f.user_id = u.id) then 'former_staff'
+    else 'member'
+  end
+  from (select public.user_id_by_email(p_email) as id) u;
+$$;
+
 -- m•••@example.com
 create function public._mask_email(p_email text) returns text
 language sql immutable set search_path = '' as $$
@@ -100,6 +125,10 @@ alter table public.profiles
   add column suspended_by uuid,
   add column lapsed_at timestamptz,
   add column deletion_by_staff uuid,
+  -- True only while the sharing suspension was set by an account suspension (admin_user_suspend or a Safety
+  -- 'suspend_account'). Any other reason to suspend sharing (a Safety 'suspend_sharing', a safety hold) clears it,
+  -- so unsuspending lifts sharing only when the suspension alone put it there.
+  add column sharing_by_suspension boolean not null default false,
   add constraint profiles_override_shape check ((plan_override_plan is null) = (plan_override_by is null)),
   add constraint profiles_suspend_shape check ((suspended_at is null) = (suspended_category is null));
 create index profiles_override_due on public.profiles (plan_override_until) where plan_override_plan is not null;
@@ -256,7 +285,7 @@ begin
   perform public._lock_storage(o);
   update public.photos set safety_hold_at = coalesce(safety_hold_at, now()),
                            safety_hold_source = coalesce(safety_hold_source, 'csam_scan') where id = p_photo;
-  update public.profiles set sharing_suspended_at = coalesce(sharing_suspended_at, now()) where id = o;
+  update public.profiles set sharing_suspended_at = coalesce(sharing_suspended_at, now()), sharing_by_suspension = false where id = o;
   delete from public.gallery_photos where photo_id = p_photo;
   if was is null then
     perform public._audit(null, 'safety.csam_match', p_photo::text,
@@ -451,9 +480,11 @@ language sql stable set search_path = '' as $$
     'id', a.id::text, 'at', a.created_at,
     'actor', case when a.actor is null then jsonb_build_object('id', null, 'name', 'System', 'role', 'system')
                   when st.user_id is not null then jsonb_build_object('id', a.actor, 'name', public._staff_name(a.actor), 'role', st.role)
+                  when fs.user_id is not null then jsonb_build_object('id', a.actor, 'name', fs.display_name || ' (former staff)', 'role', fs.role)
                   else jsonb_build_object('id', a.actor, 'name', 'Member', 'role', 'system') end,
     'action', a.action, 'target', a.target, 'reason', a.details ->> 'reason')
-    from (select 1) x left join public.staff st on st.user_id = a.actor;
+    from (select 1) x left join public.staff st on st.user_id = a.actor
+                      left join public.former_staff fs on fs.user_id = a.actor;
 $$;
 
 -- ---------------------------------------------------------------------------------------------
@@ -628,23 +659,55 @@ begin
 end;
 $$;
 
--- Grants credits (phase 6 'admin_adjust'). Support: at most 1,000 per action. Returns AdminUserDetail.
-create function public.admin_user_grant_credits(p_staff uuid, p_user uuid, p_amount integer, p_reason text) returns jsonb
+-- Grants credits (phase 6 'admin_adjust'). Limits (docs/phase-8.md › Users), checked under the granter's lock and
+-- then the member's credits lock (always in that order):
+--   * Support and Safety: at most 1,000 a grant, 5,000 in any 24 hours across all members, and 1,000 in any 24 hours
+--     to one member from Support and Safety together. Above any of these: { error: 'limit_reached' } (an Owner or
+--     Admin can grant it).
+--   * Owner and Admin: a grant above 1,000, or one that takes the granter's own 24-hour total above 5,000, is
+--     "large": it needs p_reauthed (a passkey sign-in in the last 10 minutes, checked by the API), else
+--     { error: 'reauth_required' }, and the API emails every Owner.
+-- Totals come from the 'users.credits' audit rows (append-only), which record the amount and the granter's role.
+-- Returns AdminUserDetail plus { large }.
+create function public.admin_user_grant_credits(p_staff uuid, p_user uuid, p_amount integer, p_reason text,
+                                                p_reauthed boolean default false) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
   err text := public._user_target_ok(p_staff, p_user, 'usersAct', p_reason);
+  v_role text;
+  v_mine bigint;
+  v_member bigint;
+  v_large boolean;
   b public.credit_balances;
 begin
   if err is not null then return case when err = 'not_found' then null else jsonb_build_object('error', err) end; end if;
   if p_amount is null or p_amount < 1 or p_amount > 50000 then return jsonb_build_object('error', 'invalid'); end if;
-  if public._staff_role_of(p_staff) not in ('owner', 'admin') and p_amount > 1000 then return jsonb_build_object('error', 'forbidden'); end if;
+  perform pg_advisory_xact_lock(hashtextextended('zephyr.credit_grants:' || p_staff::text, 0));
   perform public._credits_lock(p_user);
+  v_role := public._staff_role_of(p_staff)::text;
+  select coalesce(sum((a.details ->> 'amount')::bigint), 0) into v_mine
+    from public.audit_log a
+   where a.actor = p_staff and a.action = 'users.credits' and a.created_at > now() - interval '24 hours';
+  if v_role in ('owner', 'admin') then
+    v_large := p_amount > 1000 or v_mine + p_amount > 5000;
+    if v_large and not coalesce(p_reauthed, false) then return jsonb_build_object('error', 'reauth_required'); end if;
+  else
+    select coalesce(sum((a.details ->> 'amount')::bigint), 0) into v_member
+      from public.audit_log a
+     where a.target = p_user::text and a.action = 'users.credits' and a.created_at > now() - interval '24 hours'
+       and a.details ->> 'role' in ('support', 'safety');
+    if p_amount > 1000 or v_mine + p_amount > 5000 or v_member + p_amount > 1000 then
+      return jsonb_build_object('error', 'limit_reached');
+    end if;
+    v_large := false;
+  end if;
   b := public._credits_roll(p_user);
   insert into public.credit_ledger (owner_id, delta, reason, label, period_start)
   values (p_user, p_amount, 'admin_adjust', left('Added by Zephyr support', 160), b.period_start);
   update public.credit_balances set balance = balance + p_amount, updated_at = now() where owner_id = p_user;
-  perform public._audit(p_staff, 'users.credits', p_user::text, jsonb_build_object('amount', p_amount, 'reason', btrim(p_reason)));
-  return public._user_detail(p_user);
+  perform public._audit(p_staff, 'users.credits', p_user::text,
+                        jsonb_build_object('amount', p_amount, 'role', v_role, 'reason', btrim(p_reason)));
+  return public._user_detail(p_user) || jsonb_build_object('large', v_large);
 end;
 $$;
 
@@ -668,7 +731,8 @@ begin
   if err is not null then return case when err = 'not_found' then null else jsonb_build_object('error', err) end; end if;
   if p_category not in ('abuse', 'safety', 'fraud', 'legal', 'other') then return jsonb_build_object('error', 'invalid'); end if;
   update public.profiles set suspended_at = coalesce(suspended_at, now()), suspended_category = p_category, suspended_by = p_staff,
-                             sharing_suspended_at = coalesce(sharing_suspended_at, now())
+                             sharing_suspended_at = coalesce(sharing_suspended_at, now()),
+                             sharing_by_suspension = case when sharing_suspended_at is null then true else sharing_by_suspension end
    where id = p_user;
   perform public._auth_sign_out_all(p_user);
   perform public._audit(p_staff, 'users.suspend', p_user::text, jsonb_build_object('category', p_category, 'reason', btrim(p_note)));
@@ -676,8 +740,8 @@ begin
 end;
 $$;
 
--- Unsuspends (the API checks the passkey). Sharing stays suspended if a safety hold or a separate sharing
--- suspension is still in place: only a suspension this set is lifted with it.
+-- Unsuspends (the API checks the passkey). Sharing is lifted with it only when the account suspension alone set it
+-- (sharing_by_suspension) and no photo is on hold; a separate sharing suspension stays until lifted on its own.
 create function public.admin_user_unsuspend(p_staff uuid, p_user uuid, p_reason text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare
@@ -688,9 +752,10 @@ begin
   select * into pr from public.profiles where id = p_user for update;
   if pr.suspended_at is null then return public._user_detail(p_user); end if;
   update public.profiles set suspended_at = null, suspended_category = null, suspended_by = null,
-         sharing_suspended_at = case when sharing_suspended_at >= pr.suspended_at
+         sharing_suspended_at = case when sharing_by_suspension
                                           and not exists (select 1 from public.photos p where p.owner_id = p_user and p.safety_hold_at is not null)
-                                     then null else sharing_suspended_at end
+                                     then null else sharing_suspended_at end,
+         sharing_by_suspension = false
    where id = p_user;
   perform public._audit(p_staff, 'users.unsuspend', p_user::text, jsonb_build_object('reason', btrim(p_reason)));
   return public._user_detail(p_user);
@@ -707,7 +772,7 @@ begin
      or exists (select 1 from public.profiles p where p.id = p_user and p.suspended_at is not null) then
     return jsonb_build_object('error', 'conflict');
   end if;
-  update public.profiles set sharing_suspended_at = null where id = p_user;
+  update public.profiles set sharing_suspended_at = null, sharing_by_suspension = false where id = p_user;
   perform public._audit(p_staff, 'users.sharing_lift', p_user::text, jsonb_build_object('reason', btrim(p_reason)));
   return public._user_detail(p_user);
 end;
@@ -926,14 +991,17 @@ begin
     elsif a = 'end_gallery' and r.gallery_id is not null and owner is not null then
       perform public.revoke_gallery(owner, r.gallery_id);
     elsif a = 'suspend_sharing' and owner is not null then
-      update public.profiles set sharing_suspended_at = coalesce(sharing_suspended_at, now()) where id = owner;
+      update public.profiles set sharing_suspended_at = coalesce(sharing_suspended_at, now()), sharing_by_suspension = false where id = owner;
     elsif a = 'hold_photos' and v_photos is not null then
       update public.photos set safety_hold_at = coalesce(safety_hold_at, now()), safety_hold_source = coalesce(safety_hold_source, 'staff')
        where id = any (v_photos);
+      update public.profiles set sharing_by_suspension = false
+       where id in (select distinct p.owner_id from public.photos p where p.id = any (v_photos));
       delete from public.gallery_photos where photo_id = any (v_photos);
     elsif a = 'suspend_account' and owner is not null then
       update public.profiles set suspended_at = coalesce(suspended_at, now()), suspended_category = coalesce(suspended_category, 'safety'),
-                                 suspended_by = coalesce(suspended_by, p_staff), sharing_suspended_at = coalesce(sharing_suspended_at, now())
+                                 suspended_by = coalesce(suspended_by, p_staff), sharing_suspended_at = coalesce(sharing_suspended_at, now()),
+                                 sharing_by_suspension = case when sharing_suspended_at is null then true else sharing_by_suspension end
        where id = owner;
       perform public._auth_sign_out_all(owner);
       perform public._audit(p_staff, 'users.suspend', owner::text, jsonb_build_object('category', 'safety', 'reason', btrim(p_note), 'report', p_report));
@@ -971,13 +1039,16 @@ $$;
 -- separately. AdminSafetyResult.
 create function public.admin_hold_release(p_staff uuid, p_photo uuid, p_reason text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
+declare n integer;
 begin
   if not public._staff_can(p_staff, 'holdsRelease') then return jsonb_build_object('error', 'forbidden'); end if;
   if p_reason is null or length(btrim(p_reason)) not between 3 and 300 then return jsonb_build_object('error', 'invalid'); end if;
   perform set_config('zephyr.safety_release', 'on', true);
   update public.photos set safety_hold_at = null, safety_hold_source = null where id = p_photo and safety_hold_at is not null;
+  -- Read straight after the UPDATE: the PERFORM below would set FOUND again.
+  get diagnostics n = row_count;
   perform set_config('zephyr.safety_release', '', true);
-  if not found then return null; end if;
+  if n = 0 then return null; end if;
   perform public._audit(p_staff, 'safety.hold_released', p_photo::text, jsonb_build_object('reason', btrim(p_reason)));
   return public.admin_safety(p_staff, 'open');
 end;
@@ -1756,7 +1827,9 @@ $$;
 create or replace function public.get_session_profile(p_user_id uuid) returns jsonb
 language sql stable security definer set search_path = '' as $$
   select jsonb_build_object(
-    'isStaff', exists (select 1 from public.staff s where s.user_id = p_user_id),
+    -- A staff-side account (staff, or former staff): never usable in the member app.
+    'isStaff', exists (select 1 from public.staff s where s.user_id = p_user_id)
+               or exists (select 1 from public.former_staff f where f.user_id = p_user_id),
     'displayName', p.display_name,
     'plan', coalesce(p.plan_id, 'free'),
     'createdAt', p.created_at,
@@ -1775,6 +1848,7 @@ create function public._staff_lock() returns void
 language sql volatile set search_path = '' as $$
   select pg_advisory_xact_lock(hashtextextended('zephyr:staff', 0));
 $$;
+
 
 -- AdminStaffResult without ok. passkeys/lastActiveAt come from Auth (the API fills them; null here).
 create function public.admin_staff(p_staff uuid) returns jsonb
@@ -1835,14 +1909,19 @@ begin
 end;
 $$;
 
--- The invite link (checks only, doesn't use it up): { inviteId, email, role }, { error: 'account_exists' } when the
--- address already has an account (staff accounts are created fresh by the API), or null for an unknown, used,
--- revoked or expired link.
+-- The invite link (checks only, doesn't use it up): { inviteId, email, role, existingUserId }, or null for an unknown,
+-- used, revoked or expired link. existingUserId is set for a former staff member coming back (the API reuses that
+-- auth user); otherwise the API creates a fresh one. { error: 'member_account' | 'already_staff' } when the address
+-- belongs to a member or to current staff.
 create function public.staff_invite_accept(p_token_hash bytea) returns jsonb
 language sql stable security definer set search_path = '' as $$
-  select case when public.user_id_by_email(i.email::text) is not null then jsonb_build_object('error', 'account_exists')
-              else jsonb_build_object('inviteId', i.id, 'email', i.email::text, 'role', i.role) end
+  select case k.kind
+              when 'member' then jsonb_build_object('error', 'member_account')
+              when 'staff' then jsonb_build_object('error', 'already_staff')
+              else jsonb_build_object('inviteId', i.id, 'email', i.email::text, 'role', i.role,
+                                      'existingUserId', case when k.kind = 'former_staff' then public.user_id_by_email(i.email::text) end) end
     from public.staff_invites i
+    cross join lateral (select public.account_kind(i.email::text) as kind) k
    where i.token_hash = p_token_hash and i.accepted_at is null and i.revoked_at is null and i.expires_at > now();
 $$;
 
@@ -1905,6 +1984,8 @@ begin
   insert into public.staff (user_id, role, created_by) values (p_user_id, i.role, i.created_by)
   on conflict (user_id) do nothing;
   if not found then return null; end if;
+  -- A former staff member coming back: no longer 'former_staff'.
+  delete from public.former_staff where user_id = p_user_id;
   update public.staff_invites set accepted_at = now(), accepted_user = p_user_id where id = i.id;
   perform public._audit(p_user_id, 'staff.joined', p_user_id::text, jsonb_build_object('role', i.role, 'invite', i.id));
   return jsonb_build_object('userId', p_user_id, 'role', i.role);
@@ -1935,7 +2016,8 @@ begin
 end;
 $$;
 
--- Removes a staff member (Owner; passkey). Their admin sessions end. AdminStaffResult or { error }.
+-- Removes a staff member (Owner; passkey). Their admin sessions end, and they become former staff (the API also bans
+-- the auth user). AdminStaffResult or { error }.
 create function public.admin_staff_remove(p_staff uuid, p_user uuid, p_reason text) returns jsonb
 language plpgsql volatile security definer set search_path = '' as $$
 declare old public.staff_role;
@@ -1950,6 +2032,10 @@ begin
   if old = 'owner' and (select count(*) from public.staff where role = 'owner') <= 1 then
     return jsonb_build_object('error', 'last_owner');
   end if;
+  insert into public.former_staff (user_id, display_name, role, removed_by)
+  values (p_user, left(public._staff_name(p_user), 320), old, p_staff)
+  on conflict (user_id) do update set display_name = excluded.display_name, role = excluded.role,
+                                      removed_by = excluded.removed_by, removed_at = now();
   delete from public.staff where user_id = p_user;
   perform public._auth_sign_out_all(p_user);
   perform public._audit(p_staff, 'staff.removed', p_user::text, jsonb_build_object('role', old, 'reason', btrim(p_reason)));
@@ -2229,7 +2315,7 @@ grant execute on function
   public.admin_user_override(uuid, uuid, text, timestamptz, text),
   public.admin_user_override_end(uuid, uuid, text),
   public.admin_overrides_expire(),
-  public.admin_user_grant_credits(uuid, uuid, integer, text),
+  public.admin_user_grant_credits(uuid, uuid, integer, text, boolean),
   public.admin_user_sign_out(uuid, uuid, text),
   public.admin_user_suspend(uuid, uuid, text, text),
   public.admin_user_unsuspend(uuid, uuid, text),

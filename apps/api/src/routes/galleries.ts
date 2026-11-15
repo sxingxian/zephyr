@@ -25,11 +25,13 @@ import {
   galleryPhotosSchema,
 } from '@zephyr/shared';
 import { type Context, Hono, type MiddlewareHandler } from 'hono';
+import { isReadOnly } from '../admin/app-status';
 import { toPgBytea } from '../crypto';
 import { background, fail, logError, rateLimited, readBody } from '../http';
 import { actorOf, libraryContext, ownerOf, requireRole, requireWritable } from '../library/context';
 import { imageInfo } from '../library/files';
 import { nonce, stores } from '../library/objects';
+import { readOnlyAnswer } from '../library/read-only-gate';
 import {
   BodyLengthError,
   contentLength,
@@ -278,6 +280,8 @@ galleryRoutes.get('/:id/photos', async (c) => {
 galleryRoutes.post('/:id/photos', async (c) => {
   const body = await readBody(c, galleryPhotosSchema);
   if (!body) return c.json(fail('invalid'), 400);
+  // Read-only mode: removing photos from a gallery still works; adding them doesn't.
+  if (body.add?.length && (await isReadOnly(c.env))) return readOnlyAnswer(c);
   try {
     const res = await rpc<{ count: number } | { error: GalleryError } | null>(
       c.env,

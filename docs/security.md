@@ -167,6 +167,12 @@
       reviewer's name over it, logged with a reason.
     - **Suspension** ends sessions in Supabase Auth, not only the cookie; teammates and guests lose access at once.
     - **Staff invites:** email-bound, single use, hashed, 72 hours, and still behind Cloudflare Access.
+    - **Removed staff** become former staff. Their auth user is banned in Supabase Auth, and neither sign-in accepts
+      them. The audit log still names what they did.
+    - **Credits:** Support and Safety have rolling 24-hour limits: 1,000 per member and 5,000 in total, checked in
+      SQL under locks. A large grant by an Owner or Admin needs a recent passkey and emails every Owner.
+    - **Read-only mode** is enforced by one gate in front of every library route. Only exposure-reducing writes
+      (Trash, ending a gallery, replacing a link) and uploads already started get through.
     - **Audit log:** append-only, kept indefinitely; exports are role-limited and logged.
 
 17. **Storage switch (phase 8):**
@@ -193,8 +199,7 @@
       - The CSP is widened for Google's hosts only while AdSense is on, and `scripts/csp.mjs` checks both variants.
       - Google's certified consent message runs for the EEA, UK and Switzerland.
       - AdSense stays off until an Owner turns it on with a recent passkey. Turning it off applies to page loads within
-        60 seconds and needs no passkey.
-    - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
-      Turnstile.
+        60 seconds and needs no passkey. - **Never** on the landing origin: /admin lives there, so the landing still loads nothing third-party except
+        Turnstile.
 
 See the design decisions doc and `docs/phase-8.md` for the details.

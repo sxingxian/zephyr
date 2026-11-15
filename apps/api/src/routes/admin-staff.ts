@@ -159,6 +159,11 @@ export function registerAdminStaffRoutes(router: AdminRouter, requireStaff: Requ
       });
       if (isDbError(out)) return dbError(c, out);
       if (out === null || out === false) return c.json(fail('not_found'), 404);
+      // They're former staff now (account_kind refuses them on both sides); the ban also stops any sign-in path
+      // and refresh token at Auth itself. A failed ban is logged; the database already shut them out.
+      await gotrue
+        .adminSetBanned(c.env, user, true)
+        .catch((e) => logError(c.get('requestId'), 'staff_ban', e));
       await tellOwners(c, { kind: 'staff_removed', userId: user }, body.reason);
       return await staffView(c);
     } catch (err) {
@@ -168,8 +173,10 @@ export function registerAdminStaffRoutes(router: AdminRouter, requireStaff: Requ
 
   /**
    * The invite link. Cloudflare Access has already checked the identity (admin.ts); it must be the invited address.
-   * `staff_invite_accept` only checks the token (live, unused, unrevoked) and refuses addresses that already have
-   * an account; `staff_invite_complete` uses it up and adds the staff row in one transaction.
+   * `staff_invite_accept` only checks the token (live, unused, unrevoked) and refuses addresses that belong to a
+   * member or to current staff (409 conflict); `staff_invite_complete` uses it up and adds the staff row in one
+   * transaction. A former staff member coming back keeps their auth user (`existingUserId`): it's unbanned first
+   * and banned again if completing fails.
    */
   router.post(STAFF_ACCEPT_PATH, async (c) => {
     if (!(await burstOk(c, 'staff_invite'))) return rateLimited(c, 60);
@@ -177,13 +184,14 @@ export function registerAdminStaffRoutes(router: AdminRouter, requireStaff: Requ
     if (!body) return c.json(fail('invite_invalid'), 400);
     const invalid = () => c.json(fail('invite_invalid'), 400);
     try {
-      const invite = await rpc<{ inviteId: string; email: string; role: string } | null>(
-        c.env,
-        'staff_invite_accept',
-        {
-          p_token_hash: await inviteTokenHash(body.token),
-        },
-      );
+      const invite = await rpc<{
+        inviteId: string;
+        email: string;
+        role: string;
+        existingUserId?: string | null;
+      } | null>(c.env, 'staff_invite_accept', {
+        p_token_hash: await inviteTokenHash(body.token),
+      });
       if (!invite) return invalid();
       if (isDbError(invite)) {
         if (invite.error === 'member_account' || invite.error === 'already_staff')
@@ -192,24 +200,32 @@ export function registerAdminStaffRoutes(router: AdminRouter, requireStaff: Requ
       }
       const email = invite.email.toLowerCase();
       if (email !== c.get('accessEmail')) return c.json(fail('forbidden'), 403);
+      const existing = invite.existingUserId ?? null;
       let userId: string;
-      try {
-        userId = (await gotrue.adminCreateUser(c.env, email)).id;
-      } catch (err) {
-        if (err instanceof UpstreamError && (err.status === 422 || err.status === 409)) {
-          return c.json(fail('conflict'), 409);
+      if (existing) {
+        userId = existing;
+        await gotrue.adminSetBanned(c.env, userId, false);
+      } else {
+        try {
+          userId = (await gotrue.adminCreateUser(c.env, email)).id;
+        } catch (err) {
+          if (err instanceof UpstreamError && (err.status === 422 || err.status === 409)) {
+            return c.json(fail('conflict'), 409);
+          }
+          throw err;
         }
-        throw err;
       }
       const done = await rpc<unknown>(c.env, 'staff_invite_complete', {
         p_invite_id: invite.inviteId,
         p_user_id: userId,
       });
       if (!done || isDbError(done)) {
-        // Lost a race (used or revoked meanwhile): don't leave an orphan auth user behind.
-        await gotrue
-          .adminDeleteUser(c.env, userId)
-          .catch((e) => logError(c.get('requestId'), 'staff_orphan', e));
+        // Lost a race (used or revoked meanwhile): don't leave an orphan auth user behind, and keep a former
+        // staff member banned.
+        await (existing
+          ? gotrue.adminSetBanned(c.env, userId, true)
+          : gotrue.adminDeleteUser(c.env, userId)
+        ).catch((e) => logError(c.get('requestId'), 'staff_orphan', e));
         return invalid();
       }
       return c.json({ ok: true, email });

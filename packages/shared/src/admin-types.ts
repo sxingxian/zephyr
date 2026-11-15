@@ -46,6 +46,13 @@ export const staffCan = (role: StaffRole, action: StaffAction): boolean =>
 export const ADMIN_REASON_MAX = 300;
 /** Support may grant at most this many credits per action; more needs Owner or Admin with a passkey. */
 export const SUPPORT_CREDIT_GRANT_MAX = 1000;
+/**
+ * Rolling 24-hour credit limits (mirrored in admin_user_grant_credits). Support and Safety: at most this much in
+ * total across all members, and at most SUPPORT_CREDIT_MEMBER_DAILY_MAX to one member (from Support and Safety
+ * together). An Owner or Admin passing SUPPORT_CREDIT_DAILY_MAX of their own needs a passkey and emails the Owners.
+ */
+export const SUPPORT_CREDIT_DAILY_MAX = 5000;
+export const SUPPORT_CREDIT_MEMBER_DAILY_MAX = 1000;
 export const CREDIT_GRANT_MAX = 50_000;
 
 // ================================================================ routes

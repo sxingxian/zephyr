@@ -70,6 +70,10 @@ const STATUS: Record<string, [number, string]> = {
   forbidden: [403, 'forbidden'],
   not_found: [404, 'not_found'],
   last_owner: [409, 'last_owner'],
+  too_soon: [400, 'too_soon'],
+  no_changes: [409, 'no_changes'],
+  // A Support or Safety credit grant over its limits (admin_user_grant_credits).
+  limit_reached: [403, 'limit_reached'],
   conflict: [409, 'conflict'],
   already_exists: [409, 'conflict'],
   already_staff: [409, 'conflict'],

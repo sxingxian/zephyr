@@ -135,16 +135,27 @@ export function registerAdminUserRoutes(router: AdminRouter, requireStaff: Requi
     if (!id) return c.json(fail('not_found'), 404);
     const body = await readBody(c, adminCreditGrantSchema);
     if (!body) return c.json(fail('invalid'), 400);
+    // The database enforces the limits (per grant, and rolling 24-hour totals per granter and per member) under
+    // locks: Support/Safety over them get 403 limit_reached; an Owner/Admin "large" grant needs a recent passkey.
     const role = c.get('staff').role;
-    const large = body.amount > SUPPORT_CREDIT_GRANT_MAX;
-    if (large && role !== 'owner' && role !== 'admin') return c.json(fail('forbidden'), 403);
-    if (large && needsReauth(c)) return reauth(c);
-    const { res } = await act(c, id, 'admin_user_grant_credits', {
-      p_amount: body.amount,
-      p_reason: body.reason,
-    });
-    if (res) return res;
-    if (large) await tellOwners(c, { kind: 'credits', userId: id, amount: body.amount }, body.reason);
+    if (body.amount > SUPPORT_CREDIT_GRANT_MAX && (role === 'owner' || role === 'admin') && needsReauth(c))
+      return reauth(c);
+    let out: unknown;
+    try {
+      out = await rpc<unknown>(c.env, 'admin_user_grant_credits', {
+        p_staff: staffId(c),
+        p_user: id,
+        p_amount: body.amount,
+        p_reason: body.reason,
+        p_reauthed: !needsReauth(c),
+      });
+    } catch (err) {
+      return serverError(c, 'admin_user_grant_credits', err);
+    }
+    if (isDbError(out)) return out.error === 'reauth_required' ? reauth(c) : dbError(c, out);
+    if (out === null || out === false) return c.json(fail('not_found'), 404);
+    if ((out as { large?: boolean }).large === true)
+      await tellOwners(c, { kind: 'credits', userId: id, amount: body.amount }, body.reason);
     return detail(c, id);
   });
 

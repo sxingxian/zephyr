@@ -90,6 +90,8 @@ export type ApiErrorCode =
   | 'account_suspended' // phase 8 (403): staff suspended this account; the session is ended
   | 'read_only_mode' // phase 8 (503): read-only mode is on (set in Admin, or by itself when the photo store stops answering)
   | 'last_owner' // phase 8 (409): the last Owner can't be removed or demoted
+  | 'too_soon' // phase 8 admin (400): a plan-limit decrease needs a date at least LIMITS_NOTICE_DAYS out
+  | 'no_changes' // phase 8 admin (409): the plan-limit draft is the same as the live limits
   | 'server';
 
 export interface ApiError {

@@ -12,9 +12,11 @@ import {
   photoPatchSchema,
 } from '@zephyr/shared';
 import { Hono } from 'hono';
+import { isReadOnly } from '../admin/app-status';
 import { fail, logError, readBody } from '../http';
 import { libraryContext, ownerOf, requireRole, roleAllows } from '../library/context';
 import { contentDisposition, downloadName, parseRange } from '../library/files';
+import { readOnlyAnswer } from '../library/read-only-gate';
 import {
   expectedUser,
   LIBRARY_LIMITS,
@@ -72,11 +74,15 @@ const BULK_ACTION_ROLE: Record<BulkAction, LibraryAction> = {
   remove_from_album: 'edit',
 };
 
+const READ_ONLY_BULK = new Set<BulkAction>(['trash', 'restore', 'delete_forever']);
+
 // Bulk actions name the member they were started for (multi-chunk trash/restore from Cleanup and Trash).
 photoRoutes.post('/bulk', expectedUser, async (c) => {
   const body = await readBody(c, bulkSchema);
   if (!body) return c.json(fail('invalid'), 400);
   if (!roleAllows(c, BULK_ACTION_ROLE[body.action])) return c.json(fail('role_forbidden'), 403);
+  // Read-only mode lets Trash work (trash, restore, delete forever) and refuses favourites and albums.
+  if (!READ_ONLY_BULK.has(body.action) && (await isReadOnly(c.env))) return readOnlyAnswer(c);
   try {
     const res = await rpc<{ affected?: number; purge?: PurgeItem[]; error?: string } | null>(
       c.env,

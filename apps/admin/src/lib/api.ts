@@ -1,4 +1,11 @@
-import type { ApiError, ApiErrorCode } from '@zephyr/shared/client';
+import {
+  type ApiError,
+  type ApiErrorCode,
+  LIMITS_NOTICE_DAYS,
+  SUPPORT_CREDIT_DAILY_MAX,
+  SUPPORT_CREDIT_GRANT_MAX,
+  SUPPORT_CREDIT_MEMBER_DAILY_MAX,
+} from '@zephyr/shared/client';
 
 /** A failed API call, carrying the contract's error code. */
 export class ApiFailure extends Error {
@@ -47,10 +54,15 @@ const KNOWN: ApiErrorCode[] = [
   'not_found',
   'conflict',
   'last_owner',
+  'too_soon',
+  'no_changes',
+  'limit_reached',
   'read_only_mode',
   'account_suspended',
   'server',
 ];
+
+const n = (x: number) => x.toLocaleString('en-GB');
 
 /** Maps a response to an error code, falling back on the status when the body isn't the contract shape. */
 export function toFailure(status: number, body: unknown, retryHeader: string | null): ApiFailure {
@@ -141,6 +153,12 @@ export function errorMessage(err: unknown): string {
       return 'You don’t have access to that.';
     case 'last_owner':
       return 'There must always be at least one Owner. Make someone else an Owner first.';
+    case 'too_soon':
+      return `This version lowers a limit, so it needs a date at least ${LIMITS_NOTICE_DAYS} days from now. Pick a later date.`;
+    case 'no_changes':
+      return 'This draft is the same as the live limits. Change something before scheduling it.';
+    case 'limit_reached':
+      return `That’s over your credit limit (${n(SUPPORT_CREDIT_GRANT_MAX)} a grant, ${n(SUPPORT_CREDIT_MEMBER_DAILY_MAX)} per member and ${n(SUPPORT_CREDIT_DAILY_MAX)} in total in 24 hours). Ask an Owner or Admin to grant it.`;
     case 'not_found':
       return 'That no longer exists. Reload to see the latest.';
     case 'conflict':

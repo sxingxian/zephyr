@@ -15,7 +15,8 @@ import { createMemoryRouter, RouterProvider } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { routes } from './App';
 import { navFor } from './components/Shell';
-import { toLocalInput } from './lib/admin8';
+import { toLocalInput, writeError } from './lib/admin8';
+import { ApiFailure } from './lib/api';
 import { adUrlOk } from './routes/Ads';
 import { auditQuery } from './routes/Audit';
 import { limitsError } from './routes/Limits';
@@ -104,6 +105,13 @@ describe('phase 8 helpers', () => {
     expect(limitsError({ ...LIMITS.pro, seats: 0 })).toMatch(/Seats/);
     expect(limitsError({ ...LIMITS.pro, galleries: null })).toBeNull();
     expect(limitsError({ ...LIMITS.pro, fileTypes: [] })).toMatch(/file type/);
+  });
+  it('explains too_soon, no_changes and the credit limit in plain words', () => {
+    expect(writeError(new ApiFailure('too_soon', 400))).toMatch(/at least 30 days from now/);
+    expect(writeError(new ApiFailure('no_changes', 409))).toMatch(/same as the live limits/);
+    expect(writeError(new ApiFailure('limit_reached', 403))).toMatch(
+      /1,000 a grant, 1,000 per member and 5,000/,
+    );
   });
   it('accepts only https ad links with a real host and no credentials', () => {
     expect(adUrlOk('https://lumen.example/rent?x=1')).toBe(true);
@@ -796,6 +804,24 @@ describe('Staff invite link', () => {
     ).toBeTruthy();
     expect(writes('/staff/invite/accept')[0]?.body).toEqual({ token });
     expect(window.location.hash).toBe('');
+  });
+
+  it('explains a used or expired invite (invite_invalid)', async () => {
+    window.history.replaceState(null, '', `/admin/staff-invite#t=${'c'.repeat(43)}`);
+    mock(null, (c) =>
+      c.url.endsWith('/staff/invite/accept') ? json(400, { ok: false, error: 'invite_invalid' }) : undefined,
+    );
+    renderAt('/staff-invite');
+    expect(await screen.findByText(/expired or was already used/, {}, T)).toBeTruthy();
+  });
+
+  it('explains an address that already has an account (409 conflict)', async () => {
+    window.history.replaceState(null, '', `/admin/staff-invite#t=${'d'.repeat(43)}`);
+    mock(null, (c) =>
+      c.url.endsWith('/staff/invite/accept') ? json(409, { ok: false, error: 'conflict' }) : undefined,
+    );
+    renderAt('/staff-invite');
+    expect(await screen.findByText(/already has a Zephyr account/, {}, T)).toBeTruthy();
   });
 
   it('explains a missing or malformed token without calling the API', async () => {

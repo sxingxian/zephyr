@@ -212,6 +212,8 @@ export interface User {
   displayName?: string | null;
   /** Phase 8: staff suspended this member (the default member_suspended). */
   suspended?: boolean;
+  /** Phase 8: banned in Auth (removed staff). */
+  banned?: boolean;
 }
 export interface Call {
   url: string;
@@ -520,6 +522,12 @@ async function gotrueHandler(
     });
   }
   const del = path.match(/^\/admin\/users\/([^/]+)$/);
+  if (method === 'PUT' && del) {
+    const u = byId(decodeURIComponent(del[1] ?? ''));
+    if (!u) return json({ error_code: 'user_not_found' }, 404);
+    if (body.ban_duration !== undefined) u.banned = body.ban_duration !== 'none';
+    return json({ id: u.id, email: u.email });
+  }
   if (method === 'DELETE' && del) {
     const id = decodeURIComponent(del[1] ?? '');
     if (!byId(id)) return json({ error_code: 'user_not_found' }, 404);

@@ -47,8 +47,12 @@ All new tables: RLS on, no grants to anon or authenticated, SECURITY DEFINER fun
   - a downgrade through an override end follows the phase 7 lapse rules (read-only if over, `lapsed_at` set when it falls from paid to free).
 - **`admin_user_suspend(p_staff, p_user, p_category, p_note)` / `admin_user_unsuspend(...)`:**
   - suspending sets `sharing_suspended_at` too (galleries offline) and ends every member session (`_auth_sign_out_all(user)` deletes `auth.sessions`/refresh tokens);
+  - `profiles.sharing_by_suspension` records that the suspension alone took sharing offline. It is set only when sharing wasn't already suspended, and cleared by any other reason to suspend sharing (a Safety `suspend_sharing`, a hold from the scanner or from Safety). Unsuspending lifts sharing only when that flag is set and no photo is on hold; otherwise sharing stays suspended until `admin_user_sharing_lift` (its own high-risk action);
   - `library_access` returns null for teammates of a suspended owner.
-- `admin_user_sign_out(...)`, `admin_user_grant_credits(p_staff, p_user, p_amount, p_reason)` (the phase 6 `admin_adjust` ledger reason; Support ≤ 1,000).
+- `admin_user_sign_out(...)`.
+- **`admin_user_grant_credits(p_staff, p_user, p_amount, p_reason, p_reauthed)`** (the phase 6 `admin_adjust` ledger reason). The limits are checked under the granter's lock, then the member's credits lock, and totals come from the `users.credits` audit rows (which record the amount and the granter's role):
+  - **Support and Safety:** at most 1,000 a grant, 5,000 in any 24 hours across all members, and 1,000 in any 24 hours to one member from Support and Safety together (`SUPPORT_CREDIT_*` in `admin-types.ts`). Over any of them: 403 `limit_reached`; an Owner or Admin can grant it.
+  - **Owner and Admin:** a grant above 1,000, or one that takes the granter's own 24-hour total above 5,000, is large. It needs a recent passkey (`p_reauthed`; else 403 `reauth_required`) and emails every Owner.
 - `admin_user_sharing_lift(...)`, `admin_user_deletion_schedule(...)` / `_cancel(...)` (Owner; reuses phase 2 deletion, sets `deletion_by_staff`, which the member's own restore refuses).
 - `admin_users(p_staff, p_q, p_plan, p_source, p_status, p_cursor)`: keyset by `created_at, id`; masked emails; total from a cheap estimate when unfiltered. `admin_user(p_staff, p_user)` → `AdminUserDetail` (logs `user.viewed`).
 - `member_suspended(p_user) → boolean`: checked in `requireMember` (cached per request). Sign-in for a suspended account answers `account_suspended`.
@@ -62,7 +66,7 @@ All new tables: RLS on, no grants to anon or authenticated, SECURITY DEFINER fun
   - `admin_reveal(p_staff, p_report, p_reason, p_token_hash)` (Safety only; returns the photo ids and keys of the previews);
   - `reveal_grant_check(p_grant, p_token_hash, p_staff, p_photo)`;
   - `admin_report_resolve(p_staff, p_report, p_actions, p_note)` (each action through the existing phase 5 functions: remove photos from the gallery, end the gallery, suspend sharing, hold photos; plus `admin_user_suspend`);
-  - `admin_hold_report(...)`, `admin_hold_release(p_staff, p_photo, p_reason)` (Owner).
+  - `admin_hold_report(...)`, `admin_hold_release(p_staff, p_photo, p_reason)` (Owner). A photo that isn't held answers null (404): no audit row and no Owners email.
 
 **Plan limits:**
 - `plan_limit_versions`:
@@ -103,8 +107,14 @@ All new tables: RLS on, no grants to anon or authenticated, SECURITY DEFINER fun
 - **Functions:**
   - `admin_staff(p_staff)`;
   - `admin_staff_invite(p_staff, p_email, p_role, p_token_hash, p_reason)` (Owner);
-  - `staff_invite_accept(p_token_hash) → { email, role }` (the API then creates the staff auth user the same way the first Owner was created, and the normal admin email-code + passkey enrolment follows);
+  - `staff_invite_accept(p_token_hash) → { inviteId, email, role, existingUserId }`, which only checks the link. An address that belongs to a member answers `member_account`, and one that belongs to current staff answers `already_staff` (both 409 `conflict`). Otherwise the API creates the staff auth user the same way the first Owner was created, or reuses `existingUserId` for a former staff member (unbanned first). `staff_invite_complete(p_invite_id, p_user_id)` then uses the invite up and adds the staff row. The normal admin email-code + passkey enrolment follows;
   - `admin_staff_set_role(...)`, `admin_staff_remove(...)` (both refuse to leave zero Owners: `last_owner`; removal ends their admin sessions).
+- **Former staff:**
+  - `admin_staff_remove` records the person in `former_staff(user_id, display_name, role, removed_by, removed_at)` (RLS on, no grants).
+  - The auth user is kept, because audit rows and invites point at it, but the API bans it in Supabase Auth.
+  - `account_kind` answers `former_staff`, which neither sign-in accepts, and `get_session_profile` reports the account as staff-side, so the member app refuses it too. The address can't receive member invites.
+  - The audit log keeps showing their actions as "Name (former staff)" with the role they last held.
+  - A new staff invite for the address brings them back.
 - `staff_lookup` already rejects removed staff.
 
 **Audit:**
@@ -152,7 +162,16 @@ All new tables: RLS on, no grants to anon or authenticated, SECURITY DEFINER fun
 - **Health check:**
   - A cron every 5 minutes checks the write store (reachability, a signed write/read/delete round trip, latency); on demand from Admin it also measures upload speed (a 4 MB object) and free space (declared capacity minus usage, or the store's own report where it has one).
   - Three failures in a row on the write store turn on `read_only_auto` and email the Owners. Two successes turn it off (auto only, never a manual read-only).
-- **Read-only mode:** `requireWritable` (phase 7) also checks `app_status().readOnly` (cached 15 s per isolate). Library writes answer 503 `read_only_mode`. Reads, downloads, guest galleries and Trash restores still work.
+- **Read-only mode:** an app-wide gate (`library/read-only-gate.ts`, before any route) checks `app_status().readOnly` (cached 15 s per isolate) for every write under the library prefixes (`uploads`, `photos`, `albums`, `trash`, `recipes`, `ai`, `galleries`, `me/branding`) and answers 503 `read_only_mode`. A route added later under these prefixes therefore starts closed. `requireWritable` (phase 7) also checks it. Reads, downloads and guest galleries still work. **The rule:** anything that adds or changes library content, or writes bytes, is refused. Anything that only reduces exposure, or finishes work already started, stays open:
+
+  | Stays open in read-only mode                                                                           | Refused                                                                                                                                   |
+  | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+  | Upload parts, variants, complete and abort for an upload that already started                          | New uploads                                                                                                                               |
+  | `photos/bulk` trash, restore, delete forever; `trash/empty`                                            | `photos/bulk` favourites and albums; photo renames; edits of any kind (save, revert, variants, bulk paste/apply/revert)                   |
+  | Gallery: end it (`DELETE`), replace its link, set a new passcode, remove photos                        | New galleries; gallery settings (`PATCH`, including a new expiry: end the gallery instead); adding photos; renders; removing the passcode |
+  | Zephyr AI: cancel or pause a job, "Turn off and delete" face data                                      | New jobs and retries; device-job claims and progress; signals, faces, people, cleanup, settings                                           |
+  | Branding: remove an image                                                                              | Branding changes and new images                                                                                                           |
+  | Account-level routes: sign-in, `/me`, billing, team membership (including removal with `replaceLinks`) | Albums and recipes                                                                                                                        |
 
 **Admin routes (`routes/admin-users.ts`, `admin-safety.ts`, `admin-limits.ts`, `admin-ads.ts`, `admin-storage.ts`, `admin-retention.ts`, `admin-staff.ts`, `admin-audit.ts`, `admin-settings.ts`):**
 - Every route uses `requireStaff()` plus a `staffCan` check, so a role can't call a route its screen hides.
@@ -227,7 +246,7 @@ New pages matching the mockups: Users, Safety, Plan limits, Ads, Storage, Retent
   - Stats hold no identities.
   - The AdSense CSP widening applies only while it's on.
   - AdSense is never loaded on paid plans, in team libraries, or on sensitive pages, and an upgrade or account change reloads the page.
-- **Read-only mode:** enforced server-side for every library write.
+- **Read-only mode:** enforced server-side for every library write by the app-wide gate; only exposure-reducing writes and already-started uploads stay open (table under API).
 - **Retention:** only beyond the Free storage, never held photos or live-gallery photos, only after both notices and a staff approval, and always into Trash (30-day undo).
 - **Audit:** append-only, with reasons. Exports are limited and logged.
 

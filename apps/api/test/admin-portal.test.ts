@@ -16,6 +16,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { runAdminCron, runAdminDailyCron } from '../src/admin/cron';
 import { app } from '../src/app';
 import { sha256, toPgBytea } from '../src/crypto';
+import { readOnlyBlocks } from '../src/library/read-only-gate';
 import { auditCsv, csvCell } from '../src/routes/admin-audit';
 import { newRevealToken } from '../src/routes/admin-safety';
 import {
@@ -105,7 +106,10 @@ function mockAdminDb() {
     admin_user: () => ({ id: USER, email: MEI.email }),
     admin_user_override: ok,
     admin_user_override_end: ok,
-    admin_user_grant_credits: ok,
+    admin_user_grant_credits: (a: Record<string, unknown>) => ({
+      ok: true,
+      large: Number(a.p_amount) > 1000,
+    }),
     admin_user_sign_out: ok,
     admin_user_suspend: () => ({ ok: true, email: MEI.email }),
     admin_user_unsuspend: ok,
@@ -535,24 +539,62 @@ describe('high-risk writes: a recent passkey and an email to every Owner', () =>
     }
   });
 
-  it('credits: Support up to 1,000; more needs Owner/Admin, a passkey and an Owners email', async () => {
+  it('credits: the database enforces the limits; Support over them gets 403 limit_reached', async () => {
     const sup = await staff('support');
     expect((await as(sup, ADMIN8_API.userCredits(USER), { body: { amount: 1000, reason } })).status).toBe(
       200,
     );
+    expect(rpcCalls('admin_user_grant_credits')[0]).toMatchObject({ p_amount: 1000, p_reauthed: true });
+    world.rpc.admin_user_grant_credits = () => ({ error: 'limit_reached' });
     const big = await as(sup, ADMIN8_API.userCredits(USER), { body: { amount: 1001, reason } });
     expect(big.status).toBe(403);
-    expect((await read(big)).error).toBe('forbidden');
+    expect((await read(big)).error).toBe('limit_reached');
+    expect(world.emails).toHaveLength(0);
+  });
+
+  it('credits: a large Owner/Admin grant needs a passkey and emails the Owners', async () => {
     const stale = await staff('admin', { authAgo: 3600 });
     expect(
       (await read(await as(stale, ADMIN8_API.userCredits(USER), { body: { amount: 5000, reason } }))).error,
     ).toBe('reauth_required');
+    expect(rpcCalls('admin_user_grant_credits')).toHaveLength(0);
     world.emails.length = 0;
     const fresh = await staff('admin');
     expect((await as(fresh, ADMIN8_API.userCredits(USER), { body: { amount: 5000, reason } })).status).toBe(
       200,
     );
+    expect(rpcCalls('admin_user_grant_credits')[0]).toMatchObject({ p_amount: 5000, p_reauthed: true });
     expect(world.emails.filter((e) => e.subject.startsWith('[Zephyr admin]'))).toHaveLength(2);
+  });
+
+  it('credits: small grants that pass the 24-hour total ask for the passkey (database decides)', async () => {
+    const stale = await staff('admin', { authAgo: 3600 });
+    world.rpc.admin_user_grant_credits = (a) =>
+      a.p_reauthed ? { ok: true, large: true } : { error: 'reauth_required' };
+    const res = await as(stale, ADMIN8_API.userCredits(USER), { body: { amount: 100, reason } });
+    expect(res.status).toBe(403);
+    expect((await read(res)).error).toBe('reauth_required');
+    expect(rpcCalls('admin_user_grant_credits')[0]).toMatchObject({ p_amount: 100, p_reauthed: false });
+    expect(world.emails).toHaveLength(0);
+  });
+
+  it('hold release: a photo that isn’t held is a 404 with no Owners email', async () => {
+    world.rpc.admin_hold_release = () => null;
+    const s = await staff('owner');
+    world.emails.length = 0;
+    const res = await as(s, ADMIN8_API.holdRelease(PHOTO), { body: { reason } });
+    expect(res.status).toBe(404);
+    expect(world.emails).toHaveLength(0);
+  });
+
+  it('plan limits: too_soon and no_changes reach the admin app as their own codes', async () => {
+    const s = await staff('owner');
+    world.rpc.admin_limits_schedule = () => ({ error: 'too_soon' });
+    const soon = await as(s, ADMIN8_API.limitsSchedule, { body: { effectiveAt: null, reason } });
+    expect([soon.status, (await read(soon)).error]).toEqual([400, 'too_soon']);
+    world.rpc.admin_limits_schedule = () => ({ error: 'no_changes' });
+    const same = await as(s, ADMIN8_API.limitsSchedule, { body: { effectiveAt: null, reason } });
+    expect([same.status, (await read(same)).error]).toEqual([409, 'no_changes']);
   });
 
   it('AdSense: turning it off saves at once; changing the publisher id needs a passkey', async () => {
@@ -690,12 +732,76 @@ describe('staff invites', () => {
     expect(rpcCalls('staff_invite_complete')).toHaveLength(0);
   });
 
+  it('remove: bans the auth user (former staff), then emails the Owners', async () => {
+    const target = must(world.users.find((u) => u.email === EMAIL.support));
+    const s = await staff('owner');
+    const res = await as(s, ADMIN8_API.staffMember(target.id), { method: 'DELETE', body: { reason } });
+    expect(res.status).toBe(200);
+    expect(target.banned).toBe(true);
+    const ban = must(
+      world.calls.find((c) => c.method === 'PUT' && c.url.endsWith(`/auth/v1/admin/users/${target.id}`)),
+    );
+    expect(ban.body).toEqual({ ban_duration: '876000h' });
+  });
+
+  it('accept: a former staff member keeps their auth user (unbanned, no new user)', async () => {
+    const back: User = {
+      id: '20000000-0000-0000-0000-0000000000f5',
+      email: 'back@zephyr.test',
+      banned: true,
+    };
+    world.users.push(back);
+    world.rpc.staff_invite_accept = () => ({
+      inviteId: INVITE,
+      email: back.email,
+      role: 'support',
+      existingUserId: back.id,
+    });
+    world.rpc.staff_invite_complete = () => ({ ok: true });
+    const before = world.users.length;
+    const res = await call(ADMIN8_API.staffInviteAccept, {
+      body: { token: 'B'.repeat(43) },
+      access: await accessToken(back.email),
+    });
+    expect(res.status).toBe(200);
+    expect(world.users).toHaveLength(before);
+    expect(back.banned).toBe(false);
+    expect(rpcCalls('staff_invite_complete')[0]).toEqual({ p_invite_id: INVITE, p_user_id: back.id });
+  });
+
+  it('accept: a former staff member who loses the race stays banned and isn’t deleted', async () => {
+    const back: User = {
+      id: '20000000-0000-0000-0000-0000000000f6',
+      email: 'back2@zephyr.test',
+      banned: true,
+    };
+    world.users.push(back);
+    world.rpc.staff_invite_accept = () => ({
+      inviteId: INVITE,
+      email: back.email,
+      role: 'support',
+      existingUserId: back.id,
+    });
+    world.rpc.staff_invite_complete = () => null;
+    const res = await call(ADMIN8_API.staffInviteAccept, {
+      body: { token: 'B'.repeat(43) },
+      access: await accessToken(back.email),
+    });
+    expect((await read(res)).error).toBe('invite_invalid');
+    expect(back.banned).toBe(true);
+    expect(world.users.some((u) => u.id === back.id)).toBe(true);
+  });
+
   it('accept: unknown tokens, member accounts and lost races', async () => {
     const access = await accessToken('new.person@zephyr.test');
     world.rpc.staff_invite_accept = () => null;
     const bad = await call(ADMIN8_API.staffInviteAccept, { body: { token: 'B'.repeat(43) }, access });
     expect((await read(bad)).error).toBe('invite_invalid');
     world.rpc.staff_invite_accept = () => ({ error: 'member_account' });
+    expect(
+      (await call(ADMIN8_API.staffInviteAccept, { body: { token: 'B'.repeat(43) }, access })).status,
+    ).toBe(409);
+    world.rpc.staff_invite_accept = () => ({ error: 'already_staff' });
     expect(
       (await call(ADMIN8_API.staffInviteAccept, { body: { token: 'B'.repeat(43) }, access })).status,
     ).toBe(409);
@@ -857,6 +963,85 @@ describe('read-only mode', () => {
     expect(rpcCalls('create_gallery')).toHaveLength(0);
     world.rpc.list_galleries = () => [];
     expect((await call('/api/v1/galleries', { jar: await member(MEI) })).status).toBe(200);
+  });
+
+  it('refuses every content write, including bulk edits, renames, albums and gallery changes', async () => {
+    world.appStatus = { readOnly: { on: true, message: 'Moving storage' }, maintenance: null };
+    const j = await member(MEI);
+    const blocked: [string, string, unknown][] = [
+      ['POST', '/api/v1/photos/edits/bulk', { ids: [PHOTO], recipe: { exposure: 0.5 } }],
+      ['POST', '/api/v1/photos/edits/bulk', { ids: [PHOTO], recipe: null }],
+      ['DELETE', `/api/v1/photos/${PHOTO}/edit`, {}],
+      ['PATCH', `/api/v1/photos/${PHOTO}`, { filename: 'x.jpg' }],
+      ['POST', '/api/v1/albums', { name: 'A' }],
+      ['POST', '/api/v1/recipes', { name: 'R' }],
+      ['PATCH', `/api/v1/galleries/${GALLERY}`, { name: 'G' }],
+      ['PUT', `/api/v1/galleries/${GALLERY}/renders/${PHOTO}`, {}],
+      ['DELETE', `/api/v1/galleries/${GALLERY}/passcode`, {}],
+      ['PUT', '/api/v1/me/branding', { studioName: 'S' }],
+      ['POST', '/api/v1/ai/signals', {}],
+      ['PATCH', '/api/v1/ai/settings', {}],
+    ];
+    for (const [method, path, body] of blocked) {
+      const res = await call(path, { method, body, jar: j });
+      expect([res.status, (await read(res)).error], `${method} ${path}`).toEqual([503, 'read_only_mode']);
+    }
+    expect(
+      world.calls.filter((c) => c.url.includes('/rest/v1/rpc/') && !c.url.endsWith('/app_status')),
+    ).toEqual([]);
+  });
+
+  it('photos/bulk: Trash actions still work; favourites and albums don’t', async () => {
+    world.appStatus = { readOnly: { on: true, message: '' }, maintenance: null };
+    world.rpc.bulk_photos = () => ({ affected: 1 });
+    const j = await member(MEI);
+    const fav = await call('/api/v1/photos/bulk', { body: { ids: [PHOTO], action: 'favourite' }, jar: j });
+    expect([fav.status, (await read(fav)).error]).toEqual([503, 'read_only_mode']);
+    const trash = await call('/api/v1/photos/bulk', { body: { ids: [PHOTO], action: 'trash' }, jar: j });
+    expect(trash.status).toBe(200);
+    expect(rpcCalls('bulk_photos').map((b) => b.p_action)).toEqual(['trash']);
+  });
+
+  it('galleries: removing photos still works; adding them doesn’t', async () => {
+    world.appStatus = { readOnly: { on: true, message: '' }, maintenance: null };
+    world.rpc.update_gallery_photos = () => ({ count: 1 });
+    const j = await member(MEI);
+    const add = await call(`/api/v1/galleries/${GALLERY}/photos`, { body: { add: [PHOTO] }, jar: j });
+    expect([add.status, (await read(add)).error]).toEqual([503, 'read_only_mode']);
+    const rm = await call(`/api/v1/galleries/${GALLERY}/photos`, { body: { remove: [PHOTO] }, jar: j });
+    expect(rm.status).toBe(200);
+  });
+
+  it('the gate itself: allowed routes are exactly the exposure-reducing ones', () => {
+    const id = PHOTO;
+    for (const [m, p] of [
+      ['PUT', `/api/v1/uploads/${id}/parts/1`],
+      ['POST', `/api/v1/uploads/${id}/complete`],
+      ['DELETE', `/api/v1/uploads/${id}`],
+      ['POST', '/api/v1/trash/empty'],
+      ['DELETE', `/api/v1/galleries/${id}`],
+      ['POST', `/api/v1/galleries/${id}/link/replace`],
+      ['POST', `/api/v1/galleries/${id}/passcode`],
+      ['DELETE', `/api/v1/ai/jobs/${id}`],
+      ['POST', `/api/v1/ai/jobs/${id}/pause`],
+      ['DELETE', '/api/v1/ai/faces'],
+      ['DELETE', '/api/v1/me/branding/logo'],
+      ['GET', '/api/v1/photos'],
+      ['POST', '/api/v1/team/invites'],
+      ['PATCH', '/api/v1/me'],
+    ] as const)
+      expect(readOnlyBlocks(m, p), `${m} ${p}`).toBe(false);
+    for (const [m, p] of [
+      ['POST', '/api/v1/uploads'],
+      ['POST', '/api/v1/uploads/'],
+      ['POST', '/api/v1/galleries'],
+      ['POST', `/api/v1/ai/jobs/${id}/claim`],
+      ['POST', `/api/v1/ai/jobs/${id}/progress`],
+      ['POST', '/api/v1/ai/faces'],
+      ['PUT', `/api/v1/photos/${id}/edit`],
+      ['POST', '/api/v1/photos/anything-new'],
+    ] as const)
+      expect(readOnlyBlocks(m, p), `${m} ${p}`).toBe(true);
   });
 
   it('caches app_status for 15 s per isolate', async () => {
