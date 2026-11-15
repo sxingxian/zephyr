@@ -120,7 +120,20 @@ describe('Sign-ups page', () => {
     mock('owner');
     renderAt('/signups');
     await screen.findByText('Default');
+    // Query fresh and wait for each step to land: on a busy CI runner a held element reference can go stale.
     await act(async () => (screen.getByRole('radio', { name: /Open/ }) as HTMLInputElement).click());
+    await waitFor(
+      () => expect((screen.getByRole('radio', { name: /Open/ }) as HTMLInputElement).checked).toBe(true),
+      {
+        timeout: 5000,
+      },
+    );
+    await waitFor(
+      () => expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(false),
+      {
+        timeout: 5000,
+      },
+    );
     await act(async () => screen.getByRole('button', { name: 'Save' }).click());
     expect(calls.some((c) => c.method === 'PATCH')).toBe(false);
     // Generous waits: this dialog flow is the slowest render in the suite when CI runs packages in parallel.

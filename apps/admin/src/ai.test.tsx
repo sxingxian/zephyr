@@ -188,10 +188,18 @@ describe('Zephyr AI controls', () => {
   it('saves risk-lowering changes straight away with only what changed', async () => {
     mock('owner');
     renderAt('/ai');
-    const sw = await screen.findByRole('switch', { name: /Studio background removal/ }, { timeout: 4000 });
-    await act(async () => (sw as HTMLInputElement).click());
-    const save = screen.getByRole('button', { name: 'Save' });
-    await act(async () => save.click());
+    await screen.findByRole('switch', { name: /Studio background removal/ }, { timeout: 4000 });
+    // Query fresh and wait for each step to land: on a busy CI runner a held element reference can go stale.
+    const sw = () => screen.getByRole('switch', { name: /Studio background removal/ }) as HTMLInputElement;
+    await act(async () => sw().click());
+    await waitFor(() => expect(sw().checked).toBe(false), { timeout: 4000 });
+    await waitFor(
+      () => expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(false),
+      {
+        timeout: 4000,
+      },
+    );
+    await act(async () => screen.getByRole('button', { name: 'Save' }).click());
     await waitFor(() => expect(patches()[0]?.body).toEqual({ features: { bg_removal: false } }), {
       timeout: 4000,
     });

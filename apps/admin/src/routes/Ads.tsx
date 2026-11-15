@@ -21,7 +21,7 @@ import {
   Table,
   useToast,
 } from '@zephyr/ui';
-import { useCallback, useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Effects, Kpi, PageState, ReasonDialog } from '../components/Kit8';
 import { AdminShell } from '../components/Shell';
 import { can, fromLocalInput, n, shortDate, toLocalInput, useAdminWrite, writeError } from '../lib/admin8';
@@ -343,10 +343,17 @@ function AdsensePanel({ data, onSaved }: { data: AdminAdsResult; onSaved: (r: Ad
   });
   const [accept, setAccept] = useState(false);
   const [dialog, setDialog] = useState<'save' | 'on' | 'off' | null>(null);
+  // Follow the saved values only when they change: not on mount (that would wipe typing done before the effect ran)
+  // and not when the parent re-fetches the same values.
+  const aKey = JSON.stringify([a.publisherId ?? '', a.slots]);
+  const shownKey = useRef(aKey);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on the saved values, not the object identity.
   useEffect(() => {
+    if (shownKey.current === aKey) return;
+    shownKey.current = aKey;
     setPub(a.publisherId ?? '');
     setSlots({ library: a.slots.library ?? '', sidebar: a.slots.sidebar ?? '', batch: a.slots.batch ?? '' });
-  }, [a]);
+  }, [aKey]);
   const pubOk = pub === '' || PUB_RE.test(pub);
   const slotsOk = AD_PLACEMENTS.every((p) => slots[p] === '' || SLOT_RE.test(slots[p]));
   const dirty = (a.publisherId ?? '') !== pub || AD_PLACEMENTS.some((p) => (a.slots[p] ?? '') !== slots[p]);

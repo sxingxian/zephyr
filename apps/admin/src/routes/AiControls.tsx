@@ -11,7 +11,7 @@ import {
   isRiskLowering,
 } from '@zephyr/shared/client';
 import { Button, Card, CardHead, Chip, Field, Icon, Note, SelectField, Spinner, useToast } from '@zephyr/ui';
-import { useCallback, useEffect, useId, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { ReadOnlyChip, ResetsChip, SpendToday, WhereChip } from '../components/AiBits';
 import { AdminShell } from '../components/Shell';
 import {
@@ -138,10 +138,16 @@ function Controls({
   const [form, setForm] = useState<AiForm>(() => toForm(base));
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  // Follow the server only when its values change, not when the parent re-fetches the same values mid-edit.
+  // Follow the server only when its values really change. Not on mount (the form already starts from them, and a
+  // reset there would wipe a click made before the effect ran), nor when the parent re-fetches the same values.
   const baseKey = JSON.stringify(base);
+  const shownKey = useRef(baseKey);
   // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on the settings' content, not the object identity.
-  useEffect(() => setForm(toForm(base)), [baseKey]);
+  useEffect(() => {
+    if (shownKey.current === baseKey) return;
+    shownKey.current = baseKey;
+    setForm(toForm(base));
+  }, [baseKey]);
 
   const parsed = useMemo(() => parseForm(form, base), [form, base]);
   const errors: AiFormErrors = parsed.errors ?? {};

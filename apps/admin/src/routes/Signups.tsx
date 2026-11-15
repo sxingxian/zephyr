@@ -27,7 +27,16 @@ import {
   Table,
   useToast,
 } from '@zephyr/ui';
-import { type ChangeEvent, type FormEvent, useCallback, useEffect, useId, useMemo, useState } from 'react';
+import {
+  type ChangeEvent,
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { AdminShell } from '../components/Shell';
 import { api, errorMessage } from '../lib/api';
 import { MAX_PER_SEND, parseEmailList, parseEmailsCsv } from '../lib/csv';
@@ -175,11 +184,16 @@ function SettingsPanel({
   const [busy, setBusy] = useState(false);
   // Follow the server's settings only when they really change, never because the parent re-fetched the same
   // values, and never while a change is waiting for its reason: that would drop the change and save only the reason.
+  // Not on mount either: the draft already starts from them, and a reset there would wipe a click made before the
+  // effect ran.
   const baseKey = JSON.stringify(base);
+  const shownKey = useRef(baseKey);
   const [pending, setPending] = useState<Partial<SignupSettings> | null>(null);
   // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on the settings' content, not the object identity.
   useEffect(() => {
-    if (!pending) setDraft(base);
+    if (shownKey.current === baseKey || pending) return;
+    shownKey.current = baseKey;
+    setDraft(base);
   }, [baseKey]);
   const changes = useMemo(() => diffSettings(base, draft), [base, draft]);
   const dirty = Object.keys(changes).length > 0;

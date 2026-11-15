@@ -56,7 +56,7 @@ export function Security() {
   const load = useCallback(async () => {
     try {
       const r = await api<{ passkeys: Passkey[] }>(APP_API.myPasskeys);
-      setPasskeys(r.passkeys);
+      setPasskeys(Array.isArray(r?.passkeys) ? r.passkeys : []);
     } catch (e) {
       setError(errorMessage(e));
       setPasskeys([]);
