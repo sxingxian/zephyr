@@ -166,6 +166,8 @@ export function Storage() {
     storeId: string;
     copies: number;
     endsRollback?: boolean;
+    /** The unreachable stores the copies' photos are on, when the store itself answers. */
+    via?: string[];
   } | null>(null);
   const [givingUp, setGivingUp] = useState(false);
   const isOwner = staff?.role === 'owner';
@@ -195,6 +197,11 @@ export function Storage() {
   const mig = data?.migration ?? null;
   const migActive = Boolean(mig && ACTIVE.includes(mig.state));
   const byId = (id: string) => data?.stores.find((s) => s.id === id);
+  // A store that's no longer set up, or whose last check didn't answer or couldn't do a round trip.
+  const isGone = (id: string) => {
+    const st = byId(id);
+    return !st || st.health === 'unreachable' || (st.lastCheck != null && !st.lastCheck.roundTrip);
+  };
   const current = data ? byId(data.writeStore) : undefined;
   const runCheck = async (s: StoreStatus) => {
     setChecking(s.id);
@@ -470,8 +477,8 @@ export function Storage() {
                 <div className="a8-kv a8-kv--rows">
                   {(data.oldCopies ?? []).map((o) => {
                     const st = byId(o.storeId);
-                    const gone =
-                      !st || st.health === 'unreachable' || (st.lastCheck != null && !st.lastCheck.roundTrip);
+                    const gone = isGone(o.storeId);
+                    const via = gone ? [] : (o.targets ?? []).filter(isGone);
                     return (
                       <div key={o.storeId}>
                         <span>
@@ -480,12 +487,14 @@ export function Storage() {
                             ? ' · no longer set up'
                             : gone
                               ? ` · last check failed${st.lastCheck ? ` (${dateTime(st.lastCheck.at)})` : ''}`
-                              : ''}
+                              : via.length
+                                ? ` · waiting on ${via.map((t) => byId(t)?.name ?? t).join(', ')}, which can’t be reached`
+                                : ''}
                         </span>
                         <strong className="btn-row btn-row--tight">
                           {n(o.copies)} {o.copies === 1 ? 'copy' : 'copies'}
-                          {isOwner && gone && (
-                            <Button size="sm" kind="danger" onClick={() => setAbandoning(o)}>
+                          {isOwner && (gone || via.length > 0) && (
+                            <Button size="sm" kind="danger" onClick={() => setAbandoning({ ...o, via })}>
                               Abandon…
                             </Button>
                           )}
@@ -495,12 +504,24 @@ export function Storage() {
                   })}
                 </div>
                 <p className="z-hint">
-                  The clean-up job deletes these after the hold. On a store that can’t be reached it never
-                  can, and no new switch can start until they’re gone: an Owner can abandon them. Zephyr
-                  checks the store again first and refuses if it answers. Nothing is deleted there.
+                  The clean-up job deletes these after the hold, first copying anything missing to the store
+                  each photo is on now. If either store can’t be reached it never can, and no new switch can
+                  start until they’re gone: an Owner can abandon them. Zephyr checks the stores again first
+                  and refuses if they answer. Nothing is deleted there.
                 </p>
               </Card>
             )}
+            {(data.stranded ?? [])
+              .filter((x) => x.photos > 0 && isGone(x.storeId))
+              .map((x) => (
+                <Note key={`stranded-${x.storeId}`} tone="bad" icon="alert">
+                  {n(x.photos)} {x.photos === 1 ? 'photo' : 'photos'} can’t be recovered while{' '}
+                  {byId(x.storeId)?.name ?? x.storeId} is unreachable:{' '}
+                  {x.photos === 1 ? 'it was' : 'they were'} edited there after a rollback copied{' '}
+                  {x.photos === 1 ? 'it' : 'them'} back, so the older copy elsewhere can’t stand in.{' '}
+                  {x.photos === 1 ? 'It comes' : 'They come'} back if the store does.
+                </Note>
+              ))}
             {(data.followups?.dropped30d ?? 0) > 0 && (
               <Note tone="warn" icon="alert">
                 {n(data.followups?.dropped30d ?? 0)} follow-up{' '}
@@ -635,7 +656,9 @@ export function Storage() {
                     items={[
                       [
                         'refresh',
-                        'Zephyr checks the store again first. If it answers, nothing is abandoned: the clean-up job deletes the copies itself.',
+                        abandoning.via?.length
+                          ? `Only the copies whose photos are on ${abandoning.via.map((t) => byId(t)?.name ?? t).join(', ')} are abandoned. Zephyr checks the stores again first. If they answer, nothing is abandoned: the clean-up job deletes the copies itself.`
+                          : 'Zephyr checks the store again first. If it answers, nothing is abandoned: the clean-up job deletes the copies itself.',
                       ],
                       [
                         'alert',

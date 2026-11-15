@@ -125,7 +125,8 @@ export const ADMIN8_API = {
   storageSwitch: '/admin/api/v1/storage/switch',
   /** POST { action: 'pause' | 'resume' | 'rollback', reason } → AdminStorageResult (rollback: reauth) */
   storageMigration: '/admin/api/v1/storage/migration',
-  /** POST AdminStorageAbandonBody → AdminStorageResult (Owner only, reauth; the store must be unreachable or gone) */
+  /** POST AdminStorageAbandonBody → AdminStorageResult (Owner only, reauth; the store, or the store its copies'
+   *  photos are on, must be unreachable or gone) */
   storageAbandon: '/admin/api/v1/storage/abandon',
   /** POST AdminStorageGiveUpBody → AdminStorageResult (Owner only, reauth; a failed rollback only) */
   storageGiveUp: '/admin/api/v1/storage/rollback/give-up',
@@ -593,9 +594,12 @@ export interface AdminStorageResult {
   totals: { photos: number; bytes: number };
   /** Read-only mode turned on automatically because the write store stopped answering. */
   autoReadOnly: boolean;
-  /** Old copies still waiting for deletion, per store (an Owner can abandon them on a store that's gone).
-   *  endsRollback: abandoning them finishes a migration that can still be rolled back. */
-  oldCopies?: { storeId: string; copies: number; endsRollback?: boolean }[];
+  /** Old copies still waiting for deletion, per store (an Owner can abandon them when that store, or a store in
+   *  `targets`, is gone). endsRollback: abandoning them finishes a migration that can still be rolled back.
+   *  targets: the stores the copies' photos are on now (missing objects are copied there before deleting). */
+  oldCopies?: { storeId: string; copies: number; endsRollback?: boolean; targets?: string[] }[];
+  /** Photos a given-up rollback left on the store it was rolling back to: unreadable while it's unreachable. */
+  stranded?: { storeId: string; photos: number }[];
   /** Follow-up copies outstanding, and how many were dropped after 7 days in the last 30 days. */
   followups?: { pending: number; dropped30d: number };
 }
@@ -603,7 +607,8 @@ export interface AdminStorageSwitchBody {
   to: string;
   reason: string;
 }
-/** Give up on the old copies waiting on a store that's unreachable or no longer configured (bytes may remain). */
+/** Give up on the old copies waiting on a store when it, or the store their photos are on, is unreachable or no
+ *  longer configured (nothing is deleted; bytes may remain). */
 export interface AdminStorageAbandonBody {
   store: string;
   reason: string;

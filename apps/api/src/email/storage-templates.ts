@@ -51,14 +51,22 @@ export function storageGiveUpEmail(e: {
   from: string;
   to: string;
   photos: number;
+  /** Photos copied back that changed afterwards, so they stay on `from`. */
+  stranded?: number;
   adminUrl: string;
 }): Mail {
+  const stranded = e.stranded ?? 0;
   return layout(
     `[Zephyr] Rollback given up: uploads go to ${e.to} again`,
     'Rollback given up',
     [
       `${e.actor} gave up the failed rollback from ${e.to} to ${e.from}. New uploads go to ${e.to} again.`,
-      `${e.photos} ${e.photos === 1 ? 'photo that was' : 'photos that were'} still waiting to be copied back stay on ${e.to}. Photos already copied back stay on ${e.from} for as long as it's configured. The reason is in the audit log.`,
+      `${e.photos} ${e.photos === 1 ? 'photo is' : 'photos are'} read from ${e.to} now, including any already copied back that hadn't changed since. The reason is in the audit log.`,
+      ...(stranded > 0
+        ? [
+            `${stranded} ${stranded === 1 ? 'photo was' : 'photos were'} edited on ${e.from} after being copied back, so ${stranded === 1 ? 'it stays' : 'they stay'} there and can't be shown while ${e.from} is unreachable. Admin › Storage lists ${stranded === 1 ? 'it' : 'them'}.`,
+          ]
+        : []),
     ],
     adminLink(e.adminUrl),
   );

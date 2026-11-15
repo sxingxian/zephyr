@@ -731,10 +731,34 @@ describe('migration copy and verify', () => {
       expect(a).toEqual({ p_migration: MIGRATION, p_photo: PHOTO, p_store: 'r2' });
       return { copyTo: 'b2-eu' };
     };
+    world.rpc.storage_photo_store = () => 'b2-eu';
     expect(await deleteOldCopy(menv, due)).toBe(2);
     expect(mocks.b2.objects.has(`${prefix}thumb`)).toBe(true);
     expect(r2b.objects.has(`${prefix}original`)).toBe(false);
     expect(r2b.objects.has(`u/${OWNER}/p/other/original`)).toBe(true);
+    // Only a copy forward is re-checked against the photo's store.
+    expect(rpcCalls('storage_photo_store')).toHaveLength(1);
+  });
+
+  it('old copies: a photo purged while its missing objects were copied forward has that copy deleted again', async () => {
+    await seed();
+    await copyVerified(r2Store(r2b as unknown as R2Bucket), storeFor(menv, 'b2-eu'), `${prefix}original`);
+    world.rpc.storage_old_copy_claim = () => ({ copyTo: 'b2-eu' });
+    world.rpc.storage_photo_store = () => null;
+    expect(await deleteOldCopy(menv, due)).toBe(2);
+    // The rescued thumb went again, and so did the old copy.
+    expect(mocks.b2.objects.has(`${prefix}thumb`)).toBe(false);
+    expect(r2b.objects.has(`${prefix}thumb`)).toBe(false);
+  });
+
+  it('old copies: a photo that moved while copying forward keeps its old copy for the next run', async () => {
+    await seed();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    world.rpc.storage_old_copy_claim = () => ({ copyTo: 'b2-eu' });
+    world.rpc.storage_photo_store = () => 'r2-elsewhere';
+    await expect(deleteOldCopy(menv, due)).rejects.toThrow();
+    expect(r2b.objects.has(`${prefix}original`)).toBe(true);
+    expect(r2b.objects.has(`${prefix}thumb`)).toBe(true);
   });
 
   it("old copies of a photo that's gone (or a partial copy never used) are deleted without copying anything back", async () => {
@@ -800,6 +824,16 @@ describe('migration copy and verify', () => {
     expect(rpcCalls('storage_followup_add')).toHaveLength(1);
   });
 
+  it('followMove: a photo purged while its object was being copied has the copy, and the object, deleted', async () => {
+    await seed();
+    let reads = 0;
+    world.rpc.storage_photo_store = () => (++reads === 1 ? 'b2-eu' : null);
+    await followMove(menv, PHOTO, 'r2', [`${prefix}thumb`]);
+    expect(mocks.b2.objects.has(`${prefix}thumb`)).toBe(false);
+    expect(r2b.objects.has(`${prefix}thumb`)).toBe(false);
+    expect(rpcCalls('storage_followup_done').at(-1)?.body).toMatchObject({ p_ok: true });
+  });
+
   it('a followMove copy that fails stays recorded, and the cron copies it to wherever the photo is then', async () => {
     await seed();
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -824,11 +858,33 @@ describe('migration copy and verify', () => {
     ];
     expect(await runFollowups(menv)).toBe(0);
     expect(mocks.b2.objects.has(`${prefix}original`)).toBe(false);
+    // The photo gone: the object it left on the old store goes at once.
+    expect(r2b.objects.has(`${prefix}original`)).toBe(false);
     expect(
       rpcCalls('storage_followup_done')
         .slice(-3)
         .map((c) => (c.body as { p_ok: boolean }).p_ok),
     ).toEqual([true, true, true]);
+    // Purged while the copy ran: the copy goes again, and so does the source.
+    await r2b.put(`${prefix}edit-1-thumb-${'a'.repeat(32)}`, bytes('edit'));
+    world.rpc.storage_followups_due = () => [
+      { photoId: PHOTO, key: `${prefix}edit-1-thumb-${'a'.repeat(32)}`, from: 'r2', to: 'b2-eu' },
+    ];
+    world.rpc.storage_photo_store = () => null;
+    expect(await runFollowups(menv)).toBe(0);
+    expect(mocks.b2.objects.has(`${prefix}edit-1-thumb-${'a'.repeat(32)}`)).toBe(false);
+    expect(r2b.objects.has(`${prefix}edit-1-thumb-${'a'.repeat(32)}`)).toBe(false);
+    expect(rpcCalls('storage_followup_done').at(-1)?.body).toMatchObject({ p_ok: true });
+    // Moved while the copy ran: retried later towards its new store (the copy is kept).
+    await r2b.put(`${prefix}edit-2-thumb-${'b'.repeat(32)}`, bytes('edit 2'));
+    world.rpc.storage_followups_due = () => [
+      { photoId: PHOTO, key: `${prefix}edit-2-thumb-${'b'.repeat(32)}`, from: 'r2', to: 'b2-eu' },
+    ];
+    world.rpc.storage_photo_store = () => 'r2-other';
+    expect(await runFollowups(menv)).toBe(0);
+    expect(r2b.objects.has(`${prefix}edit-2-thumb-${'b'.repeat(32)}`)).toBe(true);
+    expect(rpcCalls('storage_followup_done').at(-1)?.body).toMatchObject({ p_ok: false });
+    world.rpc.storage_photo_store = () => 'b2-eu';
     // A failed retry backs off.
     mocks.b2.objects.clear();
     mocks.b2.next = { status: 503, body: '' };
@@ -999,6 +1055,7 @@ describe('photos on another store: purges and the orphan sweep', () => {
       { id: PHOTO, ownerId: OWNER, status: 'ready', activeUpload: false, storeId: 'b2-eu', maskKeys: [] },
     ];
     const later = Date.now() + 3 * 60 * 60 * 1000;
+    world.rpc.storage_photo_store = () => 'b2-eu';
     world.rpc.storage_status = () => ({ writeStore: 'r2', migration: null, cleanupPending: true });
     await sweepOrphans(menv, later);
     expect(r2b.objects.has(`${prefix}original`)).toBe(true);
@@ -1039,6 +1096,7 @@ describe('photos on another store: purges and the orphan sweep', () => {
       hasPreview: true,
     };
     world.rpc.sweep_photo_rows = () => [row];
+    world.rpc.storage_photo_store = () => 'b2-eu';
     const later = Date.now() + 3 * 60 * 60 * 1000;
     // The photo's store is down: nothing it still points at is deleted; the unrecorded keys go.
     mocks.b2.down = true;
@@ -1064,6 +1122,93 @@ describe('photos on another store: purges and the orphan sweep', () => {
     world.rpc.sweep_photo_rows = () => [{ ...row, status: 'uploading', activeUpload: true }];
     await sweepOrphans(menv, later);
     expect(r2b.objects.has(`${prefix}original`)).toBe(true);
+  });
+
+  it('a photo purged while the sweep rescued its copy has the rescued copy deleted too; a moved one keeps both', async () => {
+    await r2b.put(`${prefix}original`, bytes('away'));
+    world.rpc.get_job_state = () => null;
+    world.rpc.set_job_state = () => null;
+    world.rpc.storage_status = () => ({ writeStore: 'b2-eu', migration: null, cleanupPending: false });
+    world.rpc.sweep_photo_rows = () => [
+      { id: PHOTO, ownerId: OWNER, status: 'ready', activeUpload: false, storeId: 'b2-eu', maskKeys: [] },
+    ];
+    const later = Date.now() + 3 * 60 * 60 * 1000;
+    // Moved meanwhile: kept on both stores for the next pass.
+    world.rpc.storage_photo_store = () => 'r2';
+    expect(await sweepOrphans(menv, later)).toBe(0);
+    expect(r2b.objects.has(`${prefix}original`)).toBe(true);
+    expect(mocks.b2.objects.has(`${prefix}original`)).toBe(true);
+    // Purged meanwhile (gone, or being purged): the rescued copy goes again, and so does this one.
+    mocks.b2.objects.clear();
+    world.rpc.storage_photo_store = () => null;
+    expect(await sweepOrphans(menv, later)).toBe(1);
+    expect(r2b.objects.has(`${prefix}original`)).toBe(false);
+    expect(mocks.b2.objects.has(`${prefix}original`)).toBe(false);
+  });
+
+  it('keeps copies away from their photo store when a switch starts during the sweep, and still deletes true orphans', async () => {
+    const gone = `u/${OWNER}/p/${PHOTO2}/original`;
+    await r2b.put(`${prefix}original`, bytes('away'));
+    await r2b.put(gone, bytes('no row'));
+    mocks.b2.objects.set(`${prefix}original`, { bytes: bytes('away'), type: 'image/jpeg', etag: '"a"' });
+    world.rpc.get_job_state = () => null;
+    world.rpc.set_job_state = () => null;
+    world.rpc.storage_photo_store = () => 'b2-eu';
+    world.rpc.sweep_photo_rows = () => [
+      { id: PHOTO, ownerId: OWNER, status: 'ready', activeUpload: false, storeId: 'b2-eu', maskKeys: [] },
+    ];
+    // Nothing moving when the sweep starts; a switch has started by the time it deletes.
+    let reads = 0;
+    world.rpc.storage_status = () => {
+      reads++;
+      return reads === 1
+        ? { writeStore: 'r2', migration: null, cleanupPending: false }
+        : { writeStore: 'r2', migration: { id: MIGRATION, state: 'copying' }, cleanupPending: false };
+    };
+    expect(await sweepOrphans(menv, Date.now() + 3 * 60 * 60 * 1000)).toBe(1);
+    expect(reads).toBe(2);
+    expect(r2b.objects.has(`${prefix}original`)).toBe(true);
+    expect(r2b.objects.has(gone)).toBe(false);
+  });
+
+  it('rescues at most 40 copies a run, keeping the rest for the next pass, and moves the cursor on before working', async () => {
+    const ids = Array.from(
+      { length: 45 },
+      (_, i) => `30000000-0000-4000-8000-${String(i + 100).padStart(12, '0')}`,
+    );
+    for (const id of ids) await r2b.put(`u/${OWNER}/p/${id}/original`, bytes(`photo ${id}`));
+    const cursors: unknown[] = [];
+    world.rpc.get_job_state = () => null;
+    world.rpc.set_job_state = (a) => {
+      if (a.p_key === 'orphan_sweep_cursor') cursors.push(a.p_value);
+      return null;
+    };
+    world.rpc.storage_status = () => ({ writeStore: 'b2-eu', migration: null, cleanupPending: false });
+    world.rpc.storage_photo_store = () => 'b2-eu';
+    world.rpc.sweep_photo_rows = (a) =>
+      (a.p_ids as string[]).map((id) => ({
+        id,
+        ownerId: OWNER,
+        status: 'ready',
+        activeUpload: false,
+        storeId: 'b2-eu',
+        maskKeys: [],
+      }));
+    const later = Date.now() + 3 * 60 * 60 * 1000;
+    expect(await sweepOrphans(menv, later)).toBe(40);
+    expect(mocks.b2.objects.size).toBe(40);
+    expect([...r2b.objects.keys()].filter((k) => k.startsWith(`u/${OWNER}/p/`))).toHaveLength(5);
+    expect(await sweepOrphans(menv, later)).toBe(5);
+    expect(mocks.b2.objects.size).toBe(45);
+    // A run that fails after listing still moved its cursor on (never stuck repeating one page).
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await r2b.put(`u/${OWNER}/p/${ids[0]}/original`, bytes('again'));
+    world.rpc.sweep_photo_rows = () => {
+      throw new Error('db down');
+    };
+    const before = cursors.length;
+    await sweepOrphans(menv, later);
+    expect(cursors.length).toBe(before + 1);
   });
 });
 
@@ -1370,8 +1515,10 @@ describe('admin storage routes', () => {
     expect(rpcCalls('storage_abandon_old_copies')).toHaveLength(0);
 
     const { j, access } = await staffSession('owner@zephyr.test');
-    // A configured store whose last recorded check failed but which answers now: a fresh check runs (and is
-    // recorded), passes, and nothing is abandoned: the cron deletes its old copies itself.
+    world.rpc.storage_old_copy_targets = () => ['r2'];
+    // A configured store whose last recorded check failed but which answers now, as does the store its copies'
+    // photos are on: fresh checks run (and are recorded), pass, and nothing is abandoned: the cron deletes the
+    // old copies itself.
     checks = [
       {
         storeId: 'b2-eu',
@@ -1386,17 +1533,34 @@ describe('admin storage routes', () => {
     expect(recovered.status).toBe(409);
     expect(rpcCalls('storage_check_record').map((c) => (c.body as { p_store: string }).p_store)).toEqual([
       'b2-eu',
+      'r2',
     ]);
     expect(rpcCalls('storage_abandon_old_copies')).toHaveLength(0);
+
+    // The store answers, but some of its copies' photos are on a store that's gone (here, one the deployment no
+    // longer declares): only those copies are abandoned.
+    world.rpc.storage_old_copy_targets = (a) => (a.p_store === 'b2-eu' ? ['r2', 'old-store'] : []);
+    const via = await call(ADMIN8_API.storageAbandon, {
+      body: { store: 'b2-eu', reason: 'Their photos are on the old NAS' },
+      jar: j,
+      access,
+    });
+    expect(via.status).toBe(200);
+    expect(rpcCalls('storage_abandon_old_copies').at(-1)?.body).toMatchObject({
+      p_store: 'b2-eu',
+      p_targets: ['old-store'],
+    });
+    world.rpc.storage_old_copy_targets = () => [];
 
     // A store the deployment no longer declares (the config parses cleanly).
     const ok = await call(ADMIN8_API.storageAbandon, { body, jar: j, access });
     expect(ok.status).toBe(200);
-    expect(rpcCalls('storage_abandon_old_copies')[0]?.body).toEqual({
+    expect(rpcCalls('storage_abandon_old_copies').at(-1)?.body).toEqual({
       p_staff: '10000000-0000-0000-0000-000000000001',
       p_store: 'old-store',
       p_reason: 'The old NAS died',
       p_ack: false,
+      p_targets: null,
     });
     await vi.waitFor(() =>
       expect(world.emails.some((m) => m.subject.includes('abandoned on old-store'))).toBe(true),
@@ -1416,6 +1580,7 @@ describe('admin storage routes', () => {
     expect(rpcCalls('storage_abandon_old_copies').at(-1)?.body).toMatchObject({
       p_store: 'b2-eu',
       p_ack: true,
+      p_targets: null,
     });
     world.rpc.storage_abandon_old_copies = () => ({ error: 'rollback_ends' });
     const ends = await call(ADMIN8_API.storageAbandon, {
@@ -1448,6 +1613,8 @@ describe('admin storage routes', () => {
       from: 'r2',
       to: 'b2-eu',
       photos: 4,
+      returned: 1,
+      stranded: 1,
     });
     world.rpc.storage_check_record = () => ({ failStreak: 0, okStreak: 1, autoReadOnly: true });
     const readOnly: Record<string, unknown>[] = [];
@@ -1482,6 +1649,10 @@ describe('admin storage routes', () => {
     await vi.waitFor(() =>
       expect(world.emails.some((m) => m.subject.includes('Rollback given up'))).toBe(true),
     );
+    // The email says which photos couldn't come back to the new write store.
+    expect(world.emails.find((m) => m.subject.includes('Rollback given up'))?.text).toContain(
+      "1 photo was edited on r2 after being copied back, so it stays there and can't be shown while r2 is unreachable.",
+    );
 
     // A new write store that doesn't answer leaves read-only as it is.
     readOnly.length = 0;
@@ -1492,17 +1663,19 @@ describe('admin storage routes', () => {
     expect((await call(ADMIN8_API.storageGiveUp, { body, jar: j, access })).status).toBe(409);
   });
 
-  it('the overview passes on the old copies waiting per store and the follow-up counts', async () => {
+  it("the overview passes on the old copies waiting per store (with their photos' stores), stranded photos and the follow-up counts", async () => {
     const base = world.rpc.admin_storage as () => Record<string, unknown>;
     world.rpc.admin_storage = () => ({
       ...base(),
-      oldCopies: [{ storeId: 'old-store', copies: 4 }],
+      oldCopies: [{ storeId: 'old-store', copies: 4, targets: ['b2-eu', 7] }],
+      stranded: [{ storeId: 'old-store', photos: 2 }],
       followups: { pending: 2, dropped30d: 1 },
     });
     const { j, access } = await staffSession('admin@zephyr.test');
     const res = await call(ADMIN8_API.storage, { method: 'GET', jar: j, access });
     expect(await read(res)).toMatchObject({
-      oldCopies: [{ storeId: 'old-store', copies: 4 }],
+      oldCopies: [{ storeId: 'old-store', copies: 4, targets: ['b2-eu'] }],
+      stranded: [{ storeId: 'old-store', photos: 2 }],
       followups: { pending: 2, dropped30d: 1 },
     });
   });

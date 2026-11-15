@@ -21,7 +21,7 @@ import {
 } from './library/storage';
 import { deleteAll, deleteUnder, stores } from './storage';
 import { allStores, photoStore, storeIdOf } from './storage/config';
-import { copyVerified } from './storage/migrate';
+import { afterCopy, copyVerified } from './storage/migrate';
 import type { ObjectStore } from './storage/types';
 import { rpc } from './supabase';
 
@@ -34,6 +34,9 @@ export const JOB_LIMITS = {
   pagesPerAccount: 10,
   /** Objects the orphan sweep looks at per run (one R2 list page; the cursor carries over). */
   sweepPage: 1000,
+  /** Copies the orphan sweep makes per store per run to rescue a live key before deleting it (each is a get, a
+   *  put and a read-back on stores that may be slow); keys over the cap are kept for the next pass. */
+  sweepRescues: 40,
   /** Galleries per sharing clean-up step, and queued object deletions per run. */
   shareCleanup: 100,
   shareDeletions: 500,
@@ -450,6 +453,15 @@ async function sweepStore(env: Env, store: ObjectStore, moving: boolean, now: nu
   const key = cursorKey(store.id);
   const cursor = await rpc<string | null>(env, 'get_job_state', { p_key: key });
   const listed = await store.list('u/', { limit: JOB_LIMITS.sweepPage, cursor });
+  // The cursor moves on before this page is worked through, so a run that dies half-way (a slow store, the
+  // Worker's time limit) never repeats the same page for ever. Anything kept here is met again next cycle.
+  try {
+    await rpc(env, 'set_job_state', { p_key: key, p_value: listed.cursor });
+  } catch (err) {
+    // Never freeze on a cursor that can't be stored (e.g. too long): start over from the top next run.
+    logError('cron', 'job_sweep_cursor', err);
+    await rpc(env, 'set_job_state', { p_key: key, p_value: null });
+  }
   const parsed = listed.objects.map((o) => ({
     key: o.key,
     k: parseKey(o.key),
@@ -458,9 +470,11 @@ async function sweepStore(env: Env, store: ObjectStore, moving: boolean, now: nu
   const ids = [...new Set(parsed.flatMap((p) => (p.k ? [p.k.photo] : [])))];
   const rows = ids.length ? await rpc<PhotoRowState[]>(env, 'sweep_photo_rows', { p_ids: ids }) : [];
   const byId = new Map(rows.map((r) => [r.id, r]));
-  // Copies away from their photo's store that the photo still points at: deleted only once the photo's own
-  // store is known to hold the key (rescued there first if it doesn't).
-  const away: { key: string; home: string }[] = [];
+  // Copies away from their photo's store (deleted only while no migration is moving photos), and among them the
+  // ones the photo still points at: deleted only once the photo's own store is known to hold the key (rescued
+  // there first if it doesn't).
+  const awayKeys = new Set<string>();
+  const away: { key: string; photo: string; home: string }[] = [];
   const orphans = parsed.flatMap(({ key, k, uploaded }) => {
     // Ids spelled in another case: never recorded or counted, whatever its age.
     if (!k) return isNonCanonicalPhotoKey(key) ? [key] : [];
@@ -472,8 +486,9 @@ async function sweepStore(env: Env, store: ObjectStore, moving: boolean, now: nu
       // everything until its upload is done or expired.
       if (moving || now - uploaded <= LIBRARY_LIMITS.editGraceMs) return [];
       if (row.status === 'uploading' || row.activeUpload) return [];
+      awayKeys.add(key);
       if (liveKey(row, key, k)) {
-        away.push({ key, home: storeIdOf(row) });
+        away.push({ key, photo: row.id, home: storeIdOf(row) });
         return [];
       }
       return [key];
@@ -491,29 +506,48 @@ async function sweepStore(env: Env, store: ObjectStore, moving: boolean, now: nu
     }
     return [];
   });
+  let rescues = 0;
   for (const a of away) {
     try {
       const home = photoStore(env, a.home);
-      if (!(await home.head(a.key))) {
-        // The only copy may be this one: copy it to the photo's store (verified) before letting it go. A
-        // source that vanished meanwhile leaves nothing to delete.
-        if ((await copyVerified(store, home, a.key)) === null) continue;
+      if (await home.head(a.key)) {
+        orphans.push(a.key);
+        continue;
       }
-      orphans.push(a.key);
+      // The only copy may be this one: copy it to the photo's store (verified) before letting it go. At most
+      // sweepRescues copies a run; the rest are kept for the next pass.
+      if (rescues >= JOB_LIMITS.sweepRescues) continue;
+      rescues++;
+      // A source that vanished meanwhile leaves nothing to delete.
+      if ((await copyVerified(store, home, a.key)) === null) continue;
+      // The photo may have been purged (or moved) while this ran: a purged photo's rescued copy is deleted again
+      // and this one is an orphan; a moved photo keeps both until the next pass.
+      const after = await afterCopy(env, a.photo, home, [a.key]);
+      if (after !== 'moved') orphans.push(a.key);
     } catch (err) {
       // The photo's store can't be read or written right now: keep the copy, the next pass tries again.
       logError('cron', 'job_sweep_rescue', err);
     }
   }
-  if (orphans.length) await deleteKeys(store, orphans);
-  try {
-    await rpc(env, 'set_job_state', { p_key: key, p_value: listed.cursor });
-  } catch (err) {
-    // Never freeze on a cursor that can't be stored (e.g. too long): start over from the top next run.
-    logError('cron', 'job_sweep_cursor', err);
-    await rpc(env, 'set_job_state', { p_key: key, p_value: null });
+  let doomed = orphans;
+  if (orphans.some((k) => awayKeys.has(k))) {
+    // A switch may have started since this run looked (and the rescues widened that window): copies away from
+    // their photo's store are the migration's again, so they're kept unless nothing is moving now.
+    let movingNow = true;
+    try {
+      const status = await rpc<{ migration: { state: string } | null; cleanupPending?: boolean } | null>(
+        env,
+        'storage_status',
+      );
+      movingNow =
+        (!!status?.migration && MOVING.has(status.migration.state)) || status?.cleanupPending === true;
+    } catch (err) {
+      logError('cron', 'job_sweep_status', err);
+    }
+    if (movingNow) doomed = orphans.filter((k) => !awayKeys.has(k));
   }
-  return orphans.length;
+  if (doomed.length) await deleteKeys(store, doomed);
+  return doomed.length;
 }
 
 interface ShareCleanup {

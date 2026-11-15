@@ -43,7 +43,8 @@ interface StorageDb {
   usage: { storeId: string; objects: number; bytes: number }[];
   checks: { storeId: string; result: StoreCheck }[];
   autoReadOnly: boolean;
-  oldCopies?: { storeId: string; copies: number; endsRollback?: boolean }[];
+  oldCopies?: { storeId: string; copies: number; endsRollback?: boolean; targets?: string[] }[];
+  stranded?: { storeId: string; photos: number }[];
   followups?: { pending: number; dropped30d: number };
 }
 
@@ -133,7 +134,9 @@ export async function storageOverview(c: Ctx): Promise<AdminStorageResult> {
       storeId: o.storeId,
       copies: Number(o.copies) || 0,
       endsRollback: o.endsRollback === true,
+      targets: Array.isArray(o.targets) ? o.targets.filter((t) => typeof t === 'string') : [],
     })),
+    stranded: (db.stranded ?? []).map((x) => ({ storeId: x.storeId, photos: Number(x.photos) || 0 })),
     followups: {
       pending: Number(db.followups?.pending) || 0,
       dropped30d: Number(db.followups?.dropped30d) || 0,
@@ -286,10 +289,13 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
     }
   });
 
-  // Abandoning old copies on a store that's gone: Owner only, passkey, every Owner emailed. Only for a store
-  // that fails a health check run now, or one a cleanly parsed config no longer declares (on a healthy store
-  // the cron just deletes them). A config that doesn't parse leaves only R2 declared, so nothing is abandoned
-  // then. Finishing a migration that could still be rolled back needs acknowledgeRollbackEnds.
+  // Abandoning old copies that can never be deleted: Owner only, passkey, every Owner emailed. Each deletion
+  // first copies anything missing to the photo's store, so it's blocked when either end is gone. Allowed for
+  // every copy on a store that fails a health check run now (or that a cleanly parsed config no longer declares),
+  // or, when that store answers, for just the copies whose photos are on a store that fails one (or is
+  // undeclared). Healthy at both ends: the cron deletes them itself (409). A config that doesn't parse leaves
+  // only R2 declared, so nothing is abandoned then. Finishing a migration that could still be rolled back needs
+  // acknowledgeRollbackEnds.
   router.post('/v1/storage/abandon', requireStaff({ write: true }), canStorage, async (c) => {
     if (c.get('staff').role !== 'owner') return c.json(fail('forbidden'), 403);
     const body = await readBody(c, adminStorageAbandonSchema);
@@ -297,14 +303,27 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
     if (!c.get('staff').recentPasskey) return c.json(fail('reauth_required'), 403);
     if (storeConfigError(c.env)) return c.json(fail('conflict'), 409);
     try {
-      const configured = storeConfigs(c.env).some((s) => s.id === body.store);
-      if (configured) {
-        // A fresh check, recorded (and counted for auto read-only if it's the write store): a store that answers
-        // now keeps its copies, whatever an older check said.
-        const status = await rpc<{ writeStore: string } | null>(c.env, 'storage_status');
-        const check = await checkStore(c.env, body.store, false);
-        await recordCheck(c.env, body.store, check, body.store === (status?.writeStore || 'r2'));
-        if (checkOk(check)) return c.json(fail('conflict'), 409);
+      const declared = new Set(storeConfigs(c.env).map((s) => s.id));
+      const status = await rpc<{ writeStore: string } | null>(c.env, 'storage_status');
+      // A fresh check, recorded (and counted for auto read-only if it's the write store): a store that answers
+      // now is treated as answering, whatever an older check said.
+      const unreachable = async (id: string): Promise<boolean> => {
+        if (!declared.has(id)) return true;
+        const check = await checkStore(c.env, id, false);
+        await recordCheck(c.env, id, check, id === (status?.writeStore || 'r2'));
+        return !checkOk(check);
+      };
+      let targets: string[] | null = null;
+      if (!(await unreachable(body.store))) {
+        const listed = await rpc<string[] | null>(c.env, 'storage_old_copy_targets', { p_store: body.store });
+        const dead: string[] = [];
+        for (const t of (listed ?? [])
+          .filter((x) => typeof x === 'string' && x !== body.store)
+          .slice(0, 50)) {
+          if (await unreachable(t)) dead.push(t);
+        }
+        if (!dead.length) return c.json(fail('conflict'), 409);
+        targets = dead;
       }
       const res = await rpc<{ store?: string; copies?: number; migrations?: number; error?: string }>(
         c.env,
@@ -314,6 +333,7 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
           p_store: body.store,
           p_reason: body.reason,
           p_ack: body.acknowledgeRollbackEnds === true,
+          p_targets: targets,
         },
       );
       if (res?.error) return refused(c, res.error);
@@ -346,6 +366,7 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
         from?: string;
         to?: string;
         photos?: number;
+        stranded?: number;
         error?: string;
       }>(c.env, 'storage_rollback_give_up', { p_staff: c.get('staff').id, p_reason: body.reason });
       if (res?.error) return refused(c, res.error);
@@ -362,6 +383,7 @@ export function registerAdminStorageRoutes(router: Hono<HonoEnv>, requireStaff: 
           from: res?.from ?? '',
           to: res?.to ?? '',
           photos: Number(res?.photos) || 0,
+          stranded: Number(res?.stranded) || 0,
           adminUrl: adminUrl(c),
         }),
         'storage_give_up_notify',

@@ -486,6 +486,42 @@ describe('Storage', () => {
     await waitFor(() => expect(screen.queryByText('Old copies waiting for deletion')).toBeNull(), T);
   });
 
+  it('offers to abandon copies on a healthy store whose photos are on a store that can’t be reached, and lists stranded photos', async () => {
+    mock('owner', (c) => {
+      if (c.url.endsWith('/storage') && c.method === 'GET')
+        return json(200, {
+          ...STORAGE,
+          oldCopies: [{ storeId: 'b2', copies: 1, targets: ['nas2'] }],
+          stranded: [
+            { storeId: 'nas2', photos: 2 },
+            { storeId: 'b2', photos: 5 },
+          ],
+        });
+      if (c.url.endsWith('/storage/abandon')) return json(200, { ...STORAGE, oldCopies: [] });
+      return undefined;
+    });
+    renderAt('/storage');
+    expect(
+      await screen.findByText(/waiting on Studio NAS · hostname, which can’t be reached/, {}, T),
+    ).toBeTruthy();
+    // Stranded photos are only called out while their store can't be reached.
+    expect(
+      screen.getByText(/2 photos can’t be recovered while Studio NAS · hostname is unreachable/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/5 photos can’t be recovered/)).toBeNull();
+    await act(async () => screen.getByRole('button', { name: 'Abandon…' }).click());
+    const d = dialog('Abandon old copies on Backblaze B2');
+    expect(
+      within(d).getByText(/Only the copies whose photos are on Studio NAS · hostname are abandoned/),
+    ).toBeTruthy();
+    fireEvent.change(reasonIn(d), { target: { value: 'The NAS died' } });
+    await act(async () => btn(d, /Abandon with passkey/).click());
+    await waitFor(
+      () => expect(writes('/storage/abandon')[0]?.body).toEqual({ store: 'b2', reason: 'The NAS died' }),
+      T,
+    );
+  });
+
   it('warns that abandoning ends a rollback that’s still possible, and sends the acknowledgement', async () => {
     mock('owner', (c) => {
       if (c.url.endsWith('/storage') && c.method === 'GET')

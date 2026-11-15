@@ -117,6 +117,28 @@ export async function copyVerified(from: ObjectStore, to: ObjectStore, key: stri
 }
 
 /**
+ * After copying `keys` to `to` for a photo (a copy forward: old-copy deletion, a follow-up, followMove, the orphan
+ * sweep's rescue), the photo's store is read again, because a purge (or a move) can run between reading where the
+ * photo is and finishing the copy. 'ok': still there. 'gone': the photo is gone or being purged, so the copy just
+ * made is deleted again (nothing points at it, and the sweep could take months to reach it). 'moved': the photo
+ * is on another store now; the copy is kept (the move may already have listed it), and the caller must not treat
+ * the object as safely at its photo's store. Throws when the photo's store can't be read: the caller keeps
+ * everything and tries again later.
+ */
+export async function afterCopy(
+  env: Env,
+  photoId: string,
+  to: ObjectStore,
+  keys: string[],
+): Promise<'ok' | 'gone' | 'moved'> {
+  const now = await rpc<string | null>(env, 'storage_photo_store', { p_photo: photoId });
+  if (now === to.id) return 'ok';
+  if (now) return 'moved';
+  for (let i = 0; i < keys.length; i += 1000) await to.delete(keys.slice(i, i + 1000));
+  return 'gone';
+}
+
+/**
  * Copies and verifies every object of one photo. Re-lists until a pass finds nothing new. Throws
  * `source_incomplete` unless the original was copied from the source, every other key in `lease.keys` was
  * copied or is already on the destination (an object a writer stored on the old store whose follow-up copy
@@ -260,9 +282,15 @@ export async function deleteOldCopy(env: Env, item: OldCopyItem): Promise<number
   const keys = await listAll(from, photoPrefix(item.ownerId, item.photoId));
   if (claim.copyTo && claim.copyTo !== item.from) {
     const to = photoStore(env, claim.copyTo);
+    const copied: string[] = [];
     for (const key of keys) {
       const there = await to.head(key);
-      if (!there) await copyVerified(from, to, key);
+      if (!there && (await copyVerified(from, to, key)) !== null) copied.push(key);
+    }
+    // A photo purged while this ran: what was just copied goes again (the old copy goes below). A photo that
+    // moved meanwhile (it can't while old copies wait, but never assume): keep the old copy and retry later.
+    if (copied.length && (await afterCopy(env, item.photoId, to, copied)) === 'moved') {
+      throw new StoreError('photo_moved');
     }
   }
   for (let i = 0; i < keys.length; i += 1000) await from.delete(keys.slice(i, i + 1000));
@@ -293,7 +321,15 @@ export async function followMove(env: Env, photoId: string, wrote: string, keys:
   try {
     const from = photoStore(env, wrote);
     const to = photoStore(env, now);
-    for (const key of keys) await copyVerified(from, to, key);
+    const copied: string[] = [];
+    for (const key of keys) if ((await copyVerified(from, to, key)) !== null) copied.push(key);
+    if (copied.length) {
+      const after = await afterCopy(env, photoId, to, copied);
+      // Moved again meanwhile: the follow-up stays, and the cron copies the object to wherever it is then.
+      if (after === 'moved') return;
+      // Purged meanwhile: what this request wrote on the old store is garbage too.
+      if (after === 'gone') await from.delete(keys);
+    }
   } catch (err) {
     logError('storage', 'follow_move', err);
     return;
@@ -390,11 +426,25 @@ export async function runFollowups(env: Env): Promise<number> {
   let copied = 0;
   for (const item of due ?? []) {
     try {
-      if (item.to && item.to !== item.from) {
+      const from = photoStore(env, item.from);
+      if (!item.to) {
+        // The photo is gone (or being purged): the object it left on the old store goes now, not whenever the
+        // sweep's cursor reaches it.
+        await from.delete([item.key]);
+      } else if (item.to !== item.from) {
         const to = photoStore(env, item.to);
         if (!(await to.head(item.key))) {
-          const n = await copyVerified(photoStore(env, item.from), to, item.key);
-          if (n !== null) copied++;
+          const n = await copyVerified(from, to, item.key);
+          if (n !== null) {
+            const after = await afterCopy(env, item.photoId, to, [item.key]);
+            if (after === 'moved') {
+              // Listed again with the photo's new store, after the usual backoff.
+              await followupDone(env, item.photoId, item.key, item.from, false);
+              continue;
+            }
+            if (after === 'gone') await from.delete([item.key]);
+            else copied++;
+          }
         }
       }
       await followupDone(env, item.photoId, item.key, item.from, true);
